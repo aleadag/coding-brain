@@ -1,7 +1,7 @@
 {
   "name": "claudectl",
-  "version": "0.32.0",
-  "description": "Local LLM brain that auto-approves/denies Claude Code tool calls, with session monitoring and spend control",
+  "version": "0.43.0",
+  "description": "Mission control for Claude Code — local LLM brain, session monitoring, spend control, and hive mind skill sharing",
   "author": {
     "name": "mercurialsolo",
     "url": "https://github.com/mercurialsolo"
@@ -9,5 +9,5 @@
   "homepage": "https://mercurialsolo.github.io/claudectl/",
   "repository": "https://github.com/mercurialsolo/claudectl",
   "license": "MIT",
-  "keywords": ["auto-approve", "local-llm", "brain", "session-monitoring", "spend-control", "orchestration"]
+  "keywords": ["auto-approve", "local-llm", "brain", "session-monitoring", "spend-control", "orchestration", "hive-mind", "skill-sharing"]
 }
