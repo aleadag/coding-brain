@@ -15,6 +15,7 @@ social/
 
 #/target
 .claude/worktrees/
+.direnv/
 docs/reddit*
 site/
 outputs/
