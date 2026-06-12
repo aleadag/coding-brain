@@ -38,6 +38,8 @@ pub mod doctor;
 #[cfg(feature = "hive")]
 pub mod hive;
 pub mod init;
+#[cfg(feature = "coord")]
+pub mod r#loop;
 pub mod orchestrator;
 #[cfg(feature = "relay")]
 pub mod relay;

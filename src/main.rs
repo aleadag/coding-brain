@@ -31,6 +31,8 @@ mod hive;
 #[cfg(feature = "coord")]
 mod ingest;
 mod init;
+#[cfg(feature = "coord")]
+mod r#loop;
 mod orchestrator;
 #[cfg(feature = "relay")]
 mod relay;
@@ -106,6 +108,13 @@ pub(crate) enum Command {
     Supervisor {
         #[command(subcommand)]
         command: coord::supervisor_cli::SupervisorCommand,
+    },
+
+    #[cfg(feature = "coord")]
+    /// Loop runtime: source polling, triage, and coord task submission
+    Loop {
+        #[command(subcommand)]
+        command: r#loop::cli::LoopCommand,
     },
 
     /// Onboarding wizard (budget, brain, hooks, bus, skills). See issue #257.
@@ -820,6 +829,9 @@ fn run_main(cli: Cli) -> io::Result<()> {
 
             #[cfg(feature = "coord")]
             Command::Supervisor { command } => return coord::supervisor_cli::dispatch(command),
+
+            #[cfg(feature = "coord")]
+            Command::Loop { command } => return r#loop::cli::dispatch(command, &cfg),
 
             Command::Init {
                 check,
