@@ -173,7 +173,7 @@ mod tests {
         };
         assert_eq!(msg.role, TranscriptRole::Assistant);
         assert_eq!(msg.stop_reason.as_deref(), Some("tool_use"));
-        assert_eq!(msg.model.as_deref(), Some("codex-sonnet-4-6-20260401"));
+        assert_eq!(msg.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(msg.content.len(), 2);
     }
 

@@ -751,12 +751,12 @@ impl Config {
 # ── Model Pricing Overrides ─────────────────────────────────────────
 # Override built-in pricing for specific models.
 #
-# [models."my-custom-model"]
-# input_per_m = 3.00
-# output_per_m = 15.00
-# cache_read_per_m = 0.30
-# cache_write_per_m = 3.75
-# context_max = 200000
+# [models."gpt-5.5"]
+# input_per_m = 5.00
+# output_per_m = 30.00
+# cache_read_per_m = 0.50
+# cache_write_per_m = 5.00
+# context_max = 258400
 
 # ── Auto-Rules ──────────────────────────────────────────────────────
 # Match sessions by status/tool/command/project/cost, then take action.
@@ -1548,12 +1548,12 @@ kill_on_budget = false
 url = "https://hooks.slack.com/test"
 events = ["NeedsInput", "Finished"]
 
-[models."gpt-4o"]
-input_per_m = 1.25
-output_per_m = 5.0
-cache_read_per_m = 0.15
-cache_write_per_m = 0.9
-context_max = 128000
+[models."gpt-5.5"]
+input_per_m = 5.0
+output_per_m = 30.0
+cache_read_per_m = 0.5
+cache_write_per_m = 5.0
+context_max = 258400
 "#
         )
         .unwrap();
@@ -1572,8 +1572,8 @@ context_max = 128000
             Some(vec!["NeedsInput".into(), "Finished".into()])
         );
         assert_eq!(raw.model_overrides.len(), 1);
-        assert_eq!(raw.model_overrides[0].name, "gpt-4o");
-        assert_eq!(raw.model_overrides[0].profile.context_max, 128_000);
+        assert_eq!(raw.model_overrides[0].name, "gpt-5.5");
+        assert_eq!(raw.model_overrides[0].profile.context_max, 258_400);
     }
 
     #[test]

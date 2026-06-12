@@ -41,7 +41,7 @@ codexctl's brain is a local LLM (Gemma 4 4B, Llama 3, or any model you run local
 Every 2 seconds, the brain builds a context snapshot for each session that needs a decision:
 
 ```
-Session: acme-api | Processing | opus-4.6 | Cost: $3.20 | Context: 45%
+Session: acme-api | Processing | gpt-5.5 | Cost: $3.20 | Context: 45%
 Pending tool: Bash | Command: cargo test --release
 Last tool ERRORED: test compilation failed (src/auth.rs:47)
 

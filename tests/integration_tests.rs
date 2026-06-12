@@ -195,7 +195,7 @@ fn status_null_stop_reason_with_tool_use_infers_needs_input() {
     // Tool-call transcripts can write stop_reason: null while awaiting approval.
     // The content still has a tool_use block — infer tool_use from content so
     // that the session shows NeedsInput instead of Idle.
-    let jsonl = r#"{"type":"assistant","message":{"role":"assistant","model":"codex-opus-4-6","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_01X","name":"Bash","input":{"command":"echo hi"}}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+    let jsonl = r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_01X","name":"Bash","input":{"command":"echo hi"}}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
 
     let (mut s, _file) = make_session_with_jsonl(jsonl);
     s.cpu_percent = 0.5;
@@ -214,9 +214,9 @@ fn status_null_stop_reason_with_tool_use_infers_needs_input() {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn cost_opus_tokens() {
+fn cost_gpt_55_tokens() {
     let mut s = make_session(0.0, 0);
-    s.model = "opus-4.6".into();
+    s.model = "gpt-5.5".into();
     s.total_input_tokens = 1_000_000;
     s.total_output_tokens = 100_000;
     s.cache_read_tokens = 500_000;
@@ -224,20 +224,20 @@ fn cost_opus_tokens() {
 
     let cost = monitor::estimate_cost(&s);
     // plain_input = 1M - 500k - 200k = 300k
-    // cost = 300k/1M * 15 + 100k/1M * 75 + 500k/1M * 1.875 + 200k/1M * 18.75
-    //      = 0.3 * 15 + 0.1 * 75 + 0.5 * 1.875 + 0.2 * 18.75
-    //      = 4.5 + 7.5 + 0.9375 + 3.75 = 16.6875
-    let expected = 16.6875;
+    // cost = 300k/1M * 5 + 100k/1M * 30 + 500k/1M * 0.5 + 200k/1M * 5
+    //      = 0.3 * 5 + 0.1 * 30 + 0.5 * 0.5 + 0.2 * 5
+    //      = 1.5 + 3 + 0.25 + 1 = 5.75
+    let expected = 5.75;
     assert!(
         (cost - expected).abs() < 0.001,
-        "opus cost={cost}, expected={expected}"
+        "gpt-5.5 cost={cost}, expected={expected}"
     );
 }
 
 #[test]
-fn cost_sonnet_tokens() {
+fn cost_gpt_54_tokens() {
     let mut s = make_session(0.0, 0);
-    s.model = "sonnet-4.6".into();
+    s.model = "gpt-5.4".into();
     s.total_input_tokens = 100_000;
     s.total_output_tokens = 50_000;
     s.cache_read_tokens = 0;
@@ -245,18 +245,18 @@ fn cost_sonnet_tokens() {
 
     let cost = monitor::estimate_cost(&s);
     // plain_input = 100k
-    // cost = 100k/1M * 3 + 50k/1M * 15 = 0.3 + 0.75 = 1.05
-    let expected = 1.05;
+    // cost = 100k/1M * 2.5 + 50k/1M * 15 = 0.25 + 0.75 = 1.0
+    let expected = 1.0;
     assert!(
         (cost - expected).abs() < 0.001,
-        "sonnet cost={cost}, expected={expected}"
+        "gpt-5.4 cost={cost}, expected={expected}"
     );
 }
 
 #[test]
-fn cost_haiku_tokens() {
+fn cost_gpt_54_mini_tokens() {
     let mut s = make_session(0.0, 0);
-    s.model = "haiku".into();
+    s.model = "gpt-5.4-mini".into();
     s.total_input_tokens = 100_000;
     s.total_output_tokens = 50_000;
     s.cache_read_tokens = 0;
@@ -264,16 +264,16 @@ fn cost_haiku_tokens() {
 
     let cost = monitor::estimate_cost(&s);
     // plain_input = 100k
-    // cost = 100k/1M * 0.80 + 50k/1M * 4.0 = 0.08 + 0.2 = 0.28
-    let expected = 0.28;
+    // cost = 100k/1M * 0.75 + 50k/1M * 4.5 = 0.075 + 0.225 = 0.3
+    let expected = 0.3;
     assert!(
         (cost - expected).abs() < 0.001,
-        "haiku cost={cost}, expected={expected}"
+        "gpt-5.4-mini cost={cost}, expected={expected}"
     );
 }
 
 #[test]
-fn cost_unknown_model_defaults_to_opus() {
+fn cost_unknown_model_uses_gpt_55_fallback() {
     let mut s = make_session(0.0, 0);
     s.model = "some-future-model".into();
     s.total_input_tokens = 1_000_000;
@@ -282,8 +282,8 @@ fn cost_unknown_model_defaults_to_opus() {
     s.cache_write_tokens = 0;
 
     let cost = monitor::estimate_cost(&s);
-    // Should use opus pricing: 1M/1M * 15 = 15.0
-    let expected = 15.0;
+    // Should use GPT-5.5 fallback pricing: 1M/1M * 5 = 5.0
+    let expected = 5.0;
     assert!(
         (cost - expected).abs() < 0.001,
         "unknown model cost={cost}, expected={expected}"
@@ -302,25 +302,23 @@ fn cost_zero_tokens() {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn context_max_opus() {
-    assert_eq!(monitor::model_context_max("opus-4.6"), 1_000_000);
-    assert_eq!(monitor::model_context_max("opus"), 1_000_000);
+fn context_max_gpt_55() {
+    assert_eq!(monitor::model_context_max("gpt-5.5"), 258_400);
 }
 
 #[test]
-fn context_max_sonnet() {
-    assert_eq!(monitor::model_context_max("sonnet-4.6"), 200_000);
-    assert_eq!(monitor::model_context_max("sonnet"), 200_000);
+fn context_max_gpt_54() {
+    assert_eq!(monitor::model_context_max("gpt-5.4"), 258_400);
 }
 
 #[test]
-fn context_max_haiku() {
-    assert_eq!(monitor::model_context_max("haiku"), 200_000);
+fn context_max_gpt_54_mini() {
+    assert_eq!(monitor::model_context_max("gpt-5.4-mini"), 258_400);
 }
 
 #[test]
 fn context_max_unknown() {
-    assert_eq!(monitor::model_context_max("unknown-model"), 200_000);
+    assert_eq!(monitor::model_context_max("unknown-model"), 258_400);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -328,39 +326,27 @@ fn context_max_unknown() {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn shorten_model_opus_46() {
+fn shorten_model_gpt_55() {
+    assert_eq!(monitor::shorten_model("codex-gpt-5.5-20260612"), "gpt-5.5");
+}
+
+#[test]
+fn shorten_model_gpt_54() {
+    assert_eq!(monitor::shorten_model("codex-gpt-5.4-20260612"), "gpt-5.4");
+}
+
+#[test]
+fn shorten_model_gpt_54_mini() {
     assert_eq!(
-        monitor::shorten_model("codex-opus-4-6-20260401"),
-        "opus-4.6"
+        monitor::shorten_model("codex-gpt-5.4-mini-20260612"),
+        "gpt-5.4-mini"
     );
-}
-
-#[test]
-fn shorten_model_opus_generic() {
-    assert_eq!(monitor::shorten_model("codex-opus-20260101"), "opus");
-}
-
-#[test]
-fn shorten_model_sonnet_46() {
-    assert_eq!(
-        monitor::shorten_model("codex-sonnet-4-6-20260401"),
-        "sonnet-4.6"
-    );
-}
-
-#[test]
-fn shorten_model_sonnet_generic() {
-    assert_eq!(monitor::shorten_model("codex-sonnet-20260101"), "sonnet");
-}
-
-#[test]
-fn shorten_model_haiku() {
-    assert_eq!(monitor::shorten_model("codex-haiku-4-5-20251001"), "haiku");
+    assert_eq!(monitor::shorten_model("gpt-5.4 mini"), "gpt-5.4-mini");
 }
 
 #[test]
 fn shorten_model_unknown() {
-    assert_eq!(monitor::shorten_model("gpt-4o"), "gpt-4o");
+    assert_eq!(monitor::shorten_model("custom-model"), "custom-model");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -576,7 +562,7 @@ fn expected_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
 
 #[test]
 fn jsonl_parse_token_usage() {
-    let jsonl = r#"{"type":"assistant","message":{"model":"codex-opus-4-6-20260401","stop_reason":"end_turn","usage":{"input_tokens":50000,"output_tokens":10000,"cache_read_input_tokens":20000,"cache_creation_input_tokens":5000}}}"#;
+    let jsonl = r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":50000,"output_tokens":10000,"cache_read_input_tokens":20000,"cache_creation_input_tokens":5000}}}"#;
 
     let (mut s, _file) = make_session_with_jsonl(jsonl);
     monitor::update_tokens(&mut s);
@@ -585,8 +571,8 @@ fn jsonl_parse_token_usage() {
     assert_eq!(s.total_output_tokens, 10000);
     assert_eq!(s.cache_read_tokens, 20000);
     assert_eq!(s.cache_write_tokens, 5000);
-    assert_eq!(s.model, "opus-4.6");
-    assert_eq!(s.context_max, 1_000_000);
+    assert_eq!(s.model, "gpt-5.5");
+    assert_eq!(s.context_max, 258_400);
 }
 
 #[test]
@@ -594,9 +580,9 @@ fn jsonl_parse_multiple_entries() {
     let jsonl = concat!(
         r#"{"type":"user","message":{"type":"user"}}"#,
         "\n",
-        r#"{"type":"assistant","message":{"model":"codex-sonnet-4-6-20260401","stop_reason":"tool_use","usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"tool_use","usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
         "\n",
-        r#"{"type":"assistant","message":{"model":"codex-sonnet-4-6-20260401","stop_reason":"end_turn","usage":{"input_tokens":2000,"output_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"end_turn","usage":{"input_tokens":2000,"output_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
     );
 
     let (mut s, _file) = make_session_with_jsonl(jsonl);
@@ -604,13 +590,13 @@ fn jsonl_parse_multiple_entries() {
 
     assert_eq!(s.total_input_tokens, 3000); // 1000 + 2000
     assert_eq!(s.total_output_tokens, 1500); // 500 + 1000
-    assert_eq!(s.model, "sonnet-4.6");
+    assert_eq!(s.model, "gpt-5.4");
 }
 
 #[test]
 fn jsonl_incremental_reads() {
     let mut file = tempfile::NamedTempFile::new().unwrap();
-    let line1 = r#"{"type":"assistant","message":{"model":"codex-opus-4-6-20260401","stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+    let line1 = r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
     writeln!(file, "{line1}").unwrap();
     file.flush().unwrap();
 
@@ -634,7 +620,7 @@ fn jsonl_incremental_reads() {
     assert_eq!(s.total_output_tokens, 500);
 
     // Append more data
-    let line2 = r#"{"type":"assistant","message":{"model":"codex-opus-4-6-20260401","stop_reason":"end_turn","usage":{"input_tokens":2000,"output_tokens":800,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+    let line2 = r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":2000,"output_tokens":800,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
     writeln!(file, "{line2}").unwrap();
     file.flush().unwrap();
 
@@ -657,7 +643,7 @@ fn jsonl_corrupted_lines_skipped() {
     let jsonl = concat!(
         "not valid json at all\n",
         "{\"type\":\"something but no usage\"}\n",
-        r#"{"type":"assistant","message":{"model":"codex-opus-4-6-20260401","stop_reason":"end_turn","usage":{"input_tokens":5000,"output_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":5000,"output_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
     );
 
     let (mut s, _file) = make_session_with_jsonl(jsonl);
@@ -671,7 +657,7 @@ fn jsonl_corrupted_lines_skipped() {
 #[test]
 fn jsonl_waiting_for_task_detection() {
     let jsonl = concat!(
-        r#"{"type":"assistant","message":{"model":"codex-opus-4-6-20260401","stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
         "\n",
         r#"{"type":"progress","data":"waiting_for_task"}"#,
     );
@@ -721,7 +707,7 @@ fn jsonl_rolls_up_subagent_tokens_and_cost() {
     let parent_jsonl = temp.path().join("parent.jsonl");
     write_jsonl(
         &parent_jsonl,
-        r#"{"type":"assistant","message":{"model":"codex-sonnet-4-6-20260401","stop_reason":"end_turn","usage":{"input_tokens":100000,"output_tokens":50000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"end_turn","usage":{"input_tokens":100000,"output_tokens":50000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
     );
 
     let session_id = format!("subagent-rollup-{}", std::process::id());
@@ -734,11 +720,11 @@ fn jsonl_rolls_up_subagent_tokens_and_cost() {
         .join("tasks");
     write_jsonl(
         &tasks_dir.join("agent-1.jsonl"),
-        r#"{"type":"assistant","message":{"model":"codex-opus-4-6-20260401","stop_reason":"end_turn","usage":{"input_tokens":200000,"output_tokens":50000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":200000,"output_tokens":50000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
     );
     write_jsonl(
         &tasks_dir.join("nested/agent-2.jsonl"),
-        r#"{"type":"assistant","message":{"model":"codex-haiku-4-5-20260101","stop_reason":"end_turn","usage":{"input_tokens":50000,"output_tokens":10000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.4-mini","stop_reason":"end_turn","usage":{"input_tokens":50000,"output_tokens":10000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
     );
 
     let mut s = make_session_with_paths(cwd, session_id, parent_jsonl);
@@ -750,9 +736,9 @@ fn jsonl_rolls_up_subagent_tokens_and_cost() {
     assert_eq!(s.total_input_tokens, 350_000);
     assert_eq!(s.total_output_tokens, 110_000);
 
-    let expected = expected_cost("sonnet-4.6", 100_000, 50_000)
-        + expected_cost("opus-4.6", 200_000, 50_000)
-        + expected_cost("haiku", 50_000, 10_000);
+    let expected = expected_cost("gpt-5.4", 100_000, 50_000)
+        + expected_cost("gpt-5.5", 200_000, 50_000)
+        + expected_cost("gpt-5.4-mini", 50_000, 10_000);
     assert!((s.cost_usd - expected).abs() < 0.0001);
     assert!(!s.cost_estimate_unverified);
 
@@ -769,7 +755,7 @@ fn subagent_rollup_persists_after_task_file_disappears() {
     let parent_jsonl = temp.path().join("parent.jsonl");
     write_jsonl(
         &parent_jsonl,
-        r#"{"type":"assistant","message":{"model":"codex-sonnet-4-6-20260401","stop_reason":"end_turn","usage":{"input_tokens":100000,"output_tokens":10000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"end_turn","usage":{"input_tokens":100000,"output_tokens":10000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
     );
 
     let session_id = format!("subagent-persist-{}", std::process::id());
@@ -782,7 +768,7 @@ fn subagent_rollup_persists_after_task_file_disappears() {
     let tasks_dir = subagent_root.join("tasks");
     write_jsonl(
         &tasks_dir.join("agent-1.jsonl"),
-        r#"{"type":"assistant","message":{"model":"codex-sonnet-4-6-20260401","stop_reason":"end_turn","usage":{"input_tokens":200000,"output_tokens":20000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"end_turn","usage":{"input_tokens":200000,"output_tokens":20000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
     );
 
     let mut s = make_session_with_paths(cwd, session_id, parent_jsonl);
@@ -865,7 +851,7 @@ fn sparkline_ring_buffer_limit() {
 #[test]
 fn json_export_format() {
     let mut s = make_session(0.0, 0);
-    s.model = "opus-4.6".into();
+    s.model = "gpt-5.5".into();
     s.cost_usd = 1.234;
     s.total_input_tokens = 50000;
     s.total_output_tokens = 10000;
@@ -1117,7 +1103,7 @@ fn resolve_with_layout(
 
     let project_dir = home.path().join(".codex/sessions").join(slug_on_disk);
     std::fs::create_dir_all(&project_dir).unwrap();
-    let jsonl_content = r#"{"type":"assistant","message":{"model":"codex-opus-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"cache_creation_input_tokens":523,"cache_read_input_tokens":79425,"output_tokens":937}}}"#;
+    let jsonl_content = r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":1,"cache_creation_input_tokens":523,"cache_read_input_tokens":79425,"output_tokens":937}}}"#;
     std::fs::write(
         project_dir.join(format!("{session_id}.jsonl")),
         jsonl_content,
@@ -1197,7 +1183,7 @@ fn resolve_jsonl_encoding_mismatch_fallback() {
     std::fs::create_dir_all(&project_dir).unwrap();
     std::fs::write(
         project_dir.join(format!("{session_id}.jsonl")),
-        r#"{"type":"assistant","message":{"model":"codex-opus-4-6","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
     ).unwrap();
 
     let raw = RawSession {

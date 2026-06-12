@@ -434,7 +434,7 @@ name = "auth-middleware"
 cwd = "./services"
 prompt = "Add JWT auth middleware to all API routes"
 role = "backend"
-model = "sonnet"
+model = "gpt-5.4"
 budget_usd = 3.00
 max_retries = 2
 timeout_min = 45
@@ -447,7 +447,7 @@ timeout_min = 45
 
   [[task.verify]]
   agent = "Adversarial review: find a request that bypasses the middleware."
-  model = "haiku"
+  model = "gpt-5.4-mini"
   budget_usd = 0.25
 "#;
         let parsed = toml_parse(body).expect("parse");
@@ -463,7 +463,7 @@ timeout_min = 45
             super::super::verify::Verifier::Agent {
                 model, budget_usd, ..
             } => {
-                assert_eq!(model.as_deref(), Some("haiku"));
+                assert_eq!(model.as_deref(), Some("gpt-5.4-mini"));
                 assert_eq!(*budget_usd, Some(0.25));
             }
             other => panic!("expected Agent, got {other:?}"),

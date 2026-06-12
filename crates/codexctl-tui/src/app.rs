@@ -3200,7 +3200,7 @@ mod tests {
             make_session(
                 11,
                 "blocked-api",
-                "sonnet-4.6",
+                "gpt-5.4",
                 SessionStatus::NeedsInput,
                 2.0,
                 40.0,
@@ -3209,7 +3209,7 @@ mod tests {
             make_session(
                 12,
                 "hot-cost",
-                "opus-4.6",
+                "gpt-5.5",
                 SessionStatus::Processing,
                 7.5,
                 30.0,
@@ -3218,7 +3218,7 @@ mod tests {
             make_session(
                 13,
                 "high-context",
-                "haiku",
+                "gpt-5.4-mini",
                 SessionStatus::WaitingInput,
                 1.0,
                 90.0,
@@ -3260,7 +3260,7 @@ mod tests {
     #[test]
     fn search_query_matches_project_and_model() {
         let mut app = make_test_app();
-        app.search_query = "sonnet".into();
+        app.search_query = "gpt-5.4".into();
         let visible: Vec<u32> = app.visible_sessions().iter().map(|s| s.pid).collect();
         assert_eq!(visible, vec![11]);
 

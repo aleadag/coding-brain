@@ -7,26 +7,26 @@ use codexctl_core::session::{CodexSession, RawSession, SessionStatus, TelemetryS
 
 /// Fake project definitions for demo mode.
 const PROJECTS: &[(&str, &str, &str)] = &[
-    ("acme-api", "/Users/dev/projects/acme-api", "opus-4.6"),
-    ("acme-api", "/Users/dev/projects/acme-api", "opus-4.6"),
+    ("acme-api", "/Users/dev/projects/acme-api", "gpt-5.5"),
+    ("acme-api", "/Users/dev/projects/acme-api", "gpt-5.5"),
     (
         "web-frontend",
         "/Users/dev/projects/web-frontend",
-        "sonnet-4.6",
+        "gpt-5.4",
     ),
-    ("ml-pipeline", "/Users/dev/projects/ml-pipeline", "opus-4.6"),
+    ("ml-pipeline", "/Users/dev/projects/ml-pipeline", "gpt-5.5"),
     (
         "ml-pipeline",
         "/Users/dev/worktrees/ml-pipeline-feat",
-        "sonnet-4.6",
+        "gpt-5.4",
     ),
     (
         "infra-terraform",
         "/Users/dev/projects/infra-terraform",
-        "haiku",
+        "gpt-5.4-mini",
     ),
-    ("docs-site", "/Users/dev/projects/docs-site", "sonnet-4.6"),
-    ("mobile-app", "/Users/dev/projects/mobile-app", "opus-4.6"),
+    ("docs-site", "/Users/dev/projects/docs-site", "gpt-5.4"),
+    ("mobile-app", "/Users/dev/projects/mobile-app", "gpt-5.5"),
 ];
 
 /// Deterministic status progression per session (cycles through these).
@@ -702,7 +702,7 @@ fn assistant_msg(text: &str, tool: Option<(&str, serde_json::Value)>) -> serde_j
     serde_json::json!({
         "message": {
             "role": "assistant",
-            "model": "codex-opus-4-6-20260401",
+            "model": "gpt-5.5",
             "stop_reason": if content.len() > 1 { "tool_use" } else { "end_turn" },
             "content": content,
         }

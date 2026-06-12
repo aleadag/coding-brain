@@ -993,7 +993,7 @@ mod tests {
             } else {
                 None
             },
-            model: "sonnet".into(),
+            model: "gpt-5.4".into(),
             elapsed_secs: 60,
             files_modified_count: 2,
             total_tool_calls: 10,

@@ -176,7 +176,7 @@ mod tests {
             started_at: 0,
         };
         let mut s = CodexSession::from_raw(raw);
-        s.model = "opus-4.6".into();
+        s.model = "gpt-5.5".into();
         s.cost_usd = 3.45;
         s.total_input_tokens = 500_000;
         s.total_output_tokens = 50_000;
@@ -201,7 +201,7 @@ mod tests {
         );
         assert!(result.contains("12345"));
         assert!(result.contains("my-app"));
-        assert!(result.contains("opus-4.6"));
+        assert!(result.contains("gpt-5.5"));
         assert!(result.contains("/Users/test/projects/my-app"));
         assert!(result.contains("500000"));
         assert!(result.contains("50000"));

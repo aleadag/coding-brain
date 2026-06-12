@@ -39,12 +39,12 @@ timeout_ms = 5000
 max_context_tokens = 4000
 few_shot_count = 5
 
-[models."gpt-4o"]
-input_per_m = 1.25
-output_per_m = 5.0
-cache_read_per_m = 0.15
-cache_write_per_m = 0.9
-context_max = 128000
+[models."gpt-5.5"]
+input_per_m = 5.0
+output_per_m = 30.0
+cache_read_per_m = 0.5
+cache_write_per_m = 5.0
+context_max = 258400
 ```
 
 ## Rule-Based Auto-Actions

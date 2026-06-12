@@ -911,7 +911,7 @@ mod tests {
 
     fn make_assistant_with_tool_use(tool: &str, input_json: &str) -> String {
         format!(
-            r#"{{"type":"assistant","message":{{"role":"assistant","model":"codex-sonnet-4-6-20260401","stop_reason":"tool_use","usage":{{"input_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":200}},"content":[{{"type":"tool_use","name":"{tool}","input":{input_json}}}]}}}}"#
+            r#"{{"type":"assistant","message":{{"role":"assistant","model":"gpt-5.4","stop_reason":"tool_use","usage":{{"input_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":200}},"content":[{{"type":"tool_use","name":"{tool}","input":{input_json}}}]}}}}"#
         )
     }
 
@@ -1139,7 +1139,7 @@ mod tests {
         let report = AutopsyReport {
             session_id: "test-session".into(),
             project: "test-proj".into(),
-            model: "sonnet".into(),
+            model: "gpt-5.4".into(),
             duration_secs: 120,
             total_messages: 10,
             total_tool_calls: 5,
@@ -1183,7 +1183,7 @@ mod tests {
         let report = AutopsyReport {
             session_id: "test".into(),
             project: "proj".into(),
-            model: "sonnet".into(),
+            model: "gpt-5.4".into(),
             duration_secs: 60,
             total_messages: 5,
             total_tool_calls: 3,

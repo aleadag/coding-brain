@@ -549,7 +549,7 @@ mod tests {
         let mut s = CodexSession::from_raw(raw);
         s.status = SessionStatus::Processing;
         s.telemetry_status = TelemetryStatus::Available;
-        s.model = "opus".into();
+        s.model = "gpt-5.5".into();
         s
     }
 

@@ -482,7 +482,7 @@ mod tests {
             role: Some("backend".into()),
             cwd: "/work/services".into(),
             prompt: "Add JWT middleware".into(),
-            model: Some("sonnet".into()),
+            model: Some("gpt-5.4".into()),
             budget_usd: Some(3.0),
             max_retries: Some(2),
             timeout_min: Some(45),

@@ -370,7 +370,7 @@ mod tests {
             &PathBuf::from("/x"),
             &Verifier::Agent {
                 prompt: "Adversarial review: find a bypass".into(),
-                model: Some("haiku".into()),
+                model: Some("gpt-5.4-mini".into()),
                 budget_usd: Some(0.25),
             },
         )

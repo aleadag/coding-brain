@@ -523,7 +523,7 @@ mod tests {
         let mut s = CodexSession::from_raw(raw);
         s.status = SessionStatus::NeedsInput;
         s.telemetry_status = TelemetryStatus::Available;
-        s.model = "opus-4.6".into();
+        s.model = "gpt-5.5".into();
         s.cost_usd = 12.50;
         s.context_tokens = 50000;
         s.context_max = 200000;
@@ -538,7 +538,7 @@ mod tests {
         let summary = format_session_summary(&s);
         assert!(summary.contains("my-project"));
         assert!(summary.contains("Needs Input"));
-        assert!(summary.contains("opus-4.6"));
+        assert!(summary.contains("gpt-5.5"));
         assert!(summary.contains("$12.50"));
         assert!(summary.contains("25%"));
         assert!(summary.contains("Bash"));
@@ -585,7 +585,7 @@ mod tests {
         std::fs::write(
             &jsonl,
             concat!(
-                r#"{"type":"assistant","message":{"role":"assistant","model":"opus","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+                r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
                 "\n",
                 r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"file1.rs\nfile2.rs"}],"usage":{"input_tokens":50,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
             ),

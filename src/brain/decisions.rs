@@ -893,7 +893,7 @@ mod tests {
             } else {
                 None
             },
-            model: "sonnet".into(),
+            model: "gpt-5.4".into(),
             elapsed_secs: 60,
             files_modified_count: 2,
             total_tool_calls: 10,
@@ -1106,7 +1106,7 @@ mod tests {
             subagent_cache_write_tokens: 0,
             total_input_tokens: 1000,
             total_output_tokens: 500,
-            model: "sonnet".into(),
+            model: "gpt-5.4".into(),
             command_args: "".into(),
             session_name: "test".into(),
             jsonl_path: None,
@@ -1164,7 +1164,7 @@ mod tests {
         assert_eq!(ctx["context_pct"].as_u64().unwrap(), 80);
         assert!(ctx["last_tool_error"].as_bool().unwrap());
         assert_eq!(ctx["error_message"].as_str().unwrap(), "command failed");
-        assert_eq!(ctx["model"].as_str().unwrap(), "sonnet");
+        assert_eq!(ctx["model"].as_str().unwrap(), "gpt-5.4");
         assert_eq!(ctx["elapsed_secs"].as_u64().unwrap(), 120);
         assert_eq!(ctx["files_modified_count"].as_u64().unwrap(), 1);
         assert_eq!(ctx["total_tool_calls"].as_u64().unwrap(), 8); // 5+3
@@ -1273,7 +1273,7 @@ mod tests {
     #[test]
     fn test_backward_compat_no_hour_in_context() {
         // Old context records without hour field → hour should be None
-        let json_str = r#"{"cost_usd":1.0,"context_pct":50,"last_tool_error":false,"model":"sonnet","elapsed_secs":60,"files_modified_count":2,"total_tool_calls":10,"has_file_conflict":false,"status":"Working","burn_rate_per_hr":1.0,"recent_error_count":0,"subagent_count":0}"#;
+        let json_str = r#"{"cost_usd":1.0,"context_pct":50,"last_tool_error":false,"model":"gpt-5.4","elapsed_secs":60,"files_modified_count":2,"total_tool_calls":10,"has_file_conflict":false,"status":"Working","burn_rate_per_hr":1.0,"recent_error_count":0,"subagent_count":0}"#;
         let ctx: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let hour: Option<u8> = ctx.get("hour").and_then(|v| v.as_u64()).map(|v| v as u8);
         assert!(hour.is_none());

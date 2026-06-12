@@ -43,20 +43,13 @@ pub struct ResolvedModelProfile {
 static MODEL_OVERRIDES: OnceLock<Mutex<HashMap<String, ModelProfile>>> = OnceLock::new();
 
 pub fn shorten_model(model: &str) -> String {
-    if model.contains("opus") {
-        if model.contains("4-6") {
-            "opus-4.6".into()
-        } else {
-            "opus".into()
-        }
-    } else if model.contains("sonnet") {
-        if model.contains("4-6") {
-            "sonnet-4.6".into()
-        } else {
-            "sonnet".into()
-        }
-    } else if model.contains("haiku") {
-        "haiku".into()
+    let key = model.trim().to_lowercase();
+    if key.contains("gpt-5.5") {
+        "gpt-5.5".into()
+    } else if key.contains("gpt-5.4-mini") || key.contains("gpt-5.4 mini") {
+        "gpt-5.4-mini".into()
+    } else if key.contains("gpt-5.4") {
+        "gpt-5.4".into()
     } else {
         model.to_string()
     }
@@ -128,26 +121,26 @@ pub(crate) fn resolve_with_overrides(
 
 fn built_in_profile(key: &str) -> Option<ModelProfile> {
     match key {
-        "opus-4.6" | "opus" => Some(ModelProfile {
-            input_per_m: 15.0,
-            output_per_m: 75.0,
-            cache_read_per_m: 1.875,
-            cache_write_per_m: 18.75,
-            context_max: 1_000_000,
+        "gpt-5.5" => Some(ModelProfile {
+            input_per_m: 5.0,
+            output_per_m: 30.0,
+            cache_read_per_m: 0.5,
+            cache_write_per_m: 5.0,
+            context_max: 258_400,
         }),
-        "sonnet-4.6" | "sonnet" => Some(ModelProfile {
-            input_per_m: 3.0,
+        "gpt-5.4" => Some(ModelProfile {
+            input_per_m: 2.5,
             output_per_m: 15.0,
-            cache_read_per_m: 0.375,
-            cache_write_per_m: 3.75,
-            context_max: 200_000,
+            cache_read_per_m: 0.25,
+            cache_write_per_m: 2.5,
+            context_max: 258_400,
         }),
-        "haiku" => Some(ModelProfile {
-            input_per_m: 0.80,
-            output_per_m: 4.0,
-            cache_read_per_m: 0.10,
-            cache_write_per_m: 1.0,
-            context_max: 200_000,
+        "gpt-5.4-mini" => Some(ModelProfile {
+            input_per_m: 0.75,
+            output_per_m: 4.5,
+            cache_read_per_m: 0.075,
+            cache_write_per_m: 0.75,
+            context_max: 258_400,
         }),
         _ => None,
     }
@@ -155,11 +148,11 @@ fn built_in_profile(key: &str) -> Option<ModelProfile> {
 
 fn fallback_profile() -> ModelProfile {
     ModelProfile {
-        input_per_m: 15.0,
-        output_per_m: 75.0,
-        cache_read_per_m: 1.875,
-        cache_write_per_m: 18.75,
-        context_max: 200_000,
+        input_per_m: 5.0,
+        output_per_m: 30.0,
+        cache_read_per_m: 0.5,
+        cache_write_per_m: 5.0,
+        context_max: 258_400,
     }
 }
 
@@ -169,16 +162,34 @@ mod tests {
 
     #[test]
     fn resolve_builtin_profile() {
-        let resolved = resolve_with_overrides("codex-opus-4-6-20260401", &HashMap::new());
+        let resolved = resolve_with_overrides("gpt-5.5", &HashMap::new());
         assert_eq!(resolved.source, ModelProfileSource::BuiltIn);
-        assert_eq!(resolved.profile.context_max, 1_000_000);
+        assert_eq!(resolved.profile.input_per_m, 5.0);
+        assert_eq!(resolved.profile.cache_read_per_m, 0.5);
+        assert_eq!(resolved.profile.output_per_m, 30.0);
+        assert_eq!(resolved.profile.context_max, 258_400);
+    }
+
+    #[test]
+    fn resolve_gpt_family_profiles() {
+        let large = resolve_with_overrides("gpt-5.4", &HashMap::new());
+        assert_eq!(large.source, ModelProfileSource::BuiltIn);
+        assert_eq!(large.profile.input_per_m, 2.5);
+        assert_eq!(large.profile.cache_read_per_m, 0.25);
+        assert_eq!(large.profile.output_per_m, 15.0);
+
+        let mini = resolve_with_overrides("gpt-5.4-mini", &HashMap::new());
+        assert_eq!(mini.source, ModelProfileSource::BuiltIn);
+        assert_eq!(mini.profile.input_per_m, 0.75);
+        assert_eq!(mini.profile.cache_read_per_m, 0.075);
+        assert_eq!(mini.profile.output_per_m, 4.5);
     }
 
     #[test]
     fn resolve_override_profile() {
         let mut overrides = HashMap::new();
         overrides.insert(
-            "gpt-4o".into(),
+            "custom-model".into(),
             ModelProfile {
                 input_per_m: 1.0,
                 output_per_m: 2.0,
@@ -187,7 +198,7 @@ mod tests {
                 context_max: 128_000,
             },
         );
-        let resolved = resolve_with_overrides("gpt-4o", &overrides);
+        let resolved = resolve_with_overrides("custom-model", &overrides);
         assert_eq!(resolved.source, ModelProfileSource::Override);
         assert_eq!(resolved.profile.context_max, 128_000);
     }
@@ -196,6 +207,6 @@ mod tests {
     fn resolve_fallback_profile() {
         let resolved = resolve_with_overrides("mystery-model", &HashMap::new());
         assert_eq!(resolved.source, ModelProfileSource::Fallback);
-        assert_eq!(resolved.profile.context_max, 200_000);
+        assert_eq!(resolved.profile.context_max, 258_400);
     }
 }

@@ -274,7 +274,7 @@ mod tests {
         let p = build_recovery_prompt(
             "do thing",
             &[],
-            Some("model=sonnet duration_secs=120 tool_calls=15 errors=3"),
+            Some("model=gpt-5.4 duration_secs=120 tool_calls=15 errors=3"),
             false,
         );
         assert!(p.contains("Autopsy of the interrupted attempt:"));
