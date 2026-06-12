@@ -283,6 +283,7 @@ fn update_codex_tokens(session: &mut CodexSession) {
     let mut recognized_events = 0usize;
     let mut saw_parent_usage = false;
     let mut codex_context_max = None;
+    let previous_context_max = session.context_max;
     let jsonl_path = session.jsonl_path.clone();
 
     match jsonl_path.as_ref() {
@@ -421,6 +422,8 @@ fn update_codex_tokens(session: &mut CodexSession) {
     );
     if let Some(max) = codex_context_max {
         session.context_max = max;
+    } else if previous_context_max > 0 && session.context_tokens > 0 {
+        session.context_max = previous_context_max;
     }
 }
 

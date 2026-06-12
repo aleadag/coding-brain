@@ -506,7 +506,46 @@ fn process_backed_codex_monitor_records_usage_metrics() {
     assert!(session.cost_usd > 0.0);
     assert_ne!(session.format_tokens(), "n/a");
     assert_ne!(session.format_cost(), "n/a");
-    assert_ne!(session.format_context(), "n/a");
+    assert_eq!(session.format_context(), "16%");
+}
+
+#[test]
+fn process_backed_codex_monitor_preserves_transcript_context_window_on_idle_tick() {
+    let jsonl = concat!(
+        r#"{"timestamp":"2026-06-12T09:13:44.723Z","type":"session_meta","payload":{"id":"019ebb14-fa82-70b0-afc7-6daab97998ec","timestamp":"2026-06-12T09:06:14.788Z","cwd":"/home/alexander/hacking/aleadag/codexctl","model_provider":"openai"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-06-12T09:13:44.723Z","type":"turn_context","payload":{"cwd":"/home/alexander/hacking/aleadag/codexctl","model":"gpt-5.5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-06-12T09:13:44.723Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1539721,"cached_input_tokens":1251840,"output_tokens":8629,"reasoning_output_tokens":3422,"total_tokens":1548350},"last_token_usage":{"input_tokens":125980,"cached_input_tokens":115584,"output_tokens":143,"reasoning_output_tokens":43,"total_tokens":126123},"model_context_window":258400}}}"#,
+        "\n",
+    );
+    let mut file = tempfile::Builder::new()
+        .prefix("rollout-")
+        .suffix(".jsonl")
+        .tempfile()
+        .unwrap();
+    file.write_all(jsonl.as_bytes()).unwrap();
+    file.flush().unwrap();
+
+    let raw = RawSession {
+        pid: 1,
+        session_id: "019ebb14-fa82-70b0-afc7-6daab97998ec".into(),
+        cwd: "/home/alexander/hacking/aleadag/codexctl".into(),
+        started_at: 0,
+    };
+    let mut session = CodexSession::from_raw(raw);
+    session.jsonl_path = Some(file.path().to_path_buf());
+    session.model_profile_source = "codex-transcript".into();
+
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_tokens, 125980);
+    assert_eq!(session.context_max, 258400);
+    assert_eq!(session.format_context(), "48%");
+
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_tokens, 125980);
+    assert_eq!(session.context_max, 258400);
+    assert_eq!(session.format_context(), "48%");
 }
 
 #[test]
