@@ -342,17 +342,17 @@ pub fn list_items(conn: &Connection, loop_name: Option<&str>) -> LoopResult<Vec<
     Ok(rows)
 }
 
-pub fn list_publishable_items(conn: &Connection) -> LoopResult<Vec<LoopItemRow>> {
+pub fn list_submitted_items(conn: &Connection) -> LoopResult<Vec<LoopItemRow>> {
     let sql = item_select_sql(
-        "WHERE state = 'submitted' AND coord_task_id IS NOT NULL AND worktree_path IS NOT NULL
+        "WHERE state = 'submitted' AND coord_task_id IS NOT NULL
          ORDER BY updated_at ASC",
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare: {e}"))?;
     let rows = stmt
         .query_map([], row_to_item)
-        .map_err(|e| format!("query publishable loop items: {e}"))?
+        .map_err(|e| format!("query submitted loop items: {e}"))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("row publishable loop item: {e}"))?;
+        .map_err(|e| format!("row submitted loop item: {e}"))?;
     Ok(rows)
 }
 

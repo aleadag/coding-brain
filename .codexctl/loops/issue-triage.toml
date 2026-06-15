@@ -44,6 +44,3 @@ command = "cargo clippy --all-targets --no-default-features --features hive -- -
 max_items_per_run = 1
 max_concurrent = 1
 require_human_for = ["destructive", "ambiguous", "security-sensitive"]
-allow_source_updates = false
-allow_pr_create = true
-allow_issue_comment = false
