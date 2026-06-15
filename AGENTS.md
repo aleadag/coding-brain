@@ -45,6 +45,8 @@ src/                   # codexctl binary: brain, bus, coord, hive, relay, init
 - Do not add abstractions for one-off behavior.
 - Match existing style unless the migration requires a public rename.
 - Config fields must be added to all three layers: CLI args in `main.rs`, TOML structs in `src/config.rs`, and merge logic in `src/config.rs`.
+- All jj descriptions created or updated in this repo must use the emoji conventional format: `<emoji> <type>: <imperative summary>`.
+- When starting a jj changeset before editing, set the initial description in that format; do not use a plain temporary subject.
 - When asked to write, update, or curate a commit message, use the `commit-message` skill if available.
 - In jj repos, honor the exact user-provided revset for commit-message work; do not assume `@`.
 - For jj commit messages, inspect with `jj --no-pager show --git <revset>` or `jj --no-pager diff --git`, apply with `jj describe -r <revset> -m "<emoji> <type>: <imperative summary>"`, then verify with `jj --no-pager st` and `jj --no-pager log -r '<revset>|@' --no-graph`.
