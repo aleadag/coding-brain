@@ -42,18 +42,6 @@ pub enum LoopCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Run enabled project loops in a foreground scheduler.
-    Daemon {
-        /// Loop name. When omitted, manages every project-local loop.
-        #[arg(long)]
-        name: Option<String>,
-        /// Run due loops once and exit.
-        #[arg(long)]
-        once: bool,
-        /// Emit JSON status lines.
-        #[arg(long)]
-        json: bool,
-    },
     /// Show loop item status.
     Status { name: Option<String> },
     /// Show loop item logs/status details.
@@ -89,9 +77,6 @@ fn dispatch_inner(cmd: &LoopCommand, cfg: &crate::config::Config) -> LoopResult<
         } => run_loop(Path::new("."), name, *dry_run, *limit, cfg),
         LoopCommand::Tick { name, json } => {
             daemon::run_tick(Path::new("."), name.as_deref(), *json, cfg)
-        }
-        LoopCommand::Daemon { name, once, json } => {
-            daemon::run_daemon(Path::new("."), name.as_deref(), *once, *json, cfg)
         }
         LoopCommand::Status { name } => status(name.as_deref()),
         LoopCommand::Logs { name, item } => logs(name, item.as_deref()),
@@ -441,5 +426,15 @@ mod tests {
             Some("issue-triage")
         );
         assert!(args.get_flag("json"));
+    }
+
+    #[test]
+    fn clap_rejects_removed_daemon_command() {
+        let cmd = clap::Command::new("loop").subcommand_required(true);
+        let cmd = LoopCommand::augment_subcommands(cmd);
+
+        let err = cmd.try_get_matches_from(["loop", "daemon"]).unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 }

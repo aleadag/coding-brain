@@ -471,9 +471,9 @@ Loop config may include `cadence`. Later commands can generate timers from it:
 codexctl loop install-timer <name>
 ```
 
-Do not require a custom sleep loop for the normal production path. A foreground
-`codexctl loop daemon` can remain a secondary option if users need one process
-that interprets cadence internally.
+Do not add a custom sleep loop for the production path. Systemd or cron should
+own wakeups, and `codexctl loop tick` should remain the loop scheduling
+interface.
 
 ## Safety Gates
 
@@ -508,7 +508,7 @@ The first implementation will not:
 - Implement native email adapters.
 - Auto-comment on GitHub issues.
 - Auto-create or auto-merge PRs.
-- Interpret schedules inside a long-lived loop daemon.
+- Interpret schedules inside a long-lived loop polling process.
 - Let the model fetch arbitrary remote data directly.
 - Replace coord with a second loop-specific executor.
 - Treat markdown state files as the source of truth.

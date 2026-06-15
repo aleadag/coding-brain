@@ -228,8 +228,8 @@ long-running coord execution service.
 
 - `codexctl loop tick --json` runs all due enabled loops once, reconciles
   completed loop-submitted coord tasks, and exits.
-- `codexctl loop daemon --once` remains equivalent one-shot behavior for users
-  already using it.
+- The loop command surface does not include a custom foreground sleep-loop
+  scheduler.
 - Paused loops are skipped and reported as skipped.
 - A submitted item still creates exactly one coord task for a stable source id.
 - If `codexctl --headless` is not running, submitted coord tasks remain pending.

@@ -32,22 +32,6 @@ pub(crate) struct DaemonSummary {
     pub(crate) reconciled: usize,
 }
 
-pub(crate) fn run_daemon(
-    root: &Path,
-    name: Option<&str>,
-    once: bool,
-    json: bool,
-    app_cfg: &crate::config::Config,
-) -> LoopResult<()> {
-    loop {
-        run_daemon_once(root, name, json, app_cfg)?;
-        if once {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_secs(30));
-    }
-}
-
 pub(crate) fn run_tick(
     root: &Path,
     name: Option<&str>,
@@ -64,15 +48,6 @@ pub(crate) fn run_tick_once(
     app_cfg: &crate::config::Config,
 ) -> LoopResult<DaemonSummary> {
     run_due_once(root, name, json, app_cfg, "loop_tick")
-}
-
-pub(crate) fn run_daemon_once(
-    root: &Path,
-    name: Option<&str>,
-    json: bool,
-    app_cfg: &crate::config::Config,
-) -> LoopResult<DaemonSummary> {
-    run_due_once(root, name, json, app_cfg, "daemon_tick")
 }
 
 fn run_due_once(
@@ -434,14 +409,14 @@ mod tests {
     }
 
     #[test]
-    fn run_daemon_once_executes_due_loop_and_submits_coord_task() {
+    fn run_tick_once_executes_due_loop_and_submits_coord_task() {
         let _home_lock = HOME_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         write_shell_loop(project.path(), Some("15m"));
         let _guard = EnvGuard::set_home(home.path());
 
-        let summary = run_daemon_once(
+        let summary = run_tick_once(
             project.path(),
             None,
             false,
@@ -470,50 +445,21 @@ mod tests {
     }
 
     #[test]
-    fn run_tick_once_executes_due_loop_and_submits_coord_task() {
-        let _home_lock = HOME_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write_shell_loop(project.path(), Some("15m"));
-        let _guard = EnvGuard::set_home(home.path());
-
-        let summary = run_tick_once(
-            project.path(),
-            None,
-            false,
-            &crate::config::Config::default(),
-        )
-        .unwrap();
-
-        assert_eq!(summary.ran, 1);
-        assert_eq!(summary.skipped, 0);
-
-        let loop_conn = crate::r#loop::store::open().unwrap();
-        let rows = crate::r#loop::store::list_items(&loop_conn, Some("issue-triage")).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].state,
-            crate::r#loop::store::LoopItemState::Submitted
-        );
-        assert!(rows[0].coord_task_id.is_some());
-    }
-
-    #[test]
-    fn run_daemon_once_does_not_duplicate_coord_tasks_for_stable_source_id() {
+    fn run_tick_once_does_not_duplicate_coord_tasks_for_stable_source_id() {
         let _home_lock = HOME_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         write_shell_loop(project.path(), None);
         let _guard = EnvGuard::set_home(home.path());
 
-        run_daemon_once(
+        run_tick_once(
             project.path(),
             None,
             false,
             &crate::config::Config::default(),
         )
         .unwrap();
-        run_daemon_once(
+        run_tick_once(
             project.path(),
             None,
             false,
