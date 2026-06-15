@@ -33,7 +33,16 @@ pub enum LoopCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Run enabled project loops on cadence.
+    /// Run due project loops once and reconcile completed loop tasks.
+    Tick {
+        /// Loop name. When omitted, ticks every project-local loop.
+        #[arg(long)]
+        name: Option<String>,
+        /// Emit JSON status lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run enabled project loops in a foreground scheduler.
     Daemon {
         /// Loop name. When omitted, manages every project-local loop.
         #[arg(long)]
@@ -78,6 +87,9 @@ fn dispatch_inner(cmd: &LoopCommand, cfg: &crate::config::Config) -> LoopResult<
             dry_run,
             limit,
         } => run_loop(Path::new("."), name, *dry_run, *limit, cfg),
+        LoopCommand::Tick { name, json } => {
+            daemon::run_tick(Path::new("."), name.as_deref(), *json, cfg)
+        }
         LoopCommand::Daemon { name, once, json } => {
             daemon::run_daemon(Path::new("."), name.as_deref(), *once, *json, cfg)
         }
@@ -86,6 +98,28 @@ fn dispatch_inner(cmd: &LoopCommand, cfg: &crate::config::Config) -> LoopResult<
         LoopCommand::Pause { name } => set_paused(name, true),
         LoopCommand::Resume { name } => set_paused(name, false),
         LoopCommand::Export { name, format } => export(name, format),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clap_accepts_tick_for_due_loop_polling() {
+        let cmd = clap::Command::new("loop").subcommand_required(true);
+        let cmd = LoopCommand::augment_subcommands(cmd);
+        let matches = cmd
+            .try_get_matches_from(["loop", "tick", "--name", "issue-triage", "--json"])
+            .unwrap();
+
+        let (subcommand, args) = matches.subcommand().unwrap();
+        assert_eq!(subcommand, "tick");
+        assert_eq!(
+            args.get_one::<String>("name").map(String::as_str),
+            Some("issue-triage")
+        );
+        assert!(args.get_flag("json"));
     }
 }
 

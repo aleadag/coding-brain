@@ -435,6 +435,7 @@ Add a `codexctl loop` command group:
 codexctl loop list
 codexctl loop validate [<name>]
 codexctl loop run <name> [--dry-run] [--limit N]
+codexctl loop tick [--name <loop>] [--json]
 codexctl loop status [<name>]
 codexctl loop logs <name> [--item <id>]
 codexctl loop pause <name>
@@ -454,22 +455,25 @@ V1 should rely on external schedulers:
 
 ```text
 systemd timer or cron
-  -> codexctl loop run <name>
+  -> codexctl loop tick --json
 
-codexctl --headless
+codexctl --headless --json
   -> coord supervisor executes submitted tasks
 ```
 
-Loop config may include `cadence` as metadata. Later commands can generate
-timers from it:
+`tick` discovers project-local loop configs, skips disabled, paused, and
+not-due loops, submits accepted work, reconciles completed loop-submitted coord
+tasks, and exits. `run <name>` remains the manual single-loop command.
+
+Loop config may include `cadence`. Later commands can generate timers from it:
 
 ```bash
 codexctl loop install-timer <name>
 ```
 
-Do not make the first implementation a full scheduler daemon. A later
-`codexctl loop daemon` can interpret cadence internally if users need a single
-long-lived process.
+Do not require a custom sleep loop for the normal production path. A foreground
+`codexctl loop daemon` can remain a secondary option if users need one process
+that interprets cadence internally.
 
 ## Safety Gates
 

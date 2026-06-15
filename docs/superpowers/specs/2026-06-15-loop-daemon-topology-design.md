@@ -1,16 +1,17 @@
-# Loop Daemon Topology Design
+# Loop Timer Topology Design
 
 Date: 2026-06-15
 
 ## Goal
 
-Make `codexctl loop` useful as a long-running automation feature without making
-the dashboard responsible for backend work.
+Make `codexctl loop` useful as unattended automation without making the
+dashboard responsible for backend work or requiring a custom scheduler process
+for the normal production path.
 
-The system should support two independent daemon roles:
+The system should support two independent runtime roles:
 
-- a loop daemon that polls sources, triages items, dedupes work, and submits
-  accepted tasks to coord
+- a timer-driven loop tick that polls sources, triages items, dedupes work, and
+  submits accepted tasks to coord
 - a headless coord daemon that executes submitted tasks through the supervisor,
   `codex exec`, verifier gates, retries, resume, and escalation
 
@@ -31,16 +32,18 @@ The first loop runtime slice already separates the major responsibilities:
 
 The missing piece is durable scheduling and process topology. A user should not
 need to keep the dashboard open for source polling, task execution, or outcome
-reconciliation.
+reconciliation, and systemd can own the source-polling schedule.
 
 ## Decision
 
-Use two daemon roles and keep their state ownership separate.
+Use a systemd timer for source polling and a separate headless coord service
+for task execution. Keep their state ownership separate.
 
 ```text
-codexctl loop daemon
+systemd --user timer
+  -> codexctl loop tick --json
   -> discovers project-local loop configs
-  -> runs each enabled loop on cadence
+  -> skips disabled, paused, and not-due loops
   -> updates loop.db
   -> submits accepted work to coord.db
   -> reconciles completed loop items from coord/transcripts
@@ -73,32 +76,32 @@ wrong default runtime model:
 - system service management becomes unclear because the dashboard is interactive
 
 The dashboard can still offer a convenience mode later, such as "start local
-backend daemons for this session," but that should wrap the daemon commands
+backend runtimes for this session," but that should wrap the runtime commands
 rather than embed their control loops as the primary implementation.
 
 ## Scope
 
-### Loop Daemon
+### Loop Tick
 
-Add a long-running command:
+Add a one-shot command:
 
 ```bash
-codexctl loop daemon [--name <loop>] [--once] [--json]
+codexctl loop tick [--name <loop>] [--json]
 ```
 
 Behavior:
 
 - Discover enabled project-local `.codexctl/loops/*.toml` definitions.
-- Treat `cadence` as the polling interval for each loop.
-- Run only due loops.
+- Treat `cadence` as the due interval for each loop.
+- Run only due loops and exit.
 - Reuse the same logic as `codexctl loop run <name>`.
 - Respect existing pause markers.
 - Enforce per-loop `gates.max_items_per_run`.
-- Record daemon/run events in `loop_events`.
-- Periodically reconcile submitted loop items whose coord tasks are terminal.
-- Exit non-zero only for daemon-level failures, not for one bad source item.
+- Record tick/run events in `loop_events`.
+- Reconcile submitted loop items whose coord tasks are terminal.
+- Exit non-zero only for tick-level failures, not for one bad source item.
 
-V1 should be project-scoped. A process started in one repo manages loops from
+V1 should be project-scoped. A timer started in one repo manages loops from
 that repo only. User-scoped multi-root discovery can be added later.
 
 ### Coord Headless Daemon
@@ -160,52 +163,57 @@ Cross-links should stay one-way from loop to coord:
 
 ## Scheduling
 
-The loop daemon should parse simple cadence values already accepted in loop
-configuration, such as `15m`, `2h`, and `1d`.
+Systemd should own the wakeup cadence. `codexctl loop tick` should parse the
+simple cadence values already accepted in loop configuration, such as `15m`,
+`2h`, and `1d`, then decide which project-local loops are due during that
+one-shot invocation.
 
 Each loop needs its own next-due calculation so one slow or failing loop does
-not block unrelated loops indefinitely. A simple single-threaded scheduler is
-enough for V1:
+not block unrelated loops indefinitely. A tick should:
 
 1. Load loop configs.
 2. Select loops that are due.
 3. Run each due loop sequentially.
 4. Record success or failure.
-5. Sleep until the nearest next due time, capped by a short maximum sleep so
-   config changes are picked up promptly.
+5. Exit.
 
 No distributed locking is required in V1. If a lock is needed, use a local
-pid/lock file under `~/.codexctl/loop/` to prevent two loop daemons in the same
-project from running concurrently.
+pid/lock file under `~/.codexctl/loop/` to prevent overlapping ticks in the
+same project.
 
 ## Service Model
 
-The recommended production shape is two user services per project host:
+The recommended production shape is a timer-driven polling unit plus the
+headless coord service:
 
 ```text
 codexctl-loop@<project>.service
-  ExecStart=codexctl loop daemon --json
+  Type=oneshot
+  ExecStart=codexctl loop tick --json
   WorkingDirectory=<project>
+
+codexctl-loop@<project>.timer
+  OnUnitActiveSec=<loop polling interval>
 
 codexctl-headless.service
   ExecStart=codexctl --headless --json
 ```
 
 `codexctl loop install-service` can be added later to generate these service
-files. The first implementation should focus on the daemon commands, because
-systemd generation is packaging work around the same runtime boundary.
+files. Generated loop polling units should use a systemd timer around
+`codexctl loop tick --json`; `codexctl --headless --json` remains the
+long-running coord execution service.
 
 ## Failure Handling
 
-- Source fetch failure: record a loop event, keep the daemon alive, retry on
-  the next cadence.
+- Source fetch failure: record a loop event and let the next timer tick retry.
 - Invalid loop config: record/report the validation error and skip that loop.
 - Missing triage model or skill: fail validation for that loop and skip it.
 - Coord submission failure: keep the loop item in a failed/escalated state with
   the error recorded.
 - Headless daemon down: loop can still submit tasks; they remain pending until
   coord is running again.
-- Loop daemon down: existing coord tasks continue under the headless daemon.
+- Loop timer disabled: existing coord tasks continue under the headless daemon.
 
 ## Out Of Scope
 
@@ -214,12 +222,14 @@ systemd generation is packaging work around the same runtime boundary.
 - User-scoped multi-root loop discovery.
 - Distributed scheduling or multi-host leader election.
 - Automatic PR merge or source mutation after a task completes.
-- Service-file generation in the first daemon implementation.
+- Service-file generation in the first tick implementation.
 
 ## Acceptance Criteria
 
-- `codexctl loop daemon --once` runs all due enabled loops once and exits.
-- `codexctl loop daemon` repeatedly runs due loops by cadence.
+- `codexctl loop tick --json` runs all due enabled loops once, reconciles
+  completed loop-submitted coord tasks, and exits.
+- `codexctl loop daemon --once` remains equivalent one-shot behavior for users
+  already using it.
 - Paused loops are skipped and reported as skipped.
 - A submitted item still creates exactly one coord task for a stable source id.
 - If `codexctl --headless` is not running, submitted coord tasks remain pending.
@@ -227,6 +237,5 @@ systemd generation is packaging work around the same runtime boundary.
   by the coord supervisor.
 - The dashboard can display loop state without owning the loop scheduler.
 - Unit tests cover cadence parsing, due-loop selection, pause handling, and
-  one-shot daemon execution.
+  one-shot tick execution.
 - Existing loop tests continue to pass.
-

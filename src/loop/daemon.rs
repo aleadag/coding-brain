@@ -48,11 +48,39 @@ pub(crate) fn run_daemon(
     }
 }
 
+pub(crate) fn run_tick(
+    root: &Path,
+    name: Option<&str>,
+    json: bool,
+    app_cfg: &crate::config::Config,
+) -> LoopResult<()> {
+    run_tick_once(root, name, json, app_cfg).map(|_| ())
+}
+
+pub(crate) fn run_tick_once(
+    root: &Path,
+    name: Option<&str>,
+    json: bool,
+    app_cfg: &crate::config::Config,
+) -> LoopResult<DaemonSummary> {
+    run_due_once(root, name, json, app_cfg, "loop_tick")
+}
+
 pub(crate) fn run_daemon_once(
     root: &Path,
     name: Option<&str>,
     json: bool,
     app_cfg: &crate::config::Config,
+) -> LoopResult<DaemonSummary> {
+    run_due_once(root, name, json, app_cfg, "daemon_tick")
+}
+
+fn run_due_once(
+    root: &Path,
+    name: Option<&str>,
+    json: bool,
+    app_cfg: &crate::config::Config,
+    summary_event: &str,
 ) -> LoopResult<DaemonSummary> {
     let loops = cli::select_loops(root, name)?;
     let loop_conn = store::open()?;
@@ -116,7 +144,7 @@ pub(crate) fn run_daemon_once(
         }
     }
 
-    emit_summary(json, &summary);
+    emit_summary(json, &summary, summary_event);
     Ok(summary)
 }
 
@@ -315,12 +343,12 @@ fn emit_event(
     }
 }
 
-fn emit_summary(json: bool, summary: &DaemonSummary) {
+fn emit_summary(json: bool, summary: &DaemonSummary, event: &str) {
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "event": "daemon_tick",
+                "event": event,
                 "ran": summary.ran,
                 "skipped": summary.skipped,
                 "not_due": summary.not_due,
@@ -439,6 +467,35 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(task.state, crate::coord::tasks::TaskState::Pending);
+    }
+
+    #[test]
+    fn run_tick_once_executes_due_loop_and_submits_coord_task() {
+        let _home_lock = HOME_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_shell_loop(project.path(), Some("15m"));
+        let _guard = EnvGuard::set_home(home.path());
+
+        let summary = run_tick_once(
+            project.path(),
+            None,
+            false,
+            &crate::config::Config::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.ran, 1);
+        assert_eq!(summary.skipped, 0);
+
+        let loop_conn = crate::r#loop::store::open().unwrap();
+        let rows = crate::r#loop::store::list_items(&loop_conn, Some("issue-triage")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            crate::r#loop::store::LoopItemState::Submitted
+        );
+        assert!(rows[0].coord_task_id.is_some());
     }
 
     #[test]
