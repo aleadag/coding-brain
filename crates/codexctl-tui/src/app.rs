@@ -526,6 +526,30 @@ fn observation_from(
     }
 }
 
+fn merge_discovered_session(mut prev: CodexSession, new: CodexSession) -> CodexSession {
+    let has_new_session_id = !new.session_id.starts_with("codex-");
+    let session_changed = has_new_session_id && new.session_id != prev.session_id;
+    let transcript_changed = new.jsonl_path.is_some() && new.jsonl_path != prev.jsonl_path;
+
+    if session_changed || transcript_changed {
+        let cpu_history = std::mem::take(&mut prev.cpu_history);
+        let mut next = new;
+        next.cpu_history = cpu_history;
+        return next;
+    }
+
+    prev.elapsed = new.elapsed;
+    prev.started_at = new.started_at;
+    prev.tty = new.tty;
+    prev.cpu_percent = new.cpu_percent;
+    prev.mem_mb = new.mem_mb;
+    prev.command_args = new.command_args;
+    if prev.jsonl_path.is_none() {
+        prev.jsonl_path = new.jsonl_path;
+    }
+    prev
+}
+
 impl App {
     pub fn new() -> Self {
         let mut app = Self {
@@ -678,12 +702,10 @@ impl App {
         let mut sessions: Vec<CodexSession> = discovered
             .into_iter()
             .map(|new| {
-                if let Some(mut prev) = existing.remove(&new.pid) {
-                    // Preserve accumulated state, update ephemeral fields
-                    prev.elapsed = new.elapsed;
-                    prev.started_at = new.started_at;
-                    // cwd/project_name/session_id don't change
-                    prev
+                if let Some(prev) = existing.remove(&new.pid) {
+                    // Preserve accumulated state only while the process is still
+                    // attached to the same Codex transcript.
+                    merge_discovered_session(prev, new)
                 } else {
                     // Brand new session
                     new_pids.push(new.pid);
@@ -3321,5 +3343,46 @@ mod tests {
             app.status_msg
                 .starts_with("Launch failed: Directory not found:")
         );
+    }
+
+    #[test]
+    fn merge_discovered_session_switches_to_replaced_transcript_for_same_pid() {
+        let mut prev = make_session(
+            15,
+            "codexctl",
+            "gpt-5.4",
+            SessionStatus::Idle,
+            1.0,
+            20.0,
+            true,
+        );
+        prev.session_id = "before-clear".into();
+        prev.jsonl_path = Some("/tmp/before-clear.jsonl".into());
+        prev.jsonl_offset = 512;
+        prev.last_msg_type = "assistant".into();
+        prev.last_stop_reason = "end_turn".into();
+
+        let mut new = make_session(
+            15,
+            "codexctl",
+            "gpt-5.4",
+            SessionStatus::Processing,
+            0.0,
+            0.0,
+            false,
+        );
+        new.session_id = "after-clear".into();
+        new.jsonl_path = Some("/tmp/after-clear.jsonl".into());
+
+        let merged = merge_discovered_session(prev, new);
+
+        assert_eq!(merged.session_id, "after-clear");
+        assert_eq!(
+            merged.jsonl_path.as_deref(),
+            Some(std::path::Path::new("/tmp/after-clear.jsonl"))
+        );
+        assert_eq!(merged.jsonl_offset, 0);
+        assert!(merged.last_msg_type.is_empty());
+        assert!(merged.last_stop_reason.is_empty());
     }
 }
