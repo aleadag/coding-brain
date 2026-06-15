@@ -460,6 +460,46 @@ mod tests {
     }
 
     #[test]
+    fn run_verifier_without_declared_verifiers_marks_done() {
+        use crate::coord::tasks::list_transitions;
+
+        let mut conn = store::open_memory();
+        let id = insert_task(&conn, &sample_with_role(None)).unwrap();
+        let fx = RecordingFx::default();
+        apply(
+            &mut conn,
+            &fx,
+            &Action::Spawn {
+                task_id: id.clone(),
+                cwd: std::path::PathBuf::from("/work/x"),
+            },
+        )
+        .unwrap();
+        let attempt_id = crate::coord::tasks::latest_attempt_id(&conn, &id)
+            .unwrap()
+            .unwrap();
+
+        apply(
+            &mut conn,
+            &fx,
+            &Action::RunVerifier {
+                task_id: id.clone(),
+                attempt_id,
+            },
+        )
+        .unwrap();
+
+        let task = get_task(&conn, &id).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Done);
+        let hist = list_transitions(&conn, &id).unwrap();
+        let causes: Vec<_> = hist.iter().map(|(_, _, c, _)| c.as_str()).collect();
+        assert_eq!(
+            causes,
+            vec!["submitted", "spawned", "running-complete", "no-verifiers"]
+        );
+    }
+
+    #[test]
     fn assign_is_idempotent_against_already_assigned_task() {
         let mut conn = store::open_memory();
         let id = insert_task(&conn, &sample_with_role(Some("backend"))).unwrap();

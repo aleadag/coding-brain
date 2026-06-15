@@ -211,6 +211,7 @@ impl Supervisor {
         let pending = list_tasks(conn, Some(TaskState::Pending))?;
         let assigned = list_tasks(conn, Some(TaskState::Assigned))?;
         let running = list_tasks(conn, Some(TaskState::Running))?;
+        let verifying = list_tasks(conn, Some(TaskState::Verifying))?;
 
         // 1) Pending tasks → emit assignment actions. Tasks with a role
         //    go to that role's mailbox first; tasks without a role go
@@ -285,14 +286,24 @@ impl Supervisor {
             let Some(session) = observed_by_session.get(session_id.as_str()) else {
                 continue;
             };
-            // Dead session is the canonical resume trigger (RFC §7). It
-            // wins over health alerts — a dead session has no health
-            // signal worth honoring.
+            // Dead interactive sessions are the canonical resume trigger
+            // (RFC §7). Direct `codex exec` spawns are different: the
+            // process exiting means the attempt completed and should
+            // enter the verifier gate.
             if session.status == ObservedStatus::Dead {
-                out.push(Action::Resume {
-                    task_id: task.id.clone(),
-                    cause: "session_died".to_string(),
-                });
+                if is_spawned_exec_session(&session_id) {
+                    if let Some(attempt_id) = super::tasks::latest_attempt_id(conn, &task.id)? {
+                        out.push(Action::RunVerifier {
+                            task_id: task.id.clone(),
+                            attempt_id,
+                        });
+                    }
+                } else {
+                    out.push(Action::Resume {
+                        task_id: task.id.clone(),
+                        cause: "session_died".to_string(),
+                    });
+                }
                 continue;
             }
             // Unknown stays the no-actuation backstop. Don't act on
@@ -322,6 +333,19 @@ impl Supervisor {
                     }
                 }
                 break;
+            }
+        }
+
+        // 4) Verifying tasks are verifier runs that may have been
+        // interrupted by supervisor shutdown. Re-emit the verifier
+        // action; the actuator is idempotent from Verifying and will
+        // continue the gate without replaying Running → Verifying.
+        for task in &verifying {
+            if let Some(attempt_id) = super::tasks::latest_attempt_id(conn, &task.id)? {
+                out.push(Action::RunVerifier {
+                    task_id: task.id.clone(),
+                    attempt_id,
+                });
             }
         }
         let _ = sensors.last_hook_event_id();
@@ -357,6 +381,10 @@ impl HealthActionMap {
 /// while the sensor layer is still stubbed.
 fn session_cwd_matches(_session_id: &str, _task_cwd: &str) -> bool {
     true
+}
+
+fn is_spawned_exec_session(session_id: &str) -> bool {
+    session_id.strip_prefix("codex-exec-").is_some()
 }
 
 #[cfg(test)]
@@ -562,6 +590,75 @@ mod tests {
                 assert_eq!(cause, "session_died");
             }
             other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tick_emits_verifier_for_completed_spawned_exec_session() {
+        let mut conn = store::open_memory();
+        let task_id = task_in_running(&mut conn, "codex-exec-123");
+        let attempt_id = crate::coord::tasks::latest_attempt_id(&conn, &task_id)
+            .unwrap()
+            .unwrap();
+        let sup = Supervisor::with_defaults();
+        let sensors = StubSensors {
+            last_id: 0,
+            sessions: vec![ObservedSession {
+                session_id: "codex-exec-123".into(),
+                pid: 123,
+                status: ObservedStatus::Dead,
+                health_alerts: vec![],
+            }],
+        };
+
+        let actions = sup.tick(&conn, &sensors).unwrap();
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::RunVerifier {
+                task_id: tid,
+                attempt_id: aid,
+            } => {
+                assert_eq!(tid, &task_id);
+                assert_eq!(aid, &attempt_id);
+            }
+            other => panic!("expected RunVerifier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tick_reemits_verifier_for_interrupted_verifying_task() {
+        let mut conn = store::open_memory();
+        let task_id = task_in_running(&mut conn, "codex-exec-123");
+        crate::coord::tasks::transition(
+            &mut conn,
+            &task_id,
+            TaskState::Running,
+            TaskState::Verifying,
+            "running-complete",
+        )
+        .unwrap();
+        let attempt_id = crate::coord::tasks::latest_attempt_id(&conn, &task_id)
+            .unwrap()
+            .unwrap();
+        let sup = Supervisor::with_defaults();
+        let sensors = StubSensors {
+            last_id: 0,
+            sessions: vec![],
+        };
+
+        let actions = sup.tick(&conn, &sensors).unwrap();
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::RunVerifier {
+                task_id: tid,
+                attempt_id: aid,
+            } => {
+                assert_eq!(tid, &task_id);
+                assert_eq!(aid, &attempt_id);
+            }
+            other => panic!("expected RunVerifier, got {other:?}"),
         }
     }
 

@@ -1002,7 +1002,7 @@ pub(crate) fn run_headless(
         // sidesteps any lifetime tangle with the App's borrows.
         #[cfg(feature = "coord")]
         if let Ok(mut conn) = crate::coord::store::open() {
-            let sensors = NoopSensors;
+            let sensors = HeadlessSensors::from_coord(&conn);
             match supervisor.tick(&conn, &sensors) {
                 Ok(actions) if !actions.is_empty() => {
                     let mut actuated = 0u32;
@@ -1104,19 +1104,83 @@ fn emit_headless_event(event: &str, data: serde_json::Value, json_mode: bool) {
 }
 
 /// Check for context rot and raise typed interrupts for decaying sessions.
-/// Sensor stub for headless mode while the live JSONL/`ps`/hook-event
-/// reader lands in PR4 (#346). Reports zero events seen and no sessions,
-/// which keeps `Supervisor::tick` in the "do nothing safely" branch — the
-/// crash-safety baseline before any actuation goes live.
+/// Headless supervisor sensors for direct `codex exec` spawns. Interactive
+/// sessions still flow through the normal app/session monitor; this sensor
+/// only bridges pid-derived `codex-exec-*` attempt ids back into coord.
 #[cfg(feature = "coord")]
-struct NoopSensors;
+struct HeadlessSensors {
+    sessions: Vec<crate::coord::supervisor::ObservedSession>,
+}
+
 #[cfg(feature = "coord")]
-impl crate::coord::supervisor::Sensors for NoopSensors {
+impl HeadlessSensors {
+    fn from_coord(conn: &rusqlite::Connection) -> Self {
+        let mut sessions = Vec::new();
+        let running =
+            crate::coord::tasks::list_tasks(conn, Some(crate::coord::tasks::TaskState::Running))
+                .unwrap_or_default();
+        for task in running {
+            let Ok(Some(session_id)) = crate::coord::tasks::latest_session_id(conn, &task.id)
+            else {
+                continue;
+            };
+            let Some(pid) = codex_exec_session_pid(&session_id) else {
+                continue;
+            };
+            let status = if pid_is_alive(pid) {
+                crate::coord::supervisor::ObservedStatus::Running
+            } else {
+                crate::coord::supervisor::ObservedStatus::Dead
+            };
+            sessions.push(crate::coord::supervisor::ObservedSession {
+                session_id,
+                pid,
+                status,
+                health_alerts: Vec::new(),
+            });
+        }
+
+        Self { sessions }
+    }
+}
+
+#[cfg(feature = "coord")]
+impl crate::coord::supervisor::Sensors for HeadlessSensors {
     fn last_hook_event_id(&self) -> i64 {
         0
     }
     fn observed_sessions(&self) -> Vec<crate::coord::supervisor::ObservedSession> {
-        Vec::new()
+        self.sessions.clone()
+    }
+}
+
+#[cfg(feature = "coord")]
+fn codex_exec_session_pid(session_id: &str) -> Option<u32> {
+    let raw = session_id.strip_prefix("codex-exec-")?;
+    let pid = raw.parse::<u32>().ok()?;
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    Some(pid)
+}
+
+#[cfg(feature = "coord")]
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let pid = match i32::try_from(pid) {
+            Ok(pid) if pid > 0 => pid,
+            _ => return false,
+        };
+        unsafe {
+            libc::kill(pid, 0) == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -1174,17 +1238,35 @@ impl crate::coord::verify::VerifierBackend for LiveSideEffects {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("spawn verifier shell: {e}"))?;
+        use std::io::Read;
+        let stdout_reader = child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || {
+                let mut out = String::new();
+                let _ = stdout.read_to_string(&mut out);
+                out
+            })
+        });
+        let stderr_reader = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut out = String::new();
+                let _ = stderr.read_to_string(&mut out);
+                out
+            })
+        });
         let start = std::time::Instant::now();
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    use std::io::Read;
                     let mut combined = String::new();
-                    if let Some(mut stdout) = child.stdout.take() {
-                        let _ = stdout.read_to_string(&mut combined);
+                    if let Some(reader) = stdout_reader {
+                        if let Ok(out) = reader.join() {
+                            combined.push_str(&out);
+                        }
                     }
-                    if let Some(mut stderr) = child.stderr.take() {
-                        let _ = stderr.read_to_string(&mut combined);
+                    if let Some(reader) = stderr_reader {
+                        if let Ok(out) = reader.join() {
+                            combined.push_str(&out);
+                        }
                     }
                     return Ok(crate::coord::verify::ShellResult {
                         exit_code: status.code().unwrap_or(-1),
@@ -1194,6 +1276,7 @@ impl crate::coord::verify::VerifierBackend for LiveSideEffects {
                 Ok(None) => {
                     if start.elapsed() >= timeout {
                         let _ = child.kill();
+                        let _ = child.wait();
                         return Err(format!("shell verifier timed out after {timeout:?}"));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2064,5 +2147,29 @@ mod supervisor_spawn_tests {
             vec![std::ffi::OsStr::new("exec"), std::ffi::OsStr::new(prompt)]
         );
         assert_eq!(cmd.get_current_dir(), Some(temp.path()));
+    }
+
+    #[test]
+    fn codex_exec_session_pid_parses_only_positive_pid_ids() {
+        assert_eq!(codex_exec_session_pid("codex-exec-123"), Some(123));
+        assert_eq!(codex_exec_session_pid("sess_a"), None);
+        assert_eq!(codex_exec_session_pid("codex-exec-0"), None);
+        assert_eq!(codex_exec_session_pid("codex-exec-not-a-pid"), None);
+    }
+
+    #[cfg(feature = "bus")]
+    #[test]
+    fn live_shell_verifier_drains_large_output_before_waiting() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = crate::coord::verify::VerifierBackend::run_shell(
+            &LiveSideEffects,
+            temp.path(),
+            "yes verifier-output | head -n 20000",
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.combined_output.contains("verifier-output"));
     }
 }
