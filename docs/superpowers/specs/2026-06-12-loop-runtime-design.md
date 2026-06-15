@@ -167,9 +167,6 @@ command = "cargo clippy -- -D warnings"
 max_items_per_run = 2
 max_concurrent = 1
 require_human_for = ["destructive", "ambiguous", "security-sensitive"]
-allow_source_updates = false
-allow_pr_create = false
-allow_issue_comment = false
 ```
 
 ### Mode Semantics

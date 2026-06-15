@@ -1041,12 +1041,12 @@ pub(crate) fn run_headless(
             }
         }
         #[cfg(feature = "coord")]
-        match crate::r#loop::publish::publish_completed(std::path::Path::new(".")) {
-            Ok(summary) if summary.published > 0 || summary.failed > 0 => {
+        match crate::r#loop::outcome::reconcile_completed() {
+            Ok(summary) if summary.resolved > 0 || summary.failed > 0 => {
                 emit_headless_event(
-                    "loop_publish",
+                    "loop_outcome",
                     serde_json::json!({
-                        "published": summary.published,
+                        "resolved": summary.resolved,
                         "skipped": summary.skipped,
                         "failed": summary.failed,
                     }),
@@ -1056,7 +1056,7 @@ pub(crate) fn run_headless(
             Ok(_) => {}
             Err(e) => {
                 emit_headless_event(
-                    "loop_publish_error",
+                    "loop_outcome_error",
                     serde_json::json!({"error": e}),
                     json_mode,
                 );

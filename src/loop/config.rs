@@ -149,9 +149,6 @@ pub struct GateConfig {
     pub max_items_per_run: usize,
     pub max_concurrent: usize,
     pub require_human_for: Vec<String>,
-    pub allow_source_updates: bool,
-    pub allow_pr_create: bool,
-    pub allow_issue_comment: bool,
 }
 
 impl LoopConfig {
@@ -220,9 +217,6 @@ impl LoopConfig {
                 max_items_per_run: 2,
                 max_concurrent: 1,
                 require_human_for: Vec::new(),
-                allow_source_updates: false,
-                allow_pr_create: false,
-                allow_issue_comment: false,
             },
         }
     }
@@ -330,9 +324,6 @@ pub fn parse_loop_config(body: &str, path: PathBuf) -> LoopResult<LoopConfig> {
             max_items_per_run: optional_usize(&gates, "max_items_per_run").unwrap_or(1),
             max_concurrent: optional_usize(&gates, "max_concurrent").unwrap_or(1),
             require_human_for: optional_array(&gates, "require_human_for").unwrap_or_default(),
-            allow_source_updates: optional_bool(&gates, "allow_source_updates").unwrap_or(false),
-            allow_pr_create: optional_bool(&gates, "allow_pr_create").unwrap_or(false),
-            allow_issue_comment: optional_bool(&gates, "allow_issue_comment").unwrap_or(false),
         },
     })
 }

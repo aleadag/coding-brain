@@ -25,7 +25,7 @@ pub fn render_task_prompt(cfg: &LoopConfig, item: &SourceItem, decision: &LoopDe
         .map(|skill| format!("Use skill `{skill}` before acting.\n\n"))
         .unwrap_or_default();
     format!(
-        "{skill}Loop: {loop_name}\nSource: {source_kind} {source_id}\nURL: {url}\n\nTask:\n{task_prompt}\n\nTriage reason:\n{reason}\n\nSource body:\n{body}\n",
+        "{skill}Loop: {loop_name}\nSource: {source_kind} {source_id}\nURL: {url}\n\nTask:\n{task_prompt}\n\nWorkflow:\nIf this task changes code, create or update the pull request and include the PR URL in your final answer; codexctl records state from that URL.\n\nTriage reason:\n{reason}\n\nSource body:\n{body}\n",
         loop_name = cfg.name,
         source_kind = item.source_kind,
         source_id = item.source_item_id,
@@ -37,4 +37,22 @@ pub fn render_task_prompt(cfg: &LoopConfig, item: &SourceItem, decision: &LoopDe
         reason = decision.reason,
         body = item.body,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_prompt_requires_reporting_pr_url_for_state_tracking() {
+        let cfg = LoopConfig::minimal_for_test("issue-triage");
+        let item = SourceItem::for_test("github:aleadag/codexctl#1");
+        let decision = crate::r#loop::policy::LoopDecision::submit_for_test("Fix it");
+
+        let prompt = render_task_prompt(&cfg, &item, &decision);
+
+        assert!(prompt.contains("create or update the pull request"));
+        assert!(prompt.contains("include the PR URL in your final answer"));
+        assert!(prompt.contains("codexctl records state from that URL"));
+    }
 }
