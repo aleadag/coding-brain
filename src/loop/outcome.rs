@@ -20,14 +20,14 @@ pub struct TranscriptOutcome {
 
 pub fn reconcile_completed() -> LoopResult<OutcomeSummary> {
     let loop_conn = store::open()?;
-    let coord_conn = crate::coord::store::open()?;
+    let mut coord_conn = crate::coord::store::open()?;
     let transcripts = scan_transcript_outcomes();
-    reconcile_completed_with_transcripts(&loop_conn, &coord_conn, &transcripts)
+    reconcile_completed_with_transcripts(&loop_conn, &mut coord_conn, &transcripts)
 }
 
 pub fn reconcile_completed_with_transcripts(
     loop_conn: &Connection,
-    coord_conn: &Connection,
+    coord_conn: &mut Connection,
     transcripts: &[TranscriptOutcome],
 ) -> LoopResult<OutcomeSummary> {
     let mut summary = OutcomeSummary::default();
@@ -52,12 +52,14 @@ pub fn reconcile_completed_with_transcripts(
         else {
             let error = "completed task transcript not found";
             mark_outcome_failed(loop_conn, &item.id, error)?;
+            mark_task_needs_human(coord_conn, task_id, error)?;
             summary.failed += 1;
             continue;
         };
         let Some(url) = extract_github_pr_url(&transcript.final_message) else {
             let error = "completed task finished without a reported PR URL";
             mark_outcome_failed(loop_conn, &item.id, error)?;
+            mark_task_needs_human(coord_conn, task_id, error)?;
             summary.failed += 1;
             continue;
         };
@@ -88,6 +90,20 @@ fn mark_outcome_failed(loop_conn: &Connection, item_id: &str, error: &str) -> Lo
         "outcome_missing",
         error,
         serde_json::json!({}),
+    )
+}
+
+fn mark_task_needs_human(
+    coord_conn: &mut Connection,
+    task_id: &str,
+    error: &str,
+) -> LoopResult<()> {
+    crate::coord::tasks::transition(
+        coord_conn,
+        task_id,
+        crate::coord::tasks::TaskState::Done,
+        crate::coord::tasks::TaskState::NeedsHuman,
+        &format!("loop-outcome-missing: {error}"),
     )
 }
 
@@ -247,7 +263,7 @@ mod tests {
 
         let summary = reconcile_completed_with_transcripts(
             &loop_conn,
-            &coord_conn,
+            &mut coord_conn,
             &[TranscriptOutcome {
                 cwd: "/work/task-1".into(),
                 final_message: "Opened PR: https://github.com/aleadag/codexctl/pull/4".into(),
@@ -273,7 +289,7 @@ mod tests {
 
         let summary = reconcile_completed_with_transcripts(
             &loop_conn,
-            &coord_conn,
+            &mut coord_conn,
             &[TranscriptOutcome {
                 cwd: "/work/task-1".into(),
                 final_message: "Tests passed, but I did not create a PR.".into(),
@@ -292,6 +308,32 @@ mod tests {
                 .unwrap()
                 .contains("without a reported PR URL")
         );
+    }
+
+    #[test]
+    fn missing_pr_outcome_marks_coord_task_needs_human() {
+        let loop_conn = store::open_memory();
+        let mut coord_conn = crate::coord::store::open_memory();
+        let (item_id, task_id) = done_loop_task(&loop_conn, &mut coord_conn, "/work/task-1");
+
+        let summary = reconcile_completed_with_transcripts(
+            &loop_conn,
+            &mut coord_conn,
+            &[TranscriptOutcome {
+                cwd: "/work/task-1".into(),
+                final_message: "Tests passed, but I did not create a PR.".into(),
+            }],
+        )
+        .unwrap();
+        let row = store::get_item(&loop_conn, &item_id).unwrap().unwrap();
+        let task = crate::coord::tasks::get_task(&coord_conn, &task_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.resolved, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(row.state, store::LoopItemState::Failed);
+        assert_eq!(task.state, TaskState::NeedsHuman);
     }
 
     #[test]
