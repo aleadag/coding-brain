@@ -2698,17 +2698,17 @@ impl App {
         }
 
         let query = query.to_ascii_lowercase();
-        let fields = [
+        let text_fields = [
             session.display_name().to_string(),
             session.project_name.clone(),
-            session.model.clone(),
             session.cwd.clone(),
             session.session_id.clone(),
         ];
 
-        fields
+        text_fields
             .iter()
             .any(|field| field.to_ascii_lowercase().contains(&query))
+            || session.model.eq_ignore_ascii_case(&query)
     }
 
     fn handle_approve(&mut self) {
