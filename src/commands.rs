@@ -4,7 +4,6 @@
 //! called from `run_main()` dispatch in main.rs.
 
 use std::io;
-use std::path::Path;
 use std::time::Duration;
 
 use crate::Cli;
@@ -1042,7 +1041,7 @@ pub(crate) fn run_headless(
             }
         }
         #[cfg(feature = "coord")]
-        match crate::r#loop::publish::publish_completed(Path::new(".")) {
+        match crate::r#loop::publish::publish_completed(std::path::Path::new(".")) {
             Ok(summary) if summary.published > 0 || summary.failed > 0 => {
                 emit_headless_event(
                     "loop_publish",
@@ -1216,6 +1215,7 @@ fn build_codex_exec_spawn_command(cwd: &std::path::Path, prompt: &str) -> std::p
         .arg(cwd)
         .arg("--add-dir")
         .arg(cwd)
+        .arg("--skip-git-repo-check")
         .arg(prompt)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -2177,6 +2177,7 @@ mod supervisor_spawn_tests {
                 temp.path().as_os_str(),
                 std::ffi::OsStr::new("--add-dir"),
                 temp.path().as_os_str(),
+                std::ffi::OsStr::new("--skip-git-repo-check"),
                 std::ffi::OsStr::new(prompt),
             ]
         );

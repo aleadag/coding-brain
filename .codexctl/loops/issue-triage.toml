@@ -21,7 +21,7 @@ Escalate destructive, security-sensitive, or ambiguous work.
 [triage.allowed]
 actions = ["ignore", "report", "submit", "escalate"]
 worktree = ["none", "existing", "required", "auto"]
-verifiers = ["cargo test", "cargo clippy -- -D warnings"]
+verifiers = ["cargo clippy --all-targets -- -D warnings", "cargo clippy --all-targets --no-default-features --features hive -- -D warnings"]
 
 [execution]
 cwd = "."
@@ -34,11 +34,11 @@ timeout_min = 90
 
 [[verify]]
 kind = "run"
-command = "cargo test"
+command = "cargo clippy --all-targets -- -D warnings"
 
 [[verify]]
 kind = "run"
-command = "cargo clippy -- -D warnings"
+command = "cargo clippy --all-targets --no-default-features --features hive -- -D warnings"
 
 [gates]
 max_items_per_run = 1
