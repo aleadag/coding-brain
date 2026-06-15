@@ -18,7 +18,7 @@
 //! crash-safety claim ("restart re-converges from coord.db") rests on
 //! the ledger being honest.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::supervisor::Action;
 use super::tasks::{
@@ -95,6 +95,7 @@ pub fn apply(conn: &mut Connection, fx: &dyn SideEffects, action: &Action) -> Re
             if from_state != TaskState::Pending
                 && from_state != TaskState::Ready
                 && from_state != TaskState::Assigned
+                && from_state != TaskState::Retrying
             {
                 return Ok(());
             }
@@ -102,7 +103,12 @@ pub fn apply(conn: &mut Connection, fx: &dyn SideEffects, action: &Action) -> Re
             // fallback), we bump the attempt counter so the mailbox
             // attempt and the spawn attempt are separately addressable.
             let next_num = attempt_count(conn, task_id)? + 1;
-            let session_id = fx.spawn_session(cwd, &task.prompt)?;
+            let prompt = if from_state == TaskState::Retrying {
+                retry_prompt_for_latest_fail(conn, task_id, &task.prompt)?
+            } else {
+                task.prompt.clone()
+            };
+            let session_id = fx.spawn_session(cwd, &prompt)?;
             let _attempt_id =
                 insert_attempt(conn, task_id, next_num, Some(&session_id), None, None)?;
             transition(
@@ -110,10 +116,10 @@ pub fn apply(conn: &mut Connection, fx: &dyn SideEffects, action: &Action) -> Re
                 task_id,
                 from_state,
                 TaskState::Running,
-                if from_state == TaskState::Assigned {
-                    "spawn-fallback"
-                } else {
-                    "spawned"
+                match from_state {
+                    TaskState::Assigned => "spawn-fallback",
+                    TaskState::Retrying => "retry-spawned",
+                    _ => "spawned",
                 },
             )?;
             Ok(())
@@ -267,6 +273,30 @@ pub fn apply(conn: &mut Connection, fx: &dyn SideEffects, action: &Action) -> Re
 /// obviously the same string the ledger recorded.
 pub fn retry_prompt_for_fail(original_prompt: &str, verifier_kind: &str, output: &str) -> String {
     super::verify::build_retry_prompt(original_prompt, verifier_kind, output)
+}
+
+fn retry_prompt_for_latest_fail(
+    conn: &Connection,
+    task_id: &str,
+    original_prompt: &str,
+) -> Result<String, String> {
+    let failure = conn
+        .query_row(
+            "SELECT v.kind, v.output
+             FROM task_verifications v
+             JOIN task_attempts a ON a.id = v.attempt_id
+             WHERE a.task_id = ?1 AND v.verdict = 'FAIL'
+             ORDER BY a.attempt_num DESC, v.id DESC
+             LIMIT 1",
+            rusqlite::params![task_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("latest failed verification: {e}"))?;
+    Ok(match failure {
+        Some((kind, output)) => retry_prompt_for_fail(original_prompt, &kind, &output),
+        None => original_prompt.to_string(),
+    })
 }
 
 /// Connect the bus `message_id` to the attempt row. Separate from
@@ -624,6 +654,75 @@ mod tests {
         let hist = list_transitions(&conn, &id).unwrap();
         let last_cause = &hist.last().unwrap().2;
         assert_eq!(last_cause, "verify-fail");
+    }
+
+    #[test]
+    fn spawn_retrying_task_uses_latest_verifier_failure_prompt() {
+        use crate::coord::tasks::list_transitions;
+        use crate::coord::verify::{ShellResult, Verifier};
+
+        let mut conn = store::open_memory();
+        let new_task = NewTask {
+            prompt: "Fix the build".into(),
+            verifiers: vec![Verifier::Run {
+                command: "cargo test".into(),
+            }],
+            max_retries: Some(2),
+            ..sample_with_role(None)
+        };
+        let id = insert_task(&conn, &new_task).unwrap();
+        let fx = RecordingFx::default();
+        fx.shell_results.borrow_mut().push_back(ShellResult {
+            exit_code: 1,
+            combined_output: "test tests::auth FAILED".into(),
+        });
+
+        apply(
+            &mut conn,
+            &fx,
+            &Action::Spawn {
+                task_id: id.clone(),
+                cwd: std::path::PathBuf::from("/work/x"),
+            },
+        )
+        .unwrap();
+        let attempt_id = crate::coord::tasks::latest_attempt_id(&conn, &id)
+            .unwrap()
+            .unwrap();
+        apply(
+            &mut conn,
+            &fx,
+            &Action::RunVerifier {
+                task_id: id.clone(),
+                attempt_id,
+            },
+        )
+        .unwrap();
+
+        apply(
+            &mut conn,
+            &fx,
+            &Action::Spawn {
+                task_id: id.clone(),
+                cwd: std::path::PathBuf::from("/work/x"),
+            },
+        )
+        .unwrap();
+
+        let spawned = fx.spawned.borrow();
+        assert_eq!(spawned.len(), 2);
+        assert_eq!(spawned[1].0, std::path::PathBuf::from("/work/x"));
+        assert!(spawned[1].1.contains("Fix the build"));
+        assert!(
+            spawned[1]
+                .1
+                .contains("Previous attempt failed verification")
+        );
+        assert!(spawned[1].1.contains("run: test tests::auth FAILED"));
+        let task = get_task(&conn, &id).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        let hist = list_transitions(&conn, &id).unwrap();
+        assert_eq!(hist.last().unwrap().2, "retry-spawned");
     }
 
     #[test]

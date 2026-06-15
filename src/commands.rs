@@ -1212,6 +1212,10 @@ fn pid_is_alive(pid: u32) -> bool {
 fn build_codex_exec_spawn_command(cwd: &std::path::Path, prompt: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new("codex");
     cmd.arg("exec")
+        .arg("--cd")
+        .arg(cwd)
+        .arg("--add-dir")
+        .arg(cwd)
         .arg(prompt)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -2167,7 +2171,14 @@ mod supervisor_spawn_tests {
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("codex"));
         assert_eq!(
             cmd.get_args().collect::<Vec<_>>(),
-            vec![std::ffi::OsStr::new("exec"), std::ffi::OsStr::new(prompt)]
+            vec![
+                std::ffi::OsStr::new("exec"),
+                std::ffi::OsStr::new("--cd"),
+                temp.path().as_os_str(),
+                std::ffi::OsStr::new("--add-dir"),
+                temp.path().as_os_str(),
+                std::ffi::OsStr::new(prompt),
+            ]
         );
         assert_eq!(cmd.get_current_dir(), Some(temp.path()));
     }

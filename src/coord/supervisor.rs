@@ -212,6 +212,7 @@ impl Supervisor {
         let assigned = list_tasks(conn, Some(TaskState::Assigned))?;
         let running = list_tasks(conn, Some(TaskState::Running))?;
         let verifying = list_tasks(conn, Some(TaskState::Verifying))?;
+        let retrying = list_tasks(conn, Some(TaskState::Retrying))?;
 
         // 1) Pending tasks → emit assignment actions. Tasks with a role
         //    go to that role's mailbox first; tasks without a role go
@@ -235,6 +236,13 @@ impl Supervisor {
                         cwd: PathBuf::from(&task.cwd),
                     }),
                 }
+            }
+            let remaining_slots = slots.saturating_sub(pending.len() as u32);
+            for task in retrying.iter().take(remaining_slots as usize) {
+                out.push(Action::Spawn {
+                    task_id: task.id.clone(),
+                    cwd: PathBuf::from(&task.cwd),
+                });
             }
         }
 
@@ -481,6 +489,52 @@ mod tests {
             sessions: vec![],
         };
         let actions = sup.tick(&conn, &sensors).unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::Spawn { task_id, cwd } => {
+                assert_eq!(task_id, &id);
+                assert_eq!(cwd.to_string_lossy(), "/work/x");
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tick_emits_spawn_for_retrying_task() {
+        let mut conn = store::open_memory();
+        let id = insert_task(
+            &conn,
+            &NewTask {
+                name: "t".into(),
+                role: None,
+                cwd: "/work/x".into(),
+                prompt: "do".into(),
+                model: None,
+                budget_usd: None,
+                max_retries: None,
+                timeout_min: None,
+                depends_on: vec![],
+                policy: None,
+                verifiers: vec![],
+            },
+        )
+        .unwrap();
+        crate::coord::tasks::transition(
+            &mut conn,
+            &id,
+            TaskState::Pending,
+            TaskState::Retrying,
+            "verify-fail",
+        )
+        .unwrap();
+        let sup = Supervisor::with_defaults();
+        let sensors = StubSensors {
+            last_id: 0,
+            sessions: vec![],
+        };
+
+        let actions = sup.tick(&conn, &sensors).unwrap();
+
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             Action::Spawn { task_id, cwd } => {
