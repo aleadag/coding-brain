@@ -101,28 +101,6 @@ fn dispatch_inner(cmd: &LoopCommand, cfg: &crate::config::Config) -> LoopResult<
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clap_accepts_tick_for_due_loop_polling() {
-        let cmd = clap::Command::new("loop").subcommand_required(true);
-        let cmd = LoopCommand::augment_subcommands(cmd);
-        let matches = cmd
-            .try_get_matches_from(["loop", "tick", "--name", "issue-triage", "--json"])
-            .unwrap();
-
-        let (subcommand, args) = matches.subcommand().unwrap();
-        assert_eq!(subcommand, "tick");
-        assert_eq!(
-            args.get_one::<String>("name").map(String::as_str),
-            Some("issue-triage")
-        );
-        assert!(args.get_flag("json"));
-    }
-}
-
 fn list_loops(root: &Path) -> LoopResult<()> {
     let loops = discover_project_loops(root)?;
     if loops.is_empty() {
@@ -442,4 +420,26 @@ fn set_paused(name: &str, paused: bool) -> LoopResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clap_accepts_tick_for_due_loop_polling() {
+        let cmd = clap::Command::new("loop").subcommand_required(true);
+        let cmd = LoopCommand::augment_subcommands(cmd);
+        let matches = cmd
+            .try_get_matches_from(["loop", "tick", "--name", "issue-triage", "--json"])
+            .unwrap();
+
+        let (subcommand, args) = matches.subcommand().unwrap();
+        assert_eq!(subcommand, "tick");
+        assert_eq!(
+            args.get_one::<String>("name").map(String::as_str),
+            Some("issue-triage")
+        );
+        assert!(args.get_flag("json"));
+    }
 }
