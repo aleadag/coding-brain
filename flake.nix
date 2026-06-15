@@ -24,6 +24,7 @@
           version = cargoToml.package.version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          nativeCheckInputs = [ pkgs.git ];
 
           meta = with pkgs.lib; {
             description = "Orchestrate Codex sessions with a local-LLM brain that learns from you.";

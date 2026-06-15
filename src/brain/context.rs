@@ -682,9 +682,33 @@ mod tests {
 
     #[test]
     fn git_context_in_git_repo() {
-        let cwd = env!("CARGO_MANIFEST_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {} failed", args.join(" "));
+        };
+
+        run_git(&["init"]);
+        std::fs::write(dir.path().join("README.md"), "test\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&[
+            "-c",
+            "user.name=Codex Test",
+            "-c",
+            "user.email=codex@example.test",
+            "commit",
+            "-m",
+            "initial commit",
+        ]);
+
+        let cwd = dir.path().to_str().unwrap();
         let ctx = build_git_context_uncached(cwd);
-        // This project is a git repo — we should get either Branch or HEAD plus commits
         // In CI (detached HEAD), branch may be empty but HEAD + commits should exist
         assert!(
             ctx.contains("Branch:") || ctx.contains("HEAD:") || ctx.contains("Recent commits:"),
