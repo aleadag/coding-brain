@@ -6,6 +6,7 @@ use clap::Subcommand;
 
 use super::LoopResult;
 use super::config::{LoopConfig, TriageMode, WorktreeMode, discover_project_loops};
+use super::daemon;
 use super::policy::{LoopAction, deterministic_decision, parse_and_validate_decision};
 use super::prompt;
 use super::sources::{SourceItem, source_from_config};
@@ -31,6 +32,18 @@ pub enum LoopCommand {
         /// Override source/config item limit for this run.
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Run enabled project loops on cadence.
+    Daemon {
+        /// Loop name. When omitted, manages every project-local loop.
+        #[arg(long)]
+        name: Option<String>,
+        /// Run due loops once and exit.
+        #[arg(long)]
+        once: bool,
+        /// Emit JSON status lines.
+        #[arg(long)]
+        json: bool,
     },
     /// Show loop item status.
     Status { name: Option<String> },
@@ -65,6 +78,9 @@ fn dispatch_inner(cmd: &LoopCommand, cfg: &crate::config::Config) -> LoopResult<
             dry_run,
             limit,
         } => run_loop(Path::new("."), name, *dry_run, *limit, cfg),
+        LoopCommand::Daemon { name, once, json } => {
+            daemon::run_daemon(Path::new("."), name.as_deref(), *once, *json, cfg)
+        }
         LoopCommand::Status { name } => status(name.as_deref()),
         LoopCommand::Logs { name, item } => logs(name, item.as_deref()),
         LoopCommand::Pause { name } => set_paused(name, true),
@@ -115,12 +131,11 @@ fn run_loop(
     if !cfg.enabled {
         return Err(format!("loop {} is disabled", cfg.name));
     }
-    cfg.validate_with_skills(&available_skill_names(root))?;
 
     let loop_conn = store::open()?;
     let coord_conn = crate::coord::store::open()?;
-    let run_id = store::begin_run(&loop_conn, &cfg.name, &cfg.path)?;
-    let result = run_loop_once(
+    let result = run_loop_config(
+        root,
         &cfg,
         &loop_conn,
         &coord_conn,
@@ -128,27 +143,51 @@ fn run_loop(
         limit_override,
         app_cfg,
     );
-    let finish = match &result {
-        Ok(summary) => {
-            println!(
-                "{}: seen={} submitted={} ignored={} dry_run={}",
-                cfg.name, summary.seen, summary.submitted, summary.ignored, dry_run
-            );
-            store::finish_run(&loop_conn, &run_id, "success", None)
-        }
-        Err(err) => store::finish_run(&loop_conn, &run_id, "failed", Some(err)),
-    };
-    finish?;
+    if let Ok(summary) = &result {
+        println!(
+            "{}: seen={} submitted={} ignored={} dry_run={}",
+            cfg.name, summary.seen, summary.submitted, summary.ignored, dry_run
+        );
+    }
     result.map(|_| ())
 }
 
-struct RunSummary {
-    seen: usize,
-    submitted: usize,
-    ignored: usize,
+pub(crate) struct RunSummary {
+    pub(crate) seen: usize,
+    pub(crate) submitted: usize,
+    pub(crate) ignored: usize,
+}
+
+pub(crate) fn run_loop_config(
+    root: &Path,
+    cfg: &LoopConfig,
+    loop_conn: &rusqlite::Connection,
+    coord_conn: &rusqlite::Connection,
+    dry_run: bool,
+    limit_override: Option<usize>,
+    app_cfg: &crate::config::Config,
+) -> LoopResult<RunSummary> {
+    cfg.validate_with_skills(&available_skill_names(root))?;
+    let run_id = store::begin_run(loop_conn, &cfg.name, &cfg.path)?;
+    let result = run_loop_once(
+        root,
+        cfg,
+        loop_conn,
+        coord_conn,
+        dry_run,
+        limit_override,
+        app_cfg,
+    );
+    let finish = match &result {
+        Ok(_) => store::finish_run(loop_conn, &run_id, "success", None),
+        Err(err) => store::finish_run(loop_conn, &run_id, "failed", Some(err)),
+    };
+    finish?;
+    result
 }
 
 fn run_loop_once(
+    root: &Path,
     cfg: &LoopConfig,
     loop_conn: &rusqlite::Connection,
     coord_conn: &rusqlite::Connection,
@@ -169,6 +208,13 @@ fn run_loop_once(
     for item in fetched.items.into_iter().take(limit) {
         let loop_item_id =
             store::upsert_item(loop_conn, &NewLoopItem::from_source(&cfg.name, &item))?;
+        if store::get_item(loop_conn, &loop_item_id)?
+            .and_then(|row| row.coord_task_id)
+            .is_some()
+        {
+            summary.ignored += 1;
+            continue;
+        }
         let decision = decide_item(cfg, &item, app_cfg)?;
         let state = state_for_decision(decision.action);
         store::mark_decision(loop_conn, &loop_item_id, state, &decision.to_json())?;
@@ -180,7 +226,7 @@ fn run_loop_once(
                 );
                 continue;
             }
-            let worktree_path = resolve_worktree_path(Path::new("."), cfg, &item, &decision)?;
+            let worktree_path = resolve_worktree_path(root, cfg, &item, &decision)?;
             submit::submit_coord_task(
                 coord_conn,
                 loop_conn,
@@ -305,7 +351,7 @@ fn export(name: &str, format: &str) -> LoopResult<()> {
     Ok(())
 }
 
-fn select_loops(root: &Path, name: Option<&str>) -> LoopResult<Vec<LoopConfig>> {
+pub(crate) fn select_loops(root: &Path, name: Option<&str>) -> LoopResult<Vec<LoopConfig>> {
     let loops = discover_project_loops(root)?;
     if let Some(name) = name {
         let selected: Vec<_> = loops.into_iter().filter(|cfg| cfg.name == name).collect();
@@ -342,7 +388,7 @@ fn paused_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn is_paused(name: &str) -> bool {
+pub(crate) fn is_paused(name: &str) -> bool {
     paused_path(name).exists()
 }
 
