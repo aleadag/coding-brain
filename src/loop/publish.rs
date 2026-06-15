@@ -72,17 +72,18 @@ pub fn publish_completed_with_runner(
                 summary.published += 1;
             }
             Ok(None) => {
-                store::mark_done(loop_conn, &item.id, None)?;
+                let error = "completed loop task had no worktree changes; PR not created";
+                store::mark_failed(loop_conn, &item.id, error)?;
                 store::log_event(
                     loop_conn,
                     None,
                     Some(&item.id),
-                    "info",
+                    "error",
                     "no_changes",
-                    "completed loop task had no worktree changes",
+                    error,
                     serde_json::json!({}),
                 )?;
-                summary.skipped += 1;
+                summary.failed += 1;
             }
             Err(err) => {
                 store::mark_failed(loop_conn, &item.id, &err)?;
@@ -280,13 +281,14 @@ mod tests {
     #[derive(Default)]
     struct FakeRunner {
         commands: Vec<CommandSpec>,
+        jj_diff_summary: String,
     }
 
     impl CommandRunner for FakeRunner {
         fn run(&mut self, spec: CommandSpec) -> LoopResult<String> {
             let output = match (spec.program.as_str(), spec.args.as_slice()) {
                 ("jj", args) if args.ends_with(&["diff".into(), "--summary".into()]) => {
-                    "M src/lib.rs".into()
+                    self.jj_diff_summary.clone()
                 }
                 ("gh", _) => "https://github.com/aleadag/codexctl/pull/42".into(),
                 _ => String::new(),
@@ -361,7 +363,10 @@ allow_pr_create = true
             Some(worktree.to_str().unwrap()),
         )
         .unwrap();
-        let mut runner = FakeRunner::default();
+        let mut runner = FakeRunner {
+            jj_diff_summary: "M src/lib.rs".into(),
+            ..Default::default()
+        };
 
         let summary =
             publish_completed_with_runner(&project, &loop_conn, &coord_conn, &mut runner).unwrap();
@@ -388,5 +393,88 @@ allow_pr_create = true
                         "@",
                     ]
         }));
+    }
+
+    #[test]
+    fn marks_publish_failure_when_done_jj_task_has_no_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("codexctl");
+        let worktree = temp.path().join("codexctl-worktrees/task-1");
+        fs::create_dir_all(project.join(".codexctl/loops")).unwrap();
+        fs::create_dir_all(worktree.join(".jj")).unwrap();
+        fs::write(
+            project.join(".codexctl/loops/issue-triage.toml"),
+            r#"
+name = "issue-triage"
+
+[source]
+kind = "github_issues"
+repo = "aleadag/codexctl"
+
+[execution]
+cwd = "."
+worktree = "auto"
+
+[gates]
+allow_pr_create = true
+"#,
+        )
+        .unwrap();
+        let loop_conn = store::open_memory();
+        let mut coord_conn = crate::coord::store::open_memory();
+        let source_item = crate::r#loop::sources::SourceItem::for_test("github:aleadag/codexctl#1");
+        let item_id = store::upsert_item(
+            &loop_conn,
+            &store::NewLoopItem::from_source("issue-triage", &source_item),
+        )
+        .unwrap();
+        let task_id = crate::coord::tasks::insert_task(
+            &coord_conn,
+            &NewTask {
+                name: "Fix it".into(),
+                role: None,
+                cwd: worktree.to_string_lossy().into_owned(),
+                prompt: "Fix it".into(),
+                model: None,
+                budget_usd: None,
+                max_retries: None,
+                timeout_min: None,
+                depends_on: Vec::new(),
+                policy: None,
+                verifiers: Vec::new(),
+            },
+        )
+        .unwrap();
+        crate::coord::tasks::transition(
+            &mut coord_conn,
+            &task_id,
+            TaskState::Pending,
+            TaskState::Done,
+            "test",
+        )
+        .unwrap();
+        store::mark_submitted(
+            &loop_conn,
+            &item_id,
+            &task_id,
+            Some(worktree.to_str().unwrap()),
+        )
+        .unwrap();
+        let mut runner = FakeRunner::default();
+
+        let summary =
+            publish_completed_with_runner(&project, &loop_conn, &coord_conn, &mut runner).unwrap();
+        let row = store::get_item(&loop_conn, &item_id).unwrap().unwrap();
+
+        assert_eq!(summary.failed, 1);
+        assert_eq!(row.state, store::LoopItemState::Failed);
+        assert_eq!(row.result_url, None);
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap()
+                .contains("no worktree changes")
+        );
+        assert!(!runner.commands.iter().any(|cmd| cmd.program == "gh"));
     }
 }
