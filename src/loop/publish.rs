@@ -139,20 +139,9 @@ fn publish_jj(
     body: &str,
     runner: &mut impl CommandRunner,
 ) -> LoopResult<Option<String>> {
-    let diff = runner.run(CommandSpec {
-        program: "jj".into(),
-        args: vec![
-            "--no-pager".into(),
-            "-R".into(),
-            worktree_path.to_string_lossy().into_owned(),
-            "diff".into(),
-            "--summary".into(),
-        ],
-        cwd: None,
-    })?;
-    if diff.trim().is_empty() {
+    let Some(revision) = changed_jj_revision(worktree_path, runner)? else {
         return Ok(None);
-    }
+    };
     runner.run(CommandSpec {
         program: "jj".into(),
         args: vec![
@@ -163,7 +152,7 @@ fn publish_jj(
             "set".into(),
             branch.into(),
             "-r".into(),
-            "@".into(),
+            revision.into(),
         ],
         cwd: None,
     })?;
@@ -181,6 +170,45 @@ fn publish_jj(
         cwd: None,
     })?;
     create_pr(cfg, item, worktree_path, branch, body, runner).map(Some)
+}
+
+fn changed_jj_revision(
+    worktree_path: &Path,
+    runner: &mut impl CommandRunner,
+) -> LoopResult<Option<&'static str>> {
+    let working_copy_diff = runner.run(CommandSpec {
+        program: "jj".into(),
+        args: vec![
+            "--no-pager".into(),
+            "-R".into(),
+            worktree_path.to_string_lossy().into_owned(),
+            "diff".into(),
+            "--summary".into(),
+        ],
+        cwd: None,
+    })?;
+    if !working_copy_diff.trim().is_empty() {
+        return Ok(Some("@"));
+    }
+
+    let parent_diff = runner.run(CommandSpec {
+        program: "jj".into(),
+        args: vec![
+            "--no-pager".into(),
+            "-R".into(),
+            worktree_path.to_string_lossy().into_owned(),
+            "diff".into(),
+            "--summary".into(),
+            "-r".into(),
+            "@-".into(),
+        ],
+        cwd: None,
+    })?;
+    if parent_diff.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some("@-"))
+    }
 }
 
 fn publish_git(
@@ -281,6 +309,7 @@ mod tests {
     #[derive(Default)]
     struct FakeRunner {
         commands: Vec<CommandSpec>,
+        jj_parent_diff_summary: String,
         jj_diff_summary: String,
     }
 
@@ -289,6 +318,16 @@ mod tests {
             let output = match (spec.program.as_str(), spec.args.as_slice()) {
                 ("jj", args) if args.ends_with(&["diff".into(), "--summary".into()]) => {
                     self.jj_diff_summary.clone()
+                }
+                ("jj", args)
+                    if args.ends_with(&[
+                        "diff".into(),
+                        "--summary".into(),
+                        "-r".into(),
+                        "@-".into(),
+                    ]) =>
+                {
+                    self.jj_parent_diff_summary.clone()
                 }
                 ("gh", _) => "https://github.com/aleadag/codexctl/pull/42".into(),
                 _ => String::new(),
@@ -476,5 +515,97 @@ allow_pr_create = true
                 .contains("no worktree changes")
         );
         assert!(!runner.commands.iter().any(|cmd| cmd.program == "gh"));
+    }
+
+    #[test]
+    fn publishes_parent_commit_when_jj_working_copy_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("codexctl");
+        let worktree = temp.path().join("codexctl-worktrees/task-1");
+        fs::create_dir_all(project.join(".codexctl/loops")).unwrap();
+        fs::create_dir_all(worktree.join(".jj")).unwrap();
+        fs::write(
+            project.join(".codexctl/loops/issue-triage.toml"),
+            r#"
+name = "issue-triage"
+
+[source]
+kind = "github_issues"
+repo = "aleadag/codexctl"
+
+[execution]
+cwd = "."
+worktree = "auto"
+
+[gates]
+allow_pr_create = true
+"#,
+        )
+        .unwrap();
+        let loop_conn = store::open_memory();
+        let mut coord_conn = crate::coord::store::open_memory();
+        let source_item = crate::r#loop::sources::SourceItem::for_test("github:aleadag/codexctl#1");
+        let item_id = store::upsert_item(
+            &loop_conn,
+            &store::NewLoopItem::from_source("issue-triage", &source_item),
+        )
+        .unwrap();
+        let task_id = crate::coord::tasks::insert_task(
+            &coord_conn,
+            &NewTask {
+                name: "Fix it".into(),
+                role: None,
+                cwd: worktree.to_string_lossy().into_owned(),
+                prompt: "Fix it".into(),
+                model: None,
+                budget_usd: None,
+                max_retries: None,
+                timeout_min: None,
+                depends_on: Vec::new(),
+                policy: None,
+                verifiers: Vec::new(),
+            },
+        )
+        .unwrap();
+        crate::coord::tasks::transition(
+            &mut coord_conn,
+            &task_id,
+            TaskState::Pending,
+            TaskState::Done,
+            "test",
+        )
+        .unwrap();
+        store::mark_submitted(
+            &loop_conn,
+            &item_id,
+            &task_id,
+            Some(worktree.to_str().unwrap()),
+        )
+        .unwrap();
+        let mut runner = FakeRunner {
+            jj_parent_diff_summary: "M src/lib.rs".into(),
+            ..Default::default()
+        };
+
+        let summary =
+            publish_completed_with_runner(&project, &loop_conn, &coord_conn, &mut runner).unwrap();
+        let row = store::get_item(&loop_conn, &item_id).unwrap().unwrap();
+
+        assert_eq!(summary.published, 1);
+        assert_eq!(row.state, store::LoopItemState::Done);
+        assert!(runner.commands.iter().any(|cmd| {
+            cmd.program == "jj"
+                && cmd.args
+                    == vec![
+                        "--no-pager",
+                        "-R",
+                        worktree.to_str().unwrap(),
+                        "bookmark",
+                        "set",
+                        "loop/issue-triage/github-aleadag-codexctl-1",
+                        "-r",
+                        "@-",
+                    ]
+        }));
     }
 }
