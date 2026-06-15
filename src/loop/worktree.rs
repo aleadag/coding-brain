@@ -233,12 +233,11 @@ mod tests {
         cfg.execution.cwd = repo.to_string_lossy().into_owned();
 
         let plan = plan_for_source_id(temp.path(), &cfg, "github:aleadag/codexctl#1").unwrap();
+        let expected_worktree_root = plan.repo_root.parent().unwrap().join("codexctl-worktrees");
 
         assert_eq!(
             plan.path,
-            temp.path()
-                .join("codexctl-worktrees")
-                .join("issue-triage-github-aleadag-codexctl-1")
+            expected_worktree_root.join("issue-triage-github-aleadag-codexctl-1")
         );
         assert_eq!(plan.branch, "loop/issue-triage/github-aleadag-codexctl-1");
         assert_eq!(
@@ -274,6 +273,9 @@ mod tests {
                 plan.path.to_str().unwrap()
             ]
         );
-        assert_eq!(runner.commands[0].cwd.as_deref(), Some(repo.as_path()));
+        assert_eq!(
+            runner.commands[0].cwd.as_deref(),
+            Some(plan.repo_root.as_path())
+        );
     }
 }
