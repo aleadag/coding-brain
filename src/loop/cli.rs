@@ -826,12 +826,13 @@ mod tests {
         assert_eq!(item.title, "implement design");
         assert_eq!(item.body, "# Design\n\nBuild the thing.\n");
         assert!(item.source_item_id.starts_with("manual:"));
+        let canonical_spec = spec.canonicalize().unwrap();
         assert_eq!(
             item.raw_json
                 .get("file")
                 .and_then(|value| value.as_str())
                 .map(PathBuf::from),
-            Some(spec)
+            Some(canonical_spec)
         );
     }
 
