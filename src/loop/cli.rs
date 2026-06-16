@@ -314,6 +314,14 @@ fn handoff(
     } else {
         manual_handoff_config(root)
     };
+    if dry_run {
+        let item = handoff_source_item_from_file(file, name)?;
+        let task_name = item.title.clone();
+        let plan = plan_handoff(root, &cfg, &item, &task_name, worktree, true)?;
+        print_handoff_dry_run(&plan);
+        return Ok(());
+    }
+
     let loop_conn = store::open()?;
     let coord_conn = crate::coord::store::open()?;
     let outcome = submit_handoff(
@@ -746,6 +754,9 @@ fn set_paused(name: &str, paused: bool) -> LoopResult<()> {
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn clap_accepts_tick_for_due_loop_polling() {
@@ -932,5 +943,31 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn handoff_dry_run_does_not_create_state_files() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let spec = temp.path().join("design.md");
+        std::fs::write(&spec, "# Design\n\nBuild the thing.\n").unwrap();
+        let original_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", temp.path()) };
+
+        let result = handoff(
+            temp.path(),
+            &spec,
+            Some("implement design"),
+            Some(WorktreeMode::None),
+            None,
+            true,
+        );
+
+        match original_home {
+            Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        result.unwrap();
+        assert!(!temp.path().join(".codexctl").exists());
     }
 }
