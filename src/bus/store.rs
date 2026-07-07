@@ -539,13 +539,24 @@ mod tests {
         .unwrap();
     }
 
+    fn days_ago_iso(days: u64) -> String {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(days * 86400);
+        let d = epoch / 86400;
+        let (year, month, day) = crate::logger::days_to_date(d);
+        format!("{year:04}-{month:02}-{day:02}T00:00:00Z")
+    }
+
     #[test]
     fn prune_deletes_old_delivered_messages_only() {
         let conn = open_memory();
         // 60 days ago — should go.
-        insert_delivered_at(&conn, "old", "2026-04-08T00:00:00Z");
+        insert_delivered_at(&conn, "old", &days_ago_iso(60));
         // 5 days ago — should stay.
-        insert_delivered_at(&conn, "fresh", "2026-06-02T00:00:00Z");
+        insert_delivered_at(&conn, "fresh", &days_ago_iso(5));
         // Pending row from any era — should always stay.
         insert_message(
             &conn,
