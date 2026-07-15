@@ -9,7 +9,8 @@ use crate::codex_transcript::{
 };
 use crate::models;
 use crate::session::{
-    CodexSession, CodexTaskState, SessionStatus, SubagentRollup, TelemetryStatus,
+    ApprovalObservation, CodexSession, CodexTaskState, SessionStatus, SubagentRollup,
+    TelemetryStatus,
 };
 use crate::transcript::{TranscriptBlock, TranscriptEvent, TranscriptRole, parse_line};
 
@@ -503,6 +504,10 @@ fn apply_codex_response_item(item: CodexResponseItem, session: &mut CodexSession
             record_tool_usage(&tool_name, &input, session);
             session.task_state = CodexTaskState::Processing;
             session.explicit_input_required = tool_name == "request_user_input";
+            if session.pending_tool_call_id != item.call_id {
+                session.approval = ApprovalObservation::NotChecked;
+                session.approval_checked_at_ms = 0;
+            }
             session.pending_tool_call_id = item.call_id;
             session.pending_tool_input = if is_custom {
                 (!raw_input.is_empty()).then_some(raw_input)
@@ -537,6 +542,8 @@ fn clear_pending_tool(session: &mut CodexSession) {
     session.pending_tool_call_id = None;
     session.pending_tool_input = None;
     session.pending_file_path = None;
+    session.approval = ApprovalObservation::NotChecked;
+    session.approval_checked_at_ms = 0;
 }
 
 fn finalize_usage(
@@ -606,6 +613,11 @@ pub fn infer_status(
     last_stop_reason: &str,
     is_waiting_for_task: bool,
 ) {
+    if matches!(session.approval, ApprovalObservation::Confirmed(_)) {
+        session.status = SessionStatus::NeedsInput;
+        return;
+    }
+
     if session.explicit_input_required {
         session.status = SessionStatus::NeedsInput;
         return;
@@ -848,4 +860,105 @@ fn estimate_cost_components(
         cost,
         resolved.source == models::ModelProfileSource::Fallback,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{ApprovalEvidence, ApprovalObservation, RawSession};
+    use crate::terminals::Terminal;
+
+    fn session() -> CodexSession {
+        let mut session = CodexSession::from_raw(RawSession {
+            pid: 7,
+            session_id: "session-7".into(),
+            cwd: "/repo".into(),
+            started_at: 0,
+        });
+        session.telemetry_status = TelemetryStatus::Available;
+        session.task_state = CodexTaskState::Processing;
+        session.pending_tool_name = Some("exec_command".into());
+        session.pending_tool_call_id = Some("call-7".into());
+        session.pending_tool_input = Some("cargo test".into());
+        session
+    }
+
+    fn evidence() -> ApprovalEvidence {
+        ApprovalEvidence {
+            session_id: "session-7".into(),
+            tty: "pts/7".into(),
+            call_id: "call-7".into(),
+            tool: "exec_command".into(),
+            command: "cargo test".into(),
+            backend: Terminal::Tmux,
+            target: "main:1.0".into(),
+            prompt_pattern_version: 1,
+            prompt_fingerprint: 42,
+        }
+    }
+
+    #[test]
+    fn confirmed_terminal_prompt_precedes_processing_lifecycle() {
+        let mut session = session();
+        session.approval = ApprovalObservation::Confirmed(evidence());
+
+        refresh_status(&mut session);
+
+        assert_eq!(session.status, SessionStatus::NeedsInput);
+    }
+
+    #[test]
+    fn unconfirmed_shell_call_remains_processing() {
+        let mut session = session();
+        session.approval = ApprovalObservation::Unknown("no matching prompt".into());
+
+        refresh_status(&mut session);
+
+        assert_eq!(session.status, SessionStatus::Processing);
+    }
+
+    #[test]
+    fn new_call_identity_clears_old_approval_evidence() {
+        let mut session = session();
+        session.approval = ApprovalObservation::Confirmed(evidence());
+        session.approval_checked_at_ms = 10_000;
+
+        apply_codex_response_item(
+            CodexResponseItem {
+                kind: CodexResponseKind::FunctionCall,
+                role: None,
+                text: None,
+                name: Some("exec_command".into()),
+                arguments: Some(r#"{"cmd":"cargo clippy"}"#.into()),
+                call_id: Some("call-8".into()),
+                output: None,
+            },
+            &mut session,
+        );
+
+        assert_eq!(session.approval, ApprovalObservation::NotChecked);
+        assert_eq!(session.approval_checked_at_ms, 0);
+    }
+
+    #[test]
+    fn request_user_input_is_explicit_but_never_a_shell_approval() {
+        let mut session = session();
+        apply_codex_response_item(
+            CodexResponseItem {
+                kind: CodexResponseKind::FunctionCall,
+                role: None,
+                text: None,
+                name: Some("request_user_input".into()),
+                arguments: Some(r#"{"question":"Continue?"}"#.into()),
+                call_id: Some("question-1".into()),
+                output: None,
+            },
+            &mut session,
+        );
+
+        assert!(session.explicit_input_required);
+        assert_eq!(session.approval, ApprovalObservation::NotChecked);
+        refresh_status(&mut session);
+        assert_eq!(session.status, SessionStatus::NeedsInput);
+    }
 }

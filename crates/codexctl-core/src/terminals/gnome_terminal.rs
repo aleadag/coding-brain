@@ -31,10 +31,3 @@ pub fn send_input(_session: &CodexSession, _text: &str) -> Result<(), String> {
             .into(),
     )
 }
-
-pub fn approve(_session: &CodexSession) -> Result<(), String> {
-    Err(
-        "GNOME Terminal launch is supported, but remote focus/input control is not yet reliable. Use tmux or Kitty for approval automation."
-            .into(),
-    )
-}

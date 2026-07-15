@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::config::BrainConfig;
 use crate::rules::{self, RuleAction, RuleMatch};
-use crate::session::{CodexSession, SessionStatus};
+use crate::session::{ApprovalObservation, CodexSession, SessionStatus};
 
 use super::client::BrainSuggestion;
 use super::context;
@@ -15,7 +15,62 @@ use super::decisions::DecisionType;
 /// Result sent back from inference thread.
 pub struct BrainResult {
     pub pid: u32,
+    target: Option<BrainTargetIdentity>,
     pub suggestion: Result<BrainSuggestion, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrainTargetIdentity {
+    session_id: String,
+    status: SessionStatus,
+    last_message_ts: u64,
+    pending_tool_call_id: Option<String>,
+    pending_tool_name: Option<String>,
+    pending_tool_input: Option<String>,
+    approval: ApprovalObservation,
+}
+
+impl BrainTargetIdentity {
+    fn from_session(session: &CodexSession) -> Self {
+        Self {
+            session_id: session.session_id.clone(),
+            status: session.status,
+            last_message_ts: session.last_message_ts,
+            pending_tool_call_id: session.pending_tool_call_id.clone(),
+            pending_tool_name: session.pending_tool_name.clone(),
+            pending_tool_input: session.pending_tool_input.clone(),
+            approval: session.approval.clone(),
+        }
+    }
+
+    fn matches(&self, session: &CodexSession) -> bool {
+        self == &Self::from_session(session)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingBrainSuggestion {
+    pub suggestion: BrainSuggestion,
+    target: Option<BrainTargetIdentity>,
+}
+
+impl PendingBrainSuggestion {
+    pub(crate) fn unbound(suggestion: BrainSuggestion) -> Self {
+        Self {
+            suggestion,
+            target: None,
+        }
+    }
+
+    fn bound(suggestion: BrainSuggestion, target: Option<BrainTargetIdentity>) -> Self {
+        Self { suggestion, target }
+    }
+
+    fn matches(&self, session: &CodexSession) -> bool {
+        self.target
+            .as_ref()
+            .is_none_or(|target| target.matches(session))
+    }
 }
 
 /// The brain inference engine. Manages async inference threads and collects results.
@@ -28,7 +83,7 @@ pub struct BrainEngine {
     /// Per-PID cooldown to avoid hammering the LLM.
     cooldown: HashMap<u32, Instant>,
     /// Pending suggestions waiting for user confirmation (advisory mode).
-    pub pending: HashMap<u32, BrainSuggestion>,
+    pub(crate) pending: HashMap<u32, PendingBrainSuggestion>,
     /// Last time orchestration evaluation ran.
     last_orchestrate: Option<Instant>,
     /// Whether an orchestration inference is in-flight.
@@ -86,6 +141,17 @@ impl BrainEngine {
                 Ok(suggestion) => {
                     // Check if a deny rule overrides the brain
                     let session = sessions.iter().find(|s| s.pid == result.pid);
+                    if !matches!(
+                        (result.target.as_ref(), session),
+                        (Some(target), Some(session)) if target.matches(session)
+                    ) && result.target.is_some()
+                    {
+                        actions.push((
+                            result.pid,
+                            "Brain suggestion expired because the session changed".into(),
+                        ));
+                        continue;
+                    }
                     if let Some(session) = session {
                         let deny_match = rules::evaluate(deny_rules, session);
                         if let Some(dm) = &deny_match {
@@ -136,7 +202,13 @@ impl BrainEngine {
                                     DecisionType::Session,
                                     None,
                                 );
-                                self.pending.insert(result.pid, suggestion);
+                                self.pending.insert(
+                                    result.pid,
+                                    PendingBrainSuggestion::bound(
+                                        suggestion,
+                                        result.target.clone(),
+                                    ),
+                                );
                                 continue;
                             }
                         }
@@ -159,7 +231,10 @@ impl BrainEngine {
                                 let mut flagged = suggestion.clone();
                                 flagged.reasoning =
                                     format!("{} [CONFLICT: {}]", flagged.reasoning, conflict_msg);
-                                self.pending.insert(result.pid, flagged);
+                                self.pending.insert(
+                                    result.pid,
+                                    PendingBrainSuggestion::bound(flagged, result.target.clone()),
+                                );
                                 actions
                                     .push((result.pid, format!("File conflict: {conflict_msg}")));
                                 continue;
@@ -259,7 +334,10 @@ impl BrainEngine {
                         }
                     } else {
                         // Advisory mode: store for user confirmation
-                        self.pending.insert(result.pid, suggestion);
+                        self.pending.insert(
+                            result.pid,
+                            PendingBrainSuggestion::bound(suggestion, result.target.clone()),
+                        );
                     }
                 }
                 Err(e) => {
@@ -307,6 +385,7 @@ impl BrainEngine {
 
     fn spawn_inference(&mut self, session: &CodexSession, all_sessions: &[CodexSession]) {
         let pid = session.pid;
+        let target = BrainTargetIdentity::from_session(session);
         let config = self.config.clone();
         let tx = self.tx.clone();
 
@@ -345,7 +424,11 @@ impl BrainEngine {
 
         std::thread::spawn(move || {
             let suggestion = super::client::infer(&config, &prompt);
-            let _ = tx.send(BrainResult { pid, suggestion });
+            let _ = tx.send(BrainResult {
+                pid,
+                target: Some(target),
+                suggestion,
+            });
         });
     }
 
@@ -387,7 +470,11 @@ impl BrainEngine {
 
     /// Accept a pending brain suggestion (user pressed 'b').
     pub fn accept(&mut self, pid: u32, session: &CodexSession) -> Option<String> {
-        let suggestion = self.pending.remove(&pid)?;
+        let pending = self.pending.remove(&pid)?;
+        if !pending.matches(session) {
+            return Some("Brain suggestion expired because the session changed".into());
+        }
+        let suggestion = pending.suggestion;
         let rule_match = suggestion_to_rule_match(&suggestion);
         match rules::execute(&rule_match, session) {
             Ok(msg) => Some(msg),
@@ -397,7 +484,7 @@ impl BrainEngine {
 
     /// Reject a pending brain suggestion (user pressed 'B').
     pub fn reject(&mut self, pid: u32) -> Option<BrainSuggestion> {
-        self.pending.remove(&pid)
+        self.pending.remove(&pid).map(|pending| pending.suggestion)
     }
 
     /// Check for sessions with saturated context and auto-restart them.
@@ -486,7 +573,7 @@ impl BrainEngine {
     /// Clear pending suggestions for PIDs that are no longer in NeedsInput/WaitingInput.
     pub fn cleanup(&mut self, sessions: &[CodexSession]) {
         let active_pids: HashSet<u32> = sessions.iter().map(|s| s.pid).collect();
-        self.pending.retain(|pid, _| {
+        self.pending.retain(|pid, pending| {
             active_pids.contains(pid)
                 && sessions.iter().any(|s| {
                     s.pid == *pid
@@ -494,6 +581,7 @@ impl BrainEngine {
                             s.status,
                             SessionStatus::NeedsInput | SessionStatus::WaitingInput
                         )
+                        && pending.matches(s)
                 })
         });
         self.inflight.retain(|pid| active_pids.contains(pid));
@@ -534,7 +622,11 @@ impl BrainEngine {
         // Use PID 0 as sentinel for orchestration results
         std::thread::spawn(move || {
             let suggestion = super::client::infer(&config, &prompt);
-            let _ = tx.send(BrainResult { pid: 0, suggestion });
+            let _ = tx.send(BrainResult {
+                pid: 0,
+                target: None,
+                suggestion,
+            });
         });
 
         Vec::new()
@@ -761,7 +853,8 @@ fn suggestion_to_rule_match(suggestion: &BrainSuggestion) -> RuleMatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{RawSession, TelemetryStatus};
+    use crate::session::{ApprovalEvidence, ApprovalObservation, RawSession, TelemetryStatus};
+    use codexctl_core::terminals::Terminal;
 
     fn make_config() -> BrainConfig {
         BrainConfig {
@@ -804,7 +897,93 @@ mod tests {
     }
 
     fn inject(engine: &BrainEngine, pid: u32, suggestion: Result<BrainSuggestion, String>) {
-        engine.tx.send(BrainResult { pid, suggestion }).unwrap();
+        engine
+            .tx
+            .send(BrainResult {
+                pid,
+                target: None,
+                suggestion,
+            })
+            .unwrap();
+    }
+
+    fn confirmed_shell_session(call_id: &str, command: &str) -> CodexSession {
+        let mut session = make_session(100, SessionStatus::NeedsInput);
+        session.session_id = "session-100".into();
+        session.tty = "pts/100".into();
+        session.pending_tool_name = Some("exec_command".into());
+        session.pending_tool_call_id = Some(call_id.into());
+        session.pending_tool_input = Some(command.into());
+        session.approval = ApprovalObservation::Confirmed(ApprovalEvidence {
+            session_id: session.session_id.clone(),
+            tty: session.tty.clone(),
+            call_id: call_id.into(),
+            tool: "exec_command".into(),
+            command: command.into(),
+            backend: Terminal::Tmux,
+            target: "main:1.0".into(),
+            prompt_pattern_version: 1,
+            prompt_fingerprint: 42,
+        });
+        session
+    }
+
+    #[test]
+    fn stale_inference_result_is_discarded_when_call_changes() {
+        let mut engine = BrainEngine::new(make_config());
+        let original = confirmed_shell_session("call-a", "cargo test");
+        let replacement = confirmed_shell_session("call-b", "cargo clippy");
+        engine
+            .tx
+            .send(BrainResult {
+                pid: original.pid,
+                target: Some(BrainTargetIdentity::from_session(&original)),
+                suggestion: Ok(suggestion(RuleAction::Approve, 1.0)),
+            })
+            .unwrap();
+
+        let actions = engine.tick(&[replacement], &[]);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].1.contains("expired"));
+        assert!(engine.pending.is_empty());
+    }
+
+    #[test]
+    fn stale_pending_suggestion_is_not_accepted_for_replacement_call() {
+        let mut engine = BrainEngine::new(make_config());
+        let original = confirmed_shell_session("call-a", "cargo test");
+        let replacement = confirmed_shell_session("call-b", "cargo clippy");
+        engine.pending.insert(
+            original.pid,
+            PendingBrainSuggestion::bound(
+                suggestion(RuleAction::Approve, 1.0),
+                Some(BrainTargetIdentity::from_session(&original)),
+            ),
+        );
+
+        let message = engine.accept(original.pid, &replacement).unwrap();
+
+        assert!(message.contains("expired"));
+        assert!(engine.pending.is_empty());
+    }
+
+    #[test]
+    fn cleanup_removes_suggestion_bound_to_replaced_call() {
+        let mut engine = BrainEngine::new(make_config());
+        let original = confirmed_shell_session("call-a", "cargo test");
+        let replacement = confirmed_shell_session("call-b", "cargo clippy");
+        engine.pending.insert(
+            original.pid,
+            PendingBrainSuggestion::bound(
+                suggestion(RuleAction::Approve, 1.0),
+                Some(BrainTargetIdentity::from_session(&original)),
+            ),
+        );
+
+        engine.cleanup(&[replacement]);
+
+        assert!(engine.pending.is_empty());
     }
 
     #[test]
@@ -921,13 +1100,13 @@ mod tests {
         let mut engine = BrainEngine::new(make_config());
         engine.pending.insert(
             999,
-            BrainSuggestion {
+            PendingBrainSuggestion::unbound(BrainSuggestion {
                 action: RuleAction::Approve,
                 message: None,
                 reasoning: "test".into(),
                 confidence: 0.9,
                 suggested_at: 0,
-            },
+            }),
         );
 
         // PID 999 not in sessions list → should be cleaned up
@@ -941,13 +1120,13 @@ mod tests {
         let session = make_session(100, SessionStatus::NeedsInput);
         engine.pending.insert(
             100,
-            BrainSuggestion {
+            PendingBrainSuggestion::unbound(BrainSuggestion {
                 action: RuleAction::Approve,
                 message: None,
                 reasoning: "test".into(),
                 confidence: 0.9,
                 suggested_at: 0,
-            },
+            }),
         );
 
         engine.cleanup(&[session]);
@@ -1110,13 +1289,13 @@ mod tests {
         let mut engine = BrainEngine::new(make_config());
         engine.pending.insert(
             100,
-            BrainSuggestion {
+            PendingBrainSuggestion::unbound(BrainSuggestion {
                 action: RuleAction::Approve,
                 message: None,
                 reasoning: "test".into(),
                 confidence: 0.9,
                 suggested_at: 0,
-            },
+            }),
         );
 
         let rejected = engine.reject(100);

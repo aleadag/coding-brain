@@ -1,4 +1,46 @@
 use crate::session::CodexSession;
+use crate::terminals::{BoundedOutput, PaneCapture, Terminal, checked_capture, run_bounded};
+
+fn pane_target(session: &CodexSession) -> Result<String, String> {
+    let output = run_bounded(std::process::Command::new("tmux").args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}",
+    ]))?;
+    if !output.status.success() {
+        return Err("tmux list-panes returned non-zero".into());
+    }
+    let wanted = session.tty.trim_start_matches("/dev/");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .find(|(tty, _)| tty.trim_start_matches("/dev/") == wanted)
+        .map(|(_, target)| target.to_string())
+        .ok_or_else(|| format!("TTY {} not found in tmux panes", session.tty))
+}
+
+pub fn capture(session: &CodexSession) -> Result<PaneCapture, String> {
+    let target = pane_target(session)?;
+    let output = run_bounded(std::process::Command::new("tmux").args([
+        "capture-pane",
+        "-p",
+        "-S",
+        "-80",
+        "-t",
+        &target,
+    ]))?;
+    checked_capture(Terminal::Tmux, target, output)
+}
+
+pub fn send_enter(target: &str) -> Result<(), String> {
+    let BoundedOutput { status, .. } =
+        run_bounded(std::process::Command::new("tmux").args(["send-keys", "-t", target, "Enter"]))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "tmux send-keys returned non-zero".into())
+}
 
 pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<String, String> {
     let mut parts = vec!["codex".to_string()];
@@ -23,58 +65,25 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
 
 pub fn switch(session: &CodexSession) -> Result<(), String> {
     // tmux can list panes with their TTY: `tmux list-panes -a -F '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}'`
-    let output = std::process::Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{pane_tty} #{session_name}:#{window_index}.#{pane_index}",
-        ])
-        .output()
-        .map_err(|e| format!("tmux list-panes failed: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() == 2 && parts[0].contains(&session.tty) {
-            let target = parts[1]; // e.g. "main:2.1"
-            // Select the tmux window+pane
-            let _ = std::process::Command::new("tmux")
-                .args(["select-window", "-t", target])
-                .output();
-            let _ = std::process::Command::new("tmux")
-                .args(["select-pane", "-t", target])
-                .output();
-            return Ok(());
-        }
-    }
-
-    Err(format!("TTY {} not found in tmux panes", session.tty))
+    let target = pane_target(session)?;
+    let _ = std::process::Command::new("tmux")
+        .args(["select-window", "-t", &target])
+        .output();
+    let _ = std::process::Command::new("tmux")
+        .args(["select-pane", "-t", &target])
+        .output();
+    Ok(())
 }
 
 pub fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
+    let target = pane_target(session)?;
     let output = std::process::Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{pane_tty} #{session_name}:#{window_index}.#{pane_index}",
-        ])
+        .args(["send-keys", "-t", &target, text, ""])
         .output()
-        .map_err(|e| format!("tmux failed: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() == 2 && parts[0].contains(&session.tty) {
-            let _ = std::process::Command::new("tmux")
-                .args(["send-keys", "-t", parts[1], text, ""])
-                .output();
-            return Ok(());
-        }
-    }
-
-    Err("TTY not found in tmux".into())
+        .map_err(|error| format!("tmux send-keys failed: {error}"))?;
+    output
+        .status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "tmux send-keys returned non-zero".into())
 }

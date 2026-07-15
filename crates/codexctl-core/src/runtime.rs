@@ -40,6 +40,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::session::CodexSession;
+
 // ============================================================================
 // Sessions
 // ============================================================================
@@ -397,18 +399,18 @@ pub trait BrainDriver: Send {
     /// the messages in the status bar.
     fn tick(
         &mut self,
-        sessions: &[SessionSnapshot],
+        sessions: &[CodexSession],
         deny_rules: &[crate::rules::AutoRule],
     ) -> Vec<(u32, String)>;
 
     /// Drop pending suggestions for sessions that have exited. Called every
     /// refresh so the pending map stays bounded by the live session count.
-    fn cleanup(&mut self, sessions: &[SessionSnapshot]);
+    fn cleanup(&mut self, sessions: &[CodexSession]);
 
-    /// User accepted the pending suggestion for `pid`. Implementations
+    /// User accepted the pending suggestion for this monitored session. Implementations
     /// return the log message the TUI should surface (`None` when there's
     /// no suggestion to accept).
-    fn accept(&mut self, pid: u32) -> Option<String>;
+    fn accept(&mut self, session: &CodexSession) -> Option<String>;
 
     /// User rejected the pending suggestion for `pid`. Returns the
     /// suggestion that was rejected — the TUI logs it for replay /

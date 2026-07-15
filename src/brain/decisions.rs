@@ -1062,6 +1062,8 @@ mod tests {
             is_waiting_for_task: false,
             task_state: crate::session::CodexTaskState::Unknown,
             explicit_input_required: false,
+            approval: crate::session::ApprovalObservation::NotChecked,
+            approval_checked_at_ms: 0,
             pending_tool_name: None,
             pending_tool_call_id: None,
             pending_tool_input: None,

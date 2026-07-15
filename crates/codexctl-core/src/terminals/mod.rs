@@ -12,8 +12,143 @@ mod warp;
 mod wezterm;
 mod windows_terminal;
 
-use crate::session::CodexSession;
+use crate::session::{ApprovalEvidence, ApprovalObservation, CodexSession};
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::Duration;
+
+const CAPTURE_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+const CAPTURE_LINES: usize = 80;
+
+#[derive(Debug)]
+pub(crate) struct BoundedOutput {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneCapture {
+    pub backend: Terminal,
+    pub target: String,
+    pub text: String,
+}
+
+struct CapturedStream {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
+fn drain_bounded(mut stream: impl Read) -> Result<CapturedStream, ()> {
+    let mut bytes = Vec::new();
+    let mut oversized = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = stream.read(&mut buffer).map_err(|_| ())?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_CAPTURE_BYTES.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        oversized |= read > remaining;
+    }
+    Ok(CapturedStream { bytes, oversized })
+}
+
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn receive_stream(
+    receiver: &std::sync::mpsc::Receiver<Result<CapturedStream, ()>>,
+    started: std::time::Instant,
+    label: &str,
+) -> Result<CapturedStream, String> {
+    let remaining = CAPTURE_TIMEOUT.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err("terminal capture timed out".into());
+    }
+    receiver
+        .recv_timeout(remaining)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => "terminal capture timed out".into(),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                format!("terminal capture {label} reader failed")
+            }
+        })?
+        .map_err(|_| format!("terminal capture {label} read failed"))
+}
+
+pub(crate) fn run_bounded(command: &mut Command) -> Result<BoundedOutput, String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("terminal capture command failed: {error}"))?;
+    let Some(stdout) = child.stdout.take() else {
+        kill_and_reap(&mut child);
+        return Err("terminal capture stdout unavailable".into());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        kill_and_reap(&mut child);
+        return Err("terminal capture stderr unavailable".into());
+    };
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1);
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = stdout_tx.send(drain_bounded(stdout));
+    });
+    std::thread::spawn(move || {
+        let _ = stderr_tx.send(drain_bounded(stderr));
+    });
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Err(error) => {
+                kill_and_reap(&mut child);
+                return Err(format!("terminal capture wait failed: {error}"));
+            }
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < CAPTURE_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) => {
+                kill_and_reap(&mut child);
+                return Err("terminal capture timed out".into());
+            }
+        }
+    };
+    let stdout = receive_stream(&stdout_rx, started, "stdout")?;
+    let stderr = receive_stream(&stderr_rx, started, "stderr")?;
+    if stdout.oversized || stderr.oversized {
+        return Err("terminal capture exceeded 64 KiB".into());
+    }
+    Ok(BoundedOutput {
+        status,
+        stdout: stdout.bytes,
+    })
+}
+
+pub(crate) fn checked_capture(
+    backend: Terminal,
+    target: String,
+    output: BoundedOutput,
+) -> Result<PaneCapture, String> {
+    if !output.status.success() {
+        return Err("terminal capture command returned non-zero".into());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(CAPTURE_LINES);
+    Ok(PaneCapture {
+        backend,
+        target,
+        text: lines[start..].join("\n"),
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalAction {
@@ -247,11 +382,9 @@ fn supported_actions(terminal: &Terminal) -> Vec<TerminalAction> {
         ],
         Terminal::WezTerm => vec![TerminalAction::Launch, TerminalAction::Switch],
         #[cfg(target_os = "macos")]
-        Terminal::Ghostty | Terminal::Warp | Terminal::ITerm2 | Terminal::Apple => vec![
-            TerminalAction::Switch,
-            TerminalAction::Input,
-            TerminalAction::Approve,
-        ],
+        Terminal::Ghostty | Terminal::Warp | Terminal::ITerm2 | Terminal::Apple => {
+            vec![TerminalAction::Switch, TerminalAction::Input]
+        }
         Terminal::Unknown(_) => Vec::new(),
         #[cfg(not(target_os = "macos"))]
         _ => Vec::new(),
@@ -1066,29 +1199,260 @@ pub fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
     }
 }
 
-pub fn approve_session(session: &CodexSession) -> Result<(), String> {
-    match detect_terminal() {
-        Terminal::Gnome => gnome_terminal::approve(session),
-        #[cfg(target_os = "macos")]
-        Terminal::Ghostty => ghostty::approve(session),
-        Terminal::Kitty => kitty::approve(session),
-        Terminal::Tmux => tmux::send_input(session, "\r"),
-        Terminal::WindowsTerm => Err(
-            "Windows Terminal currently supports WSL launch only. Use tmux or Kitty inside WSL for approval automation."
-                .into(),
-        ),
-        #[cfg(target_os = "macos")]
-        Terminal::Warp => warp::approve(session),
-        #[cfg(target_os = "macos")]
-        _ => {
-            // iTerm2, Apple Terminal, etc: switch + press Enter
-            switch_to_terminal(session)?;
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            run_osascript(r#"tell application "System Events" to key code 36"#)
-        }
-        #[cfg(not(target_os = "macos"))]
-        _ => Err("Input injection not supported for this terminal. Run `codexctl doctor` for details.".into()),
+struct ApprovalPromptPattern {
+    version: u16,
+    question: &'static str,
+    choice_anchors: &'static [&'static str],
+    confirmation: &'static str,
+}
+
+const APPROVAL_PROMPT_PATTERNS: &[ApprovalPromptPattern] = &[
+    ApprovalPromptPattern {
+        version: 1,
+        question: "would you like to run the following command?",
+        choice_anchors: &[
+            "1. yes, just this once",
+            "2. yes, and don't ask again for commands that start with",
+            "3. no, and tell codex what to do differently",
+        ],
+        confirmation: "press enter to confirm",
+    },
+    ApprovalPromptPattern {
+        version: 2,
+        question: "would you like to run the following command?",
+        choice_anchors: &[
+            "1. yes, proceed",
+            "2. yes, and don't ask again for commands that start with",
+            "3. no, and tell codex what to do differently",
+        ],
+        confirmation: "press enter to confirm",
+    },
+    ApprovalPromptPattern {
+        version: 3,
+        question: "would you like to run the following command?",
+        choice_anchors: &[
+            "1. yes, just this once",
+            "2. yes, and don't ask again for this command in this session",
+            "3. no, and tell codex what to do differently",
+        ],
+        confirmation: "press enter to confirm",
+    },
+];
+
+trait ApprovalIo {
+    fn capture(&self, session: &CodexSession) -> Result<PaneCapture, String>;
+    fn send_enter(
+        &self,
+        session: &CodexSession,
+        backend: Terminal,
+        target: &str,
+    ) -> Result<(), String>;
+}
+
+struct RealApprovalIo;
+
+impl ApprovalIo for RealApprovalIo {
+    fn capture(&self, session: &CodexSession) -> Result<PaneCapture, String> {
+        capture_session(session)
     }
+
+    fn send_enter(
+        &self,
+        _session: &CodexSession,
+        backend: Terminal,
+        target: &str,
+    ) -> Result<(), String> {
+        send_enter_to_target(backend, target)
+    }
+}
+
+fn capture_session(session: &CodexSession) -> Result<PaneCapture, String> {
+    let captures = [tmux::capture(session), kitty::capture(session)]
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    match captures.as_slice() {
+        [capture] => Ok(capture.clone()),
+        [] => Err("no supported terminal pane matched the session".into()),
+        _ => Err("multiple terminal panes matched the session".into()),
+    }
+}
+
+fn send_enter_to_target(backend: Terminal, target: &str) -> Result<(), String> {
+    match backend {
+        Terminal::Tmux => tmux::send_enter(target),
+        Terminal::Kitty => kitty::send_enter(target),
+        _ => Err("approval backend does not support guarded input".into()),
+    }
+}
+
+fn is_pending_shell_call(session: &CodexSession) -> bool {
+    session.pending_tool_call_id.is_some()
+        && session.pending_tool_input.is_some()
+        && matches!(
+            session.pending_tool_name.as_deref(),
+            Some("exec_command" | "shell" | "Bash")
+        )
+}
+
+fn strip_ansi(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if ('@'..='~').contains(&code) {
+                    break;
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn normalize_whitespace(value: &str) -> String {
+    strip_ansi(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn fingerprint(value: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn displayed_command(text: &str, pattern: &ApprovalPromptPattern) -> Option<String> {
+    let cleaned = strip_ansi(text);
+    let lines = cleaned.lines().collect::<Vec<_>>();
+    let question_index = lines.iter().position(|line| {
+        normalize_whitespace(line)
+            .to_ascii_lowercase()
+            .contains(pattern.question)
+    })?;
+    let first_choice = pattern.choice_anchors.first()?;
+    let choice_index = lines
+        .iter()
+        .enumerate()
+        .skip(question_index + 1)
+        .find(|(_, line)| {
+            normalize_whitespace(line)
+                .to_ascii_lowercase()
+                .contains(first_choice)
+        })?
+        .0;
+    let command_index = lines[question_index + 1..choice_index]
+        .iter()
+        .rposition(|line| line.trim_start().starts_with("$ "))?
+        + question_index
+        + 1;
+
+    let mut command_lines = Vec::new();
+    command_lines.push(lines[command_index].trim_start()[2..].trim());
+    for line in &lines[command_index + 1..choice_index] {
+        if line.trim().is_empty() {
+            break;
+        }
+        command_lines.push(line.trim());
+    }
+    Some(normalize_whitespace(&command_lines.join(" ")))
+}
+
+fn match_approval_prompt(
+    capture: &PaneCapture,
+    session: &CodexSession,
+) -> Option<ApprovalEvidence> {
+    if !is_pending_shell_call(session) {
+        return None;
+    }
+    let call_id = session.pending_tool_call_id.as_deref()?;
+    let tool = session.pending_tool_name.as_deref()?;
+    let command = session.pending_tool_input.as_deref()?;
+    let pane = normalize_whitespace(&capture.text).to_ascii_lowercase();
+    let command_normalized = normalize_whitespace(command).to_ascii_lowercase();
+
+    let (pattern, block) = APPROVAL_PROMPT_PATTERNS.iter().find_map(|pattern| {
+        let start = pane.find(pattern.question)?;
+        let mut cursor = start + pattern.question.len();
+        for anchor in pattern.choice_anchors {
+            let relative = pane[cursor..].find(anchor)?;
+            cursor += relative + anchor.len();
+        }
+        let relative = pane[cursor..].find(pattern.confirmation)?;
+        let end = cursor + relative + pattern.confirmation.len();
+        let block = &pane[start..end];
+        (displayed_command(&capture.text, pattern)?.to_ascii_lowercase() == command_normalized)
+            .then_some((pattern, block))
+    })?;
+
+    Some(ApprovalEvidence {
+        session_id: session.session_id.clone(),
+        tty: session.tty.clone(),
+        call_id: call_id.into(),
+        tool: tool.into(),
+        command: command.into(),
+        backend: capture.backend.clone(),
+        target: capture.target.clone(),
+        prompt_pattern_version: pattern.version,
+        prompt_fingerprint: fingerprint(block),
+    })
+}
+
+fn refresh_approval_observation_with(
+    io: &impl ApprovalIo,
+    session: &mut CodexSession,
+    checked_at_ms: u64,
+) {
+    session.approval_checked_at_ms = checked_at_ms;
+    if !is_pending_shell_call(session) {
+        session.approval = ApprovalObservation::NotChecked;
+        return;
+    }
+    session.approval = match io.capture(session) {
+        Ok(capture) => match match_approval_prompt(&capture, session) {
+            Some(evidence) => ApprovalObservation::Confirmed(evidence),
+            None => ApprovalObservation::Unknown("no matching Codex approval prompt".into()),
+        },
+        Err(error) => ApprovalObservation::Unknown(error),
+    };
+}
+
+pub fn refresh_approval_observation(session: &mut CodexSession) {
+    let checked_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    refresh_approval_observation_with(&RealApprovalIo, session, checked_at_ms);
+}
+
+fn approve_shell_permission_with(
+    io: &impl ApprovalIo,
+    session: &CodexSession,
+) -> Result<(), String> {
+    let ApprovalObservation::Confirmed(expected) = &session.approval else {
+        return Err("approval is not terminal-confirmed".into());
+    };
+    if !is_pending_shell_call(session) {
+        return Err("shell call is no longer pending".into());
+    }
+    let capture = io.capture(session)?;
+    let current = match_approval_prompt(&capture, session)
+        .ok_or_else(|| "approval prompt changed or disappeared".to_string())?;
+    if &current != expected {
+        return Err("approval identity changed; action cancelled".into());
+    }
+    io.send_enter(session, expected.backend.clone(), expected.target.as_str())
+}
+
+pub fn approve_shell_permission(session: &CodexSession) -> Result<(), String> {
+    approve_shell_permission_with(&RealApprovalIo, session)
 }
 
 #[cfg(target_os = "macos")]
@@ -1109,6 +1473,225 @@ pub fn run_osascript(script: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::RawSession;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct FakeApprovalIo {
+        captures: std::sync::Mutex<VecDeque<Result<PaneCapture, String>>>,
+        sends: AtomicUsize,
+    }
+
+    impl FakeApprovalIo {
+        fn with_captures(captures: impl IntoIterator<Item = Result<PaneCapture, String>>) -> Self {
+            Self {
+                captures: std::sync::Mutex::new(captures.into_iter().collect()),
+                sends: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    fn capture(text: &str) -> PaneCapture {
+        PaneCapture {
+            backend: Terminal::Tmux,
+            target: "test-pane".into(),
+            text: text.into(),
+        }
+    }
+
+    fn pending_shell_session(call_id: &str, command: &str) -> CodexSession {
+        let mut session = CodexSession::from_raw(RawSession {
+            pid: 7,
+            session_id: "session-7".into(),
+            cwd: "/repo".into(),
+            started_at: 0,
+        });
+        session.tty = "pts/7".into();
+        session.pending_tool_name = Some("exec_command".into());
+        session.pending_tool_call_id = Some(call_id.into());
+        session.pending_tool_input = Some(command.into());
+        session
+    }
+
+    impl ApprovalIo for FakeApprovalIo {
+        fn capture(&self, _session: &CodexSession) -> Result<PaneCapture, String> {
+            self.captures.lock().unwrap().pop_front().unwrap()
+        }
+
+        fn send_enter(
+            &self,
+            _session: &CodexSession,
+            _backend: Terminal,
+            _target: &str,
+        ) -> Result<(), String> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn exact_shell_approval_is_confirmed() {
+        let mut session = pending_shell_session("call-7", "cargo test");
+        let io = FakeApprovalIo::with_captures([Ok(capture(include_str!(
+            "../../../../tests/fixtures/codex-shell-approval-pane.txt"
+        )))]);
+
+        refresh_approval_observation_with(&io, &mut session, 10_000);
+
+        assert!(matches!(
+            session.approval,
+            ApprovalObservation::Confirmed(_)
+        ));
+    }
+
+    #[test]
+    fn running_and_lookalike_panes_are_not_confirmed() {
+        for pane in [
+            include_str!("../../../../tests/fixtures/codex-running-shell-pane.txt"),
+            include_str!("../../../../tests/fixtures/codex-approval-lookalike-pane.txt"),
+        ] {
+            let mut session = pending_shell_session("call-7", "cargo test");
+            let io = FakeApprovalIo::with_captures([Ok(capture(pane))]);
+
+            refresh_approval_observation_with(&io, &mut session, 10_000);
+
+            assert!(matches!(session.approval, ApprovalObservation::Unknown(_)));
+            assert_eq!(io.sends.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn command_mismatch_is_not_confirmed() {
+        let mut session = pending_shell_session("call-7", "cargo clippy");
+        let io = FakeApprovalIo::with_captures([Ok(capture(include_str!(
+            "../../../../tests/fixtures/codex-shell-approval-pane.txt"
+        )))]);
+
+        refresh_approval_observation_with(&io, &mut session, 10_000);
+
+        assert!(matches!(session.approval, ApprovalObservation::Unknown(_)));
+    }
+
+    #[test]
+    fn command_prefix_or_superstring_is_not_confirmed() {
+        let fixture = include_str!("../../../../tests/fixtures/codex-shell-approval-pane.txt");
+        for (pending, displayed) in [
+            ("cargo test", "cargo test --all"),
+            ("cargo test", "cargo test-danger"),
+            ("cargo test --all", "cargo test"),
+        ] {
+            let pane = fixture.replacen("$ cargo test", &format!("$ {displayed}"), 1);
+            let mut session = pending_shell_session("call-7", pending);
+            let io = FakeApprovalIo::with_captures([Ok(capture(&pane))]);
+
+            refresh_approval_observation_with(&io, &mut session, 10_000);
+
+            assert!(matches!(session.approval, ApprovalObservation::Unknown(_)));
+            assert_eq!(io.sends.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn stale_prompt_never_sends_enter() {
+        let mut session = pending_shell_session("call-7", "cargo test");
+        let io = FakeApprovalIo::with_captures([
+            Ok(capture(include_str!(
+                "../../../../tests/fixtures/codex-shell-approval-pane.txt"
+            ))),
+            Ok(capture(include_str!(
+                "../../../../tests/fixtures/codex-running-shell-pane.txt"
+            ))),
+        ]);
+        refresh_approval_observation_with(&io, &mut session, 10_000);
+        assert!(matches!(
+            session.approval,
+            ApprovalObservation::Confirmed(_)
+        ));
+
+        let error = approve_shell_permission_with(&io, &session).unwrap_err();
+
+        assert!(error.contains("approval prompt changed"));
+        assert_eq!(io.sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn changed_backend_or_target_never_sends_enter() {
+        let pane = include_str!("../../../../tests/fixtures/codex-shell-approval-pane.txt");
+        let mut session = pending_shell_session("call-7", "cargo test");
+        let io = FakeApprovalIo::with_captures([
+            Ok(capture(pane)),
+            Ok(PaneCapture {
+                backend: Terminal::Kitty,
+                target: "pid:99".into(),
+                text: pane.into(),
+            }),
+        ]);
+        refresh_approval_observation_with(&io, &mut session, 10_000);
+
+        let error = approve_shell_permission_with(&io, &session).unwrap_err();
+
+        assert!(error.contains("identity changed"));
+        assert_eq!(io.sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn request_user_input_never_captures_or_sends_enter() {
+        let mut session = pending_shell_session("question-1", "Continue?");
+        session.pending_tool_name = Some("request_user_input".into());
+        session.approval = ApprovalObservation::Confirmed(ApprovalEvidence {
+            session_id: session.session_id.clone(),
+            tty: session.tty.clone(),
+            call_id: "question-1".into(),
+            tool: "request_user_input".into(),
+            command: "Continue?".into(),
+            backend: Terminal::Tmux,
+            target: "test-pane".into(),
+            prompt_pattern_version: 1,
+            prompt_fingerprint: 1,
+        });
+        let io = FakeApprovalIo::default();
+
+        let error = approve_shell_permission_with(&io, &session).unwrap_err();
+
+        assert!(error.contains("no longer pending"));
+        assert_eq!(io.sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bounded_command_runner_handles_success_and_non_zero_exit() {
+        let success = run_bounded(Command::new("sh").args(["-c", "printf ok"])).unwrap();
+        assert!(success.status.success());
+        assert_eq!(success.stdout, b"ok");
+
+        let failure = run_bounded(Command::new("sh").args(["-c", "exit 7"])).unwrap();
+        assert_eq!(failure.status.code(), Some(7));
+    }
+
+    #[test]
+    fn bounded_command_runner_times_out() {
+        let error = run_bounded(Command::new("sh").args(["-c", "sleep 2"])).unwrap_err();
+        assert!(error.contains("timed out"));
+    }
+
+    #[test]
+    fn bounded_command_runner_does_not_wait_for_inherited_pipe() {
+        let started = std::time::Instant::now();
+        let error = run_bounded(Command::new("sh").args(["-c", "sleep 2 &"])).unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bounded_command_runner_rejects_oversized_output() {
+        let error = run_bounded(Command::new("sh").args([
+            "-c",
+            "i=0; while [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("exceeded 64 KiB"));
+    }
 
     #[test]
     fn help_summary_lists_kitty_actions() {

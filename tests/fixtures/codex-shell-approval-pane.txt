@@ -1,0 +1,11 @@
+  Would you like to run the following command?
+
+  Reason: Run the requested test suite
+
+  $ cargo test
+
+> 1. Yes, just this once
+  2. Yes, and don't ask again for commands that start with `cargo test`
+  3. No, and tell Codex what to do differently
+
+  Press enter to confirm or esc to cancel

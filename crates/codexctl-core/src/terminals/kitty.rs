@@ -1,4 +1,29 @@
 use crate::session::CodexSession;
+use crate::terminals::{PaneCapture, Terminal, checked_capture, run_bounded};
+
+pub fn capture(session: &CodexSession) -> Result<PaneCapture, String> {
+    let target = format!("pid:{}", session.pid);
+    let output = run_bounded(
+        std::process::Command::new("kitty")
+            .args(["@", "get-text", "--match", &target, "--extent", "screen"]),
+    )?;
+    checked_capture(Terminal::Kitty, target, output)
+}
+
+pub fn send_enter(target: &str) -> Result<(), String> {
+    let output = run_bounded(std::process::Command::new("kitty").args([
+        "@",
+        "send-text",
+        "--match",
+        target,
+        "\r",
+    ]))?;
+    output
+        .status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "kitty send-text returned non-zero".into())
+}
 
 pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<String, String> {
     let mut cmd = std::process::Command::new("kitty");
@@ -61,25 +86,6 @@ pub fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
             "--match",
             &format!("pid:{}", session.pid),
             text,
-        ])
-        .output()
-        .map_err(|e| format!("kitty send-text failed: {e}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
-
-pub fn approve(session: &CodexSession) -> Result<(), String> {
-    let output = std::process::Command::new("kitty")
-        .args([
-            "@",
-            "send-text",
-            "--match",
-            &format!("pid:{}", session.pid),
-            "\r",
         ])
         .output()
         .map_err(|e| format!("kitty send-text failed: {e}"))?;

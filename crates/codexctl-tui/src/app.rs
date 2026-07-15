@@ -11,7 +11,7 @@ use codexctl_core::hooks::{HookEvent, HookRegistry};
 use codexctl_core::launch::{self, LaunchRequest};
 use codexctl_core::monitor;
 use codexctl_core::process;
-use codexctl_core::session::{CodexSession, SessionStatus};
+use codexctl_core::session::{ApprovalObservation, CodexSession, SessionStatus};
 use codexctl_core::terminals;
 use codexctl_core::theme::Theme;
 
@@ -447,6 +447,16 @@ fn observation_from(
     }
 }
 
+fn has_matching_deny_rule(
+    rules: &[codexctl_core::rules::AutoRule],
+    session: &CodexSession,
+) -> bool {
+    matches!(
+        codexctl_core::rules::evaluate(rules, session),
+        Some(rule_match) if rule_match.action == codexctl_core::rules::RuleAction::Deny
+    )
+}
+
 fn merge_discovered_session(mut prev: CodexSession, new: CodexSession) -> CodexSession {
     let has_new_session_id = !new.session_id.starts_with("codex-");
     let session_changed = has_new_session_id && new.session_id != prev.session_id;
@@ -624,6 +634,8 @@ impl App {
         let jsonl_start = std::time::Instant::now();
         for session in &mut sessions {
             monitor::update_tokens(session);
+            terminals::refresh_approval_observation(session);
+            monitor::refresh_status(session);
         }
         let jsonl_elapsed = jsonl_start.elapsed();
 
@@ -1320,7 +1332,12 @@ impl App {
         let legacy_pids: Vec<u32> = self
             .sessions
             .iter()
-            .filter(|s| s.status == SessionStatus::NeedsInput && self.auto_approve.contains(&s.pid))
+            .filter(|s| {
+                s.status == SessionStatus::NeedsInput
+                    && matches!(s.approval, ApprovalObservation::Confirmed(_))
+                    && self.auto_approve.contains(&s.pid)
+                    && !has_matching_deny_rule(&self.rules, s)
+            })
             .map(|s| s.pid)
             .collect();
 
@@ -1330,7 +1347,7 @@ impl App {
                     .runtime
                     .actions
                     .log_observation(observation_from(session, "user_approve"));
-                match terminals::approve_session(session) {
+                match terminals::approve_shell_permission(session) {
                     Ok(()) => self.status_msg = format!("Auto-approved {}", session.display_name()),
                     Err(e) => self.status_msg = format!("Auto-approve error: {e}"),
                 }
@@ -1409,7 +1426,9 @@ impl App {
                         SessionStatus::NeedsInput | SessionStatus::WaitingInput
                     )
                 })
-                .filter(|s| !self.auto_approve.contains(&s.pid)) // Legacy takes priority
+                .filter(|s| {
+                    !self.auto_approve.contains(&s.pid) || has_matching_deny_rule(&self.rules, s)
+                })
                 .map(|s| s.pid)
                 .collect();
 
@@ -1465,14 +1484,13 @@ impl App {
                 .cloned()
                 .collect();
 
-            let snapshots: Vec<_> = self.sessions.iter().map(snapshot_from).collect();
-            let actions = driver.tick(&snapshots, &deny_rules);
+            let actions = driver.tick(&self.sessions, &deny_rules);
             for (_pid, msg) in actions {
                 codexctl_core::logger::log("BRAIN", &msg);
                 self.status_msg = msg;
             }
 
-            driver.cleanup(&snapshots);
+            driver.cleanup(&self.sessions);
         }
 
         let snapshots = self.sessions.iter().map(snapshot_from).collect::<Vec<_>>();
@@ -2251,18 +2269,22 @@ impl App {
                 self.status_msg = "Remote session \u{2014} action not available".into();
                 return;
             }
-            if session.status == SessionStatus::NeedsInput {
+            if matches!(session.approval, ApprovalObservation::Confirmed(_)) {
+                if has_matching_deny_rule(&self.rules, session) {
+                    self.status_msg = "Approval blocked by a matching deny rule".into();
+                    return;
+                }
                 // Log passive observation: user approved without brain involvement
                 let _ = self
                     .runtime
                     .actions
                     .log_observation(observation_from(session, "user_approve"));
-                match terminals::approve_session(session) {
+                match terminals::approve_shell_permission(session) {
                     Ok(()) => self.status_msg = format!("Approved {}", session.display_name()),
                     Err(e) => self.status_msg = format!("Error: {e}"),
                 }
             } else {
-                self.status_msg = "Session is not waiting for input".into();
+                self.status_msg = "No terminal-confirmed shell approval is pending".into();
             }
         }
     }
@@ -2292,6 +2314,11 @@ impl App {
             return;
         };
 
+        if sg.action == "approve" && has_matching_deny_rule(&self.rules, &session) {
+            self.status_msg = "Brain approval blocked by a matching deny rule".into();
+            return;
+        }
+
         // If brain suggested deny and no override reason yet, prompt for one
         if sg.action == "deny" && override_reason.is_none() {
             self.pending_override_reason = Some(pid);
@@ -2301,7 +2328,7 @@ impl App {
             return;
         }
 
-        if let Some(msg) = driver.accept(pid) {
+        if let Some(msg) = driver.accept(&session) {
             let _ = self
                 .runtime
                 .actions
@@ -2638,6 +2665,32 @@ mod tests {
         app.deliver_brain_mailbox(&snapshots);
 
         assert_eq!(app.status_msg, "Delivered 1 message to high-context");
+    }
+
+    #[test]
+    fn matching_deny_rule_vetoes_approval_sources() {
+        let mut session = make_session(
+            11,
+            "blocked-api",
+            "gpt-5.4",
+            SessionStatus::NeedsInput,
+            0.0,
+            0.0,
+            true,
+        );
+        session.pending_tool_name = Some("exec_command".into());
+        session.pending_tool_input = Some("rm -rf build".into());
+        let approve = codexctl_core::rules::AutoRule::new(
+            "approve-all".into(),
+            codexctl_core::rules::RuleAction::Approve,
+        );
+        let mut deny = codexctl_core::rules::AutoRule::new(
+            "deny-rm".into(),
+            codexctl_core::rules::RuleAction::Deny,
+        );
+        deny.match_command = vec!["rm -rf".into()];
+
+        assert!(has_matching_deny_rule(&[approve, deny], &session));
     }
 
     #[test]

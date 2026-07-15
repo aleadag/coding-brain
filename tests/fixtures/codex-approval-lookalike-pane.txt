@@ -1,0 +1,4 @@
+The documentation asks: Would you like to run the following command?
+It discusses permission prompts and says cargo test might need approval.
+1. Yes, just this once
+2. No, and tell Codex what to do differently

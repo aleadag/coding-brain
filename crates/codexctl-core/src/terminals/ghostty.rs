@@ -87,20 +87,6 @@ pub fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
     run_osascript(&script)
 }
 
-pub fn approve(session: &CodexSession) -> Result<(), String> {
-    let find = find_terminal_script(session);
-
-    let script = format!(
-        r#"
-        tell application "Ghostty"
-            {find}
-            send key "enter" to t
-        end tell
-        "#,
-    );
-    run_osascript(&script)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

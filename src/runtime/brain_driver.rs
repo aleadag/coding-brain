@@ -1,13 +1,10 @@
 //! Bind `BrainDriver` to the binary's `BrainEngine`.
 //!
-//! Wraps a `BrainEngine` instance and translates the trait's
-//! `SessionSnapshot` inputs to the live `CodexSession` values the engine
-//! expects, looking up real sessions via discovery on each call. The
-//! `PendingSuggestion` DTO is projected from the brain's internal type.
+//! Wraps a `BrainEngine` instance. The TUI passes the authoritative monitored
+//! sessions directly, while the pending-suggestion DTO remains core-owned.
 
-use codexctl_core::discovery;
 use codexctl_core::rules::AutoRule;
-use codexctl_core::runtime::{BrainDriver, PendingSuggestion, SessionSnapshot};
+use codexctl_core::runtime::{BrainDriver, PendingSuggestion};
 use codexctl_core::session::CodexSession;
 
 use crate::brain;
@@ -25,46 +22,19 @@ impl LiveBrainDriver {
     pub fn new(engine: brain::engine::BrainEngine) -> Self {
         Self { engine }
     }
-
-    /// Convert a SessionSnapshot batch into the live `CodexSession` values
-    /// the engine expects. Sessions that have exited between the snapshot
-    /// and the call are silently dropped (the engine's cleanup pass will
-    /// notice independently).
-    fn resolve_live(&self, snapshots: &[SessionSnapshot]) -> Vec<CodexSession> {
-        let mut live = discovery::scan_sessions();
-        discovery::resolve_jsonl_paths(&mut live);
-        let mut by_id: std::collections::HashMap<String, CodexSession> = live
-            .into_iter()
-            .map(|s| (s.session_id.clone(), s))
-            .collect();
-        snapshots
-            .iter()
-            .filter_map(|snap| by_id.remove(snap.session_id.as_str()))
-            .collect()
-    }
 }
 
 impl BrainDriver for LiveBrainDriver {
-    fn tick(
-        &mut self,
-        sessions: &[SessionSnapshot],
-        deny_rules: &[AutoRule],
-    ) -> Vec<(u32, String)> {
-        let live = self.resolve_live(sessions);
-        self.engine.tick(&live, deny_rules)
+    fn tick(&mut self, sessions: &[CodexSession], deny_rules: &[AutoRule]) -> Vec<(u32, String)> {
+        self.engine.tick(sessions, deny_rules)
     }
 
-    fn cleanup(&mut self, sessions: &[SessionSnapshot]) {
-        let live = self.resolve_live(sessions);
-        self.engine.cleanup(&live);
+    fn cleanup(&mut self, sessions: &[CodexSession]) {
+        self.engine.cleanup(sessions);
     }
 
-    fn accept(&mut self, pid: u32) -> Option<String> {
-        // accept() needs the live session for the PID; look it up directly.
-        let mut live = discovery::scan_sessions();
-        discovery::resolve_jsonl_paths(&mut live);
-        let session = live.into_iter().find(|s| s.pid == pid)?;
-        self.engine.accept(pid, &session)
+    fn accept(&mut self, session: &CodexSession) -> Option<String> {
+        self.engine.accept(session.pid, session)
     }
 
     fn reject(&mut self, pid: u32) -> Option<PendingSuggestion> {
@@ -78,7 +48,7 @@ impl BrainDriver for LiveBrainDriver {
             .pending
             .get(&pid)
             .cloned()
-            .map(|s| suggestion_from_brain(pid, s))
+            .map(|pending| suggestion_from_brain(pid, pending.suggestion))
     }
 
     fn pending_count(&self) -> usize {
@@ -98,13 +68,13 @@ impl BrainDriver for LiveBrainDriver {
         };
         self.engine.pending.insert(
             suggestion.pid,
-            BrainSuggestion {
+            brain::engine::PendingBrainSuggestion::unbound(BrainSuggestion {
                 action,
                 message: suggestion.message,
                 reasoning: suggestion.reasoning,
                 confidence: suggestion.confidence,
                 suggested_at: suggestion.suggested_at,
-            },
+            }),
         );
     }
 }

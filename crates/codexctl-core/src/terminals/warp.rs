@@ -61,24 +61,6 @@ pub fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
     run_osascript(&script)
 }
 
-/// Approve a permission prompt by sending Enter to the Codex session's Warp pane.
-/// Switches to the pane, ensures terminal focus, presses Enter, then switches back.
-pub fn approve(session: &CodexSession) -> Result<(), String> {
-    switch(session)?;
-    ensure_terminal_focus()?;
-
-    // Send Enter (key code 36)
-    run_osascript(
-        r#"
-        tell application "System Events"
-            tell process "stable"
-                key code 36
-            end tell
-        end tell
-        "#,
-    )
-}
-
 /// After switching tabs via Command Palette, the palette may still have focus.
 /// Press Escape to dismiss it, then click the center of the window to ensure
 /// keystrokes reach the terminal input area.

@@ -1,0 +1,7 @@
+* Working (12s - esc to interrupt)
+
+  Running cargo test
+
+  $ cargo test
+  Compiling codexctl-core v0.53.0
+  test result: ok. 135 passed; 0 failed

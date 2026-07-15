@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::terminals::Terminal;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SessionStatus {
     NeedsInput,   // Blocked — waiting for user to approve/confirm (permission prompt)
@@ -48,6 +50,27 @@ pub enum CodexTaskState {
     Processing,
     WaitingInput,
     Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalEvidence {
+    pub session_id: String,
+    pub tty: String,
+    pub call_id: String,
+    pub tool: String,
+    pub command: String,
+    pub backend: Terminal,
+    pub target: String,
+    pub prompt_pattern_version: u16,
+    pub prompt_fingerprint: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ApprovalObservation {
+    #[default]
+    NotChecked,
+    Confirmed(ApprovalEvidence),
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +174,8 @@ pub struct CodexSession {
     pub is_waiting_for_task: bool,
     pub task_state: CodexTaskState,
     pub explicit_input_required: bool,
+    pub approval: ApprovalObservation,
+    pub approval_checked_at_ms: u64,
     /// Pending tool call details for rule-based auto-actions.
     pub pending_tool_name: Option<String>,
     pub pending_tool_call_id: Option<String>,
@@ -359,6 +384,8 @@ impl CodexSession {
             is_waiting_for_task: false,
             task_state: CodexTaskState::Unknown,
             explicit_input_required: false,
+            approval: ApprovalObservation::NotChecked,
+            approval_checked_at_ms: 0,
             pending_tool_name: None,
             pending_tool_call_id: None,
             pending_tool_input: None,

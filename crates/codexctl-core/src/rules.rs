@@ -1,4 +1,4 @@
-use crate::session::CodexSession;
+use crate::session::{ApprovalObservation, CodexSession};
 use crate::terminals;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +187,10 @@ pub fn execute(result: &RuleMatch, session: &CodexSession) -> Result<String, Str
     let name = session.display_name();
     match result.action {
         RuleAction::Approve => {
-            terminals::approve_session(session)?;
+            if !matches!(session.approval, ApprovalObservation::Confirmed(_)) {
+                return Err("shell approval is not terminal-confirmed".into());
+            }
+            terminals::approve_shell_permission(session)?;
             Ok(format!(
                 "Rule '{}': approved {} ({})",
                 result.rule_name,
@@ -463,5 +466,24 @@ mod tests {
         let mut rule = approve_rule("bash");
         rule.match_tool = vec!["Bash".into()];
         assert!(evaluate(&[rule], &s).is_none());
+    }
+
+    #[test]
+    fn request_user_input_cannot_execute_shell_approval() {
+        let mut s = make_session();
+        s.pending_tool_name = Some("request_user_input".into());
+        s.explicit_input_required = true;
+
+        let error = execute(
+            &RuleMatch {
+                rule_name: "approve-all".into(),
+                action: RuleAction::Approve,
+                message: None,
+            },
+            &s,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("not terminal-confirmed"));
     }
 }
