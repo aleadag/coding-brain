@@ -5,8 +5,18 @@ pub enum CodexEvent {
     SessionMeta(CodexSessionMeta),
     TurnContext(CodexTurnContext),
     TokenCount(CodexTokenCount),
-    EventMessage(String),
+    Lifecycle(CodexLifecycleEvent),
     ResponseItem(CodexResponseItem),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexLifecycleEvent {
+    TaskStarted,
+    TaskComplete,
+    TurnAborted,
+    UserMessage,
+    AgentMessage,
+    Other(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +57,8 @@ pub enum CodexResponseKind {
     Message,
     FunctionCall,
     FunctionCallOutput,
+    CustomToolCall,
+    CustomToolCallOutput,
     Reasoning,
     Other,
 }
@@ -117,16 +129,20 @@ fn parse_turn_context(payload: &Value) -> CodexTurnContext {
 }
 
 fn parse_event_msg(payload: &Value) -> Option<CodexEvent> {
-    if payload.get("type").and_then(|v| v.as_str()) == Some("token_count") {
+    let event_type = payload.get("type").and_then(|v| v.as_str())?;
+    if event_type == "token_count" {
         return parse_token_count(payload).map(CodexEvent::TokenCount);
     }
 
-    payload
-        .get("message")
-        .and_then(|v| v.as_str())
-        .or_else(|| payload.get("text").and_then(|v| v.as_str()))
-        .map(str::to_string)
-        .map(CodexEvent::EventMessage)
+    let event = match event_type {
+        "task_started" => CodexLifecycleEvent::TaskStarted,
+        "task_complete" => CodexLifecycleEvent::TaskComplete,
+        "turn_aborted" => CodexLifecycleEvent::TurnAborted,
+        "user_message" => CodexLifecycleEvent::UserMessage,
+        "agent_message" => CodexLifecycleEvent::AgentMessage,
+        other => CodexLifecycleEvent::Other(other.to_string()),
+    };
+    Some(CodexEvent::Lifecycle(event))
 }
 
 fn parse_token_count(payload: &Value) -> Option<CodexTokenCount> {
@@ -172,6 +188,8 @@ fn parse_response_item(payload: &Value) -> Option<CodexResponseItem> {
         "message" => CodexResponseKind::Message,
         "function_call" => CodexResponseKind::FunctionCall,
         "function_call_output" => CodexResponseKind::FunctionCallOutput,
+        "custom_tool_call" => CodexResponseKind::CustomToolCall,
+        "custom_tool_call_output" => CodexResponseKind::CustomToolCallOutput,
         "reasoning" => CodexResponseKind::Reasoning,
         _ => CodexResponseKind::Other,
     };
@@ -189,8 +207,8 @@ fn parse_response_item(payload: &Value) -> Option<CodexResponseItem> {
             .map(str::to_string),
         arguments: payload
             .get("arguments")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+            .or_else(|| payload.get("input"))
+            .and_then(value_as_string),
         call_id: payload
             .get("call_id")
             .and_then(|v| v.as_str())
@@ -200,6 +218,13 @@ fn parse_response_item(payload: &Value) -> Option<CodexResponseItem> {
             .and_then(|v| v.as_str())
             .map(str::to_string),
     })
+}
+
+fn value_as_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| serde_json::to_string(value).ok())
 }
 
 fn extract_text(payload: &Value) -> Option<String> {
@@ -261,5 +286,36 @@ mod tests {
         assert_eq!(count.total.output_tokens, 12000);
         assert_eq!(count.last.input_tokens, 42000);
         assert_eq!(count.model_context_window, Some(258400));
+    }
+
+    #[test]
+    fn parses_task_lifecycle_events() {
+        let started = r#"{"type":"event_msg","payload":{"type":"task_started"}}"#;
+        let complete = r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+
+        assert_eq!(
+            parse_line(started),
+            Some(CodexEvent::Lifecycle(CodexLifecycleEvent::TaskStarted))
+        );
+        assert_eq!(
+            parse_line(complete),
+            Some(CodexEvent::Lifecycle(CodexLifecycleEvent::TaskComplete))
+        );
+    }
+
+    #[test]
+    fn parses_custom_tool_call_and_output() {
+        let call = r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"shell","input":"cargo test","call_id":"call-7"}}"#;
+        let output = r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-7","output":"ok"}}"#;
+
+        let Some(CodexEvent::ResponseItem(call)) = parse_line(call) else {
+            panic!("custom call");
+        };
+        let Some(CodexEvent::ResponseItem(output)) = parse_line(output) else {
+            panic!("custom output");
+        };
+        assert_eq!(call.kind, CodexResponseKind::CustomToolCall);
+        assert_eq!(call.arguments.as_deref(), Some("cargo test"));
+        assert_eq!(output.kind, CodexResponseKind::CustomToolCallOutput);
     }
 }

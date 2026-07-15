@@ -4,10 +4,13 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use serde_json::Value;
 
 use crate::codex_transcript::{
-    CodexEvent, CodexResponseItem, CodexResponseKind, parse_line as parse_codex_line,
+    CodexEvent, CodexLifecycleEvent, CodexResponseItem, CodexResponseKind,
+    parse_line as parse_codex_line,
 };
 use crate::models;
-use crate::session::{CodexSession, SessionStatus, SubagentRollup, TelemetryStatus};
+use crate::session::{
+    CodexSession, CodexTaskState, SessionStatus, SubagentRollup, TelemetryStatus,
+};
 use crate::transcript::{TranscriptBlock, TranscriptEvent, TranscriptRole, parse_line};
 
 #[derive(Default)]
@@ -305,6 +308,9 @@ fn update_codex_tokens(session: &mut CodexSession) {
                     session.jsonl_offset = 0;
                     last_type.clear();
                     last_stop_reason.clear();
+                    session.task_state = CodexTaskState::Unknown;
+                    session.explicit_input_required = false;
+                    clear_pending_tool(session);
                 }
 
                 if session.jsonl_offset < file_len {
@@ -347,11 +353,30 @@ fn update_codex_tokens(session: &mut CodexSession) {
                                 codex_context_max = count.model_context_window;
                                 saw_parent_usage = true;
                             }
-                            CodexEvent::EventMessage(message) => {
-                                if message.contains("user_message") {
-                                    last_type = "user".into();
-                                    last_stop_reason.clear();
+                            CodexEvent::Lifecycle(event) => {
+                                match &event {
+                                    CodexLifecycleEvent::TaskStarted => {
+                                        last_stop_reason.clear();
+                                    }
+                                    CodexLifecycleEvent::TaskComplete => {
+                                        last_type = "assistant".into();
+                                        last_stop_reason = "end_turn".into();
+                                    }
+                                    CodexLifecycleEvent::TurnAborted => {
+                                        last_type = "assistant".into();
+                                        last_stop_reason.clear();
+                                    }
+                                    CodexLifecycleEvent::UserMessage => {
+                                        last_type = "user".into();
+                                        last_stop_reason.clear();
+                                    }
+                                    CodexLifecycleEvent::AgentMessage => {
+                                        last_type = "assistant".into();
+                                        last_stop_reason.clear();
+                                    }
+                                    CodexLifecycleEvent::Other(_) => {}
                                 }
+                                apply_lifecycle(event, session);
                             }
                             CodexEvent::ResponseItem(item) => {
                                 let kind = item.kind;
@@ -379,9 +404,21 @@ fn update_codex_tokens(session: &mut CodexSession) {
                                     }
                                     CodexResponseKind::FunctionCallOutput => {
                                         last_type = "assistant".into();
-                                        last_stop_reason = "end_turn".into();
+                                        last_stop_reason.clear();
                                     }
-                                    CodexResponseKind::Reasoning | CodexResponseKind::Other => {}
+                                    CodexResponseKind::CustomToolCall => {
+                                        last_type = "assistant".into();
+                                        last_stop_reason = "tool_use".into();
+                                    }
+                                    CodexResponseKind::CustomToolCallOutput => {
+                                        last_type = "assistant".into();
+                                        last_stop_reason.clear();
+                                    }
+                                    CodexResponseKind::Reasoning => {
+                                        last_type = "assistant".into();
+                                        last_stop_reason.clear();
+                                    }
+                                    CodexResponseKind::Other => {}
                                 }
                             }
                         }
@@ -427,37 +464,79 @@ fn update_codex_tokens(session: &mut CodexSession) {
     }
 }
 
+fn apply_lifecycle(event: CodexLifecycleEvent, session: &mut CodexSession) {
+    match event {
+        CodexLifecycleEvent::TaskStarted | CodexLifecycleEvent::UserMessage => {
+            session.task_state = CodexTaskState::Processing;
+            session.explicit_input_required = false;
+            clear_pending_tool(session);
+        }
+        CodexLifecycleEvent::AgentMessage => {
+            session.task_state = CodexTaskState::Processing;
+            session.explicit_input_required = false;
+        }
+        CodexLifecycleEvent::TaskComplete => {
+            session.task_state = CodexTaskState::WaitingInput;
+            session.explicit_input_required = false;
+            clear_pending_tool(session);
+        }
+        CodexLifecycleEvent::TurnAborted => {
+            session.task_state = CodexTaskState::Aborted;
+            session.explicit_input_required = false;
+            clear_pending_tool(session);
+        }
+        CodexLifecycleEvent::Other(_) => {}
+    }
+}
+
 fn apply_codex_response_item(item: CodexResponseItem, session: &mut CodexSession) {
     match item.kind {
-        CodexResponseKind::Message => {}
-        CodexResponseKind::FunctionCall => {
+        CodexResponseKind::Message | CodexResponseKind::Reasoning => {
+            session.task_state = CodexTaskState::Processing;
+            session.explicit_input_required = false;
+        }
+        CodexResponseKind::FunctionCall | CodexResponseKind::CustomToolCall => {
+            let is_custom = item.kind == CodexResponseKind::CustomToolCall;
             let tool_name = item.name.unwrap_or_else(|| "unknown".into());
-            let input = item
-                .arguments
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .unwrap_or(Value::Null);
+            let raw_input = item.arguments.unwrap_or_default();
+            let input = serde_json::from_str::<Value>(&raw_input).unwrap_or(Value::Null);
             record_tool_usage(&tool_name, &input, session);
-            session.pending_tool_name = Some(tool_name);
-            session.pending_tool_input = input
-                .get("cmd")
-                .or_else(|| input.get("command"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
+            session.task_state = CodexTaskState::Processing;
+            session.explicit_input_required = tool_name == "request_user_input";
+            session.pending_tool_call_id = item.call_id;
+            session.pending_tool_input = if is_custom {
+                (!raw_input.is_empty()).then_some(raw_input)
+            } else {
+                input
+                    .get("cmd")
+                    .or_else(|| input.get("command"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            };
             session.pending_file_path = input
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            session.pending_tool_name = Some(tool_name);
         }
-        CodexResponseKind::FunctionCallOutput => {
-            session.last_tool_error = false;
-            session.last_error_message = None;
-            session.pending_tool_name = None;
-            session.pending_tool_input = None;
-            session.pending_file_path = None;
+        CodexResponseKind::FunctionCallOutput | CodexResponseKind::CustomToolCallOutput => {
+            session.task_state = CodexTaskState::Processing;
+            if item.call_id.is_some() && item.call_id == session.pending_tool_call_id {
+                session.last_tool_error = false;
+                session.last_error_message = None;
+                session.explicit_input_required = false;
+                clear_pending_tool(session);
+            }
         }
-        CodexResponseKind::Reasoning | CodexResponseKind::Other => {}
+        CodexResponseKind::Other => {}
     }
+}
+
+fn clear_pending_tool(session: &mut CodexSession) {
+    session.pending_tool_name = None;
+    session.pending_tool_call_id = None;
+    session.pending_tool_input = None;
+    session.pending_file_path = None;
 }
 
 fn finalize_usage(
@@ -510,20 +589,47 @@ fn finalize_usage(
     infer_status(session, last_type, last_stop_reason, is_waiting_for_task);
 }
 
+pub fn refresh_status(session: &mut CodexSession) {
+    let last_type = session.last_msg_type.clone();
+    let stop_reason = session.last_stop_reason.clone();
+    infer_status(
+        session,
+        &last_type,
+        &stop_reason,
+        session.is_waiting_for_task,
+    );
+}
+
 pub fn infer_status(
     session: &mut CodexSession,
     last_msg_type: &str,
     last_stop_reason: &str,
     is_waiting_for_task: bool,
 ) {
-    // CPU is the strongest real-time signal — if the process is burning CPU,
-    // it's processing regardless of what the JSONL says (JSONL can lag).
+    if session.explicit_input_required {
+        session.status = SessionStatus::NeedsInput;
+        return;
+    }
+
+    match session.task_state {
+        CodexTaskState::Processing => {
+            session.status = SessionStatus::Processing;
+            return;
+        }
+        CodexTaskState::WaitingInput | CodexTaskState::Aborted => {
+            session.status = recent_waiting_or_idle(session.last_message_ts);
+            return;
+        }
+        CodexTaskState::Unknown => {}
+    }
+
+    // High CPU is evidence of processing, but low CPU never authorizes input.
     if session.cpu_percent > 5.0 {
         session.status = SessionStatus::Processing;
         return;
     }
 
-    // NeedsInput: JSONL says waiting_for_task and CPU is low (confirmed idle)
+    // Preserve the legacy explicit waiting signal.
     if is_waiting_for_task {
         session.status = SessionStatus::NeedsInput;
         return;
@@ -535,64 +641,34 @@ pub fn infer_status(
     }
 
     if last_msg_type == "assistant" && last_stop_reason == "end_turn" {
-        // Codex finished its turn — waiting for user input
-        // But if it's been a long time (>10 min), mark as Idle
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let age_mins = (now_ms.saturating_sub(session.last_message_ts)) / 60_000;
-
-        if age_mins > 10 {
-            session.status = SessionStatus::Idle;
-        } else {
-            session.status = SessionStatus::WaitingInput;
-        }
+        session.status = recent_waiting_or_idle(session.last_message_ts);
         return;
     }
 
     if last_msg_type == "assistant" && last_stop_reason == "tool_use" {
-        // Codex called a tool. If CPU is low, it's likely waiting for user to
-        // approve/deny the tool (permission prompt). The permission prompt doesn't
-        // emit waiting_for_task — detect via CPU + pending tool state or age.
-        //
-        // Primary signal: if pending_tool_name is set (ToolUse parsed but no ToolResult
-        // yet), the session is blocked on a permission prompt regardless of timing.
-        // Fallback: low CPU + age > 5s for cases where the tool was auto-approved
-        // but JSONL hasn't caught up yet.
-        let has_pending_tool = session.pending_tool_name.is_some();
-
-        if session.cpu_percent < 2.0 && has_pending_tool {
-            session.status = SessionStatus::NeedsInput;
-        } else if session.cpu_percent < 2.0 {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let age_secs = (now_ms.saturating_sub(session.last_message_ts)) / 1000;
-            if age_secs > 5 {
-                session.status = SessionStatus::NeedsInput;
-            } else {
-                session.status = SessionStatus::Processing;
-            }
-        } else {
-            session.status = SessionStatus::Processing;
-        }
+        session.status = SessionStatus::Processing;
         return;
     }
 
     if last_msg_type == "user" {
-        // User sent a message, Codex hasn't finished responding
-        if session.cpu_percent > 1.0 {
-            session.status = SessionStatus::Processing;
-        } else {
-            // Low CPU + user message pending — might be waiting for API or stalled
-            session.status = SessionStatus::Processing;
-        }
+        session.status = SessionStatus::Processing;
         return;
     }
 
     session.status = SessionStatus::Idle;
+}
+
+fn recent_waiting_or_idle(last_message_ts: u64) -> SessionStatus {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let age_mins = (now_ms.saturating_sub(last_message_ts)) / 60_000;
+    if age_mins > 10 {
+        SessionStatus::Idle
+    } else {
+        SessionStatus::WaitingInput
+    }
 }
 
 /// Estimate USD cost based on token usage and model.

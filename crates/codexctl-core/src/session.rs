@@ -41,6 +41,15 @@ impl SessionStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodexTaskState {
+    #[default]
+    Unknown,
+    Processing,
+    WaitingInput,
+    Aborted,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryStatus {
     Pending,
@@ -140,8 +149,11 @@ pub struct CodexSession {
     pub last_msg_type: String,
     pub last_stop_reason: String,
     pub is_waiting_for_task: bool,
+    pub task_state: CodexTaskState,
+    pub explicit_input_required: bool,
     /// Pending tool call details for rule-based auto-actions.
     pub pending_tool_name: Option<String>,
+    pub pending_tool_call_id: Option<String>,
     pub pending_tool_input: Option<String>, // Extracted command string (for Bash)
     pub pending_file_path: Option<String>,  // File path for pending Edit/Write/NotebookEdit
     pub has_file_conflict: bool,            // Pending file edit conflicts with another session
@@ -345,7 +357,10 @@ impl CodexSession {
             last_msg_type: String::new(),
             last_stop_reason: String::new(),
             is_waiting_for_task: false,
+            task_state: CodexTaskState::Unknown,
+            explicit_input_required: false,
             pending_tool_name: None,
+            pending_tool_call_id: None,
             pending_tool_input: None,
             pending_file_path: None,
             has_file_conflict: false,

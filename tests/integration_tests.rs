@@ -5,7 +5,7 @@ use codexctl::discovery;
 use codexctl::models;
 use codexctl::monitor;
 use codexctl::process;
-use codexctl::session::{CodexSession, RawSession, SessionStatus, TelemetryStatus};
+use codexctl::session::{CodexSession, CodexTaskState, RawSession, SessionStatus, TelemetryStatus};
 
 /// Helper: create a minimal session for testing status inference.
 fn make_session(cpu: f32, last_message_age_secs: u64) -> CodexSession {
@@ -93,11 +93,11 @@ fn status_end_turn_11min_idle() {
 }
 
 #[test]
-fn status_tool_use_low_cpu_old_needs_input() {
-    // tool_use + low CPU + >5s ago = permission prompt
+fn status_tool_use_low_cpu_old_stays_processing() {
+    // A pending tool and low CPU are not approval evidence.
     let mut s = make_session(0.5, 30);
     monitor::infer_status(&mut s, "assistant", "tool_use", false);
-    assert_eq!(s.status, SessionStatus::NeedsInput);
+    assert_eq!(s.status, SessionStatus::Processing);
 }
 
 #[test]
@@ -113,6 +113,18 @@ fn status_tool_use_high_cpu_processing() {
     // tool_use + high CPU = still crunching
     let mut s = make_session(15.0, 30);
     monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    assert_eq!(s.status, SessionStatus::Processing);
+}
+
+#[test]
+fn pending_shell_with_low_cpu_is_processing_without_approval_evidence() {
+    let mut s = make_session(0.1, 30);
+    s.task_state = CodexTaskState::Processing;
+    s.pending_tool_name = Some("exec_command".into());
+    s.pending_tool_call_id = Some("call-7".into());
+
+    monitor::refresh_status(&mut s);
+
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -167,15 +179,13 @@ fn status_cpu_threshold_boundary() {
 
 #[test]
 fn status_persisted_tool_use_survives_empty_tick() {
-    // Reproduces the bug: session blocked on permission prompt ("Do you want to
-    // proceed?"), first tick correctly detects NeedsInput via tool_use + low CPU,
-    // but second tick has no new JSONL data (empty signals) and must NOT fall
-    // through to Idle.
+    // A pending tool stays Processing across empty ticks until separate approval
+    // evidence is supplied.
     let mut s = make_session(0.5, 30);
 
     // Tick 1: new JSONL data — tool_use detected
     monitor::infer_status(&mut s, "assistant", "tool_use", false);
-    assert_eq!(s.status, SessionStatus::NeedsInput);
+    assert_eq!(s.status, SessionStatus::Processing);
 
     // Simulate what update_tokens() now does: persist the signals
     s.last_msg_type = "assistant".into();
@@ -187,14 +197,13 @@ fn status_persisted_tool_use_survives_empty_tick() {
     let stop_reason = s.last_stop_reason.clone();
     let waiting = s.is_waiting_for_task;
     monitor::infer_status(&mut s, &msg_type, &stop_reason, waiting);
-    assert_eq!(s.status, SessionStatus::NeedsInput);
+    assert_eq!(s.status, SessionStatus::Processing);
 }
 
 #[test]
-fn status_null_stop_reason_with_tool_use_infers_needs_input() {
-    // Tool-call transcripts can write stop_reason: null while awaiting approval.
-    // The content still has a tool_use block — infer tool_use from content so
-    // that the session shows NeedsInput instead of Idle.
+fn status_null_stop_reason_with_tool_use_stays_processing() {
+    // Tool-call transcripts can write stop_reason: null. The content still has a
+    // tool_use block, but that alone is not approval evidence.
     let jsonl = r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_01X","name":"Bash","input":{"command":"echo hi"}}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
 
     let (mut s, _file) = make_session_with_jsonl(jsonl);
@@ -203,10 +212,10 @@ fn status_null_stop_reason_with_tool_use_infers_needs_input() {
 
     // stop_reason was null in JSONL but must be inferred from tool_use content
     assert_eq!(s.last_stop_reason, "tool_use");
-    // pending_tool_name is set (ToolUse parsed, no ToolResult yet) so low CPU
-    // immediately infers NeedsInput — no need to wait for the 5s age threshold.
+    // pending_tool_name is set (ToolUse parsed, no ToolResult yet), while status
+    // remains Processing until terminal confirmation is added in Task 3.
     assert_eq!(s.pending_tool_name, Some("Bash".into()));
-    assert_eq!(s.status, SessionStatus::NeedsInput);
+    assert_eq!(s.status, SessionStatus::Processing);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -369,6 +378,26 @@ fn make_session_with_jsonl(content: &str) -> (CodexSession, tempfile::NamedTempF
     (s, file)
 }
 
+fn make_codex_session_with_jsonl(content: &str) -> (CodexSession, tempfile::NamedTempFile) {
+    let mut file = tempfile::Builder::new()
+        .prefix("rollout-")
+        .suffix(".jsonl")
+        .tempfile()
+        .unwrap();
+    file.write_all(content.as_bytes()).unwrap();
+    file.flush().unwrap();
+
+    let raw = RawSession {
+        pid: 1,
+        session_id: "test".into(),
+        cwd: "/tmp/test".into(),
+        started_at: 0,
+    };
+    let mut session = CodexSession::from_raw(raw);
+    session.jsonl_path = Some(file.path().to_path_buf());
+    (session, file)
+}
+
 fn make_session_with_paths(
     cwd: String,
     session_id: String,
@@ -450,6 +479,153 @@ fn codex_monitor_records_function_calls() {
     assert_eq!(session.tool_usage.get("exec_command").unwrap().calls, 1);
     assert_eq!(session.pending_tool_name, None);
     assert!(!session.last_tool_error);
+}
+
+#[test]
+fn mismatched_tool_output_does_not_close_pending_call() {
+    let (mut session, _file) =
+        make_codex_session_with_jsonl(include_str!("fixtures/codex-modern-lifecycle.jsonl"));
+
+    monitor::update_tokens(&mut session);
+
+    assert_eq!(session.pending_tool_call_id.as_deref(), Some("call-live"));
+    assert_eq!(session.status, SessionStatus::Processing);
+}
+
+#[test]
+fn agent_message_does_not_close_pending_call() {
+    let jsonl = concat!(
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"call-live"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"still working"}}"#,
+        "\n",
+    );
+    let (mut session, _file) = make_codex_session_with_jsonl(jsonl);
+
+    monitor::update_tokens(&mut session);
+
+    assert_eq!(session.pending_tool_call_id.as_deref(), Some("call-live"));
+    assert_eq!(session.status, SessionStatus::Processing);
+}
+
+#[test]
+fn matching_tool_output_closes_pending_call() {
+    let jsonl = concat!(
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"shell","input":"cargo test","call_id":"call-7"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-7","output":"ok"}}"#,
+        "\n",
+    );
+    let (mut session, _file) = make_codex_session_with_jsonl(jsonl);
+
+    monitor::update_tokens(&mut session);
+
+    assert_eq!(session.pending_tool_call_id, None);
+    assert_eq!(session.pending_tool_name, None);
+    assert_eq!(session.status, SessionStatus::Processing);
+}
+
+#[test]
+fn request_user_input_requires_input_until_matching_output() {
+    let jsonl = concat!(
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{\"questions\":[]}","call_id":"ask-1"}}"#,
+        "\n",
+    );
+    let (mut session, mut file) = make_codex_session_with_jsonl(jsonl);
+
+    monitor::update_tokens(&mut session);
+    assert!(session.explicit_input_required);
+    assert_eq!(session.status, SessionStatus::NeedsInput);
+
+    file.write_all(
+        concat!(
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"ask-1","output":"answer"}}"#,
+            "\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    file.flush().unwrap();
+    monitor::update_tokens(&mut session);
+
+    assert!(!session.explicit_input_required);
+    assert_eq!(session.pending_tool_call_id, None);
+    assert_eq!(session.status, SessionStatus::Processing);
+}
+
+#[test]
+fn continued_activity_dismisses_explicit_input_without_closing_call() {
+    let jsonl = concat!(
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{\"questions\":[]}","call_id":"ask-1"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"continuing"}}"#,
+        "\n",
+    );
+    let (mut session, _file) = make_codex_session_with_jsonl(jsonl);
+
+    monitor::update_tokens(&mut session);
+
+    assert!(!session.explicit_input_required);
+    assert_eq!(session.pending_tool_call_id.as_deref(), Some("ask-1"));
+    assert_eq!(session.status, SessionStatus::Processing);
+}
+
+#[test]
+fn task_complete_becomes_waiting_input() {
+    let jsonl = concat!(
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"reasoning","summary":[]}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        "\n",
+    );
+    let (mut session, _file) = make_codex_session_with_jsonl(jsonl);
+
+    monitor::update_tokens(&mut session);
+
+    assert_eq!(session.task_state, CodexTaskState::WaitingInput);
+    assert_eq!(session.status, SessionStatus::WaitingInput);
+}
+
+#[test]
+fn turn_aborted_ends_processing_without_needs_input() {
+    let jsonl = concat!(
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"turn_aborted"}}"#,
+        "\n",
+    );
+    let (mut session, _file) = make_codex_session_with_jsonl(jsonl);
+
+    monitor::update_tokens(&mut session);
+
+    assert_eq!(session.task_state, CodexTaskState::Aborted);
+    assert_eq!(session.status, SessionStatus::WaitingInput);
+}
+
+#[test]
+fn unknown_modern_event_does_not_end_active_task() {
+    let jsonl = concat!(
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"future_event"}}"#,
+        "\n",
+    );
+    let (mut session, _file) = make_codex_session_with_jsonl(jsonl);
+
+    monitor::update_tokens(&mut session);
+
+    assert_eq!(session.task_state, CodexTaskState::Processing);
+    assert_eq!(session.status, SessionStatus::Processing);
 }
 
 #[test]
