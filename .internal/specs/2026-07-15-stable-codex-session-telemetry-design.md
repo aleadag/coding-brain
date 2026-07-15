@@ -94,6 +94,15 @@ observation immediately after establishing its retained assignment, but it may
 switch only after the next outer refresh confirms the same candidate using a
 new uncached scan.
 
+A bare interactive Codex process may also resume a transcript that started
+before its retained transcript. When the retained transcript has stopped
+advancing, an older same-directory transcript may enter the same two-scan
+confirmation only if its modification time is newer than the retained
+transcript's last observed activity and it is the unique most-recently-active
+unclaimed candidate. This activity exception permits reattachment to a resumed
+session without weakening the uniqueness and confirmation safeguards used for
+`/clear`.
+
 ## Status State Machine
 
 The Codex parser will expose lifecycle meaning rather than converting response
@@ -216,6 +225,8 @@ Regression tests will cover:
   files alternate writes;
 - an ambiguous new process remains pending rather than borrowing a transcript;
 - `/clear` replaces telemetry only after a distinct session is identified;
+- a long-running dashboard reattaches when bare Codex resumes an older
+  transcript and that file becomes the unique most-recently-active candidate;
 - repeated refreshes charge each request once and never lower the estimate;
 - mixed-model requests preserve their individual prices;
 - cached input, exposed cache writes, and GPT-5.6 long-context multipliers are

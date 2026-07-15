@@ -395,7 +395,9 @@ fn compatible_transition(
 ) -> bool {
     candidate.cwd == process.cwd
         && candidate.session_id != previous.session_id
-        && candidate.started_at_ms > previous.transcript_started_at_ms
+        && (candidate.mtime_ms > previous.transcript_mtime_ms
+            || (!previous.resume_superseded
+                && candidate.started_at_ms > previous.transcript_started_at_ms))
 }
 
 fn assign_transcripts<'a>(
@@ -1224,6 +1226,34 @@ mod tests {
         assert_eq!(second[&11].session_id, "new");
         assert_eq!(state.retained[&11].session_id, "new");
         assert!(!state.transitions.contains_key(&11));
+    }
+
+    #[test]
+    fn retained_process_transitions_to_older_resumed_transcript_by_activity() {
+        let processes = vec![process(11, "/repo", 100_000, "")];
+        let mut resumed = transcript("resumed", "/repo", 150_000, "/resumed.jsonl");
+        resumed.mtime_ms = 400_000;
+        let mut completed = transcript("completed", "/repo", 300_000, "/completed.jsonl");
+        completed.mtime_ms = 350_000;
+        let transcripts = vec![resumed, completed];
+        let mut retained_map = retained(11, 100_000, "completed", "/completed.jsonl", 300_000);
+        retained_map.get_mut(&11).unwrap().transcript_mtime_ms = 350_000;
+        let mut state = TranscriptAssignmentState {
+            retained: retained_map,
+            transitions: HashMap::new(),
+            unmatched_index_generations: HashMap::new(),
+        };
+
+        let first = assign_transcripts_with_state(&processes, &transcripts, &mut state, true);
+        assert_eq!(first[&11].session_id, "completed");
+        assert_eq!(state.transitions[&11].session_id, "resumed");
+
+        let second = assign_transcripts_with_state(&processes, &transcripts, &mut state, true);
+        assert_eq!(second[&11].session_id, "resumed");
+
+        let third = assign_transcripts_with_state(&processes, &transcripts, &mut state, true);
+        assert_eq!(third[&11].session_id, "resumed");
+        assert!(state.transitions.is_empty());
     }
 
     #[test]
