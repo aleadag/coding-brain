@@ -303,10 +303,15 @@ fn sessions_from_discovered_processes(
     processes: Vec<LiveCodexProcess>,
     state: &mut TranscriptAssignmentState,
 ) -> Vec<CodexSession> {
+    let initializing_assignments = state.retained.is_empty();
     let had_pending_transition = !state.transitions.is_empty();
     let (mut transcripts, refreshed, mut generation) =
         collect_transcript_summaries_with_refresh(false);
     let mut assigned = assign_transcripts_with_state(&processes, &transcripts, state, refreshed);
+    if initializing_assignments && refreshed && !state.retained.is_empty() {
+        drop(assigned);
+        assigned = assign_transcripts_with_state(&processes, &transcripts, state, true);
+    }
     let unmatched: Vec<u32> = processes
         .iter()
         .filter(|process| !assigned.contains_key(&process.pid))
@@ -542,6 +547,40 @@ fn assign_transcripts<'a>(
         }
     }
 
+    let mut activity_candidates = Vec::new();
+    let mut activity_claims: HashMap<PathBuf, usize> = HashMap::new();
+    for process in processes.iter().filter(|process| {
+        !assigned.contains_key(&process.pid)
+            && !blocked_heuristic_pids.contains(&process.pid)
+            && process.command_args.trim().is_empty()
+    }) {
+        let candidates: Vec<_> = transcripts
+            .iter()
+            .filter(|transcript| {
+                !used_paths.contains(&transcript.path)
+                    && blocked_paths_by_pid.get(&process.pid) != Some(&transcript.path)
+                    && transcript.cwd == process.cwd
+                    && transcript
+                        .started_at_ms
+                        .saturating_add(TRANSCRIPT_START_SKEW_MS)
+                        < process.started_at
+                    && transcript.mtime_ms >= process.started_at
+            })
+            .collect();
+        let [candidate] = candidates.as_slice() else {
+            continue;
+        };
+        *activity_claims.entry(candidate.path.clone()).or_default() += 1;
+        activity_candidates.push((process.pid, *candidate));
+    }
+    for (pid, candidate) in activity_candidates {
+        if activity_claims.get(&candidate.path) != Some(&1) {
+            continue;
+        }
+        used_paths.insert(candidate.path.clone());
+        assigned.insert(pid, candidate);
+    }
+
     assigned
 }
 
@@ -589,8 +628,11 @@ fn assign_transcripts_with_state<'a>(
                     && !used_by_others.contains(&candidate.path)
             })
             .collect();
+        if let Some(latest_mtime_ms) = candidates.iter().map(|candidate| candidate.mtime_ms).max() {
+            candidates.retain(|candidate| candidate.mtime_ms == latest_mtime_ms);
+        }
         candidates.sort_by_key(|candidate| candidate.path.as_os_str());
-        for candidate in &candidates {
+        if let [candidate] = candidates.as_slice() {
             *candidate_claims.entry(candidate.path.clone()).or_default() += 1;
         }
         candidate_sets.push((process.pid, candidates));
@@ -1015,6 +1057,46 @@ mod tests {
     }
 
     #[test]
+    fn interactive_resume_attaches_unique_transcript_with_post_launch_activity() {
+        let processes = vec![process(11, "/repo", 200_000, "")];
+        let mut inactive = transcript("inactive", "/repo", 50_000, "/inactive.jsonl");
+        inactive.mtime_ms = 150_000;
+        let mut resumed = transcript("resumed", "/repo", 100_000, "/resumed.jsonl");
+        resumed.mtime_ms = 250_000;
+        let transcripts = [inactive, resumed];
+
+        let assigned = assign_transcripts(&processes, &transcripts, &HashMap::new());
+
+        assert_eq!(assigned[&11].session_id, "resumed");
+    }
+
+    #[test]
+    fn interactive_resume_with_multiple_active_transcripts_stays_unassigned() {
+        let processes = vec![process(11, "/repo", 200_000, "")];
+        let mut first = transcript("first", "/repo", 50_000, "/first.jsonl");
+        first.mtime_ms = 250_000;
+        let mut second = transcript("second", "/repo", 100_000, "/second.jsonl");
+        second.mtime_ms = 260_000;
+        let transcripts = [first, second];
+
+        let assigned = assign_transcripts(&processes, &transcripts, &HashMap::new());
+
+        assert!(assigned.is_empty());
+    }
+
+    #[test]
+    fn noninteractive_process_does_not_attach_old_activity() {
+        let processes = vec![process(11, "/repo", 200_000, "exec task")];
+        let mut old = transcript("old", "/repo", 100_000, "/old.jsonl");
+        old.mtime_ms = 250_000;
+        let transcripts = [old];
+
+        let assigned = assign_transcripts(&processes, &transcripts, &HashMap::new());
+
+        assert!(assigned.is_empty());
+    }
+
+    #[test]
     fn explicit_resume_replaces_temporary_heuristic_assignment() {
         let processes = vec![process(11, "/repo", 100_000, "resume wanted")];
         let temporary = transcript("temporary", "/repo", 101_000, "/temporary.jsonl");
@@ -1142,6 +1224,50 @@ mod tests {
         assert_eq!(second[&11].session_id, "new");
         assert_eq!(state.retained[&11].session_id, "new");
         assert!(!state.transitions.contains_key(&11));
+    }
+
+    #[test]
+    fn clear_transition_selects_unique_most_recently_active_candidate() {
+        let processes = vec![process(11, "/repo", 100_000, "")];
+        let old = transcript("old", "/repo", 101_000, "/old.jsonl");
+        let mut active = transcript("active", "/repo", 150_000, "/active.jsonl");
+        active.mtime_ms = 400_000;
+        let mut completed = transcript("completed", "/repo", 300_000, "/completed.jsonl");
+        completed.mtime_ms = 350_000;
+        let transcripts = vec![old, completed, active];
+        let mut state = TranscriptAssignmentState {
+            retained: retained(11, 100_000, "old", "/old.jsonl", 101_000),
+            transitions: HashMap::new(),
+            unmatched_index_generations: HashMap::new(),
+        };
+
+        let first = assign_transcripts_with_state(&processes, &transcripts, &mut state, true);
+        assert_eq!(first[&11].session_id, "old");
+        assert_eq!(state.transitions[&11].session_id, "active");
+
+        let second = assign_transcripts_with_state(&processes, &transcripts, &mut state, true);
+        assert_eq!(second[&11].session_id, "active");
+    }
+
+    #[test]
+    fn clear_transition_with_activity_tie_stays_on_retained_transcript() {
+        let processes = vec![process(11, "/repo", 100_000, "")];
+        let old = transcript("old", "/repo", 101_000, "/old.jsonl");
+        let mut first = transcript("first", "/repo", 150_000, "/first.jsonl");
+        first.mtime_ms = 400_000;
+        let mut second = transcript("second", "/repo", 300_000, "/second.jsonl");
+        second.mtime_ms = 400_000;
+        let transcripts = vec![old, first, second];
+        let mut state = TranscriptAssignmentState {
+            retained: retained(11, 100_000, "old", "/old.jsonl", 101_000),
+            transitions: HashMap::new(),
+            unmatched_index_generations: HashMap::new(),
+        };
+
+        let assigned = assign_transcripts_with_state(&processes, &transcripts, &mut state, true);
+
+        assert_eq!(assigned[&11].session_id, "old");
+        assert!(state.transitions.is_empty());
     }
 
     #[test]
@@ -1506,6 +1632,39 @@ mod tests {
             vec![process(42, "/repo", process_start, "")],
             &mut state,
         );
+        unsafe {
+            std::env::remove_var("CODEXCTL_CODEX_HOME");
+        }
+        assert_eq!(second[0].session_id, "new");
+    }
+
+    #[test]
+    fn fresh_state_seeds_transition_on_first_outer_scan() {
+        let _guard = CODEX_HOME_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join(".codex");
+        let sessions = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("07");
+        let old_path = sessions.join("rollout-old.jsonl");
+        let new_path = sessions.join("rollout-new.jsonl");
+        write_transcript_at(&old_path, "old", "/repo", "2026-07-07T00:00:00Z");
+        write_transcript_at(&new_path, "new", "/repo", "2026-07-07T02:00:00Z");
+
+        unsafe {
+            std::env::set_var("CODEXCTL_CODEX_HOME", &codex_home);
+        }
+        let process_start = transcript_started_at_ms(Some("2026-07-07T00:00:00Z")).unwrap();
+        let live_process = process(42, "/repo", process_start, "");
+        let mut state = TranscriptAssignmentState::default();
+
+        let first = sessions_from_discovered_processes(vec![live_process.clone()], &mut state);
+        assert_eq!(first[0].session_id, "old");
+        assert_eq!(state.transitions[&42].consecutive_uncached_scans, 1);
+
+        let second = sessions_from_discovered_processes(vec![live_process], &mut state);
         unsafe {
             std::env::remove_var("CODEXCTL_CODEX_HOME");
         }

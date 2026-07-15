@@ -71,7 +71,11 @@ priority. Other candidate transcripts must match the process working directory
 and have a session start time compatible with the process start. Candidates are
 ranked by the distance between process start and transcript start, using the
 timestamp in `session_meta`; file modification time is only a freshness
-constraint and tie-breaker.
+constraint and tie-breaker. When an interactive bare `codex` process resumes an
+older session without exposing its ID in the command line, one otherwise-unused
+older transcript may instead match if it is the only same-directory transcript
+with activity after the process launched. Multiple such transcripts remain
+unassigned.
 
 A transcript may be assigned to at most one live process in a discovery pass.
 The merge layer retains an existing attachment while it remains a valid
@@ -83,7 +87,12 @@ instead of borrowing another process's transcript.
 `/clear` remains a real transcript transition. Once the new transcript has a
 distinct session identity and matches the same process, the TUI replaces the
 old telemetry state while preserving process-level history such as CPU
-samples.
+samples. If multiple newer same-directory transcripts exist, only a unique
+most-recently-modified candidate may enter the transition confirmation; a tie
+keeps the retained transcript. A fresh dashboard may seed the first transition
+observation immediately after establishing its retained assignment, but it may
+switch only after the next outer refresh confirms the same candidate using a
+new uncached scan.
 
 ## Status State Machine
 

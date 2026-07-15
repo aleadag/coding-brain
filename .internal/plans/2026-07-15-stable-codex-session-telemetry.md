@@ -244,11 +244,14 @@ Use one `used_paths` set for the batch and this fixed order:
 2. Assign exact explicit-resume session IDs.
 3. Keep valid retained assignments unless a `/clear` transition has matured.
 4. Repeatedly assign a sole compatible candidate or a mutual unique-best process/transcript edge, removing each assigned process/path before the next pass.
-5. Do not use iteration order to break ties; leave remaining processes unassigned.
+5. For a still-unmatched bare interactive process, assign an older transcript only when it is the sole unused same-cwd transcript whose mtime is at or after the process start.
+6. Do not use iteration order to break ties; leave remaining processes unassigned.
 
 Before returning an unmatched process, invalidate the ten-second transcript-summary cache once and rerun the same deterministic pass. Ordinary scans may use the cache; transition confirmation must use uncached scans.
 
-For a retained process, record a possible `/clear` transition only when the retained transcript mtime did not advance, exactly one newer unclaimed transcript has the same cwd and a later `session_meta` start, and no other process has an equally reliable claim. Keep the retained transcript on the first observation. Promote the new session only when the same candidate satisfies those conditions on the next uncached scan; otherwise clear the transition candidate.
+On the first fresh stateful scan, establish retained assignments and then evaluate transition candidates once from that fresh snapshot. This may seed the first confirmation but must not promote it; the next outer refresh still requires a new uncached scan before switching transcripts.
+
+For a retained process, record a possible `/clear` transition only when the retained transcript mtime did not advance and the newer unclaimed same-cwd transcripts with a later `session_meta` start have a unique greatest mtime that no other process claims equally reliably. Keep the retained transcript on the first observation. Promote the new session only when the same candidate satisfies those conditions on the next uncached scan; otherwise clear the transition candidate. Equal greatest mtimes remain ambiguous.
 
 - [ ] **Step 5: Wire retained mappings through the TUI and remove independent latest-file fallback**
 
