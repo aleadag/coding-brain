@@ -28,6 +28,6 @@ fmt-check:
 clippy:
     cargo clippy -- -D warnings
 
-# Run headless mode as JSON.
-headless-json interval="2000":
-    cargo run -- --headless --json --interval "{{interval}}"
+# Run codexctl, forwarding optional CLI arguments.
+run *args:
+    cargo run -- {{args}}
