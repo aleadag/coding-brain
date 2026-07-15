@@ -1287,12 +1287,15 @@ fn send_enter_to_target(backend: Terminal, target: &str) -> Result<(), String> {
 }
 
 fn is_pending_shell_call(session: &CodexSession) -> bool {
+    let Some(tool) = session.pending_tool_name.as_deref() else {
+        return false;
+    };
+    let Some(input) = session.pending_tool_input.as_deref() else {
+        return false;
+    };
     session.pending_tool_call_id.is_some()
-        && session.pending_tool_input.is_some()
-        && matches!(
-            session.pending_tool_name.as_deref(),
-            Some("exec_command" | "shell" | "Bash")
-        )
+        && (matches!(tool, "exec_command" | "shell" | "Bash")
+            || (tool == "exec" && input.contains("tools.exec_command(")))
 }
 
 fn strip_ansi(value: &str) -> String {
@@ -1329,40 +1332,100 @@ fn fingerprint(value: &str) -> u64 {
     hasher.finish()
 }
 
-fn displayed_command(text: &str, pattern: &ApprovalPromptPattern) -> Option<String> {
-    let cleaned = strip_ansi(text);
-    let lines = cleaned.lines().collect::<Vec<_>>();
-    let question_index = lines.iter().position(|line| {
-        normalize_whitespace(line)
-            .to_ascii_lowercase()
-            .contains(pattern.question)
-    })?;
-    let first_choice = pattern.choice_anchors.first()?;
-    let choice_index = lines
-        .iter()
-        .enumerate()
-        .skip(question_index + 1)
-        .find(|(_, line)| {
-            normalize_whitespace(line)
-                .to_ascii_lowercase()
-                .contains(first_choice)
-        })?
-        .0;
+fn displayed_command(lines: &[&str], question_index: usize, choice_index: usize) -> Option<String> {
     let command_index = lines[question_index + 1..choice_index]
         .iter()
-        .rposition(|line| line.trim_start().starts_with("$ "))?
+        .rposition(|line| line.contains("$ "))?
         + question_index
         + 1;
+    let command_column = lines[command_index].find("$ ")?;
 
     let mut command_lines = Vec::new();
-    command_lines.push(lines[command_index].trim_start()[2..].trim());
+    command_lines.push(lines[command_index][command_column + 2..].trim());
     for line in &lines[command_index + 1..choice_index] {
-        if line.trim().is_empty() {
+        let continuation = line.get(command_column..).unwrap_or(line).trim();
+        if continuation.is_empty() {
             break;
         }
-        command_lines.push(line.trim());
+        command_lines.push(continuation);
     }
     Some(normalize_whitespace(&command_lines.join(" ")))
+}
+
+fn strip_prompt_gutter(line: &str) -> &str {
+    let Some((prefix, content)) = line.split_once('│') else {
+        return line;
+    };
+    let marker = prefix.trim();
+    if marker.is_empty()
+        || marker.chars().all(|character| {
+            character.is_ascii_digit() || character.is_ascii_whitespace() || character == '#'
+        })
+    {
+        let mut content = content.trim_end();
+        for _ in 0..2 {
+            let Some(stripped) = content.strip_suffix('│') else {
+                break;
+            };
+            content = stripped.trim_end();
+        }
+        content
+    } else {
+        line
+    }
+}
+
+fn last_approval_prompt(text: &str) -> Option<(&'static ApprovalPromptPattern, String, String)> {
+    let cleaned = strip_ansi(text);
+    let lines = cleaned.lines().map(strip_prompt_gutter).collect::<Vec<_>>();
+    let normalized = lines
+        .iter()
+        .map(|line| normalize_whitespace(line).to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    let question_index = (0..lines.len()).rev().find(|index| {
+        APPROVAL_PROMPT_PATTERNS
+            .iter()
+            .any(|pattern| normalized[*index].contains(pattern.question))
+    })?;
+    for pattern in APPROVAL_PROMPT_PATTERNS {
+        if !normalized[question_index].contains(pattern.question) {
+            continue;
+        }
+
+        let mut cursor = question_index + 1;
+        let mut first_choice_index = None;
+        let mut complete = true;
+        for anchor in pattern.choice_anchors {
+            let Some(choice_index) = normalized[cursor..]
+                .iter()
+                .position(|line| line.contains(anchor))
+                .map(|relative| cursor + relative)
+            else {
+                complete = false;
+                break;
+            };
+            first_choice_index.get_or_insert(choice_index);
+            cursor = choice_index + 1;
+        }
+        if !complete {
+            continue;
+        }
+
+        let Some(confirmation_index) = normalized[cursor..]
+            .iter()
+            .position(|line| line.contains(pattern.confirmation))
+            .map(|relative| cursor + relative)
+        else {
+            continue;
+        };
+        let command = displayed_command(&lines, question_index, first_choice_index?)?;
+        let block = normalize_whitespace(&lines[question_index..=confirmation_index].join("\n"))
+            .to_ascii_lowercase();
+        return Some((pattern, command, block));
+    }
+
+    None
 }
 
 fn match_approval_prompt(
@@ -1374,34 +1437,27 @@ fn match_approval_prompt(
     }
     let call_id = session.pending_tool_call_id.as_deref()?;
     let tool = session.pending_tool_name.as_deref()?;
-    let command = session.pending_tool_input.as_deref()?;
-    let pane = normalize_whitespace(&capture.text).to_ascii_lowercase();
-    let command_normalized = normalize_whitespace(command).to_ascii_lowercase();
-
-    let (pattern, block) = APPROVAL_PROMPT_PATTERNS.iter().find_map(|pattern| {
-        let start = pane.find(pattern.question)?;
-        let mut cursor = start + pattern.question.len();
-        for anchor in pattern.choice_anchors {
-            let relative = pane[cursor..].find(anchor)?;
-            cursor += relative + anchor.len();
-        }
-        let relative = pane[cursor..].find(pattern.confirmation)?;
-        let end = cursor + relative + pattern.confirmation.len();
-        let block = &pane[start..end];
-        (displayed_command(&capture.text, pattern)?.to_ascii_lowercase() == command_normalized)
-            .then_some((pattern, block))
-    })?;
+    let pending_input = session.pending_tool_input.as_deref()?;
+    let (pattern, displayed_command, block) = last_approval_prompt(&capture.text)?;
+    let is_wrapper = tool == "exec" && pending_input.contains("tools.exec_command(");
+    if !is_wrapper
+        && !normalize_whitespace(&displayed_command)
+            .eq_ignore_ascii_case(&normalize_whitespace(pending_input))
+    {
+        return None;
+    }
+    let evidence_tool = if is_wrapper { "exec_command" } else { tool };
 
     Some(ApprovalEvidence {
         session_id: session.session_id.clone(),
         tty: session.tty.clone(),
         call_id: call_id.into(),
-        tool: tool.into(),
-        command: command.into(),
+        tool: evidence_tool.into(),
+        command: displayed_command,
         backend: capture.backend.clone(),
         target: capture.target.clone(),
         prompt_pattern_version: pattern.version,
-        prompt_fingerprint: fingerprint(block),
+        prompt_fingerprint: fingerprint(&block),
     })
 }
 
@@ -1415,13 +1471,18 @@ fn refresh_approval_observation_with(
         session.approval = ApprovalObservation::NotChecked;
         return;
     }
-    session.approval = match io.capture(session) {
+    let observation = match io.capture(session) {
         Ok(capture) => match match_approval_prompt(&capture, session) {
             Some(evidence) => ApprovalObservation::Confirmed(evidence),
             None => ApprovalObservation::Unknown("no matching Codex approval prompt".into()),
         },
         Err(error) => ApprovalObservation::Unknown(error),
     };
+    if let ApprovalObservation::Confirmed(evidence) = &observation {
+        session.pending_tool_name = Some(evidence.tool.clone());
+        session.pending_tool_input = Some(evidence.command.clone());
+    }
+    session.approval = observation;
 }
 
 pub fn refresh_approval_observation(session: &mut CodexSession) {
@@ -1514,6 +1575,12 @@ mod tests {
         session
     }
 
+    fn pending_exec_wrapper_session(call_id: &str, input: &str) -> CodexSession {
+        let mut session = pending_shell_session(call_id, input);
+        session.pending_tool_name = Some("exec".into());
+        session
+    }
+
     impl ApprovalIo for FakeApprovalIo {
         fn capture(&self, _session: &CodexSession) -> Result<PaneCapture, String> {
             self.captures.lock().unwrap().pop_front().unwrap()
@@ -1543,6 +1610,78 @@ mod tests {
             session.approval,
             ApprovalObservation::Confirmed(_)
         ));
+    }
+
+    #[test]
+    fn exec_wrapper_uses_last_complete_visible_prompt() {
+        let earlier = include_str!("../../../../tests/fixtures/codex-shell-approval-pane.txt")
+            .replace("$ cargo test", "$ cargo clippy");
+        let current = include_str!("../../../../tests/fixtures/codex-shell-approval-pane.txt");
+        let pane = format!("{earlier}\n\n{current}");
+        let mut session = pending_exec_wrapper_session(
+            "call-7",
+            "const args = next(); await tools.exec_command(args);",
+        );
+        let io = FakeApprovalIo::with_captures([Ok(capture(&pane))]);
+
+        refresh_approval_observation_with(&io, &mut session, 10_000);
+
+        let ApprovalObservation::Confirmed(evidence) = &session.approval else {
+            panic!("wrapper approval was not confirmed");
+        };
+        assert_eq!(evidence.tool, "exec_command");
+        assert_eq!(evidence.command, "cargo test");
+        assert_eq!(session.pending_tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(session.pending_tool_input.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn exec_wrapper_without_nested_shell_is_not_actionable() {
+        let mut session = pending_exec_wrapper_session("call-7", "text(true);");
+        let io = FakeApprovalIo::with_captures([Ok(capture(include_str!(
+            "../../../../tests/fixtures/codex-shell-approval-pane.txt"
+        )))]);
+
+        refresh_approval_observation_with(&io, &mut session, 10_000);
+
+        assert!(matches!(session.approval, ApprovalObservation::NotChecked));
+    }
+
+    #[test]
+    fn exec_wrapper_reads_prompt_inside_neovim_gutter() {
+        let pane = include_str!("../../../../tests/fixtures/codex-shell-approval-pane.txt")
+            .lines()
+            .enumerate()
+            .map(|(index, line)| format!("{:>4} # │{line} │ │", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut session =
+            pending_exec_wrapper_session("call-7", "await tools.exec_command(runtime_args);");
+        let io = FakeApprovalIo::with_captures([Ok(capture(&pane))]);
+
+        refresh_approval_observation_with(&io, &mut session, 10_000);
+
+        let ApprovalObservation::Confirmed(evidence) = &session.approval else {
+            panic!("guttered wrapper approval was not confirmed");
+        };
+        assert_eq!(evidence.command, "cargo test");
+    }
+
+    #[test]
+    fn newer_incomplete_prompt_blocks_older_complete_prompt() {
+        let current = include_str!("../../../../tests/fixtures/codex-shell-approval-pane.txt");
+        let pane = format!(
+            "{current}\n\nWould you like to run the following command?\n\n$ cargo clippy\n"
+        );
+        let wrapper = "await tools.exec_command(runtime_args);";
+        let mut session = pending_exec_wrapper_session("call-7", wrapper);
+        let io = FakeApprovalIo::with_captures([Ok(capture(&pane))]);
+
+        refresh_approval_observation_with(&io, &mut session, 10_000);
+
+        assert!(matches!(session.approval, ApprovalObservation::Unknown(_)));
+        assert_eq!(session.pending_tool_name.as_deref(), Some("exec"));
+        assert_eq!(session.pending_tool_input.as_deref(), Some(wrapper));
     }
 
     #[test]
