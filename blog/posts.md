@@ -151,7 +151,7 @@ Happy to answer questions about keeping the dependency count low or the no-async
 
 ## 5. r/commandline
 
-**Title:** codexctl: orchestrate a swarm of Codex agents with a local-LLM brain that learns from you
+**Title:** codexctl: supervise Codex sessions with a local brain that learns from you
 
 **Body:**
 

@@ -143,7 +143,7 @@ pub(crate) enum Command {
 #[command(
     name = "codexctl",
     version,
-    about = "Orchestrate Codex sessions with a local-LLM brain that learns from you."
+    about = "Supervise Codex sessions with a local brain that learns from you."
 )]
 pub(crate) struct Cli {
     // ── Dashboard ───────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ pub(crate) struct Cli {
     #[arg(short, long, help_heading = "Output Modes")]
     pub(crate) watch: bool,
 
-    /// Run headless with brain, coordination, and context rot prevention active (no TUI).
+    /// Run headless with brain evaluation and context rot prevention active (no TUI).
     /// Attach a dashboard with `codexctl` in another terminal.
     #[arg(long, help_heading = "Output Modes")]
     pub(crate) headless: bool,

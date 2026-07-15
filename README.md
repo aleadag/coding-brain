@@ -1,123 +1,101 @@
 # codexctl
 
-Control plane for Codex sessions with a local-LLM brain, multi-session coordination, and terminal dashboard.
+codexctl is a local-brain companion for Codex sessions. It observes active sessions, evaluates pending actions with deterministic rules and a local LLM, learns from operator corrections, and can execute high-confidence decisions when `--auto-run` is enabled.
 
-`codexctl` watches Codex JSONL transcripts under `~/.codex/sessions`, tracks session health, coordinates parallel work, and can use a local model to approve, deny, route, or terminate work according to your rules. It is local-first: decision logs, preferences, coordination state, and learned examples stay on your machine.
+It reads Codex transcripts from your machine and presents session state, health, cost, and context pressure in one terminal dashboard. Advisory mode is the default: the brain recommends an action and leaves control with you.
 
 ## Install
 
 ```bash
 cargo install codexctl
+# or, from this repository
 cargo install --path .
 ```
 
-The package builds the `codexctl` binary and the `codexctl-core` / `codexctl-tui` workspace crates.
-
-## Get Started
+## Quick start
 
 ```bash
-codexctl init                # Onboarding wizard
-codexctl doctor              # Verify install and runtime health
-codexctl                     # Live dashboard for Codex sessions
-codexctl --brain             # Enable local LLM supervision
+codexctl init
+codexctl doctor
+codexctl
 ```
 
-After upgrading, run:
-
-```bash
-codexctl init --upgrade
-```
-
-This refreshes Codex hook entries and local database migrations.
-
-## What It Does
-
-- **Codex transcript discovery**: reads recursive `~/.codex/sessions/**/rollout-*.jsonl` session transcripts.
-- **Local LLM supervision**: uses OpenAI-compatible local endpoints such as Ollama, llama.cpp, vLLM, or LM Studio.
-- **Multi-session orchestration**: runs dependency-ordered tasks, coordinates handoffs, and detects file conflicts.
-- **Health monitoring**: detects loops, stalls, context pressure, cost spikes, and long-running blocked work.
-- **Learning from corrections**: stores approval/rejection outcomes locally and adapts confidence thresholds per project and tool.
-- **Terminal integration**: supports Ghostty, Kitty, tmux, WezTerm, Warp, iTerm2, Terminal.app, Gnome Terminal, and Windows Terminal where available.
-
-## Local LLM Brain
+To enable the brain with Ollama:
 
 ```bash
 ollama pull gemma4:e4b
 ollama serve
 codexctl --brain
-codexctl --brain --auto-run
 ```
 
-The brain can:
+Use `codexctl --brain --auto-run` only when you want high-confidence suggestions executed automatically. Without `--auto-run`, suggestions remain advisory.
 
-- approve routine reads, searches, and test commands,
-- deny risky or destructive commands,
-- route summarized context between sessions,
-- terminate sessions that appear stuck or unsafe,
-- suggest durable rules from repeated corrections.
+## What the brain can do
 
-Prompt overrides live in:
+The six immediate actions are:
 
-```text
-~/.codexctl/brain/prompts/
-```
+- `approve`: allow a pending tool call.
+- `deny`: reject a risky or unwanted tool call.
+- `send`: send text to a waiting session.
+- `terminate`: stop a session.
+- `route`: send summarized context to another live session.
+- `spawn`: open a new Codex session for an immediate subtask.
 
-State is still stored under `~/.codexctl` for upgrade compatibility.
+These are live, best-effort actions. codexctl does not own a durable task ledger, dependency queue, worker pool, or distributed coordinator.
 
-## Build And Test
+## Learning and review
+
+Brain decisions, outcomes, preferences, prompt overrides, review data, and mailbox state remain under `~/.codexctl/brain/`. Useful commands include:
 
 ```bash
-cargo build
-cargo test
-cargo clippy -- -D warnings
-cargo fmt --check
+codexctl --brain-review list
+codexctl --brain-review
+codexctl --brain-stats scorecard
+codexctl --brain-baseline
+codexctl --brain-briefing --project my-project
 ```
 
-Release builds:
+Prompt overrides live in `~/.codexctl/brain/prompts/`. The session mailbox is local and delivery is best effort: a message is marked delivered only after terminal input succeeds.
 
-```bash
-cargo build --release
-cargo build --release --features "bus,coord,relay,hive"
-```
+## Privacy
+
+The default brain endpoint is loopback-only. If an enabled brain uses a non-loopback endpoint, codexctl warns that transcript context may leave the machine. Review the endpoint's privacy policy before continuing.
+
+## External coordination with Beads
+
+codexctl deliberately keeps durable project coordination outside the process. If you need tasks, dependencies, claims, blockers, gates, or handoffs across sessions, use [Beads](https://github.com/steveyegge/beads) or another external tracker. Beads is optional and is not a codexctl runtime dependency.
+
+## Compatibility
+
+Configuration stays in `.codexctl.toml` and `~/.config/codexctl/config.toml`; state stays under `~/.codexctl`. Legacy `[relay]`, `[hive]`, `[idle]`, `[agents.*]`, and `lifecycle.retention_days` settings are ignored with warnings.
+
+Normal startup and `codexctl init --upgrade` leave legacy data untouched. `codexctl init --purge` is the explicit destructive cleanup path.
 
 ## Architecture
 
-This is a three-crate Cargo workspace:
-
-```text
-crates/
-├── codexctl-core/    # core types, discovery, monitoring, runtime traits
-└── codexctl-tui/     # terminal UI, demo fixtures, recording
-src/                   # codexctl binary: brain, bus, coord, hive, relay, init
-```
-
-Dependency direction is strict:
-
 ```text
 codexctl -> codexctl-tui -> codexctl-core
+
+crates/
+├── codexctl-core/    # session types, discovery, monitoring, runtime contracts
+└── codexctl-tui/     # terminal UI, recording, demo fixtures
+src/                   # binary wiring, local brain, configuration, init
 ```
 
-`codexctl-core` must not depend on binary-only modules.
+Codex integration uses:
 
-## Codex Integration Points
+- `~/.codex/sessions/**/rollout-*.jsonl` for session discovery.
+- `.codex/hooks.json` and `~/.codex/hooks.json` for hook installation.
+- `~/.codex/skills`, plugin skills, and project `.codex/skills` for discovery.
+- supported terminal backends for input, focus, launch, and termination.
 
-- `~/.codex/sessions/**/rollout-*.jsonl` for session discovery and monitoring.
-- `.codex/hooks.json` and `~/.codex/hooks.json` for hook install.
-- `~/.codex/skills` and `~/.codex/plugins/*/skills` for skill discovery.
-- `codex` and `codex exec` for launched or delegated work.
+## Build and test
 
-## Configuration
-
-Project config:
-
-```text
-.codexctl.toml
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Global config:
-
-```text
-~/.config/codexctl/config.toml
-```
-
-These paths remain unchanged for compatibility with existing installs.
+See the [documentation](https://aleadag.github.io/codexctl/) for setup, configuration, CLI reference, terminal support, and troubleshooting.

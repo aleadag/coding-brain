@@ -9,11 +9,11 @@
 #
 # Targets:
 #   all        - Record all GIFs (default)
-#   hero       - Full dashboard with all features (~50s, press q after one cycle)
+#   hero       - Full local dashboard (~50s, press q after one cycle)
 #   health     - Health monitoring showcase (~20s)
 #   brain      - Brain + rules showcase (~26s)
 #   overview   - Quick dashboard overview (~12s)
-#   skills     - Skills & Hive mode (~30s, requires CODEXCTL_DEMO_SKILLS=1)
+#   skills     - Local skill discovery (~30s, requires CODEXCTL_DEMO_SKILLS=1)
 #
 # Requirements:
 #   - agg (cargo install agg, or: brew install agg)
@@ -88,18 +88,18 @@ target="${1:-all}"
 
 case "$target" in
     hero|all)
-        # Full cycle: 24 ticks * 2s = 48s — captures all features
+        # Full cycle: 24 ticks * 2s = 48s.
         record_gif "demo-hero" 50 "Full dashboard with health, brain, rules, routing"
         ;;&
 
     health|all)
-        # Health icons visible from the start (cache, stall, context, cost spike, loops)
-        record_gif "demo-health" 20 "Health monitoring — cache, context, cost, stalls, loops"
+        # Health icons are visible from the start.
+        record_gif "demo-health" 20 "Health monitoring — cache, context, cost, stalls"
         ;;&
 
     brain|all)
-        # Rules fire at ticks 3,5,8; brain at 10,13,15; routing at 18
-        record_gif "demo-brain-rules" 40 "Brain auto-pilot and rules engine"
+        # Rules and brain decisions appear throughout the scripted demo.
+        record_gif "demo-brain-rules" 40 "Local brain and rules engine"
         ;;&
 
     overview|all)
@@ -108,16 +108,15 @@ case "$target" in
         ;;&
 
     skills|all)
-        # Skills & Hive mode — auto-opens K view, cycles Skills → Hive → Skills.
-        # 30s captures ~2 full cycles of the scripted tab rotation in refresh_demo.
+        # Auto-open the local Skills view.
         export CODEXCTL_DEMO_SKILLS=1
-        record_gif "codexctl-demo-skills" 30 "Skills & Hive — discover, share, invite, join"
+        record_gif "codexctl-demo-skills" 30 "Discover locally installed skills"
         unset CODEXCTL_DEMO_SKILLS
         ;;&
 
     social)
         # 30-second showcase for social media (README, Twitter, etc.)
-        record_gif "demo-social" 30 "30s social media showcase — brain + health + orchestration"
+        record_gif "demo-social" 30 "30s social media showcase — brain + health"
         echo ""
         echo "Next steps for social sharing:"
         echo "  1. Compress: gifsicle -O3 --lossy=80 $OUT_DIR/demo-social.gif -o $OUT_DIR/demo-social-opt.gif"

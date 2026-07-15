@@ -2,6 +2,23 @@
 
 All notable changes to codexctl are documented here.
 
+## [0.58.0] - 2026-07-15
+
+### Changed
+
+- **Breaking:** codexctl is now a focused local-brain companion. The built-in
+  coordinator, supervisor, loop runner, agent bus, relay, hive, prompt
+  decomposition, and dependency task execution surfaces have been removed.
+- Advisory decisions remain the default. Use `--auto-run` to opt into
+  high-confidence automatic actions.
+- Use Beads or another external system for durable task tracking, dependencies,
+  and multi-agent coordination.
+- Existing legacy configuration and data under `~/.codexctl` are left
+  untouched. Remove them only with the explicit purge workflow.
+
+Before upgrading, back up `~/.codexctl` if you may need the old stores. To
+restore the removed functionality, roll back to `0.57.2`.
+
 ## [0.57.2] - 2026-06-07
 
 ### Added — `codexctl init --upgrade` + plugin-version doctor row (closes #327)

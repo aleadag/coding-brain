@@ -1,6 +1,6 @@
 # codexctl
 
-Codex-only control plane for supervising, coordinating, and learning from Codex sessions.
+Local-brain companion for supervising and learning from Codex sessions.
 
 ## Build And Test
 
@@ -27,7 +27,7 @@ The workspace crates are `codexctl-core` and `codexctl-tui`; the runtime integra
 crates/
 ├── codexctl-core/    # session types, Codex transcript discovery, monitor, runtime traits
 └── codexctl-tui/     # terminal UI, recording, demo fixtures
-src/                   # codexctl binary: brain, bus, coord, hive, relay, init
+src/                   # codexctl binary: brain, config, init, runtime
 ```
 
 `codexctl-core` must not depend on binary-only modules. The TUI communicates with the binary through runtime traits in `crates/codexctl-core/src/runtime.rs`.

@@ -60,18 +60,28 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+cargo build
+cargo test
+cargo clippy -- -D warnings
+cargo fmt --check
 ```
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+codexctl is a three-crate Rust workspace:
+
+```text
+codexctl -> codexctl-tui -> codexctl-core
+```
+
+The binary owns the local brain, configuration, onboarding, and runtime adapters.
+The TUI consumes runtime traits from `codexctl-core`; core must not depend on
+binary-only modules.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Keep changes surgical and preserve the brain-only product boundary.
+- Coordination and durable task tracking belong to external tools such as Beads.
+- Use Jujutsu for version-control operations in this repository.
+- Format jj descriptions as `<emoji> <type>: <imperative summary>`.

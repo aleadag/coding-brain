@@ -1,70 +1,33 @@
 # codexctl
 
-> Orchestrate a swarm of Codex agents with a local-LLM brain that learns from you.
+codexctl is a local-brain companion and terminal dashboard for Codex sessions.
 
-codexctl is a Rust TUI that monitors all your Codex sessions from one terminal. It shows which agent is blocked, burning budget, waiting for approval, or stalled - and lets you intervene without tab hunting.
+Primary capabilities:
+- Discover local Codex rollouts under ~/.codex/sessions/**/rollout-*.jsonl.
+- Show status, health, cost, context pressure, and supported terminal actions.
+- Evaluate pending actions with deterministic rules and a local LLM.
+- Keep advisory mode by default; --auto-run executes high-confidence actions.
+- Immediate actions: approve, deny, send, terminate, route, and spawn.
+- Learn from local decisions, outcomes, preferences, and canonical review examples.
+- Deliver best-effort local mailbox messages to live sessions.
 
-## Install
+Privacy:
+- Brain data remains under ~/.codexctl/brain.
+- Non-loopback endpoints trigger a warning because transcript context may leave the machine.
 
-```
-brew install aleadag/tap/codexctl
-cargo install codexctl
-```
+Compatibility:
+- Config paths remain .codexctl.toml and ~/.config/codexctl/config.toml.
+- Legacy relay, hive, idle, external-agent, and retention settings are ignored with warnings.
+- Normal upgrade preserves legacy state; codexctl init --purge is destructive.
 
-Setup:
-```
-codexctl --init    # wire up Codex hooks (one-time)
-codexctl           # launch dashboard
-codexctl --demo    # try with fake sessions
-```
+Durable coordination:
+- codexctl has no durable task queue or distributed coordinator.
+- Beads or another external tracker can manage tasks, dependencies, claims, blockers, gates, and handoffs.
 
-## Key Features
-
-- Live dashboard: status, burn rate, context %, CPU, memory, tokens, sparklines for all sessions
-- One-key actions: approve (y), send input (i), launch new session (n), kill (d), record GIF (R)
-- Budget enforcement: per-session and daily limits with auto-kill
-- Local LLM brain: ollama/gemma auto-approves safe commands, denies dangerous ones, learns from corrections
-- Auto-rules engine: TOML rules to approve/deny by tool name, command pattern, project, cost
-- Health monitoring: detects stalls, context saturation, cache issues, cost spikes, retry loops
-- Multi-session orchestration: dependency-ordered task graphs, prompt decomposition into parallel DAGs
-- Event hooks: desktop notifications, shell commands, webhooks on session events
-- Session recording: highlight reels as GIFs (edits, commands, errors - strips idle time)
-- Relay & hive mind: connect instances across machines, share brain learnings peer-to-peer
-- Remote task delegation: offload tasks to connected peers with status streaming
-- Discovery: invite codes, word phrases, QR codes, LAN broadcast scanning
-- Terminal support: Ghostty, tmux, Kitty, Warp, iTerm2, Terminal.app, WezTerm, GNOME Terminal
-
-## How It Works
-
-Reads Codex's local files (no API keys, no network, read-only):
-- ~/.codex/sessions/*.json - session metadata
-- ~/.codex/projects/{slug}/*.jsonl - conversation logs with token usage
-- ps - CPU%, memory, TTY per process
-
-Status inference uses multiple signals: waiting_for_task events, CPU thresholds, stop_reason fields, message recency.
-
-## Architecture
-
-~1 MB binary, sub-50ms startup, 7 runtime crates, no async runtime.
-
-Core: main.rs, app.rs, session.rs, discovery.rs, monitor.rs, process.rs, config.rs, history.rs, hooks.rs, orchestrator.rs, health.rs, rules.rs, launch.rs, models.rs
-Brain: engine.rs, client.rs, context.rs, decisions.rs, agents.rs, mailbox.rs, prompts.rs, evals.rs, insights.rs
-Relay: mod.rs, cli.rs, crypto.rs, protocol.rs, peer.rs, listener.rs, mesh.rs, delegation.rs, worker.rs, invite.rs, lan.rs
-Hive: mod.rs, cli.rs, store.rs, distiller.rs, merger.rs, gossip.rs, trust.rs, injection.rs
-TUI: table.rs, detail.rs, help.rs, status_bar.rs
-Terminals: ghostty, kitty, tmux, wezterm, warp, iterm2, terminal_app, gnome_terminal, windows_terminal
-
-## Docs
-
-- [Quick Start](https://aleadag.github.io/codexctl/quickstart/)
-- [Configuration](https://aleadag.github.io/codexctl/configuration/)
-- [Reference](https://aleadag.github.io/codexctl/reference/)
-- [Terminal Support](https://aleadag.github.io/codexctl/terminal-support/)
-- [Troubleshooting](https://aleadag.github.io/codexctl/troubleshooting/)
-- [Relay & Hive Mind](https://aleadag.github.io/codexctl/relay/)
-- [Contributing](https://aleadag.github.io/codexctl/contributing/)
-
-## Links
-
-- Source: https://github.com/aleadag/codexctl
-- License: MIT
+Docs:
+- https://aleadag.github.io/codexctl/quickstart/
+- https://aleadag.github.io/codexctl/configuration/
+- https://aleadag.github.io/codexctl/reference/
+- https://aleadag.github.io/codexctl/terminal-support/
+- https://aleadag.github.io/codexctl/troubleshooting/
+- https://aleadag.github.io/codexctl/contributing/

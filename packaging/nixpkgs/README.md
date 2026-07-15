@@ -31,7 +31,7 @@ rustPlatform.buildRustPackage rec {
   cargoHash = lib.fakeHash;
 
   meta = {
-    description = "Orchestrate a swarm of Codex agents with a local-LLM brain that learns from you.";
+    description = "Supervise Codex sessions with a local brain that learns from you.";
     homepage = "https://github.com/aleadag/codexctl";
     license = lib.licenses.mit;
     mainProgram = "codexctl";

@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "codexctl"
-version = "0.57.2"
+version = "0.58.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "codexctl-core"
-version = "0.52.1"
+version = "0.53.0"
 dependencies = [
  "crossterm",
  "libc",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "codexctl-tui"
-version = "0.52.1"
+version = "0.53.0"
 dependencies = [
  "codexctl-core",
  "crossterm",

@@ -17,11 +17,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Default features now include bus+coord+relay+hive (mirrors the
-      # Homebrew bottle). The no-default-features matrix preserves coverage
-      # of the minimal sync-only build path.
       - run: cargo check --all-targets
-      - run: cargo check --all-targets --no-default-features --features hive
 
   fmt:
     name: Format
@@ -43,7 +39,6 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --all-targets --no-default-features --features hive -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -56,7 +51,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
-      - run: cargo test --all-targets --no-default-features --features hive
 
   # Workspace refactor (#279) — verify codexctl-core builds and tests
   # standalone, without the binary crate. Guards the
@@ -105,10 +99,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: No `crate::{brain,bus,coord,hive,relay,init,orchestrator,launch,hooks,recorder,session_recorder,app,ui,demo}` inside codexctl-core
+      - name: No binary modules inside codexctl-core
         run: |
           set -e
-          PATTERN='crate::(brain|bus|coord|hive|relay|init|orchestrator|launch|hooks|recorder|session_recorder|app|ui|demo)\b'
+          PATTERN='crate::(brain|init|launch|hooks|recorder|session_recorder|app|ui|demo)\b'
           if grep -rEn "${PATTERN}" crates/codexctl-core/src/ ; then
             echo "::error::codexctl-core must not depend on binary-crate modules. See #279 dependency rule."
             exit 1

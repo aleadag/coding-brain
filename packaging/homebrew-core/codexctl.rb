@@ -1,5 +1,5 @@
 class Codexctl < Formula
-  desc "Orchestrate a swarm of Codex agents with a learning local-LLM brain"
+  desc "Supervise Codex sessions with a learning local brain"
   homepage "https://github.com/aleadag/codexctl"
   url "https://github.com/aleadag/codexctl/archive/refs/tags/v0.49.3.tar.gz"
   sha256 "601bad4b04822b5910ddd05833de955d238874476270f0a0a26262a8a513b6fd"

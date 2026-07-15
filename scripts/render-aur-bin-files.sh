@@ -15,7 +15,7 @@ cat >"${OUT_DIR}/PKGBUILD" <<EOF
 pkgname=codexctl-bin
 pkgver=${VERSION}
 pkgrel=1
-pkgdesc='Orchestrate a swarm of Codex agents with a learning local-LLM brain'
+pkgdesc='Supervise Codex sessions with a learning local brain'
 arch=('x86_64')
 url='https://github.com/aleadag/codexctl'
 license=('MIT')
@@ -38,7 +38,7 @@ EOF
 
 cat >"${OUT_DIR}/.SRCINFO" <<EOF
 pkgbase = codexctl-bin
-	pkgdesc = Orchestrate a swarm of Codex agents with a learning local-LLM brain
+	pkgdesc = Supervise Codex sessions with a learning local brain
 	pkgver = ${VERSION}
 	pkgrel = 1
 	url = https://github.com/aleadag/codexctl

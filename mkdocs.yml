@@ -1,6 +1,6 @@
 site_name: codexctl
 site_url: https://aleadag.github.io/codexctl/
-site_description: Orchestrate a swarm of Codex agents with a local-LLM brain that learns from you.
+site_description: A local-brain companion for supervising Codex sessions.
 repo_url: https://github.com/aleadag/codexctl
 repo_name: aleadag/codexctl
 
@@ -44,8 +44,6 @@ nav:
   - Quick Start: quickstart.md
   - Configuration: configuration.md
   - Reference: reference.md
-  - Agent Bus: agent-bus.md
-  - Relay & Hive Mind: relay.md
   - Terminal Support: terminal-support.md
   - Troubleshooting: troubleshooting.md
   - Contributing: contributing.md

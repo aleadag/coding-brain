@@ -3,7 +3,7 @@
 pkgname=codexctl-bin
 pkgver=0.16.0
 pkgrel=1
-pkgdesc='Orchestrate a swarm of Codex agents with a learning local-LLM brain'
+pkgdesc='Supervise Codex sessions with a learning local brain'
 arch=('x86_64')
 url='https://github.com/aleadag/codexctl'
 license=('MIT')

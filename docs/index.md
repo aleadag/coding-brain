@@ -1,209 +1,49 @@
 # codexctl
 
-**Orchestrate a swarm of Codex agents with a local-LLM brain that learns from you.**
+codexctl is a local-brain companion for Codex sessions. It observes active sessions, evaluates pending actions with deterministic rules and a local LLM, learns from operator corrections, and can execute high-confidence decisions when `--auto-run` is enabled.
 
-<p class="hero-tagline">
-Know which agent is blocked, burning budget, waiting for approval, or stalled - and intervene without tab hunting.
-</p>
+The dashboard reads local Codex transcripts and shows which sessions are processing, waiting, blocked, finished, unhealthy, or approaching budget and context limits.
 
-<div class="proof-strip">
-  <span>~6 MB binary (full features)</span>
-  <span>Sub-50ms startup</span>
-  <span>Zero config</span>
-  <span>macOS &amp; Linux</span>
-</div>
-
-![codexctl dashboard demo](assets/codexctl-demo-hero.gif){ .terminal-screenshot }
-
-## Install
-
-=== "Homebrew"
-
-    ```bash
-    brew install aleadag/tap/codexctl
-    ```
-
-=== "Cargo"
-
-    ```bash
-    cargo install codexctl
-    ```
-
-Then wire up Codex hooks and start the dashboard:
+## Start here
 
 ```bash
-codexctl --init    # one-time setup
-codexctl           # launch dashboard
+cargo install codexctl
+codexctl init
+codexctl doctor
+codexctl
 ```
 
-Or try it without Codex running:
+Enable a local brain with:
 
 ```bash
-codexctl --demo
+ollama pull gemma4:e4b
+ollama serve
+codexctl --brain
 ```
 
-See the [Quick Start](quickstart.md) for the full walkthrough.
+Advisory mode is the default. Add `--auto-run` only when codexctl should execute high-confidence actions automatically.
 
-## Features
+## Immediate actions
 
-<div class="feature-grid" markdown>
-<div class="feature-item" markdown>
+The brain can approve, deny, send input, terminate a session, route summarized context to another live session, or spawn a new Codex session. These actions operate on live sessions; codexctl does not maintain a durable task queue.
 
-### Live Dashboard
+## Local learning
 
-See every session's status, burn rate, context usage, activity sparkline, CPU, memory, and subagent rows in one place.
+Decisions, outcomes, preferences, canonical review examples, prompt overrides, and mailbox state are stored below `~/.codexctl/brain/`. Review the learning loop with `codexctl --brain-review` and inspect metrics with `codexctl --brain-stats scorecard`.
 
-</div>
-<div class="feature-item" markdown>
+## Privacy
 
-### Intervene Fast
+Local loopback endpoints keep transcript context on the machine. codexctl emits an advisory before using a non-loopback brain endpoint because transcript context may leave the machine.
 
-Approve prompts, send input, jump to the right terminal tab, or kill a runaway session - without leaving the dashboard.
+## Durable work
 
-</div>
-<div class="feature-item" markdown>
+For durable tasks, dependencies, claims, blockers, gates, and handoffs, use [Beads](https://github.com/steveyegge/beads) or another external tracker. Beads is optional; codexctl does not embed or require it.
 
-### Budget Enforcement
+## Documentation
 
-Set per-session or daily spending limits. Alert at 80%, auto-kill at 100%. Track live $/hr burn rate.
-
-</div>
-<div class="feature-item" markdown>
-
-### Local LLM Brain
-
-A local model (ollama/gemma) watches sessions, auto-approves safe commands, denies dangerous ones. Learns from your corrections. All on-device.
-
-</div>
-<div class="feature-item" markdown>
-
-### Auto-Rules Engine
-
-TOML rules to approve, deny, send, terminate, route, or spawn based on tool name, command pattern, project, or cost threshold.
-
-</div>
-<div class="feature-item" markdown>
-
-### Health Monitoring
-
-10 automatic checks: stalled sessions, context saturation, cache ratio, cost spikes, retry loops, cognitive decay, proactive compaction, token efficiency, error acceleration, and repetition detection - no config needed.
-
-</div>
-<div class="feature-item" markdown>
-
-### Multi-Session Orchestration
-
-Run dependency-ordered task graphs across sessions. Decompose prompts into parallel DAGs.
-
-</div>
-<div class="feature-item" markdown>
-
-### Event Hooks
-
-Trigger desktop notifications, shell commands, and webhooks when sessions need attention.
-
-</div>
-<div class="feature-item" markdown>
-
-### Session Recording
-
-Press `R` to record a session highlight reel as a GIF. Extracts edits, commands, errors - strips idle time.
-
-</div>
-<div class="feature-item" markdown>
-
-### Relay & Hive Mind
-
-Connect codexctl instances across machines. Share brain learnings, delegate tasks, and build a convergent hive mind - all peer-to-peer. [Learn more](relay.md)
-
-</div>
-<div class="feature-item" markdown>
-
-### Agent Bus (preview)
-
-Durable role directory + persistent mailbox exposed as an MCP server. Running Codex instances discover each other, look up their own role, send directed messages, and drain their inbox at turn boundaries. Phases 1-4 of the [design spec](AGENT_BUS.md) are shipped behind `--features bus`.
-
-</div>
-<div class="feature-item" markdown>
-
-### Headless Daemon
-
-Run without the TUI via `--headless`. Brain, coordination, and context rot prevention stay active while you work. Attach a dashboard from another terminal anytime.
-
-</div>
-<div class="feature-item" markdown>
-
-### Session Autopsy
-
-Post-mortem analysis on completed sessions via `--autopsy`. Inspect what went wrong, what burned cost, and where the session stalled - after the fact.
-
-</div>
-</div>
-
-## Screenshots
-
-Skills & Hive mode (press `K` in the dashboard):
-
-![codexctl Skills & Hive mode](assets/codexctl-demo-skills.gif){ .terminal-screenshot }
-
-Dashboard health monitoring:
-
-![codexctl health monitoring](assets/demo-health.gif){ .terminal-screenshot }
-
-## Status Detection
-
-Multi-signal inference from CPU usage, JSONL events, and timestamps:
-
-| Status | Meaning |
-|--------|---------|
-| **Needs Input** | Waiting for user to approve/confirm a tool use |
-| **Processing** | Actively generating or executing tools |
-| **Waiting** | Done responding, waiting for user's next prompt |
-| **Unknown** | Process alive, but transcript telemetry unavailable |
-| **Idle** | No recent activity (>10 min) |
-| **Finished** | Process exited |
-
-## Terminal Support
-
-| Terminal | Launch | Switch | Input | Approve |
-|----------|:------:|:------:|:-----:|:-------:|
-| Ghostty | - | Yes | Yes | Yes |
-| tmux | Yes | Yes | Yes | Yes |
-| Kitty | Yes | Yes | Yes | Yes |
-| Warp | - | Yes | Yes | Yes |
-| iTerm2 | - | Yes | Yes | Yes |
-| Terminal.app | - | Yes | Yes | Yes |
-| WezTerm | Yes | Yes | - | - |
-| GNOME Terminal | Yes | - | - | - |
-
-Run `codexctl doctor` to verify your install + terminal support in one command. See [Terminal Support](terminal-support.md) for setup notes.
-
-## How It Works
-
-codexctl reads Codex's local data - no API keys, no network access, no modifications to Codex:
-
-- **`~/.codex/sessions/*.json`** - session metadata
-- **`~/.codex/projects/{slug}/*.jsonl`** - conversation logs with token usage
-- **`ps`** - CPU%, memory, TTY for each process
-
-Status inference combines multiple signals: `waiting_for_task` events, CPU usage thresholds, `stop_reason` fields, and message recency.
-
-## Security
-
-codexctl runs entirely locally. It does not:
-
-- Send data to any server (unless you configure webhooks)
-- Modify Codex's files or behavior
-- Require API keys or authentication
-- Run with elevated privileges
-
-## Built With
-
-- [Rust](https://www.rust-lang.org/) - systems language
-- [ratatui](https://github.com/ratatui/ratatui) - TUI framework
-- [crossterm](https://github.com/crossterm-rs/crossterm) - terminal manipulation
-- [Ollama](https://ollama.com/) - local LLM inference (for brain mode)
-
-## License
-
-MIT
+- [Quick Start](quickstart.md)
+- [Configuration](configuration.md)
+- [CLI Reference](reference.md)
+- [Terminal Support](terminal-support.md)
+- [Troubleshooting](troubleshooting.md)
+- [Contributing](contributing.md)

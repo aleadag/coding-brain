@@ -1,6 +1,6 @@
 # Terminal Support
 
-Run `codexctl doctor` to check your terminal's capabilities along with the rest of the install (PATH, hooks, plugin files, brain endpoint, bus, session discovery). The legacy `codexctl --doctor` flag still works for the terminal-only report.
+Run `codexctl doctor` to check your terminal's capabilities along with the rest of the install (PATH, hooks, plugin files, brain endpoint, and session discovery). The legacy `codexctl --doctor` flag still works for the terminal-only report.
 
 ## Compatibility Matrix
 

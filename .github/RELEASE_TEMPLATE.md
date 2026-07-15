@@ -17,14 +17,14 @@
 ## Install / Upgrade
 
 ```bash
-brew upgrade claudectl                    # Homebrew
-cargo install claudectl                   # Cargo
-curl -fsSL https://raw.githubusercontent.com/mercurialsolo/claudectl/main/install.sh | sh
+brew upgrade codexctl                     # Homebrew
+cargo install codexctl                    # Cargo
+curl -fsSL https://raw.githubusercontent.com/aleadag/codexctl/main/install.sh | sh
 ```
 
 ## Changelog
 
-<!-- Link to full diff: https://github.com/mercurialsolo/claudectl/compare/vX.Y.Z...vA.B.C -->
+<!-- Link to full diff: https://github.com/aleadag/codexctl/compare/vX.Y.Z...vA.B.C -->
 
 <details>
 <summary>Full changelog</summary>
@@ -36,4 +36,4 @@ curl -fsSL https://raw.githubusercontent.com/mercurialsolo/claudectl/main/instal
 
 ---
 
-Questions? [Start a Discussion](https://github.com/mercurialsolo/claudectl/discussions). Found a bug? [Open an issue](https://github.com/mercurialsolo/claudectl/issues/new).
+Questions? [Start a Discussion](https://github.com/aleadag/codexctl/discussions). Found a bug? [Open an issue](https://github.com/aleadag/codexctl/issues/new).

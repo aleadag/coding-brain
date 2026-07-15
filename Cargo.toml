@@ -5,17 +5,17 @@ members = ["crates/codexctl-core", "crates/codexctl-tui"]
 
 [package]
 name = "codexctl"
-version = "0.57.2"
+version = "0.58.0"
 edition = "2024"
 # MSRV — bumped to 1.88 in #328 so cargo-install on older toolchains
 # emits a clean "rustc too old" error instead of opaque transitive-dep
 # errors from `darling` and `instability`.
 rust-version = "1.88"
-description = "Orchestrate Codex sessions with a local-LLM brain that learns from you."
+description = "Supervise Codex sessions with a local brain that learns from you."
 license = "MIT"
 repository = "https://github.com/aleadag/codexctl"
 homepage = "https://github.com/aleadag/codexctl"
-keywords = ["codex", "agent-orchestration", "local-llm", "tui", "hive-mind"]
+keywords = ["codex", "session-monitoring", "local-llm", "tui", "automation"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["*.gif", "*.cast", "codex-demo.*", ".github/"]
 
@@ -32,8 +32,8 @@ path = "src/lib.rs"
 # published to crates.io. Local builds always use the path; crates.io strips
 # the path and resolves the published version. Bump both when the workspace
 # crates change.
-codexctl-core = { path = "crates/codexctl-core", version = "0.52.1" }
-codexctl-tui = { path = "crates/codexctl-tui", version = "0.52.1" }
+codexctl-core = { path = "crates/codexctl-core", version = "0.53.0" }
+codexctl-tui = { path = "crates/codexctl-tui", version = "0.53.0" }
 ratatui = "0.29"
 crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }

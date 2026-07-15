@@ -32,40 +32,25 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             runner: macos-latest
-            archive: tar.gz
           - target: x86_64-apple-darwin
             runner: macos-latest
-            archive: tar.gz
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-            archive: tar.gz
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
-            archive: tar.gz
     steps:
       - uses: actions/checkout@v6
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl tools (x86_64 only)
-        # x86_64 musl can build natively on Ubuntu via `musl-tools`. The
-        # aarch64 musl build uses `cross` instead — see below — because
-        # the gnu cross-linker pulls glibc headers that the rusqlite
-        # bundled-sqlite source then references (open64/stat64/etc.),
-        # which musl libc doesn't provide.
+      - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      - name: Install cross (aarch64 musl only)
-        # `cross` runs the build inside a docker image that has a real
-        # musl toolchain. This is the canonical Rust-on-musl
-        # cross-compile path; the alternative of using gcc-aarch64-linux-gnu
-        # is fragile because it brings glibc headers (FORTIFY_SOURCE
-        # wrappers, _FILE_OFFSET_BITS=64 LFS symbols) the musl libc lacks.
+      - name: Install cross
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cargo install cross --locked --git https://github.com/cross-rs/cross --branch main
 
@@ -73,207 +58,150 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build (native)
-        # #321 — release tarballs (and therefore Homebrew bottles)
-        # include every optional feature so `claudectl bus`, `coord`,
-        # `relay`, and `hive` all work out of the box. Since the
-        # supervisor RFC (#342, PR1) the cargo defaults match this set,
-        # so `--features` here is redundant but kept explicit — release
-        # builds should never silently drift if defaults change later.
+      - name: Build
         if: matrix.target != 'aarch64-unknown-linux-musl'
-        run: |
-          cargo build --release \
-            --target ${{ matrix.target }} \
-            --features "bus,coord,relay,hive"
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (cross for aarch64 musl)
+      - name: Build with cross
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          cross build --release \
-            --target ${{ matrix.target }} \
-            --features "bus,coord,relay,hive"
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           cd target/${{ matrix.target }}/release
-          tar czf ../../../claudectl-${TAG}-${{ matrix.target }}.tar.gz claudectl
+          tar czf ../../../codexctl-${TAG}-${{ matrix.target }}.tar.gz codexctl
           cd ../../..
-          shasum -a 256 claudectl-${TAG}-${{ matrix.target }}.tar.gz > claudectl-${TAG}-${{ matrix.target }}.tar.gz.sha256
+          shasum -a 256 codexctl-${TAG}-${{ matrix.target }}.tar.gz > codexctl-${TAG}-${{ matrix.target }}.tar.gz.sha256
 
       - uses: actions/upload-artifact@v4
         with:
-          name: claudectl-${{ matrix.target }}
+          name: codexctl-${{ matrix.target }}
           path: |
-            claudectl-*.tar.gz
-            claudectl-*.tar.gz.sha256
+            codexctl-*.tar.gz
+            codexctl-*.tar.gz.sha256
 
-  # crates.io publish order: claudectl-core → claudectl-tui → claudectl.
-  # Each downstream publish needs the previous one to be visible on
-  # crates.io, which can lag the upload by 30s–2min. We poll the
-  # crates.io HTTP API (not `cargo search` — Actions caches its
-  # registry index aggressively) with a hard cap so a hung index never
-  # blocks the whole pipeline forever.
-  publish-crate-core:
-    name: Publish claudectl-core
+  publish-core:
+    name: Publish codexctl-core
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Publish claudectl-core
+      - name: Publish codexctl-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/claudectl-core/Cargo.toml | head -n 1)
-          # Idempotent: skip if this version is already on crates.io.
-          FOUND=$(curl -sS -A "claudectl-release-workflow" \
-            "https://crates.io/api/v1/crates/claudectl-core/${VERSION}" \
-            | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codexctl-core/Cargo.toml | head -n 1)
+          FOUND=$(curl -sS -A "codexctl-release-workflow" "https://crates.io/api/v1/crates/codexctl-core/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
           if [ -n "$FOUND" ]; then
-            echo "claudectl-core ${VERSION} already on crates.io, skipping"
+            echo "codexctl-core ${VERSION} already published"
           else
-            cargo publish -p claudectl-core --locked --token "$CARGO_REGISTRY_TOKEN"
+            cargo publish -p codexctl-core --locked --token "$CARGO_REGISTRY_TOKEN"
           fi
 
-  publish-crate-tui:
-    name: Publish claudectl-tui
-    needs: publish-crate-core
+  publish-tui:
+    name: Publish codexctl-tui
+    needs: publish-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Wait for claudectl-core on crates.io
-        # `cargo search` reads the local registry index, which the GitHub
-        # Actions runner caches and is slow to refresh. Hit the crates.io
-        # HTTP API directly so we see a fresh result every call.
+      - name: Wait for codexctl-core
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/claudectl-core/Cargo.toml | head -n 1)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codexctl-core/Cargo.toml | head -n 1)
           for i in $(seq 1 30); do
-            FOUND=$(curl -sS -A "claudectl-release-workflow" \
-              "https://crates.io/api/v1/crates/claudectl-core/${VERSION}" \
-              | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
-            if [ -n "$FOUND" ]; then
-              echo "claudectl-core ${VERSION} visible on crates.io"
-              exit 0
-            fi
-            echo "waiting for claudectl-core ${VERSION} (attempt ${i}/30)..."
+            FOUND=$(curl -sS -A "codexctl-release-workflow" "https://crates.io/api/v1/crates/codexctl-core/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
+            [ -n "$FOUND" ] && exit 0
+            echo "waiting for codexctl-core ${VERSION} (attempt ${i}/30)"
             sleep 10
           done
-          echo "::error::claudectl-core ${VERSION} never appeared on crates.io after 5 minutes"
           exit 1
-      - name: Publish claudectl-tui
+      - name: Publish codexctl-tui
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/claudectl-tui/Cargo.toml | head -n 1)
-          FOUND=$(curl -sS -A "claudectl-release-workflow" \
-            "https://crates.io/api/v1/crates/claudectl-tui/${VERSION}" \
-            | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codexctl-tui/Cargo.toml | head -n 1)
+          FOUND=$(curl -sS -A "codexctl-release-workflow" "https://crates.io/api/v1/crates/codexctl-tui/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
           if [ -n "$FOUND" ]; then
-            echo "claudectl-tui ${VERSION} already on crates.io, skipping"
+            echo "codexctl-tui ${VERSION} already published"
           else
-            cargo publish -p claudectl-tui --locked --token "$CARGO_REGISTRY_TOKEN"
+            cargo publish -p codexctl-tui --locked --token "$CARGO_REGISTRY_TOKEN"
           fi
 
-  publish-crate:
-    name: Publish claudectl (binary)
-    needs: publish-crate-tui
+  publish:
+    name: Publish codexctl
+    needs: publish-tui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Wait for claudectl-tui on crates.io
+      - name: Wait for codexctl-tui
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/claudectl-tui/Cargo.toml | head -n 1)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codexctl-tui/Cargo.toml | head -n 1)
           for i in $(seq 1 30); do
-            FOUND=$(curl -sS -A "claudectl-release-workflow" \
-              "https://crates.io/api/v1/crates/claudectl-tui/${VERSION}" \
-              | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
-            if [ -n "$FOUND" ]; then
-              echo "claudectl-tui ${VERSION} visible on crates.io"
-              exit 0
-            fi
-            echo "waiting for claudectl-tui ${VERSION} (attempt ${i}/30)..."
+            FOUND=$(curl -sS -A "codexctl-release-workflow" "https://crates.io/api/v1/crates/codexctl-tui/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
+            [ -n "$FOUND" ] && exit 0
+            echo "waiting for codexctl-tui ${VERSION} (attempt ${i}/30)"
             sleep 10
           done
-          echo "::error::claudectl-tui ${VERSION} never appeared on crates.io after 5 minutes"
           exit 1
-      - name: Publish claudectl binary
+      - name: Publish codexctl
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
 
   release:
-    name: Release
+    name: Create GitHub release
     needs:
       - build
-      - publish-crate
+      - publish
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            artifacts/claudectl-*.tar.gz
-            artifacts/claudectl-*.tar.gz.sha256
+            artifacts/codexctl-*.tar.gz
+            artifacts/codexctl-*.tar.gz.sha256
 
   update-homebrew:
     name: Update Homebrew tap
-    needs:
-      - build
-      - release
+    needs: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          path: claudectl
-
+          path: codexctl
       - uses: actions/checkout@v6
         with:
-          repository: mercurialsolo/homebrew-tap
+          repository: aleadag/homebrew-tap
           path: homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-
       - name: Render formula
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           VERSION="${TAG#v}"
-          cd claudectl
-          ./scripts/render-homebrew-formula.sh \
-            "$VERSION" \
-            "$(awk '{print $1}' ../artifacts/claudectl-${TAG}-aarch64-apple-darwin.tar.gz.sha256)" \
-            "$(awk '{print $1}' ../artifacts/claudectl-${TAG}-x86_64-apple-darwin.tar.gz.sha256)" \
-            "$(awk '{print $1}' ../artifacts/claudectl-${TAG}-x86_64-unknown-linux-musl.tar.gz.sha256)" \
-            "$(awk '{print $1}' ../artifacts/claudectl-${TAG}-aarch64-unknown-linux-musl.tar.gz.sha256)" \
-            > ../homebrew-tap/Formula/claudectl.rb
-
+          cd codexctl
+          ./scripts/render-homebrew-formula.sh "$VERSION" "$(awk '{print $1}' ../artifacts/codexctl-${TAG}-aarch64-apple-darwin.tar.gz.sha256)" "$(awk '{print $1}' ../artifacts/codexctl-${TAG}-x86_64-apple-darwin.tar.gz.sha256)" "$(awk '{print $1}' ../artifacts/codexctl-${TAG}-x86_64-unknown-linux-musl.tar.gz.sha256)" "$(awk '{print $1}' ../artifacts/codexctl-${TAG}-aarch64-unknown-linux-musl.tar.gz.sha256)" > ../homebrew-tap/Formula/codexctl.rb
       - name: Commit formula update
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/claudectl.rb
+          git add Formula/codexctl.rb
           git diff --cached --quiet && exit 0
-          git commit -m "claudectl ${GITHUB_REF#refs/tags/v}"
+          git commit -m "codexctl ${GITHUB_REF#refs/tags/v}"
           git push

@@ -13,7 +13,7 @@ BASE_URL="https://github.com/aleadag/codexctl/releases/download/${TAG}"
 
 cat <<EOF
 class Codexctl < Formula
-  desc "Orchestrate a swarm of Codex agents with a learning local-LLM brain"
+  desc "Supervise Codex sessions with a learning local brain"
   homepage "https://github.com/aleadag/codexctl"
   version "${VERSION}"
   license "MIT"

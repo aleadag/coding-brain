@@ -1,9 +1,9 @@
 [package]
 name = "codexctl-tui"
-version = "0.52.1"
+version = "0.53.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Terminal UI, dashboard recording, and demo-mode fixtures for codexctl. Splits out of the binary so the TUI can evolve independently of the brain/coord/bus subsystems."
+description = "Terminal UI, dashboard recording, and demo-mode fixtures for codexctl."
 license = "MIT"
 repository = "https://github.com/aleadag/codexctl"
 keywords = ["codex", "tui", "ratatui"]
@@ -14,7 +14,7 @@ name = "codexctl_tui"
 path = "src/lib.rs"
 
 [dependencies]
-codexctl-core = { path = "../codexctl-core", version = "0.52.1" }
+codexctl-core = { path = "../codexctl-core", version = "0.53.0" }
 ratatui = "0.29"
 crossterm = "0.28"
 serde_json = "1"

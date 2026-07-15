@@ -1,9 +1,9 @@
 [package]
 name = "codexctl-core"
-version = "0.52.1"
+version = "0.53.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Foundational types and IO primitives for codexctl. Shared across the TUI, the binary, and future crates."
+description = "Session types, transcript discovery, health checks, and runtime traits for codexctl."
 license = "MIT"
 repository = "https://github.com/aleadag/codexctl"
 keywords = ["codex", "session-monitoring", "internals"]
