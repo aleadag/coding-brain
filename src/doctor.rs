@@ -178,7 +178,13 @@ fn check_binary_on_path() -> Check {
 }
 
 fn check_codex_hooks() -> Check {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    check_codex_hooks_at(home.as_deref(), &cwd)
+}
+
+fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -> Check {
+    let Some(home) = home else {
         return Check {
             name: "Codex hooks".into(),
             status: CheckStatus::Fail,
@@ -186,31 +192,57 @@ fn check_codex_hooks() -> Check {
             fix_hint: None,
         };
     };
-    let settings = home.join(".codex").join("hooks.json");
-    let contents = match std::fs::read_to_string(&settings) {
-        Ok(s) => s,
-        Err(_) => {
-            return Check {
-                name: "Codex hooks".into(),
-                status: CheckStatus::Fail,
-                message: format!("{} not found", settings.display()),
-                fix_hint: Some("Run `codexctl init` to install hooks.".into()),
-            };
-        }
-    };
-    if !contents.contains("codexctl") {
+    let discovery = crate::init::hooks::discover_permission_hooks_at(Some(home), cwd);
+    if !discovery.configured() {
         return Check {
             name: "Codex hooks".into(),
             status: CheckStatus::Fail,
-            message: format!("{} has no codexctl entries", settings.display()),
+            message: "managed PermissionRequest hook not found".into(),
             fix_hint: Some("Run `codexctl init` (or `codexctl init --plugin-only`).".into()),
         };
     }
-    let entries = contents.matches("codexctl").count();
+
+    if discovery.duplicate_scopes() {
+        return Check {
+            name: "Codex hooks".into(),
+            status: CheckStatus::Advisory,
+            message: "managed permission hook is installed in global and project scopes".into(),
+            fix_hint: Some(
+                "Keep the managed PermissionRequest hook in one scope, restart Codex, and verify it with `/hooks`."
+                    .into(),
+            ),
+        };
+    }
+
+    let scope = if discovery.global.configured {
+        (&discovery.global, "global")
+    } else {
+        (&discovery.project, "project")
+    };
+    if scope.0.stale {
+        return Check {
+            name: "Codex hooks".into(),
+            status: CheckStatus::Advisory,
+            message: format!("{0} managed permission hook is outdated", scope.1),
+            fix_hint: Some(
+                "Run `codexctl init`, restart Codex, and verify the changed command with `/hooks`."
+                    .into(),
+            ),
+        };
+    }
+    if scope.0.disabled {
+        return Check {
+            name: "Codex hooks".into(),
+            status: CheckStatus::Advisory,
+            message: format!("{} managed permission hook is disabled", scope.1),
+            fix_hint: Some("Enable and trust the hook through Codex `/hooks`.".into()),
+        };
+    }
+
     Check {
         name: "Codex hooks".into(),
         status: CheckStatus::Pass,
-        message: format!("{entries} codexctl entries in {}", settings.display()),
+        message: format!("{} managed permission hook is current", scope.1),
         fix_hint: None,
     }
 }
@@ -486,5 +518,70 @@ mod tests {
         assert!(!is_loopback_endpoint(
             "http://localhost.example.com/v1/chat"
         ));
+    }
+
+    fn write_permission_hook(path: &std::path::Path, timeout: u64) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let value = serde_json::json!({
+            "hooks": { "PermissionRequest": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "codexctl --permission-hook",
+                    "timeout": timeout,
+                    "statusMessage": "Brain reviewing permission…"
+                }]
+            }] }
+        });
+        std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn duplicate_global_and_project_permission_hooks_are_advisory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        write_permission_hook(&home.join(".codex/hooks.json"), 30);
+        write_permission_hook(&cwd.join(".codex/hooks.json"), 30);
+
+        let check = check_codex_hooks_at(Some(&home), &cwd);
+
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert!(check.message.contains("global and project"));
+        assert!(check.fix_hint.unwrap().contains("one scope"));
+    }
+
+    #[test]
+    fn stale_permission_hook_is_configured_but_advisory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        write_permission_hook(&home.join(".codex/hooks.json"), 5);
+
+        let check = check_codex_hooks_at(Some(&home), &cwd);
+
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert!(check.message.contains("outdated"));
+        assert!(check.fix_hint.unwrap().contains("codexctl init"));
+    }
+
+    #[test]
+    fn conservative_only_ancestor_does_not_report_active_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let jj_root = temp.path().join("project");
+        let git_root = jj_root.join("nested");
+        let cwd = git_root.join("work");
+        std::fs::create_dir_all(jj_root.join(".jj")).unwrap();
+        std::fs::create_dir_all(git_root.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_permission_hook(&jj_root.join(".codex/hooks.json"), 30);
+
+        let check = check_codex_hooks_at(Some(&home), &cwd);
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("not found"));
     }
 }

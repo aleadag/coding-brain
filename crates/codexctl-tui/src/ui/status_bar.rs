@@ -8,6 +8,34 @@ use ratatui::{
 
 use crate::app::App;
 
+fn brain_mode_label(
+    fallback_configured: bool,
+    mode: codexctl_core::runtime::BrainGateMode,
+) -> &'static str {
+    if fallback_configured {
+        return "Brain: auto/fallback configured ⚠";
+    }
+    match mode {
+        codexctl_core::runtime::BrainGateMode::Off => "Brain: off",
+        codexctl_core::runtime::BrainGateMode::Auto => "Brain: auto",
+        codexctl_core::runtime::BrainGateMode::On => "Brain: on",
+    }
+}
+
+enum TransientStatus<'a> {
+    Generic(&'a str),
+    Brain(&'a str),
+}
+
+fn transient_status_at(app: &App, now: std::time::Instant) -> Option<TransientStatus<'_>> {
+    if !app.status_msg.is_empty() {
+        Some(TransientStatus::Generic(&app.status_msg))
+    } else {
+        app.brain_decision_notice_at(now)
+            .map(TransientStatus::Brain)
+    }
+}
+
 pub fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     if app.search_mode {
@@ -55,16 +83,26 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("_", Style::default().fg(t.text_muted)),
         ]));
         frame.render_widget(msg, area);
-    } else if !app.status_msg.is_empty() {
-        let color = if app.status_msg.starts_with("Error") {
-            t.error
-        } else {
-            t.success
+    } else if let Some(status) = transient_status_at(app, std::time::Instant::now()) {
+        let (text, color) = match status {
+            TransientStatus::Generic(text) => {
+                let color = if text.starts_with("Error") {
+                    t.error
+                } else {
+                    t.success
+                };
+                (text, color)
+            }
+            TransientStatus::Brain(text) => {
+                let color = if text.starts_with("Brain denied") {
+                    t.error
+                } else {
+                    t.success
+                };
+                (text, color)
+            }
         };
-        let msg = Paragraph::new(Span::styled(
-            format!(" {}", app.status_msg),
-            Style::default().fg(color),
-        ));
+        let msg = Paragraph::new(Span::styled(format!(" {text}"), Style::default().fg(color)));
         frame.render_widget(msg, area);
     } else if app.has_active_filters() {
         let msg = Paragraph::new(Span::styled(
@@ -111,16 +149,82 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             frame.render_widget(msg, area);
         } else {
             use codexctl_core::runtime::BrainGateMode;
-            let (label, color) = match app.runtime.brain.gate_mode() {
-                BrainGateMode::Off => ("Brain: off", t.text_muted),
-                BrainGateMode::Auto => ("Brain: auto", t.header),
-                BrainGateMode::On => ("Brain: on", t.success),
+            let mode = app.runtime.brain.gate_mode();
+            let color = match mode {
+                BrainGateMode::Off => t.text_muted,
+                BrainGateMode::Auto => t.header,
+                BrainGateMode::On => t.success,
             };
+            let label = brain_mode_label(app.terminal_auto_fallback_configured(), mode);
             let msg = Paragraph::new(Span::styled(
                 format!(" {label}  (Ctrl+b toggle)"),
                 Style::default().fg(color),
             ));
             frame.render_widget(msg, area);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codexctl_core::runtime::{BrainGateMode, DecisionSummary, MockRuntime};
+
+    fn app_with_brain_notice(now: std::time::Instant) -> App {
+        let mut app = App::new();
+        app.runtime = MockRuntime {
+            decisions: vec![DecisionSummary {
+                id: "new".into(),
+                timestamp: "2026-07-16T00:00:00Z".into(),
+                action: "approve".into(),
+                confidence: Some(0.95),
+                project: Some("test".into()),
+                tool: Some("Bash".into()),
+                pid: 42,
+                command: Some("cargo test".into()),
+                reasoning: Some("safe".into()),
+                user_action: Some("hook_allow".into()),
+                override_reason: None,
+                brain_decision_ms: None,
+                canonical: None,
+                cache_hit: None,
+                cost_usd: None,
+                model: None,
+                outcome_kind: None,
+                outcome_detail: None,
+                suggested_at: None,
+                resolved_at: None,
+            }],
+            ..Default::default()
+        }
+        .into_runtime();
+        app.poll_brain_decision_notice_at(now);
+        app
+    }
+
+    #[test]
+    fn unsafe_fallback_has_an_explicit_warning_label() {
+        assert_eq!(
+            brain_mode_label(true, BrainGateMode::Auto),
+            "Brain: auto/fallback configured ⚠"
+        );
+    }
+
+    #[test]
+    fn brain_notice_reappears_after_generic_status_clears() {
+        let now = std::time::Instant::now();
+        let mut app = app_with_brain_notice(now);
+        app.status_msg = "Approved test".into();
+
+        assert!(matches!(
+            transient_status_at(&app, now),
+            Some(TransientStatus::Generic("Approved test"))
+        ));
+
+        app.status_msg.clear();
+        assert!(matches!(
+            transient_status_at(&app, now),
+            Some(TransientStatus::Brain("Brain allowed Bash — safe"))
+        ));
     }
 }

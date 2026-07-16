@@ -104,17 +104,28 @@ fn probe_http(url: &str) -> bool {
 
 // ---------------- Codex hooks ------------------------------------------------
 
-/// Plugin is "installed" when our hooks are present in
-/// `~/.codex/hooks.json` (global scope). Reuses the existing detection
-/// logic from `hooks.rs` so it stays consistent with what `--init` writes.
+/// Plugin is "installed" when the managed permission hook is configured in
+/// either the global or an applicable project scope. Stale and disabled
+/// handlers still count as configured; `doctor` reports those diagnostics.
 pub fn detect_plugin() -> PhaseStatus {
-    let path = hooks::user_settings_path();
-    match hooks::settings_contain_codexctl_hooks(&path) {
-        Some(true) => PhaseStatus::Installed {
-            details: format!("hooks in {}", path.display()),
-        },
-        Some(false) => PhaseStatus::NotInstalled,
-        None => PhaseStatus::NotInstalled,
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    detect_plugin_at(home.as_deref(), &cwd)
+}
+
+fn detect_plugin_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -> PhaseStatus {
+    let discovery = hooks::discover_permission_hooks_at(home, cwd);
+    if !discovery.configured() {
+        return PhaseStatus::NotInstalled;
+    }
+    let scope = match (discovery.global.configured, discovery.project.configured) {
+        (true, true) => "global and project scopes",
+        (true, false) => "global scope",
+        (false, true) => "project scope",
+        (false, false) => unreachable!("configured state checked above"),
+    };
+    PhaseStatus::Installed {
+        details: format!("permission hook in {scope}"),
     }
 }
 
@@ -175,11 +186,6 @@ impl EnvironmentReport {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn _codex_config_dir_for_tests() -> PathBuf {
-    hooks::user_settings_path()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +209,66 @@ mod tests {
         let r = EnvironmentReport::detect();
         let rendered = r.render_human();
         assert_eq!(rendered.lines().count(), 4);
+    }
+
+    #[test]
+    fn plugin_detection_accepts_project_permission_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::create_dir_all(cwd.join(".codex")).unwrap();
+        std::fs::write(
+            cwd.join(".codex/hooks.json"),
+            r#"{"hooks":{"PermissionRequest":[{"matcher":"Bash","hooks":[{"type":"command","command":"codexctl --permission-hook","timeout":30,"statusMessage":"Brain reviewing permission…"}]}]}}"#,
+        )
+        .unwrap();
+
+        let status = detect_plugin_at(Some(&home), &cwd);
+
+        assert!(matches!(status, PhaseStatus::Installed { .. }));
+        assert!(status.details().unwrap().contains("project"));
+    }
+
+    #[test]
+    fn plugin_detection_requires_managed_permission_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex/hooks.json"),
+            r#"{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"codexctl --json 2>/dev/null || true","timeout":5}]}]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_plugin_at(Some(&home), &cwd),
+            PhaseStatus::NotInstalled
+        );
+    }
+
+    #[test]
+    fn plugin_detection_ignores_conservative_only_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let jj_root = temp.path().join("project");
+        let git_root = jj_root.join("nested");
+        let cwd = git_root.join("work");
+        std::fs::create_dir_all(jj_root.join(".jj")).unwrap();
+        std::fs::create_dir_all(git_root.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(jj_root.join(".codex")).unwrap();
+        std::fs::write(
+            jj_root.join(".codex/hooks.json"),
+            r#"{"hooks":{"PermissionRequest":[{"matcher":"Bash","hooks":[{"type":"command","command":"codexctl --permission-hook","timeout":30,"statusMessage":"Brain reviewing permission…"}]}]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_plugin_at(Some(&home), &cwd),
+            PhaseStatus::NotInstalled
+        );
     }
 }

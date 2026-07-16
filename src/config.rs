@@ -127,8 +127,41 @@ struct RawConfig {
     health: Option<RawHealthThresholds>,
     file_conflicts: Option<bool>,
     auto_deny_file_conflicts: Option<bool>,
-    brain: Option<BrainConfig>,
+    brain: Option<RawBrainConfig>,
     lifecycle: Option<RawLifecycleConfig>,
+}
+
+#[derive(Debug, Default)]
+struct RawBrainConfig {
+    enabled: Option<bool>,
+    endpoint: Option<String>,
+    model: Option<String>,
+    auto_mode: Option<bool>,
+    terminal_auto_approve_fallback: Option<bool>,
+    timeout_ms: Option<u64>,
+    max_context_tokens: Option<u32>,
+    few_shot_count: Option<usize>,
+    max_sessions: Option<usize>,
+    orchestrate: Option<bool>,
+    orchestrate_interval_secs: Option<u64>,
+    test_runners: Option<Vec<String>>,
+}
+
+impl RawBrainConfig {
+    fn only_terminal_fallback_is_set(&self) -> bool {
+        self.terminal_auto_approve_fallback.is_some()
+            && self.enabled.is_none()
+            && self.endpoint.is_none()
+            && self.model.is_none()
+            && self.auto_mode.is_none()
+            && self.timeout_ms.is_none()
+            && self.max_context_tokens.is_none()
+            && self.few_shot_count.is_none()
+            && self.max_sessions.is_none()
+            && self.orchestrate.is_none()
+            && self.orchestrate_interval_secs.is_none()
+            && self.test_runners.is_none()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -257,8 +290,48 @@ impl Config {
                 self.rules.push(rule);
             }
         }
-        if let Some(brain) = raw.brain {
-            self.brain = Some(brain);
+        if let Some(raw_brain) = raw.brain {
+            let fallback_only = raw_brain.only_terminal_fallback_is_set();
+            let brain = self.brain.get_or_insert_with(|| BrainConfig {
+                enabled: !fallback_only,
+                ..BrainConfig::default()
+            });
+            if let Some(value) = raw_brain.enabled {
+                brain.enabled = value;
+            }
+            if let Some(value) = raw_brain.endpoint {
+                brain.endpoint = value;
+            }
+            if let Some(value) = raw_brain.model {
+                brain.model = value;
+            }
+            if let Some(value) = raw_brain.auto_mode {
+                brain.auto_mode = value;
+            }
+            if let Some(value) = raw_brain.terminal_auto_approve_fallback {
+                brain.terminal_auto_approve_fallback = value;
+            }
+            if let Some(value) = raw_brain.timeout_ms {
+                brain.timeout_ms = value;
+            }
+            if let Some(value) = raw_brain.max_context_tokens {
+                brain.max_context_tokens = value;
+            }
+            if let Some(value) = raw_brain.few_shot_count {
+                brain.few_shot_count = value;
+            }
+            if let Some(value) = raw_brain.max_sessions {
+                brain.max_sessions = value;
+            }
+            if let Some(value) = raw_brain.orchestrate {
+                brain.orchestrate = value;
+            }
+            if let Some(value) = raw_brain.orchestrate_interval_secs {
+                brain.orchestrate_interval_secs = value;
+            }
+            if let Some(value) = raw_brain.test_runners {
+                brain.test_runners = value;
+            }
         }
         if let Some(lc) = raw.lifecycle {
             if let Some(v) = lc.auto_restart {
@@ -379,6 +452,16 @@ impl Config {
             "  restart_idle_only: {}",
             self.lifecycle.restart_only_when_idle
         );
+        if let Some(brain) = &self.brain {
+            println!();
+            println!("  [brain]");
+            println!("  enabled:                        {}", brain.enabled);
+            println!("  auto:                           {}", brain.auto_mode);
+            println!(
+                "  terminal_auto_approve_fallback: {}",
+                brain.terminal_auto_approve_fallback
+            );
+        }
         if self.model_overrides.is_empty() {
             println!("  model_overrides: none");
         } else {
@@ -558,6 +641,9 @@ impl Config {
 # endpoint = "http://localhost:11434/api/generate"
 # model = "gemma4:e4b"
 # auto = false
+# UNSAFE compatibility mode: allow guarded Enter on a terminal-confirmed shell
+# prompt only when auto=true and no managed PermissionRequest hook is configured.
+# terminal_auto_approve_fallback = false
 # timeout_ms = 5000
 # max_context_tokens = 4000
 # few_shot_count = 5
@@ -754,54 +840,41 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
                 }
             }
             ("brain", _) => {
-                let brain = raw.brain.get_or_insert_with(BrainConfig::default);
+                let brain = raw.brain.get_or_insert_with(RawBrainConfig::default);
                 match key {
                     "enabled" => {
-                        if let Some(v) = parse_bool(value) {
-                            brain.enabled = v;
-                        }
+                        brain.enabled = parse_bool(value);
                     }
-                    "endpoint" => brain.endpoint = unquote(value),
-                    "model" => brain.model = unquote(value),
+                    "endpoint" => brain.endpoint = Some(unquote(value)),
+                    "model" => brain.model = Some(unquote(value)),
                     "auto" => {
-                        if let Some(v) = parse_bool(value) {
-                            brain.auto_mode = v;
-                        }
+                        brain.auto_mode = parse_bool(value);
+                    }
+                    "terminal_auto_approve_fallback" => {
+                        brain.terminal_auto_approve_fallback = parse_bool(value);
                     }
                     "timeout_ms" => {
-                        if let Ok(v) = value.parse() {
-                            brain.timeout_ms = v;
-                        }
+                        brain.timeout_ms = value.parse().ok();
                     }
                     "max_context_tokens" => {
-                        if let Ok(v) = value.parse() {
-                            brain.max_context_tokens = v;
-                        }
+                        brain.max_context_tokens = value.parse().ok();
                     }
                     "few_shot_count" => {
-                        if let Ok(v) = value.parse() {
-                            brain.few_shot_count = v;
-                        }
+                        brain.few_shot_count = value.parse().ok();
                     }
                     "max_sessions" => {
-                        if let Ok(v) = value.parse() {
-                            brain.max_sessions = v;
-                        }
+                        brain.max_sessions = value.parse().ok();
                     }
                     "orchestrate" => {
-                        if let Some(v) = parse_bool(value) {
-                            brain.orchestrate = v;
-                        }
+                        brain.orchestrate = parse_bool(value);
                     }
                     "orchestrate_interval" => {
-                        if let Ok(v) = value.parse() {
-                            brain.orchestrate_interval_secs = v;
-                        }
+                        brain.orchestrate_interval_secs = value.parse().ok();
                     }
                     "test_runners" => {
                         let parsed = parse_string_array(value);
                         if !parsed.is_empty() {
-                            brain.test_runners = parsed;
+                            brain.test_runners = Some(parsed);
                         }
                     }
                     _ => {}
@@ -870,6 +943,7 @@ fn known_keys(section: &str) -> Option<&'static [&'static str]> {
             "endpoint",
             "model",
             "auto",
+            "terminal_auto_approve_fallback",
             "timeout_ms",
             "max_context_tokens",
             "few_shot_count",
@@ -1344,19 +1418,91 @@ model = "llama3:8b"
 auto = true
 timeout_ms = 3000
 max_context_tokens = 8000
+terminal_auto_approve_fallback = true
 "#
         )
         .unwrap();
         file.flush().unwrap();
 
         let raw = parse_config_file(&file.path().to_path_buf()).unwrap();
-        let brain = raw.brain.expect("brain config should be parsed");
+        let mut config = Config::default();
+        config.apply(raw);
+        let brain = config.brain.expect("brain config should be parsed");
         assert!(brain.enabled);
         assert_eq!(brain.endpoint, "http://localhost:8080/v1/chat");
         assert_eq!(brain.model, "llama3:8b");
         assert!(brain.auto_mode);
+        assert!(brain.terminal_auto_approve_fallback);
         assert_eq!(brain.timeout_ms, 3000);
         assert_eq!(brain.max_context_tokens, 8000);
+    }
+
+    #[test]
+    fn terminal_fallback_is_a_known_brain_key_and_is_in_the_template() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[brain]\nterminal_auto_approve_fallback = true").unwrap();
+        file.flush().unwrap();
+
+        let (warnings, has_errors) = validate_config_file(&file.path().to_path_buf());
+        assert!(!has_errors);
+        assert!(warnings.is_empty());
+        assert!(Config::template_string().contains("terminal_auto_approve_fallback = false"));
+
+        let mut config = Config::default();
+        config.apply(parse_config_file(&file.path().to_path_buf()).unwrap());
+        let brain = config.brain.unwrap();
+        assert!(!brain.enabled);
+        assert!(!brain.auto_mode);
+    }
+
+    #[test]
+    fn brain_config_layers_merge_field_by_field() {
+        use std::io::Write;
+
+        let mut global = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            global,
+            r#"
+[brain]
+enabled = true
+endpoint = "http://localhost:8080/v1/chat"
+model = "local-model"
+auto = true
+terminal_auto_approve_fallback = false
+timeout_ms = 3210
+max_context_tokens = 7654
+few_shot_count = 7
+max_sessions = 12
+orchestrate = true
+orchestrate_interval = 45
+test_runners = ["just test", "cargo test"]
+"#
+        )
+        .unwrap();
+        global.flush().unwrap();
+        let mut project = tempfile::NamedTempFile::new().unwrap();
+        writeln!(project, "[brain]\nterminal_auto_approve_fallback = true").unwrap();
+        project.flush().unwrap();
+
+        let mut config = Config::default();
+        config.apply(parse_config_file(&global.path().to_path_buf()).unwrap());
+        config.apply(parse_config_file(&project.path().to_path_buf()).unwrap());
+
+        let brain = config.brain.unwrap();
+        assert!(brain.enabled);
+        assert_eq!(brain.endpoint, "http://localhost:8080/v1/chat");
+        assert_eq!(brain.model, "local-model");
+        assert!(brain.auto_mode);
+        assert!(brain.terminal_auto_approve_fallback);
+        assert_eq!(brain.timeout_ms, 3210);
+        assert_eq!(brain.max_context_tokens, 7654);
+        assert_eq!(brain.few_shot_count, 7);
+        assert_eq!(brain.max_sessions, 12);
+        assert!(brain.orchestrate);
+        assert_eq!(brain.orchestrate_interval_secs, 45);
+        assert_eq!(brain.test_runners, vec!["just test", "cargo test"]);
     }
 
     #[test]

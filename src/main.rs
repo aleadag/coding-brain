@@ -257,6 +257,10 @@ pub(crate) struct Cli {
     #[arg(long, help_heading = "Brain (Local LLM)")]
     pub(crate) auto_run: bool,
 
+    /// UNSAFE: allow guarded terminal Enter approval when no managed permission hook is configured
+    #[arg(long, help_heading = "Brain (Local LLM)")]
+    pub(crate) terminal_auto_approve_fallback: bool,
+
     /// LLM endpoint URL for brain (requires --brain)
     #[arg(long, help_heading = "Brain (Local LLM)")]
     pub(crate) url: Option<String>,
@@ -293,6 +297,10 @@ pub(crate) struct Cli {
     /// Used by Codex hooks for inline approve/deny.
     #[arg(long, help_heading = "Brain (Local LLM)")]
     pub(crate) brain_query: bool,
+
+    /// Internal Codex PermissionRequest hook adapter.
+    #[arg(long, hide = true)]
+    pub(crate) permission_hook: bool,
 
     /// Tool name for --brain-query (e.g., "Bash", "Write", "Edit")
     #[arg(long, help_heading = "Brain (Local LLM)")]
@@ -475,8 +483,9 @@ pub(crate) struct Cli {
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let is_demo = cli.demo;
+    let is_permission_hook = cli.permission_hook;
     let result = run_main(cli);
-    if result.is_ok() {
+    if result.is_ok() && !is_permission_hook {
         maybe_print_star_prompt(is_demo);
     }
     result
@@ -543,6 +552,29 @@ fn print_first_run_banner() {
     std::thread::sleep(std::time::Duration::from_millis(800));
 }
 
+fn apply_brain_cli_overrides(cfg: &mut config::Config, cli: &Cli) {
+    if cli.brain {
+        let brain = cfg.brain.get_or_insert_with(config::BrainConfig::default);
+        brain.enabled = true;
+        if cli.auto_run {
+            brain.auto_mode = true;
+        }
+        if let Some(ref endpoint) = cli.url {
+            brain.endpoint = endpoint.clone();
+        }
+        if let Some(ref model) = cli.brain_model {
+            brain.model = model.clone();
+        }
+    }
+    if cli.terminal_auto_approve_fallback {
+        let brain = cfg.brain.get_or_insert_with(|| config::BrainConfig {
+            enabled: false,
+            ..config::BrainConfig::default()
+        });
+        brain.terminal_auto_approve_fallback = true;
+    }
+}
+
 fn run_main(cli: Cli) -> io::Result<()> {
     // Initialize diagnostic logger if --log is set
     if let Some(ref log_path) = cli.log {
@@ -589,19 +621,10 @@ fn run_main(cli: Cli) -> io::Result<()> {
         });
     }
 
-    // Brain CLI overrides
-    if cli.brain {
-        let brain = cfg.brain.get_or_insert_with(config::BrainConfig::default);
-        brain.enabled = true;
-        if cli.auto_run {
-            brain.auto_mode = true;
-        }
-        if let Some(ref endpoint) = cli.url {
-            brain.endpoint = endpoint.clone();
-        }
-        if let Some(ref model) = cli.brain_model {
-            brain.model = model.clone();
-        }
+    apply_brain_cli_overrides(&mut cfg, &cli);
+    if cli.permission_hook {
+        brain::permission_hook::run(cfg.brain.as_ref());
+        return Ok(());
     }
     if let Some(brain) = cfg.brain.as_ref().filter(|brain| brain.enabled) {
         if !doctor::is_loopback_endpoint(&brain.endpoint) {
@@ -1009,6 +1032,7 @@ fn run_tui<W: io::Write>(
     // intentionally uses a mock so its many test call sites stay parameter-
     // free; the production wiring happens here, in main.
     app.runtime = runtime::build_runtime();
+    app.prime_brain_decision_notice();
     app.notify = cfg.notify;
     app.debug = cfg.debug;
     app.webhook_url = cfg.webhook.clone();
@@ -1029,9 +1053,11 @@ fn run_tui<W: io::Write>(
     if let Some(ref brain_cfg) = cfg.brain {
         if brain_cfg.enabled {
             if commands::check_brain_endpoint(&brain_cfg.endpoint, brain_cfg.timeout_ms) {
-                app.brain_driver = Some(Box::new(runtime::LiveBrainDriver::new(
-                    brain::engine::BrainEngine::new(brain_cfg.clone()),
-                )));
+                let mut engine = brain::engine::BrainEngine::new(brain_cfg.clone());
+                engine.set_terminal_fallback_blocker(|cwd| {
+                    init::hooks::discover_permission_hooks(cwd).blocks_terminal_fallback()
+                });
+                app.brain_driver = Some(Box::new(runtime::LiveBrainDriver::new(engine)));
                 app.status_msg = format!(
                     "Brain: connected to {} ({})",
                     brain_cfg.endpoint, brain_cfg.model
@@ -1053,9 +1079,11 @@ fn run_tui<W: io::Write>(
         app.rules = demo::demo_rules();
         // Create a stub brain engine so the status bar can show brain suggestions
         if app.brain_driver.is_none() {
-            app.brain_driver = Some(Box::new(runtime::LiveBrainDriver::new(
-                brain::engine::BrainEngine::new(config::BrainConfig::default()),
-            )));
+            let mut engine = brain::engine::BrainEngine::new(config::BrainConfig::default());
+            engine.set_terminal_fallback_blocker(|cwd| {
+                init::hooks::discover_permission_hooks(cwd).blocks_terminal_fallback()
+            });
+            app.brain_driver = Some(Box::new(runtime::LiveBrainDriver::new(engine)));
         }
         // Re-refresh to replace real sessions discovered during App::new()
         app.refresh();
@@ -1307,5 +1335,31 @@ mod first_run_tests {
             !is_first_run(),
             "no HOME should be treated as not-first-run (no nudge possible)"
         );
+    }
+}
+
+#[cfg(test)]
+mod permission_hook_cli_tests {
+    use super::*;
+
+    #[test]
+    fn permission_hook_flag_is_hidden() {
+        let cli = Cli::try_parse_from(["codexctl", "--permission-hook"]).unwrap();
+        assert!(cli.permission_hook);
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--permission-hook"));
+    }
+
+    #[test]
+    fn terminal_fallback_cli_override_does_not_enable_brain_or_auto_mode() {
+        let cli = Cli::try_parse_from(["codexctl", "--terminal-auto-approve-fallback"]).unwrap();
+        let mut cfg = config::Config::default();
+
+        apply_brain_cli_overrides(&mut cfg, &cli);
+
+        let brain = cfg.brain.expect("CLI override should be retained");
+        assert!(!brain.enabled);
+        assert!(!brain.auto_mode);
+        assert!(brain.terminal_auto_approve_fallback);
     }
 }

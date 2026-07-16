@@ -15,7 +15,6 @@ use crate::demo;
 use crate::discovery;
 use crate::launch;
 use crate::process;
-use crate::rules;
 use crate::session;
 
 pub(crate) fn launch_session(
@@ -935,9 +934,8 @@ pub(crate) fn run_headless(
     if let Some(ref brain_cfg) = cfg.brain {
         if brain_cfg.enabled {
             if check_brain_endpoint(&brain_cfg.endpoint, brain_cfg.timeout_ms) {
-                app.brain_driver = Some(Box::new(crate::runtime::LiveBrainDriver::new(
-                    crate::brain::engine::BrainEngine::new(brain_cfg.clone()),
-                )));
+                let engine = headless_brain_engine(brain_cfg.clone());
+                app.brain_driver = Some(Box::new(crate::runtime::LiveBrainDriver::new(engine)));
                 emit_headless_event(
                     "startup",
                     serde_json::json!({
@@ -991,6 +989,14 @@ pub(crate) fn run_headless(
 
         prev_statuses = app.sessions.iter().map(|s| (s.pid, s.status)).collect();
     }
+}
+
+fn headless_brain_engine(config: crate::config::BrainConfig) -> crate::brain::engine::BrainEngine {
+    let mut engine = crate::brain::engine::BrainEngine::new(config);
+    engine.set_terminal_fallback_blocker(|cwd| {
+        crate::init::hooks::discover_permission_hooks(cwd).blocks_terminal_fallback()
+    });
+    engine
 }
 
 fn emit_headless_event(event: &str, data: serde_json::Value, json_mode: bool) {
@@ -1395,22 +1401,10 @@ fn read_diff_digest_from_stdin(tool_name: &str) -> Option<brain::diff_digest::Di
 /// local LLM, and prints a JSON decision to stdout. Designed to be called
 /// by Codex hooks for inline approve/deny.
 pub(crate) fn run_brain_query(cfg: &config::Config, cli: &Cli) -> io::Result<()> {
-    // Respect brain gate mode — if off, skip immediately
     let gate_mode = read_brain_gate_mode();
-    if gate_mode == "off" {
-        let result = serde_json::json!({
-            "action": "abstain",
-            "reasoning": "Brain gate mode is off",
-            "confidence": 0.0,
-            "source": "gate",
-        });
-        println!("{}", serde_json::to_string(&result).unwrap());
-        return Ok(());
-    }
-
     let brain_cfg = cfg.brain.clone().unwrap_or_default();
 
-    if !brain_cfg.enabled && !cli.brain {
+    if gate_mode != "off" && !brain_cfg.enabled && !cli.brain {
         eprintln!("Brain is not enabled. Use --brain or set brain.enabled = true in config.");
         std::process::exit(1);
     }
@@ -1428,152 +1422,49 @@ pub(crate) fn run_brain_query(cfg: &config::Config, cli: &Cli) -> io::Result<()>
     // We try to parse it into a `DiffDigest` for richer prompt context and
     // structured decision-log attribution. Missing/invalid stdin is fine —
     // the rest of the flow degrades to the pre-#237 behaviour.
-    let diff_digest = read_diff_digest_from_stdin(&tool_name);
-
-    // Step 1: Check static deny rules first (instant, no LLM needed)
-    let auto_rules = cfg.rules.clone();
-    let deny_rules: Vec<_> = auto_rules
-        .iter()
-        .filter(|r| r.action == rules::RuleAction::Deny)
-        .cloned()
-        .collect();
-
-    // Build a minimal synthetic session for rule matching
-    let mut synthetic = session::CodexSession::from_raw(session::RawSession {
-        pid: std::process::id(),
-        session_id: "brain-query".into(),
-        cwd: std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".into()),
-        started_at: 0,
-    });
-    synthetic.project_name = project.clone();
-    synthetic.status = session::SessionStatus::NeedsInput;
-    synthetic.pending_tool_name = Some(tool_name.clone());
-    synthetic.pending_tool_input = if command.is_empty() {
+    let diff_digest = if gate_mode == "off" {
         None
     } else {
-        Some(command.clone())
+        read_diff_digest_from_stdin(&tool_name)
     };
 
-    // Check deny rules
-    if let Some(deny_match) = rules::evaluate(&deny_rules, &synthetic) {
-        let result = serde_json::json!({
-            "action": "deny",
-            "reasoning": format!("Deny rule '{}' matched", deny_match.rule_name),
-            "confidence": 1.0,
-            "source": "rule",
-        });
-        println!("{}", serde_json::to_string(&result).unwrap());
-        return Ok(());
-    }
-
-    // Step 2: Check approve rules
-    let approve_rules: Vec<_> = auto_rules
-        .iter()
-        .filter(|r| r.action == rules::RuleAction::Approve)
-        .cloned()
-        .collect();
-    if let Some(approve_match) = rules::evaluate(&approve_rules, &synthetic) {
-        let result = serde_json::json!({
-            "action": "approve",
-            "reasoning": format!("Approve rule '{}' matched", approve_match.rule_name),
-            "confidence": 1.0,
-            "source": "rule",
-        });
-        println!("{}", serde_json::to_string(&result).unwrap());
-        return Ok(());
-    }
-
-    // Step 3: Query the LLM brain
-    let tool_display = if command.is_empty() {
-        tool_name.clone()
-    } else {
-        format!("{tool_name}: {command}")
+    let request = brain::query::BrainDecisionRequest {
+        project,
+        tool_name,
+        tool_input: command,
+        diff_digest,
     };
+    let result = brain_query_json_with(cfg, &request, &gate_mode, brain::client::infer);
+    println!("{}", serde_json::to_string(&result).unwrap());
+    Ok(())
+}
 
-    let session_summary = format!(
-        "Project: {project} | Status: Needs Input | Pending tool: {tool_name} | Command: {command}"
-    );
-
-    // #237: include the diff digest when we have one.
-    let diff_section = match diff_digest.as_ref() {
-        Some(d) => format!("\n\n## Proposed change\n{}", d.format_for_prompt()),
-        None => String::new(),
-    };
-
-    // Load distilled preferences
-    let pref_section = if let Some(prefs) = brain::decisions::load_preferences_for_project(&project)
-    {
-        let summary = brain::decisions::format_preference_summary(&prefs);
-        format!("\n\n## Learned Preferences\n{summary}")
-    } else {
-        String::new()
-    };
-
-    // Load few-shot examples
-    let few_shot_section = {
-        let similar = brain::decisions::retrieve_similar(
-            Some(&tool_name),
-            &project,
-            brain_cfg.few_shot_count.min(5),
-            Some(brain::decisions::DecisionType::Session),
-        );
-        if similar.is_empty() {
-            String::new()
-        } else {
-            let examples = brain::decisions::format_few_shot_examples(&similar);
-            format!("\n\n## Past Decisions\n{examples}")
-        }
-    };
-
-    let prompt = format!(
-        "You are a session supervisor deciding whether to approve or deny a tool call.\n\
-         \n## Session\n{session_summary}\
-         {diff_section}\
-         {pref_section}\
-         {few_shot_section}\n\
-         \n## Decision\n\
-         The session wants to run [{tool_display}]. \
-         Weigh the proposed change against the learned preferences and past \
-         decisions. Be more cautious when sensitive paths or risky tokens are \
-         present. Respond with JSON: {{\"action\": \"approve\"|\"deny\", \
-         \"message\": \"...\", \"reasoning\": \"...\", \"confidence\": 0.0-1.0}}"
-    );
-
-    match brain::client::infer(&brain_cfg, &prompt) {
-        Ok(suggestion) => {
-            // Check adaptive threshold
-            let threshold = brain::decisions::adaptive_threshold(Some(&tool_name)).unwrap_or(0.6);
-            let below_threshold = suggestion.confidence < threshold;
-
-            let mut result = serde_json::json!({
-                "action": suggestion.action.label(),
-                "reasoning": suggestion.reasoning,
-                "confidence": suggestion.confidence,
-                "message": suggestion.message,
-                "source": "brain",
-                "below_threshold": below_threshold,
-                "threshold": threshold,
-            });
-            if let Some(d) = diff_digest.as_ref() {
-                result["diff_digest"] = d.to_log_json();
-            }
-            println!("{}", serde_json::to_string(&result).unwrap());
-            Ok(())
-        }
-        Err(e) => {
-            // On brain failure, output abstain (don't block the user)
-            let result = serde_json::json!({
-                "action": "abstain",
-                "reasoning": format!("Brain query failed: {e}"),
-                "confidence": 0.0,
-                "source": "error",
-            });
-            println!("{}", serde_json::to_string(&result).unwrap());
-            Ok(())
+fn brain_query_json_with<F>(
+    cfg: &config::Config,
+    request: &brain::query::BrainDecisionRequest,
+    gate_mode: &str,
+    infer: F,
+) -> serde_json::Value
+where
+    F: FnOnce(&config::BrainConfig, &str) -> Result<brain::client::BrainSuggestion, String>,
+{
+    let brain_cfg = cfg.brain.clone().unwrap_or_default();
+    let decision = brain::query::evaluate_with(request, &brain_cfg, gate_mode, infer);
+    let mut result = serde_json::json!({
+        "action": decision.action,
+        "reasoning": decision.reasoning,
+        "confidence": decision.confidence,
+        "source": decision.source,
+    });
+    if decision.source == "brain" {
+        result["message"] = serde_json::to_value(decision.message).unwrap();
+        result["below_threshold"] = serde_json::to_value(decision.below_threshold).unwrap();
+        result["threshold"] = serde_json::to_value(decision.threshold).unwrap();
+        if let Some(digest) = decision.diff_digest {
+            result["diff_digest"] = digest;
         }
     }
+    result
 }
 
 #[cfg(test)]
@@ -1593,6 +1484,50 @@ mod headless_tests {
                 "supervisor_tick" | "coord_summary" | "loop_outcome"
             )
         }));
+    }
+
+    #[test]
+    fn headless_engine_resolves_managed_hooks_for_the_session_project() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let clean_project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".codex")).unwrap();
+        std::fs::create_dir_all(project.path().join(".git")).unwrap();
+        std::fs::create_dir_all(clean_project.path().join(".git")).unwrap();
+        std::fs::write(
+            project.path().join(".codex/hooks.json"),
+            r#"{"hooks":{"PermissionRequest":[{"matcher":"Bash","hooks":[{"type":"command","command":"codexctl --permission-hook"}]}]}}"#,
+        )
+        .unwrap();
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: HOME reads in config-sensitive tests are serialized by HOME_ENV_LOCK.
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let engine = headless_brain_engine(crate::config::BrainConfig::default());
+        let hooked_session = crate::session::CodexSession::from_raw(crate::session::RawSession {
+            pid: 1,
+            session_id: "session-1".into(),
+            cwd: project.path().display().to_string(),
+            started_at: 0,
+        });
+        let clean_session = crate::session::CodexSession::from_raw(crate::session::RawSession {
+            pid: 2,
+            session_id: "session-2".into(),
+            cwd: clean_project.path().display().to_string(),
+            started_at: 0,
+        });
+
+        assert!(engine.terminal_fallback_blocked_for(&hooked_session));
+        assert!(!engine.terminal_fallback_blocked_for(&clean_session));
+        // SAFETY: restore HOME before releasing HOME_ENV_LOCK.
+        unsafe {
+            match original_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 }
 
@@ -1634,5 +1569,46 @@ mod digest_parser_tests {
     #[test]
     fn returns_none_for_invalid_json() {
         assert!(digest_from_hook_payload("Edit", "{not json").is_none());
+    }
+}
+
+#[cfg(test)]
+mod brain_query_adapter_tests {
+    use super::*;
+    use crate::brain::client::BrainSuggestion;
+    use crate::rules::{AutoRule, RuleAction};
+
+    #[test]
+    fn matching_auto_rules_do_not_override_injected_brain_decision() {
+        let mut cfg = config::Config::default();
+        let mut deny = AutoRule::new("deny cargo".into(), RuleAction::Deny);
+        deny.match_tool.push("Bash".into());
+        deny.match_command.push("cargo test".into());
+        let mut approve = AutoRule::new("approve cargo".into(), RuleAction::Approve);
+        approve.match_tool.push("Bash".into());
+        approve.match_command.push("cargo test".into());
+        cfg.rules = vec![deny, approve];
+        cfg.brain = Some(config::BrainConfig::default());
+
+        let request = brain::query::BrainDecisionRequest {
+            project: "codexctl".into(),
+            tool_name: "Bash".into(),
+            tool_input: "cargo test".into(),
+            diff_digest: None,
+        };
+        let result = brain_query_json_with(&cfg, &request, "on", |_, _| {
+            Ok(BrainSuggestion {
+                action: RuleAction::Approve,
+                message: Some("brain chose this".into()),
+                reasoning: "injected brain decision".into(),
+                confidence: 0.9,
+                suggested_at: 0,
+            })
+        });
+
+        assert_eq!(result["action"], "approve");
+        assert_eq!(result["source"], "brain");
+        assert_eq!(result["reasoning"], "injected brain decision");
+        assert_ne!(result["source"], "rule");
     }
 }

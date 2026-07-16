@@ -8,35 +8,85 @@ use std::path::{Path, PathBuf};
 /// `codexctl --json` which is a lightweight, non-TUI snapshot that the
 /// brain / hooks system can consume.
 ///
-/// We also wire up `PermissionRequest` for Bash commands so codexctl's rule
-/// engine can evaluate approval requests before execution.
+/// We also wire up `PermissionRequest` for Bash commands so codexctl's brain
+/// can return a native allow or deny decision before execution.
 struct HookSpec {
     event: &'static str,
     matcher: &'static str,
     command: &'static str,
     timeout: u32,
+    status_message: Option<&'static str>,
 }
 
 const HOOKS: &[HookSpec] = &[
     HookSpec {
         event: "PermissionRequest",
         matcher: "Bash",
-        command: "codexctl --json 2>/dev/null || true",
-        timeout: 5,
+        command: "codexctl --permission-hook",
+        timeout: 30,
+        status_message: Some("Brain reviewing permission…"),
     },
     HookSpec {
         event: "PostToolUse",
         matcher: "*",
         command: "codexctl --json 2>/dev/null || true",
         timeout: 5,
+        status_message: None,
     },
     HookSpec {
         event: "Stop",
         matcher: "",
         command: "codexctl --json 2>/dev/null || true",
         timeout: 5,
+        status_message: None,
     },
 ];
+
+const LEGACY_SNAPSHOT_COMMAND: &str = "codexctl --json 2>/dev/null || true";
+const CURRENT_PERMISSION_COMMAND: &str = "codexctl --permission-hook";
+const PERMISSION_STATUS_MESSAGE: &str = "Brain reviewing permission…";
+
+/// Managed PermissionRequest hook state in one Codex configuration scope.
+///
+/// A stale or disabled managed entry is still configured: callers use that
+/// conservative signal to avoid enabling terminal-input fallback.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionHookScope {
+    pub configured: bool,
+    pub current: bool,
+    pub stale: bool,
+    pub disabled: bool,
+}
+
+/// Managed PermissionRequest hook state across the active user and project
+/// configuration layers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionHookDiscovery {
+    pub global: PermissionHookScope,
+    pub project: PermissionHookScope,
+    conservative_ancestor_configured: bool,
+}
+
+impl PermissionHookDiscovery {
+    pub fn configured(&self) -> bool {
+        self.global.configured || self.project.configured
+    }
+
+    pub fn duplicate_scopes(&self) -> bool {
+        self.global.configured && self.project.configured
+    }
+
+    /// Whether terminal input fallback must remain disabled.
+    ///
+    /// This deliberately includes managed permission hooks in every cwd
+    /// ancestor, even outside the exact project scope derived from the base
+    /// user config. Codex may have a CLI/profile root-marker override that
+    /// codexctl cannot observe; a false positive safely leaves the normal
+    /// permission prompt visible, while a false negative could inject Enter.
+    pub fn blocks_terminal_fallback(&self) -> bool {
+        self.configured() || self.conservative_ancestor_configured
+    }
+}
 
 fn settings_path(project: bool) -> PathBuf {
     if project {
@@ -49,31 +99,185 @@ fn settings_path(project: bool) -> PathBuf {
     }
 }
 
-/// Convenience for the init wizard's state-detection path. Returns the
-/// global (user-scope) settings file location.
-pub fn user_settings_path() -> PathBuf {
-    settings_path(false)
+/// Discover codexctl's managed PermissionRequest hook in the global and
+/// project configuration layers applicable to `cwd`.
+pub fn discover_permission_hooks(cwd: &Path) -> PermissionHookDiscovery {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    discover_permission_hooks_at(home.as_deref(), cwd)
 }
 
-/// Probe a hooks.json on disk for codexctl-managed hooks. Returns
-/// `Some(true)` when present, `Some(false)` when absent, and `None` when the
-/// file doesn't exist or can't be parsed. Used by `init::state` to keep
-/// detection consistent with what `run_init` writes.
-pub fn settings_contain_codexctl_hooks(path: &Path) -> Option<bool> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    Some(has_codexctl_hooks(&value))
+pub(crate) fn discover_permission_hooks_at(
+    home: Option<&Path>,
+    cwd: &Path,
+) -> PermissionHookDiscovery {
+    let global = home
+        .map(|home| scope_from_paths([home.join(".codex/hooks.json")]))
+        .unwrap_or_default();
+    let markers = project_root_markers(home);
+    let project = scope_from_paths(applicable_project_hook_paths(cwd, &markers));
+    let conservative_ancestor_configured =
+        scope_from_paths(cwd.ancestors().map(|path| path.join(".codex/hooks.json"))).configured;
+    PermissionHookDiscovery {
+        global,
+        project,
+        conservative_ancestor_configured,
+    }
+}
+
+fn project_root_markers(home: Option<&Path>) -> Vec<String> {
+    const DEFAULT: &[&str] = &[".git"];
+    let Some(home) = home else {
+        return DEFAULT.iter().map(|marker| (*marker).to_owned()).collect();
+    };
+    let Ok(raw) = std::fs::read_to_string(home.join(".codex/config.toml")) else {
+        return DEFAULT.iter().map(|marker| (*marker).to_owned()).collect();
+    };
+    parse_project_root_markers(&raw)
+        .unwrap_or_else(|| DEFAULT.iter().map(|marker| (*marker).to_owned()).collect())
+}
+
+fn parse_project_root_markers(raw: &str) -> Option<Vec<String>> {
+    let mut section = "";
+    let lines = raw.lines().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim();
+            index += 1;
+            continue;
+        }
+        let Some((key, first_value)) = line.split_once('=') else {
+            index += 1;
+            continue;
+        };
+        if section.is_empty() && key.trim() == "project_root_markers" {
+            let mut value = first_value.trim().to_owned();
+            while !value.contains(']') && index + 1 < lines.len() {
+                index += 1;
+                value.push(' ');
+                value.push_str(lines[index].split('#').next().unwrap_or_default().trim());
+            }
+            return parse_marker_array(&value);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn parse_marker_array(value: &str) -> Option<Vec<String>> {
+    let value = value.trim();
+    let inner = value.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            item.strip_prefix('"')
+                .and_then(|item| item.strip_suffix('"'))
+                .or_else(|| {
+                    item.strip_prefix('\'')
+                        .and_then(|item| item.strip_suffix('\''))
+                })
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn applicable_project_hook_paths(cwd: &Path, markers: &[String]) -> Vec<PathBuf> {
+    let root = if markers.is_empty() {
+        cwd
+    } else {
+        cwd.ancestors()
+            .find(|path| markers.iter().any(|marker| path.join(marker).exists()))
+            .unwrap_or(cwd)
+    };
+    let mut dirs = cwd
+        .ancestors()
+        .take_while(|path| *path != root)
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    dirs.push(root.to_path_buf());
+    dirs.reverse();
+    dirs.into_iter()
+        .map(|path| path.join(".codex/hooks.json"))
+        .collect()
+}
+
+fn scope_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> PermissionHookScope {
+    let mut scope = PermissionHookScope::default();
+    for path in paths {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        inspect_permission_handlers(&value, &mut scope);
+    }
+    scope
+}
+
+fn inspect_permission_handlers(value: &serde_json::Value, scope: &mut PermissionHookScope) {
+    let Some(matchers) = value
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PermissionRequest"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for matcher in matchers {
+        let matcher_disabled = entry_is_disabled(matcher);
+        let matcher_name = matcher
+            .get("matcher")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(handlers) = matcher.get("hooks").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for handler in handlers {
+            let Some(command) = handler.get("command").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !is_managed_permission_command(matcher_name, command) {
+                continue;
+            }
+            scope.configured = true;
+            scope.disabled |= matcher_disabled || entry_is_disabled(handler);
+            let current = matcher_name == "Bash"
+                && handler.get("type").and_then(serde_json::Value::as_str) == Some("command")
+                && command.trim() == CURRENT_PERMISSION_COMMAND
+                && handler.get("timeout").and_then(serde_json::Value::as_u64) == Some(30)
+                && handler
+                    .get("statusMessage")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(PERMISSION_STATUS_MESSAGE);
+            scope.current |= current;
+            scope.stale |= !current;
+        }
+    }
+}
+
+fn entry_is_disabled(value: &serde_json::Value) -> bool {
+    value.get("enabled").and_then(serde_json::Value::as_bool) == Some(false)
+        || value.get("disabled").and_then(serde_json::Value::as_bool) == Some(true)
 }
 
 fn build_hooks_value() -> serde_json::Value {
     let mut hooks_map = serde_json::Map::new();
 
     for spec in HOOKS {
-        let hook_entry = serde_json::json!({
+        let mut hook_entry = serde_json::json!({
             "type": "command",
             "command": spec.command,
             "timeout": spec.timeout,
         });
+        if let Some(status_message) = spec.status_message {
+            hook_entry["statusMessage"] = serde_json::Value::String(status_message.to_owned());
+        }
 
         let matcher_entry = serde_json::json!({
             "matcher": spec.matcher,
@@ -95,7 +299,7 @@ fn build_hooks_value() -> serde_json::Value {
 fn has_codexctl_hooks(existing: &serde_json::Value) -> bool {
     if let Some(hooks) = existing.get("hooks") {
         if let Some(obj) = hooks.as_object() {
-            for (_event, matchers) in obj {
+            for (event, matchers) in obj {
                 if let Some(arr) = matchers.as_array() {
                     for matcher_entry in arr {
                         if let Some(inner_hooks) = matcher_entry.get("hooks") {
@@ -103,7 +307,11 @@ fn has_codexctl_hooks(existing: &serde_json::Value) -> bool {
                                 for hook in inner_arr {
                                     if let Some(cmd) = hook.get("command") {
                                         if let Some(s) = cmd.as_str() {
-                                            if s.contains("codexctl") {
+                                            let matcher = matcher_entry
+                                                .get("matcher")
+                                                .and_then(serde_json::Value::as_str)
+                                                .unwrap_or_default();
+                                            if is_managed_command(event, matcher, s) {
                                                 return true;
                                             }
                                         }
@@ -117,6 +325,34 @@ fn has_codexctl_hooks(existing: &serde_json::Value) -> bool {
         }
     }
     false
+}
+
+fn is_current_permission_command(command: &str) -> bool {
+    let command = command.trim();
+    command == CURRENT_PERMISSION_COMMAND
+        || command.split_whitespace().next().is_some_and(|program| {
+            (program == "codexctl" || program.ends_with("/codexctl"))
+                && command
+                    .split_whitespace()
+                    .any(|arg| arg == "--permission-hook")
+        })
+}
+
+fn is_legacy_snapshot_command(command: &str) -> bool {
+    matches!(command.trim(), LEGACY_SNAPSHOT_COMMAND | "codexctl --json")
+}
+
+fn is_managed_permission_command(matcher: &str, command: &str) -> bool {
+    is_current_permission_command(command)
+        || (matcher == "Bash" && is_legacy_snapshot_command(command))
+}
+
+fn is_managed_command(event: &str, matcher: &str, command: &str) -> bool {
+    match event {
+        "PermissionRequest" => is_managed_permission_command(matcher, command),
+        "PostToolUse" | "Stop" => is_legacy_snapshot_command(command),
+        _ => false,
+    }
 }
 
 /// Merge codexctl hooks into existing settings, preserving all other keys
@@ -137,6 +373,7 @@ fn merge_hooks(existing: &mut serde_json::Value) {
                 .or_insert_with(|| serde_json::Value::Array(Vec::new()));
             if let (Some(arr), Some(new_arr)) = (event_arr.as_array_mut(), new_matchers.as_array())
             {
+                arr.retain_mut(|matcher| filter_managed_hooks(event, matcher).1);
                 for new_matcher in new_arr {
                     arr.push(new_matcher.clone());
                 }
@@ -146,19 +383,25 @@ fn merge_hooks(existing: &mut serde_json::Value) {
 }
 
 /// Remove codexctl hooks from a matcher entry's inner hooks array.
-/// Returns true if any hooks remain after filtering.
-fn filter_codexctl_hooks(matcher_entry: &mut serde_json::Value) -> bool {
+/// Returns the number removed and whether any hooks remain after filtering.
+fn filter_managed_hooks(event: &str, matcher_entry: &mut serde_json::Value) -> (usize, bool) {
+    let matcher = matcher_entry
+        .get("matcher")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     if let Some(inner_hooks) = matcher_entry.get_mut("hooks") {
         if let Some(arr) = inner_hooks.as_array_mut() {
+            let before = arr.len();
             arr.retain(|hook| {
                 hook.get("command")
                     .and_then(|c| c.as_str())
-                    .is_none_or(|s| !s.contains("codexctl"))
+                    .is_none_or(|command| !is_managed_command(event, &matcher, command))
             });
-            return !arr.is_empty();
+            return (before - arr.len(), !arr.is_empty());
         }
     }
-    true
+    (0, true)
 }
 
 /// Remove all codexctl hook entries from settings, preserving everything else.
@@ -177,9 +420,11 @@ fn remove_codexctl_hooks(settings: &mut serde_json::Value) -> usize {
     let mut empty_events = Vec::new();
     for (event, matchers) in hooks_obj.iter_mut() {
         if let Some(arr) = matchers.as_array_mut() {
-            let before = arr.len();
-            arr.retain_mut(filter_codexctl_hooks);
-            removed += before - arr.len();
+            arr.retain_mut(|matcher| {
+                let (removed_handlers, keep) = filter_managed_hooks(event, matcher);
+                removed += removed_handlers;
+                keep
+            });
             if arr.is_empty() {
                 empty_events.push(event.clone());
             }
@@ -283,15 +528,11 @@ pub fn run_init(project: bool, dry_run: bool) -> io::Result<()> {
         serde_json::json!({})
     };
 
-    // Check for existing codexctl hooks
-    if has_codexctl_hooks(&settings) {
-        println!("codexctl hooks already configured in {}", path.display());
-        println!("To re-initialize, run `codexctl init --remove` first.");
-        return Ok(());
-    }
-
-    // Merge hooks into settings
+    // Replace known managed entries with the current definitions. This makes
+    // init both an installer and an idempotent in-place upgrader.
+    let before = settings.clone();
     merge_hooks(&mut settings);
+    let changed = settings != before;
 
     if dry_run {
         // Show what would be written without actually writing
@@ -300,6 +541,11 @@ pub fn run_init(project: bool, dry_run: bool) -> io::Result<()> {
         println!("Would write to {}:", path.display());
         println!();
         println!("{json}");
+        return Ok(());
+    }
+
+    if !changed {
+        println!("codexctl hooks are current in {}", path.display());
         return Ok(());
     }
 
@@ -322,11 +568,12 @@ fn print_success(path: &Path) {
     println!("Initialized codexctl hooks in {}", path.display());
     println!();
     println!("Hooks installed:");
-    println!("  PermissionRequest (Bash) — lets codexctl observe approval requests");
+    println!("  PermissionRequest (Bash) — lets the brain allow or deny requests");
     println!("  PostToolUse (*)          — notifies codexctl after every tool completion");
     println!("  Stop                     — notifies codexctl when a session ends");
     println!();
-    println!("Codex will now notify codexctl on each tool use.");
+    println!("Restart Codex, then open `/hooks` to review and trust the command.");
+    println!("Codex will then ask the brain to review Bash permission requests.");
     println!("Run `codexctl` to start the dashboard.");
 }
 
@@ -627,5 +874,461 @@ mod tests {
         let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(session_start.len(), 1);
         assert_eq!(session_start[0]["hooks"][0]["command"], "echo started");
+    }
+
+    #[test]
+    fn permission_hook_spec_uses_native_decision_adapter() {
+        let hooks = build_hooks_value();
+        let handler = &hooks["PermissionRequest"][0]["hooks"][0];
+
+        assert_eq!(handler["command"], "codexctl --permission-hook");
+        assert_eq!(handler["timeout"], 30);
+        assert_eq!(handler["statusMessage"], "Brain reviewing permission…");
+    }
+
+    #[test]
+    fn merge_upgrades_legacy_permission_handler_and_is_idempotent() {
+        let mut settings = serde_json::json!({
+            "custom": { "keep": true },
+            "hooks": {
+                "PermissionRequest": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --json 2>/dev/null || true",
+                        "timeout": 5
+                    }]
+                }]
+            }
+        });
+
+        merge_hooks(&mut settings);
+        let once = settings.clone();
+        merge_hooks(&mut settings);
+
+        assert_eq!(settings, once);
+        assert_eq!(settings["custom"], serde_json::json!({ "keep": true }));
+        let permission = settings["hooks"]["PermissionRequest"].as_array().unwrap();
+        assert_eq!(permission.len(), 1);
+        assert_eq!(
+            permission[0]["hooks"][0]["command"],
+            "codexctl --permission-hook"
+        );
+    }
+
+    #[test]
+    fn merge_preserves_unrelated_handlers_and_keys_in_shared_matcher() {
+        let unrelated = serde_json::json!({
+            "type": "command",
+            "command": "notify-send codexctl",
+            "timeout": 7,
+            "custom": "unchanged"
+        });
+        let mut settings = serde_json::json!({
+            "topLevel": [1, 2, 3],
+            "hooks": {
+                "PermissionRequest": [{
+                    "matcher": "Bash",
+                    "customMatcherKey": "keep",
+                    "hooks": [
+                        unrelated.clone(),
+                        {
+                            "type": "command",
+                            "command": "codexctl --json 2>/dev/null || true",
+                            "timeout": 5
+                        }
+                    ]
+                }]
+            }
+        });
+
+        merge_hooks(&mut settings);
+
+        assert_eq!(settings["topLevel"], serde_json::json!([1, 2, 3]));
+        let permission = settings["hooks"]["PermissionRequest"].as_array().unwrap();
+        assert_eq!(permission.len(), 2);
+        assert_eq!(permission[0]["customMatcherKey"], "keep");
+        assert_eq!(permission[0]["hooks"], serde_json::json!([unrelated]));
+    }
+
+    fn write_hooks(path: &Path, value: serde_json::Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn discovery_treats_disabled_and_stale_managed_handlers_as_configured() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        write_hooks(
+            &home.join(".codex/hooks.json"),
+            serde_json::json!({
+                "hooks": { "PermissionRequest": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --permission-hook",
+                        "timeout": 5,
+                        "statusMessage": "old copy",
+                        "enabled": false
+                    }]
+                }] }
+            }),
+        );
+
+        let discovery = discover_permission_hooks_at(Some(&home), &cwd);
+
+        assert!(discovery.configured());
+        assert!(discovery.global.configured);
+        assert!(discovery.global.disabled);
+        assert!(discovery.global.stale);
+        assert!(!discovery.project.configured);
+        assert!(discovery.blocks_terminal_fallback());
+    }
+
+    #[test]
+    fn discovery_treats_legacy_permission_handler_as_configured() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        write_hooks(
+            &home.join(".codex/hooks.json"),
+            serde_json::json!({
+                "hooks": { "PermissionRequest": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --json 2>/dev/null || true",
+                        "timeout": 5
+                    }]
+                }] }
+            }),
+        );
+
+        let discovery = discover_permission_hooks_at(Some(&home), &cwd);
+
+        assert!(discovery.configured());
+        assert!(discovery.global.stale);
+        assert!(!discovery.global.current);
+    }
+
+    #[test]
+    fn discovery_finds_applicable_project_only_handler() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = temp.path().join("project");
+        let cwd = root.join("nested/dir");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_hooks(
+            &root.join(".codex/hooks.json"),
+            serde_json::json!({
+                "hooks": { "PermissionRequest": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --permission-hook",
+                        "timeout": 30,
+                        "statusMessage": "Brain reviewing permission…"
+                    }]
+                }] }
+            }),
+        );
+
+        let discovery = discover_permission_hooks_at(Some(&home), &cwd);
+
+        assert!(discovery.configured());
+        assert!(!discovery.global.configured);
+        assert!(discovery.project.configured);
+        assert!(!discovery.project.stale);
+        assert!(discovery.blocks_terminal_fallback());
+    }
+
+    #[test]
+    fn discovery_reports_duplicate_global_and_project_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        let current = serde_json::json!({
+            "hooks": { "PermissionRequest": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "codexctl --permission-hook",
+                    "timeout": 30,
+                    "statusMessage": "Brain reviewing permission…"
+                }]
+            }] }
+        });
+        write_hooks(&home.join(".codex/hooks.json"), current.clone());
+        write_hooks(&cwd.join(".codex/hooks.json"), current);
+
+        let discovery = discover_permission_hooks_at(Some(&home), &cwd);
+
+        assert!(discovery.duplicate_scopes());
+    }
+
+    #[test]
+    fn discovery_honors_custom_project_root_marker_from_user_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = temp.path().join("project");
+        let cwd = root.join("nested/dir");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "project_root_markers = [\".jj\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".jj")).unwrap();
+        // A nearer `.git` marker must not win when the user replaced the
+        // default marker list with `.jj`.
+        std::fs::create_dir_all(root.join("nested/.git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_hooks(
+            &root.join(".codex/hooks.json"),
+            serde_json::json!({
+                "hooks": { "PermissionRequest": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --permission-hook",
+                        "timeout": 30,
+                        "statusMessage": "Brain reviewing permission…"
+                    }]
+                }] }
+            }),
+        );
+
+        let discovery = discover_permission_hooks_at(Some(&home), &cwd);
+
+        assert!(discovery.project.configured);
+    }
+
+    #[test]
+    fn discovery_accepts_linked_worktree_git_file_as_root_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = temp.path().join("worktree");
+        let cwd = root.join("nested");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: /tmp/main/.git/worktrees/wt\n").unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_hooks(
+            &root.join(".codex/hooks.json"),
+            serde_json::json!({
+                "hooks": { "PermissionRequest": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --permission-hook",
+                        "timeout": 30,
+                        "statusMessage": "Brain reviewing permission…"
+                    }]
+                }] }
+            }),
+        );
+
+        let discovery = discover_permission_hooks_at(Some(&home), &cwd);
+
+        assert!(discovery.project.configured);
+    }
+
+    #[test]
+    fn empty_project_root_markers_limit_discovery_to_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = temp.path().join("project");
+        let cwd = root.join("nested");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "project_root_markers = []\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_hooks(
+            &root.join(".codex/hooks.json"),
+            serde_json::json!({
+                "hooks": { "PermissionRequest": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --permission-hook",
+                        "timeout": 30,
+                        "statusMessage": "Brain reviewing permission…"
+                    }]
+                }] }
+            }),
+        );
+
+        let discovery = discover_permission_hooks_at(Some(&home), &cwd);
+
+        assert!(!discovery.project.configured);
+    }
+
+    #[test]
+    fn legacy_snapshot_in_write_matcher_is_user_owned() {
+        let mut settings = serde_json::json!({
+            "hooks": { "PermissionRequest": [{
+                "matcher": "Write",
+                "hooks": [{
+                    "type": "command",
+                    "command": "codexctl --json",
+                    "timeout": 5
+                }]
+            }] }
+        });
+
+        merge_hooks(&mut settings);
+
+        let matchers = settings["hooks"]["PermissionRequest"].as_array().unwrap();
+        assert_eq!(matchers.len(), 2);
+        assert_eq!(matchers[0]["matcher"], "Write");
+        assert_eq!(matchers[0]["hooks"][0]["command"], "codexctl --json");
+    }
+
+    #[test]
+    fn discovery_ignores_legacy_snapshot_outside_bash_matcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        write_hooks(
+            &home.join(".codex/hooks.json"),
+            serde_json::json!({
+                "hooks": { "PermissionRequest": [{
+                    "matcher": "Write",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --json",
+                        "timeout": 5
+                    }]
+                }] }
+            }),
+        );
+
+        let discovery = discover_permission_hooks_at(Some(&home), &cwd);
+
+        assert!(!discovery.configured());
+    }
+
+    #[test]
+    fn uninit_preserves_user_owned_write_snapshot_handler() {
+        let mut settings = serde_json::json!({
+            "hooks": { "PermissionRequest": [
+                {
+                    "matcher": "Write",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --json",
+                        "timeout": 5
+                    }]
+                },
+                {
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --permission-hook",
+                        "timeout": 30
+                    }]
+                }
+            ] }
+        });
+
+        let removed = remove_codexctl_hooks(&mut settings);
+
+        assert_eq!(removed, 1);
+        let matchers = settings["hooks"]["PermissionRequest"].as_array().unwrap();
+        assert_eq!(matchers.len(), 1);
+        assert_eq!(matchers[0]["matcher"], "Write");
+    }
+
+    #[test]
+    fn uninit_counts_managed_handler_removed_from_shared_matcher() {
+        let mut settings = serde_json::json!({
+            "hooks": { "PermissionRequest": [{
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "echo keep",
+                        "timeout": 5
+                    },
+                    {
+                        "type": "command",
+                        "command": "codexctl --permission-hook",
+                        "timeout": 30
+                    }
+                ]
+            }] }
+        });
+
+        let removed = remove_codexctl_hooks(&mut settings);
+
+        assert_eq!(removed, 1);
+        assert_eq!(
+            settings["hooks"]["PermissionRequest"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
+            "echo keep"
+        );
+    }
+
+    #[test]
+    fn ancestor_hook_blocks_fallback_without_becoming_exact_project_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let jj_root = temp.path().join("project");
+        let git_root = jj_root.join("nested");
+        let cwd = git_root.join("work");
+        std::fs::create_dir_all(jj_root.join(".jj")).unwrap();
+        std::fs::create_dir_all(git_root.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_hooks(
+            &jj_root.join(".codex/hooks.json"),
+            serde_json::json!({
+                "hooks": { "PermissionRequest": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "codexctl --permission-hook",
+                        "timeout": 30,
+                        "statusMessage": "Brain reviewing permission…"
+                    }]
+                }] }
+            }),
+        );
+
+        let discovery = discover_permission_hooks_at(Some(&home), &cwd);
+
+        assert!(!discovery.configured());
+        assert!(!discovery.project.configured);
+        assert!(discovery.blocks_terminal_fallback());
+    }
+
+    #[test]
+    fn fallback_is_not_blocked_without_global_or_ancestor_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = temp.path().join("project");
+        let cwd = root.join("nested");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let discovery = discover_permission_hooks_at(Some(&home), &cwd);
+
+        assert!(!discovery.configured());
+        assert!(!discovery.blocks_terminal_fallback());
     }
 }

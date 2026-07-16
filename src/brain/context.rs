@@ -70,13 +70,13 @@ fn format_session_summary(session: &CodexSession) -> String {
         context_pct,
     );
 
-    if let Some(ref tool) = session.pending_tool_name {
+    if let Some(tool) = session.actionable_tool_name() {
         summary.push_str(&format!(" | Pending tool: {tool}"));
-        if let Some(ref input) = session.pending_tool_input {
+        if let Some(input) = session.actionable_tool_input() {
             let truncated = if input.len() > 200 {
                 format!("{}...", session::truncate_str(input, 200))
             } else {
-                input.clone()
+                input.to_string()
             };
             summary.push_str(&format!(" | Command: {truncated}"));
         }
@@ -101,7 +101,7 @@ fn format_session_summary(session: &CodexSession) -> String {
 fn format_decision_prompt(session: &CodexSession) -> String {
     match session.status {
         crate::session::SessionStatus::NeedsInput => {
-            let tool = session.pending_tool_name.as_deref().unwrap_or("unknown");
+            let tool = session.actionable_tool_name().unwrap_or("unknown");
             format!(
                 "The session is waiting for approval of a '{}' tool call. \
                  Should this be approved, denied, or should a message be sent instead? \
@@ -149,20 +149,19 @@ fn format_global_session_map(current_pid: u32, sessions: &[CodexSession]) -> Str
             0
         };
 
-        let tool_info = match &s.pending_tool_name {
+        let tool_info = match s.actionable_tool_name() {
             Some(tool) => {
-                let cmd = s
-                    .pending_tool_input
-                    .as_deref()
-                    .map(|c| {
-                        if c.len() > 60 {
-                            format!(" \"{}...\"", session::truncate_str(c, 60))
+                let command = s
+                    .actionable_tool_input()
+                    .map(|command| {
+                        if command.len() > 60 {
+                            format!(" \"{}...\"", session::truncate_str(command, 60))
                         } else {
-                            format!(" \"{c}\"")
+                            format!(" \"{command}\"")
                         }
                     })
                     .unwrap_or_default();
-                format!(" [{}{}]", tool, cmd)
+                format!(" [{}{}]", tool, command)
             }
             None => String::new(),
         };
@@ -491,7 +490,11 @@ pub fn format_brain_prompt(ctx: &BrainContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{CodexSession, RawSession, SessionStatus, TelemetryStatus};
+    use crate::session::{
+        ApprovalEvidence, ApprovalObservation, CodexSession, RawSession, SessionStatus,
+        TelemetryStatus,
+    };
+    use codexctl_core::terminals::Terminal;
 
     fn make_session() -> CodexSession {
         let raw = RawSession {
@@ -510,6 +513,50 @@ mod tests {
         s.pending_tool_name = Some("Bash".into());
         s.pending_tool_input = Some("cargo test --release".into());
         s
+    }
+
+    fn confirm_wrapper_command(session: &mut CodexSession, command: &str) {
+        session.pending_tool_name = Some("exec".into());
+        session.pending_tool_call_id = Some("call-1".into());
+        session.pending_tool_input = Some("await tools.exec_command(args);".into());
+        session.approval = ApprovalObservation::Confirmed(ApprovalEvidence {
+            session_id: session.session_id.clone(),
+            tty: session.tty.clone(),
+            call_id: "call-1".into(),
+            tool: "exec_command".into(),
+            command: command.into(),
+            backend: Terminal::Tmux,
+            target: "main:1.0".into(),
+            prompt_pattern_version: 1,
+            prompt_fingerprint: 42,
+        });
+    }
+
+    #[test]
+    fn brain_context_uses_confirmed_wrapper_command() {
+        let mut session = make_session();
+        confirm_wrapper_command(&mut session, "install -m 664 source target");
+
+        let summary = format_session_summary(&session);
+        let prompt = format_decision_prompt(&session);
+        let context = build_context(&session, std::slice::from_ref(&session), 4000);
+
+        assert!(summary.contains("exec_command"));
+        assert!(summary.contains("install -m 664 source target"));
+        assert!(!summary.contains("await tools.exec_command(args);"));
+        assert!(prompt.contains("exec_command"));
+        assert!(!prompt.contains("await tools.exec_command(args);"));
+        assert!(context.session_summary.contains("exec_command"));
+        assert!(
+            context
+                .session_summary
+                .contains("install -m 664 source target")
+        );
+        assert!(
+            !context
+                .session_summary
+                .contains("await tools.exec_command(args);")
+        );
     }
 
     #[test]

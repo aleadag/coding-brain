@@ -248,6 +248,55 @@ fn compact_value(value: &str, empty_label: &str) -> String {
     }
 }
 
+const BRAIN_DECISION_NOTICE_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+const BRAIN_DECISION_NOTICE_MAX_CHARS: usize = 120;
+
+struct BrainDecisionNotice {
+    decision_id: String,
+    message: String,
+    expires_at: std::time::Instant,
+}
+
+fn truncate_notice(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let prefix: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{prefix}…")
+}
+
+fn brain_decision_notice_message(
+    decision: &codexctl_core::runtime::DecisionSummary,
+) -> Option<String> {
+    let verb = match decision.user_action.as_deref() {
+        Some("auto" | "hook_allow" | "terminal_fallback_allow") => "allowed",
+        Some("hook_deny") => "denied",
+        _ => return None,
+    };
+    let tool = decision
+        .tool
+        .as_deref()
+        .unwrap_or("request")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let tool = if tool.is_empty() { "request" } else { &tool };
+    let reasoning = decision
+        .reasoning
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let message = if reasoning.is_empty() {
+        format!("Brain {verb} {tool}")
+    } else {
+        format!("Brain {verb} {tool} — {reasoning}")
+    };
+    Some(truncate_notice(&message, BRAIN_DECISION_NOTICE_MAX_CHARS))
+}
+
 pub struct App {
     pub sessions: Vec<CodexSession>,
     transcript_assignments: discovery::TranscriptAssignmentState,
@@ -342,6 +391,9 @@ pub struct App {
     pub brain_note_input_mode: bool,
     /// Buffer for the in-progress note.
     pub brain_note_buffer: String,
+
+    brain_decision_cursor: Option<String>,
+    brain_decision_notice: Option<BrainDecisionNotice>,
 
     /// UI ↔ runtime contract (epic #279, issue #275). `App::new` starts with
     /// an in-memory `MockRuntime`; `main` swaps in the live runtime at
@@ -441,8 +493,8 @@ fn observation_from(
     codexctl_core::runtime::ObservationInput {
         session_pid: session.pid,
         project: session.display_name().to_string(),
-        tool: session.pending_tool_name.clone(),
-        command: session.pending_tool_input.clone(),
+        tool: session.actionable_tool_name().map(str::to_owned),
+        command: session.actionable_tool_input().map(str::to_owned),
         observed_action: action.to_string(),
     }
 }
@@ -559,12 +611,70 @@ impl App {
             brain_status_msg: None,
             brain_note_input_mode: false,
             brain_note_buffer: String::new(),
+            brain_decision_cursor: None,
+            brain_decision_notice: None,
         };
         app.refresh();
         if app.visible_session_count() > 0 {
             app.table_state.select(Some(0));
         }
         app
+    }
+
+    pub fn terminal_auto_fallback_configured(&self) -> bool {
+        self.brain_config
+            .as_ref()
+            .is_some_and(|brain| brain.auto_mode && brain.terminal_auto_approve_fallback)
+    }
+
+    /// Establish the current durable-decision cursor without replaying history.
+    pub fn prime_brain_decision_notice(&mut self) {
+        self.brain_decision_cursor = self
+            .runtime
+            .brain
+            .recent_decisions(1)
+            .into_iter()
+            .next()
+            .map(|decision| decision.id);
+        self.brain_decision_notice = None;
+    }
+
+    fn poll_brain_decision_notice(&mut self) {
+        self.poll_brain_decision_notice_at(std::time::Instant::now());
+    }
+
+    pub(crate) fn poll_brain_decision_notice_at(&mut self, now: std::time::Instant) {
+        let Some(decision) = self.runtime.brain.recent_decisions(1).into_iter().next() else {
+            return;
+        };
+        let already_noticed = self
+            .brain_decision_notice
+            .as_ref()
+            .is_some_and(|notice| notice.decision_id == decision.id);
+        if self.brain_decision_cursor.as_deref() == Some(decision.id.as_str()) || already_noticed {
+            return;
+        }
+
+        self.brain_decision_cursor = Some(decision.id.clone());
+        let Some(message) = brain_decision_notice_message(&decision) else {
+            return;
+        };
+        self.brain_decision_notice = Some(BrainDecisionNotice {
+            decision_id: decision.id,
+            message,
+            expires_at: now + BRAIN_DECISION_NOTICE_DURATION,
+        });
+    }
+
+    pub(crate) fn brain_decision_notice_at(&self, now: std::time::Instant) -> Option<&str> {
+        self.brain_decision_notice
+            .as_ref()
+            .and_then(|notice| (now < notice.expires_at).then_some(notice.message.as_str()))
+    }
+
+    pub(crate) fn has_active_brain_decision_notice(&self) -> bool {
+        self.brain_decision_notice_at(std::time::Instant::now())
+            .is_some()
     }
 
     pub fn refresh(&mut self) {
@@ -1112,7 +1222,7 @@ impl App {
                     driver.set_pending(codexctl_core::runtime::PendingSuggestion {
                         pid: s.pid,
                         action: "approve".into(),
-                        message: s.pending_tool_input.clone(),
+                        message: s.actionable_tool_input().map(str::to_owned),
                         reasoning: "Safe build command, no side effects".into(),
                         confidence: 0.92,
                         suggested_at: 0,
@@ -1127,7 +1237,7 @@ impl App {
                     driver.set_pending(codexctl_core::runtime::PendingSuggestion {
                         pid: s.pid,
                         action: "deny".into(),
-                        message: s.pending_tool_input.clone(),
+                        message: s.actionable_tool_input().map(str::to_owned),
                         reasoning: "Destructive operation, needs manual review".into(),
                         confidence: 0.87,
                         suggested_at: 0,
@@ -1190,6 +1300,7 @@ impl App {
 
         self.refresh();
         self.run_auto_actions();
+        self.poll_brain_decision_notice();
 
         // Refresh weekly summary every ~30s (15 ticks at 2s interval)
         self.weekly_summary_tick += 1;
@@ -1449,6 +1560,15 @@ impl App {
                 let Some(rule_match) = result else {
                     continue;
                 };
+                if session.is_shell_permission_request()
+                    && matches!(
+                        rule_match.action,
+                        codexctl_core::rules::RuleAction::Approve
+                            | codexctl_core::rules::RuleAction::Deny
+                    )
+                {
+                    continue;
+                }
 
                 // Log passive observation: static rule fired
                 let obs_action = format!("rule_{}", rule_match.action.label());
@@ -2335,8 +2455,8 @@ impl App {
                 .log_decision(codexctl_core::runtime::LogDecisionInput {
                     session_pid: pid,
                     project: session.display_name().to_string(),
-                    tool: session.pending_tool_name.clone(),
-                    command: session.pending_tool_input.clone(),
+                    tool: session.actionable_tool_name().map(str::to_owned),
+                    command: session.actionable_tool_input().map(str::to_owned),
                     suggestion: sg,
                     user_action: "accept".into(),
                     decision_type: codexctl_core::runtime::DecisionScope::Session,
@@ -2365,8 +2485,8 @@ impl App {
             let log_input = codexctl_core::runtime::LogDecisionInput {
                 session_pid: pid,
                 project: session.display_name().to_string(),
-                tool: session.pending_tool_name.clone(),
-                command: session.pending_tool_input.clone(),
+                tool: session.actionable_tool_name().map(str::to_owned),
+                command: session.actionable_tool_input().map(str::to_owned),
                 suggestion: suggestion.clone(),
                 user_action: "reject".into(),
                 decision_type: codexctl_core::runtime::DecisionScope::Session,
@@ -2572,7 +2692,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codexctl_core::session::{RawSession, TelemetryStatus};
+    use codexctl_core::runtime::DecisionSummary;
+    use codexctl_core::session::{
+        ApprovalEvidence, ApprovalObservation, RawSession, TelemetryStatus,
+    };
+    use codexctl_core::terminals::Terminal;
 
     fn make_session(
         pid: u32,
@@ -2652,6 +2776,139 @@ mod tests {
         app
     }
 
+    fn decision(id: &str, user_action: &str, reasoning: &str) -> DecisionSummary {
+        DecisionSummary {
+            id: id.into(),
+            timestamp: "2026-07-16T00:00:00Z".into(),
+            action: if matches!(user_action, "hook_deny") {
+                "deny".into()
+            } else {
+                "approve".into()
+            },
+            confidence: Some(0.95),
+            project: Some("test".into()),
+            tool: Some("Bash".into()),
+            pid: 42,
+            command: Some("cargo test".into()),
+            reasoning: Some(reasoning.into()),
+            user_action: Some(user_action.into()),
+            override_reason: None,
+            brain_decision_ms: None,
+            canonical: None,
+            cache_hit: None,
+            cost_usd: None,
+            model: None,
+            outcome_kind: None,
+            outcome_detail: None,
+            suggested_at: None,
+            resolved_at: None,
+        }
+    }
+
+    fn set_decisions(app: &mut App, decisions: Vec<DecisionSummary>) {
+        app.runtime = codexctl_core::runtime::MockRuntime {
+            decisions,
+            ..Default::default()
+        }
+        .into_runtime();
+    }
+
+    #[test]
+    fn brain_notice_primes_latest_decision_without_replay() {
+        let mut app = App::new();
+        let now = std::time::Instant::now();
+        set_decisions(&mut app, vec![decision("old", "hook_allow", "safe")]);
+
+        app.prime_brain_decision_notice();
+        app.poll_brain_decision_notice_at(now);
+
+        assert_eq!(app.brain_decision_notice_at(now), None);
+    }
+
+    #[test]
+    fn brain_notice_uses_allow_and_deny_copy_for_durable_actions() {
+        let now = std::time::Instant::now();
+        for (user_action, verb) in [
+            ("auto", "allowed"),
+            ("hook_allow", "allowed"),
+            ("terminal_fallback_allow", "allowed"),
+            ("hook_deny", "denied"),
+        ] {
+            let mut app = App::new();
+            set_decisions(
+                &mut app,
+                vec![decision("new", user_action, "safe read-only command")],
+            );
+
+            app.poll_brain_decision_notice_at(now);
+
+            assert_eq!(
+                app.brain_decision_notice_at(now),
+                Some(format!("Brain {verb} Bash — safe read-only command").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn brain_notice_same_id_does_not_restart_ten_second_deadline() {
+        let mut app = App::new();
+        let now = std::time::Instant::now();
+        set_decisions(&mut app, vec![decision("same", "hook_allow", "safe")]);
+
+        app.poll_brain_decision_notice_at(now);
+        app.poll_brain_decision_notice_at(now + std::time::Duration::from_millis(9_900));
+
+        assert!(
+            app.brain_decision_notice_at(now + std::time::Duration::from_millis(9_900))
+                .is_some()
+        );
+        assert_eq!(
+            app.brain_decision_notice_at(now + std::time::Duration::from_secs(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn brain_notice_newer_decision_replaces_current_notice() {
+        let mut app = App::new();
+        let now = std::time::Instant::now();
+        set_decisions(&mut app, vec![decision("allow", "hook_allow", "safe")]);
+        app.poll_brain_decision_notice_at(now);
+
+        set_decisions(
+            &mut app,
+            vec![decision("deny", "hook_deny", "destructive command")],
+        );
+        app.poll_brain_decision_notice_at(now + std::time::Duration::from_secs(2));
+
+        assert_eq!(
+            app.brain_decision_notice_at(now + std::time::Duration::from_secs(11)),
+            Some("Brain denied Bash — destructive command")
+        );
+        assert_eq!(
+            app.brain_decision_notice_at(now + std::time::Duration::from_secs(12)),
+            None
+        );
+    }
+
+    #[test]
+    fn brain_notice_is_compact_and_single_line() {
+        let mut app = App::new();
+        let now = std::time::Instant::now();
+        let reasoning = format!("safe\nread-only {}", "command ".repeat(30));
+        set_decisions(
+            &mut app,
+            vec![decision("compact", "hook_allow", &reasoning)],
+        );
+
+        app.poll_brain_decision_notice_at(now);
+
+        let message = app.brain_decision_notice_at(now).unwrap();
+        assert!(!message.contains('\n'));
+        assert!(message.chars().count() <= 120);
+        assert!(message.ends_with('…'));
+    }
+
     #[test]
     fn brain_delivery_reaches_tui_status_path() {
         let mut app = make_test_app();
@@ -2665,6 +2922,118 @@ mod tests {
         app.deliver_brain_mailbox(&snapshots);
 
         assert_eq!(app.status_msg, "Delivered 1 message to high-context");
+    }
+
+    #[test]
+    fn unsafe_terminal_fallback_reports_configured_double_opt_in() {
+        let app = App {
+            brain_config: Some(codexctl_core::config::BrainConfig {
+                auto_mode: true,
+                terminal_auto_approve_fallback: true,
+                ..Default::default()
+            }),
+            ..App::new()
+        };
+
+        assert!(app.terminal_auto_fallback_configured());
+    }
+
+    #[test]
+    fn static_shell_approve_and_deny_rules_do_not_run_before_the_brain() {
+        for action in [
+            codexctl_core::rules::RuleAction::Approve,
+            codexctl_core::rules::RuleAction::Deny,
+        ] {
+            let mut app = App::new();
+            let mut session = make_session(
+                11,
+                "shell-project",
+                "gpt-5.5",
+                SessionStatus::NeedsInput,
+                0.0,
+                0.0,
+                true,
+            );
+            session.pending_tool_call_id = Some("call-1".into());
+            session.pending_tool_name = Some("exec_command".into());
+            session.pending_tool_input = Some("cargo test".into());
+            session.approval = ApprovalObservation::Unknown("capture unavailable".into());
+            app.sessions = vec![session];
+            app.rules = vec![codexctl_core::rules::AutoRule::new(
+                "shell policy".into(),
+                action,
+            )];
+
+            app.run_auto_actions();
+
+            assert!(app.last_rule_action.is_none());
+            assert!(!app.auto_actions_fired.contains_key(&11));
+        }
+    }
+
+    #[test]
+    fn static_non_shell_rules_remain_active() {
+        let mut app = App::new();
+        let mut session = make_session(
+            11,
+            "input-project",
+            "gpt-5.5",
+            SessionStatus::NeedsInput,
+            0.0,
+            0.0,
+            true,
+        );
+        session.pending_tool_call_id = Some("call-1".into());
+        session.pending_tool_name = Some("request_user_input".into());
+        session.pending_tool_input = Some("question".into());
+        app.sessions = vec![session];
+        app.rules = vec![codexctl_core::rules::AutoRule::new(
+            "deny input".into(),
+            codexctl_core::rules::RuleAction::Deny,
+        )];
+
+        app.run_auto_actions();
+
+        assert!(
+            app.last_rule_action
+                .as_deref()
+                .is_some_and(|message| message.contains("denied"))
+        );
+    }
+
+    #[test]
+    fn observation_projects_confirmed_wrapper_command() {
+        let mut session = make_session(
+            11,
+            "approval-project",
+            "gpt-5.5",
+            SessionStatus::NeedsInput,
+            0.0,
+            0.0,
+            true,
+        );
+        session.pending_tool_name = Some("exec".into());
+        session.pending_tool_call_id = Some("call-1".into());
+        session.pending_tool_input = Some("await tools.exec_command(args);".into());
+        session.approval = ApprovalObservation::Confirmed(ApprovalEvidence {
+            session_id: session.session_id.clone(),
+            tty: session.tty.clone(),
+            call_id: "call-1".into(),
+            tool: "exec_command".into(),
+            command: "install -m 664 source target".into(),
+            backend: Terminal::Tmux,
+            target: "main:1.0".into(),
+            prompt_pattern_version: 1,
+            prompt_fingerprint: 42,
+        });
+
+        let observation = observation_from(&session, "user_approve");
+
+        assert_eq!(observation.tool.as_deref(), Some("exec_command"));
+        assert_eq!(
+            observation.command.as_deref(),
+            Some("install -m 664 source target")
+        );
     }
 
     #[test]

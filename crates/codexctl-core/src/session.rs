@@ -415,6 +415,54 @@ impl CodexSession {
         }
     }
 
+    /// Tool identity currently presented to consumers.
+    ///
+    /// This is a projection, not approval authorization. Guarded input still
+    /// requires terminal-confirmed evidence and final revalidation.
+    pub fn actionable_tool_name(&self) -> Option<&str> {
+        match &self.approval {
+            ApprovalObservation::Confirmed(evidence) => Some(evidence.tool.as_str()),
+            ApprovalObservation::NotChecked | ApprovalObservation::Unknown(_) => {
+                self.pending_tool_name.as_deref()
+            }
+        }
+    }
+
+    /// Tool input currently presented to consumers.
+    ///
+    /// This is a projection, not approval authorization. Guarded input still
+    /// requires terminal-confirmed evidence and final revalidation.
+    pub fn actionable_tool_input(&self) -> Option<&str> {
+        match &self.approval {
+            ApprovalObservation::Confirmed(evidence) => Some(evidence.command.as_str()),
+            ApprovalObservation::NotChecked | ApprovalObservation::Unknown(_) => {
+                self.pending_tool_input.as_deref()
+            }
+        }
+    }
+
+    /// Whether the pending tool call is a shell permission request.
+    ///
+    /// This classification is intentionally independent of terminal capture:
+    /// capture decides whether guarded input is authorized, while this method
+    /// decides which policy path owns the request.
+    pub fn is_shell_permission_request(&self) -> bool {
+        if self.pending_tool_call_id.is_none() {
+            return false;
+        }
+
+        let direct_shell = |tool: &str| matches!(tool, "Bash" | "exec_command" | "shell");
+        if self.actionable_tool_name().is_some_and(direct_shell) {
+            return true;
+        }
+
+        self.pending_tool_name.as_deref() == Some("exec")
+            && self
+                .pending_tool_input
+                .as_deref()
+                .is_some_and(|input| input.contains("tools.exec_command("))
+    }
+
     pub fn from_codex_transcript(
         session_id: String,
         cwd: String,
@@ -944,6 +992,95 @@ mod tests {
             cwd: "/tmp/project".into(),
             started_at: 0,
         })
+    }
+
+    #[test]
+    fn actionable_identity_prefers_confirmed_evidence() {
+        let mut session = make_session();
+        session.pending_tool_name = Some("exec".into());
+        session.pending_tool_call_id = Some("call-1".into());
+        session.pending_tool_input = Some("await tools.exec_command(args);".into());
+        session.approval = ApprovalObservation::Confirmed(ApprovalEvidence {
+            session_id: session.session_id.clone(),
+            tty: session.tty.clone(),
+            call_id: "call-1".into(),
+            tool: "exec_command".into(),
+            command: "install -m 664 source target".into(),
+            backend: Terminal::Tmux,
+            target: "main:1.0".into(),
+            prompt_pattern_version: 1,
+            prompt_fingerprint: 42,
+        });
+
+        assert_eq!(session.actionable_tool_name(), Some("exec_command"));
+        assert_eq!(
+            session.actionable_tool_input(),
+            Some("install -m 664 source target")
+        );
+        assert_eq!(session.pending_tool_name.as_deref(), Some("exec"));
+        assert_eq!(
+            session.pending_tool_input.as_deref(),
+            Some("await tools.exec_command(args);")
+        );
+    }
+
+    #[test]
+    fn non_confirmed_identity_falls_back_to_pending_call() {
+        for approval in [
+            ApprovalObservation::NotChecked,
+            ApprovalObservation::Unknown("no matching prompt".into()),
+        ] {
+            let mut session = make_session();
+            session.pending_tool_name = Some("exec".into());
+            session.pending_tool_input = Some("await tools.exec_command(args);".into());
+            session.approval = approval;
+
+            assert_eq!(session.actionable_tool_name(), Some("exec"));
+            assert_eq!(
+                session.actionable_tool_input(),
+                Some("await tools.exec_command(args);")
+            );
+        }
+    }
+
+    #[test]
+    fn shell_permission_request_classifies_direct_tools_without_terminal_evidence() {
+        for tool in ["Bash", "exec_command", "shell"] {
+            let mut session = make_session();
+            session.pending_tool_call_id = Some("call-1".into());
+            session.pending_tool_name = Some(tool.into());
+            session.pending_tool_input = Some("cargo test".into());
+
+            assert!(session.is_shell_permission_request(), "tool={tool}");
+        }
+    }
+
+    #[test]
+    fn shell_permission_request_classifies_unknown_exec_wrapper() {
+        let mut session = make_session();
+        session.pending_tool_call_id = Some("call-1".into());
+        session.pending_tool_name = Some("exec".into());
+        session.pending_tool_input = Some("await tools.exec_command(args);".into());
+        session.approval = ApprovalObservation::Unknown("capture unavailable".into());
+
+        assert!(session.is_shell_permission_request());
+    }
+
+    #[test]
+    fn shell_permission_request_rejects_non_shell_and_incomplete_calls() {
+        let mut session = make_session();
+        session.pending_tool_call_id = Some("call-1".into());
+        session.pending_tool_name = Some("request_user_input".into());
+        session.pending_tool_input = Some("question".into());
+        assert!(!session.is_shell_permission_request());
+
+        session.pending_tool_name = Some("exec".into());
+        session.pending_tool_input = Some("text(true);".into());
+        assert!(!session.is_shell_permission_request());
+
+        session.pending_tool_name = Some("Bash".into());
+        session.pending_tool_call_id = None;
+        assert!(!session.is_shell_permission_request());
     }
 
     #[test]

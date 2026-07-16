@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -114,13 +114,13 @@ pub struct DecisionRecord {
 
 /// Generate a unique decision id.
 pub fn gen_decision_id() -> String {
-    let secs = std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_nanos();
     let pid = std::process::id();
     let seq = DECISION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("dec_{secs}_{pid}_{seq}")
+    format!("dec_{nanos}_{pid}_{seq}")
 }
 
 /// Outcome of a decision, backfilled during distillation by looking at
@@ -295,6 +295,16 @@ fn timestamp_now() -> String {
     format!("{secs}")
 }
 
+fn append_json_line(path: &std::path::Path, record: &serde_json::Value) -> io::Result<()> {
+    let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
+    line.push(b'\n');
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&line)
+}
+
 /// Compute the current local hour (0-23) without chrono.
 /// Uses libc::localtime_r for timezone-aware hour so that work-hours
 /// pattern detection aligns with the user's actual schedule.
@@ -426,18 +436,7 @@ pub fn log_decision_full(
         record["context"] = snapshot_context(s);
     }
 
-    let path = decisions_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&record).unwrap_or_default()
-        );
-    }
+    let _ = append_json_line(&decisions_path(), &record);
 
     // Re-distill preferences in a background thread every Nth decision.
     // The file append above is fast (single write), but distillation reads
@@ -473,20 +472,56 @@ pub fn log_observation(
         record["context"] = snapshot_context(s);
     }
 
-    let path = decisions_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&record).unwrap_or_default()
-        );
-    }
+    let _ = append_json_line(&decisions_path(), &record);
 
     maybe_distill_background();
+}
+
+pub(crate) struct HookDecisionAudit<'a> {
+    pub project: &'a str,
+    pub tool: &'a str,
+    pub command: &'a str,
+    pub brain_action: &'a str,
+    pub brain_confidence: f64,
+    pub brain_reasoning: &'a str,
+    pub brain_source: &'a str,
+    pub brain_threshold: Option<f64>,
+    pub user_action: &'a str,
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+}
+
+/// Persist a permission-hook decision before it is returned to Codex.
+///
+/// `hook_allow` and `hook_deny` mean that the decision was prepared; this
+/// hook does not receive a later execution confirmation from Codex.
+pub(crate) fn log_hook_decision(audit: &HookDecisionAudit<'_>) -> io::Result<()> {
+    let resolved_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let record = serde_json::json!({
+        "ts": timestamp_now(),
+        "pid": 0,
+        "project": audit.project,
+        "tool": audit.tool,
+        "command": audit.command,
+        "brain_action": audit.brain_action,
+        "brain_confidence": audit.brain_confidence,
+        "brain_reasoning": audit.brain_reasoning,
+        "brain_source": audit.brain_source,
+        "brain_threshold": audit.brain_threshold,
+        "user_action": audit.user_action,
+        "decision_type": DecisionType::Session.label(),
+        "suggested_at": resolved_at,
+        "resolved_at": resolved_at,
+        "decision_id": gen_decision_id(),
+        "session_id": audit.session_id,
+        "turn_id": audit.turn_id,
+    });
+    append_json_line(&decisions_path(), &record)?;
+    maybe_distill_background();
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -909,6 +944,31 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_single_buffer_appends_are_parseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let mut threads = Vec::new();
+        for worker in 0..8 {
+            let path = path.clone();
+            threads.push(std::thread::spawn(move || {
+                for item in 0..50 {
+                    append_json_line(&path, &serde_json::json!({"worker": worker, "item": item}))
+                        .unwrap();
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let log = fs::read_to_string(path).unwrap();
+        assert_eq!(log.lines().count(), 400);
+        for line in log.lines() {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+    }
+
+    #[test]
     fn stats_accuracy() {
         let stats = DecisionStats {
             total: 10,
@@ -918,6 +978,17 @@ mod tests {
             observations: 0,
         };
         assert!((stats.accuracy_pct() - 80.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn decision_id_uses_subsecond_timestamp() {
+        let id = gen_decision_id();
+        let timestamp = id.split('_').nth(1).unwrap().parse::<u128>().unwrap();
+        let current_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u128;
+        assert!(timestamp > current_seconds.saturating_sub(1) * 1_000_000_000);
     }
 
     #[test]

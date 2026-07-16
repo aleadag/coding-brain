@@ -25,6 +25,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         || app.input_mode
         || app.launch_mode
         || app.search_mode
+        || app.has_active_brain_decision_notice()
         || app.has_active_filters();
     let show_detail = app.detail_panel && app.selected_session().is_some();
 

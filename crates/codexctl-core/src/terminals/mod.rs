@@ -1286,18 +1286,6 @@ fn send_enter_to_target(backend: Terminal, target: &str) -> Result<(), String> {
     }
 }
 
-fn is_pending_shell_call(session: &CodexSession) -> bool {
-    let Some(tool) = session.pending_tool_name.as_deref() else {
-        return false;
-    };
-    let Some(input) = session.pending_tool_input.as_deref() else {
-        return false;
-    };
-    session.pending_tool_call_id.is_some()
-        && (matches!(tool, "exec_command" | "shell" | "Bash")
-            || (tool == "exec" && input.contains("tools.exec_command(")))
-}
-
 fn strip_ansi(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
@@ -1432,7 +1420,7 @@ fn match_approval_prompt(
     capture: &PaneCapture,
     session: &CodexSession,
 ) -> Option<ApprovalEvidence> {
-    if !is_pending_shell_call(session) {
+    if !session.is_shell_permission_request() {
         return None;
     }
     let call_id = session.pending_tool_call_id.as_deref()?;
@@ -1467,7 +1455,7 @@ fn refresh_approval_observation_with(
     checked_at_ms: u64,
 ) {
     session.approval_checked_at_ms = checked_at_ms;
-    if !is_pending_shell_call(session) {
+    if !session.is_shell_permission_request() {
         session.approval = ApprovalObservation::NotChecked;
         return;
     }
@@ -1478,10 +1466,6 @@ fn refresh_approval_observation_with(
         },
         Err(error) => ApprovalObservation::Unknown(error),
     };
-    if let ApprovalObservation::Confirmed(evidence) = &observation {
-        session.pending_tool_name = Some(evidence.tool.clone());
-        session.pending_tool_input = Some(evidence.command.clone());
-    }
     session.approval = observation;
 }
 
@@ -1500,7 +1484,7 @@ fn approve_shell_permission_with(
     let ApprovalObservation::Confirmed(expected) = &session.approval else {
         return Err("approval is not terminal-confirmed".into());
     };
-    if !is_pending_shell_call(session) {
+    if !session.is_shell_permission_request() {
         return Err("shell call is no longer pending".into());
     }
     let capture = io.capture(session)?;
@@ -1618,10 +1602,8 @@ mod tests {
             .replace("$ cargo test", "$ cargo clippy");
         let current = include_str!("../../../../tests/fixtures/codex-shell-approval-pane.txt");
         let pane = format!("{earlier}\n\n{current}");
-        let mut session = pending_exec_wrapper_session(
-            "call-7",
-            "const args = next(); await tools.exec_command(args);",
-        );
+        let wrapper = "const args = next(); await tools.exec_command(args);";
+        let mut session = pending_exec_wrapper_session("call-7", wrapper);
         let io = FakeApprovalIo::with_captures([Ok(capture(&pane))]);
 
         refresh_approval_observation_with(&io, &mut session, 10_000);
@@ -1631,8 +1613,48 @@ mod tests {
         };
         assert_eq!(evidence.tool, "exec_command");
         assert_eq!(evidence.command, "cargo test");
-        assert_eq!(session.pending_tool_name.as_deref(), Some("exec_command"));
-        assert_eq!(session.pending_tool_input.as_deref(), Some("cargo test"));
+        assert_eq!(session.pending_tool_name.as_deref(), Some("exec"));
+        assert_eq!(session.pending_tool_input.as_deref(), Some(wrapper));
+    }
+
+    #[test]
+    fn exec_wrapper_confirms_sequential_prompts_without_rewriting_transcript_identity() {
+        let fixture = include_str!("../../../../tests/fixtures/codex-shell-approval-pane.txt");
+        let clippy = fixture.replace("$ cargo test", "$ cargo clippy");
+        let wrapper = "const args = next(); await tools.exec_command(args);";
+        let mut session = pending_exec_wrapper_session("call-7", wrapper);
+        let io = FakeApprovalIo::with_captures([
+            Ok(capture(fixture)),
+            Ok(capture(include_str!(
+                "../../../../tests/fixtures/codex-running-shell-pane.txt"
+            ))),
+            Ok(capture(&clippy)),
+            Ok(capture(&clippy)),
+        ]);
+
+        refresh_approval_observation_with(&io, &mut session, 10_000);
+        let ApprovalObservation::Confirmed(first) = &session.approval else {
+            panic!("first wrapper approval was not confirmed");
+        };
+        assert_eq!(first.command, "cargo test");
+        assert_eq!(session.pending_tool_name.as_deref(), Some("exec"));
+        assert_eq!(session.pending_tool_input.as_deref(), Some(wrapper));
+
+        refresh_approval_observation_with(&io, &mut session, 11_000);
+        assert!(matches!(session.approval, ApprovalObservation::Unknown(_)));
+        assert_eq!(session.pending_tool_name.as_deref(), Some("exec"));
+        assert_eq!(session.pending_tool_input.as_deref(), Some(wrapper));
+
+        refresh_approval_observation_with(&io, &mut session, 12_000);
+        let ApprovalObservation::Confirmed(evidence) = &session.approval else {
+            panic!("second wrapper approval was not confirmed");
+        };
+        assert_eq!(evidence.command, "cargo clippy");
+        assert_eq!(session.pending_tool_name.as_deref(), Some("exec"));
+        assert_eq!(session.pending_tool_input.as_deref(), Some(wrapper));
+
+        approve_shell_permission_with(&io, &session).unwrap();
+        assert_eq!(io.sends.load(Ordering::SeqCst), 1);
     }
 
     #[test]

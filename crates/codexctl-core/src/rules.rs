@@ -126,25 +126,28 @@ fn matches_rule(rule: &AutoRule, session: &CodexSession) -> bool {
     }
 
     if !rule.match_tool.is_empty() {
-        let tool = match &session.pending_tool_name {
-            Some(t) => t.to_lowercase(),
+        let tool = match session.actionable_tool_name() {
+            Some(tool) => tool.to_lowercase(),
             None => return false,
         };
-        let any_match = rule.match_tool.iter().any(|t| tool == t.to_lowercase());
+        let any_match = rule
+            .match_tool
+            .iter()
+            .any(|value| tool == value.to_lowercase());
         if !any_match {
             return false;
         }
     }
 
     if !rule.match_command.is_empty() {
-        let cmd = match &session.pending_tool_input {
-            Some(c) => c.to_lowercase(),
+        let command = match session.actionable_tool_input() {
+            Some(command) => command.to_lowercase(),
             None => return false,
         };
         let any_match = rule
             .match_command
             .iter()
-            .any(|pattern| cmd.contains(&pattern.to_lowercase()));
+            .any(|pattern| command.contains(&pattern.to_lowercase()));
         if !any_match {
             return false;
         }
@@ -195,14 +198,14 @@ pub fn execute(result: &RuleMatch, session: &CodexSession) -> Result<String, Str
                 "Rule '{}': approved {} ({})",
                 result.rule_name,
                 name,
-                session.pending_tool_name.as_deref().unwrap_or("?")
+                session.actionable_tool_name().unwrap_or("?")
             ))
         }
         RuleAction::Deny => Ok(format!(
             "Rule '{}': denied {} ({})",
             result.rule_name,
             name,
-            session.pending_tool_name.as_deref().unwrap_or("?")
+            session.actionable_tool_name().unwrap_or("?")
         )),
         RuleAction::Send => {
             let msg = result.message.as_deref().unwrap_or("continue");
@@ -267,7 +270,11 @@ pub fn execute_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{CodexSession, RawSession, SessionStatus, TelemetryStatus};
+    use crate::session::{
+        ApprovalEvidence, ApprovalObservation, CodexSession, RawSession, SessionStatus,
+        TelemetryStatus,
+    };
+    use crate::terminals::Terminal;
 
     fn make_session() -> CodexSession {
         let raw = RawSession {
@@ -354,6 +361,35 @@ mod tests {
         let mut rule2 = approve_rule("approve_cargo");
         rule2.match_command = vec!["cargo".into()];
         assert!(evaluate(&[rule2], &s).is_some());
+    }
+
+    #[test]
+    fn confirmed_wrapper_rules_match_displayed_command() {
+        let mut session = make_session();
+        session.pending_tool_name = Some("exec".into());
+        session.pending_tool_call_id = Some("call-1".into());
+        session.pending_tool_input = Some("await tools.exec_command(args);".into());
+        session.approval = ApprovalObservation::Confirmed(ApprovalEvidence {
+            session_id: session.session_id.clone(),
+            tty: session.tty.clone(),
+            call_id: "call-1".into(),
+            tool: "exec_command".into(),
+            command: "install -m 664 source target".into(),
+            backend: Terminal::Tmux,
+            target: "main:1.0".into(),
+            prompt_pattern_version: 1,
+            prompt_fingerprint: 42,
+        });
+
+        let mut displayed = approve_rule("displayed-command");
+        displayed.match_tool = vec!["exec_command".into()];
+        displayed.match_command = vec!["install -m 664".into()];
+        assert!(evaluate(&[displayed], &session).is_some());
+
+        let mut wrapper = approve_rule("wrapper-source");
+        wrapper.match_tool = vec!["exec".into()];
+        wrapper.match_command = vec!["tools.exec_command".into()];
+        assert!(evaluate(&[wrapper], &session).is_none());
     }
 
     #[test]

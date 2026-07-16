@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
@@ -37,8 +38,8 @@ impl BrainTargetIdentity {
             status: session.status,
             last_message_ts: session.last_message_ts,
             pending_tool_call_id: session.pending_tool_call_id.clone(),
-            pending_tool_name: session.pending_tool_name.clone(),
-            pending_tool_input: session.pending_tool_input.clone(),
+            pending_tool_name: session.actionable_tool_name().map(str::to_owned),
+            pending_tool_input: session.actionable_tool_input().map(str::to_owned),
             approval: session.approval.clone(),
         }
     }
@@ -76,6 +77,8 @@ impl PendingBrainSuggestion {
 /// The brain inference engine. Manages async inference threads and collects results.
 pub struct BrainEngine {
     config: BrainConfig,
+    terminal_fallback_blocker: Box<dyn Fn(&Path) -> bool + Send>,
+    shell_approval_executor: fn(&BrainSuggestion, &CodexSession) -> Result<String, String>,
     tx: Sender<BrainResult>,
     rx: Receiver<BrainResult>,
     /// PIDs currently being inferred (prevents duplicate requests).
@@ -94,11 +97,21 @@ pub struct BrainEngine {
 
 const COOLDOWN_SECS: u64 = 10;
 
+fn execute_guarded_shell_approval(
+    suggestion: &BrainSuggestion,
+    session: &CodexSession,
+) -> Result<String, String> {
+    let rule_match = suggestion_to_rule_match(suggestion);
+    rules::execute(&rule_match, session)
+}
+
 impl BrainEngine {
     pub fn new(config: BrainConfig) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             config,
+            terminal_fallback_blocker: Box::new(|_| true),
+            shell_approval_executor: execute_guarded_shell_approval,
             tx,
             rx,
             inflight: HashSet::new(),
@@ -108,6 +121,25 @@ impl BrainEngine {
             orchestrate_inflight: false,
             restarted_pids: HashSet::new(),
         }
+    }
+
+    pub fn set_terminal_fallback_blocker(
+        &mut self,
+        blocker: impl Fn(&Path) -> bool + Send + 'static,
+    ) {
+        self.terminal_fallback_blocker = Box::new(blocker);
+    }
+
+    pub fn terminal_fallback_blocked_for(&self, session: &CodexSession) -> bool {
+        (self.terminal_fallback_blocker)(Path::new(&session.cwd))
+    }
+
+    #[cfg(test)]
+    fn set_shell_approval_executor_for_test(
+        &mut self,
+        executor: fn(&BrainSuggestion, &CodexSession) -> Result<String, String>,
+    ) {
+        self.shell_approval_executor = executor;
     }
 
     /// Run one tick of the brain engine. Call this from app.tick() after refresh().
@@ -152,7 +184,9 @@ impl BrainEngine {
                         ));
                         continue;
                     }
-                    if let Some(session) = session {
+                    let shell_permission_request =
+                        session.is_some_and(CodexSession::is_shell_permission_request);
+                    if let Some(session) = session.filter(|_| !shell_permission_request) {
                         let deny_match = rules::evaluate(deny_rules, session);
                         if let Some(dm) = &deny_match {
                             if dm.action == RuleAction::Deny {
@@ -160,8 +194,8 @@ impl BrainEngine {
                                 super::decisions::log_decision(
                                     result.pid,
                                     session.display_name(),
-                                    session.pending_tool_name.as_deref(),
-                                    session.pending_tool_input.as_deref(),
+                                    session.actionable_tool_name(),
+                                    session.actionable_tool_input(),
                                     &suggestion,
                                     "deny_rule_override",
                                     Some(session),
@@ -186,7 +220,7 @@ impl BrainEngine {
                         // If the brain's track record for this tool is poor, require
                         // higher confidence before auto-executing.
                         if let Some(session) = session {
-                            let tool_name = session.pending_tool_name.as_deref();
+                            let tool_name = session.actionable_tool_name();
                             let threshold =
                                 super::decisions::adaptive_threshold(tool_name).unwrap_or(0.6);
                             if suggestion.confidence < threshold {
@@ -195,7 +229,7 @@ impl BrainEngine {
                                     result.pid,
                                     session.display_name(),
                                     tool_name,
-                                    session.pending_tool_input.as_deref(),
+                                    session.actionable_tool_input(),
                                     &suggestion,
                                     "deferred_low_confidence",
                                     Some(session),
@@ -213,6 +247,105 @@ impl BrainEngine {
                             }
                         }
 
+                        if shell_permission_request {
+                            let Some(session) = session else {
+                                continue;
+                            };
+                            if suggestion.action != RuleAction::Approve
+                                || !self.config.terminal_auto_approve_fallback
+                                || self.terminal_fallback_blocked_for(session)
+                            {
+                                self.pending.insert(
+                                    result.pid,
+                                    PendingBrainSuggestion::bound(
+                                        suggestion,
+                                        result.target.clone(),
+                                    ),
+                                );
+                                continue;
+                            }
+
+                            let unavailable_reason = match &session.approval {
+                                ApprovalObservation::Unknown(reason) => Some(reason.as_str()),
+                                ApprovalObservation::NotChecked => {
+                                    Some("terminal evidence was not checked")
+                                }
+                                ApprovalObservation::Confirmed(_) => None,
+                            };
+                            if let Some(reason) = unavailable_reason {
+                                self.pending.insert(
+                                    result.pid,
+                                    PendingBrainSuggestion::bound(
+                                        suggestion,
+                                        result.target.clone(),
+                                    ),
+                                );
+                                actions.push((
+                                    result.pid,
+                                    format!(
+                                        "Brain approval pending: terminal fallback unavailable ({reason}); approve manually in Codex"
+                                    ),
+                                ));
+                                continue;
+                            }
+
+                            let supported_backend = matches!(
+                                &session.approval,
+                                ApprovalObservation::Confirmed(evidence)
+                                    if matches!(
+                                        evidence.backend,
+                                        crate::terminals::Terminal::Kitty
+                                            | crate::terminals::Terminal::Tmux
+                                    )
+                            );
+                            if !supported_backend {
+                                self.pending.insert(
+                                    result.pid,
+                                    PendingBrainSuggestion::bound(
+                                        suggestion,
+                                        result.target.clone(),
+                                    ),
+                                );
+                                actions.push((
+                                    result.pid,
+                                    "Brain fallback kept pending: guarded approval requires Kitty or tmux"
+                                        .into(),
+                                ));
+                                continue;
+                            }
+
+                            match (self.shell_approval_executor)(&suggestion, session) {
+                                Ok(message) => {
+                                    super::decisions::log_decision(
+                                        result.pid,
+                                        session.display_name(),
+                                        session.actionable_tool_name(),
+                                        session.actionable_tool_input(),
+                                        &suggestion,
+                                        "terminal_fallback_allow",
+                                        Some(session),
+                                        DecisionType::Session,
+                                        None,
+                                    );
+                                    actions.push((result.pid, message));
+                                }
+                                Err(error) => {
+                                    self.pending.insert(
+                                        result.pid,
+                                        PendingBrainSuggestion::bound(
+                                            suggestion,
+                                            result.target.clone(),
+                                        ),
+                                    );
+                                    actions.push((
+                                        result.pid,
+                                        format!("Brain fallback kept pending: {error}"),
+                                    ));
+                                }
+                            }
+                            continue;
+                        }
+
                         // Check for file conflicts before executing
                         if let Some(session) = session {
                             if let Some(conflict_msg) = check_file_conflicts(session, sessions) {
@@ -220,8 +353,8 @@ impl BrainEngine {
                                 super::decisions::log_decision(
                                     result.pid,
                                     session.display_name(),
-                                    session.pending_tool_name.as_deref(),
-                                    session.pending_tool_input.as_deref(),
+                                    session.actionable_tool_name(),
+                                    session.actionable_tool_input(),
                                     &suggestion,
                                     "deferred_file_conflict",
                                     Some(session),
@@ -252,8 +385,8 @@ impl BrainEngine {
                                                 super::decisions::log_decision(
                                                     result.pid,
                                                     session.display_name(),
-                                                    session.pending_tool_name.as_deref(),
-                                                    session.pending_tool_input.as_deref(),
+                                                    session.actionable_tool_name(),
+                                                    session.actionable_tool_input(),
                                                     &suggestion,
                                                     "auto",
                                                     Some(session),
@@ -293,8 +426,8 @@ impl BrainEngine {
                                                 super::decisions::log_decision(
                                                     result.pid,
                                                     session.display_name(),
-                                                    session.pending_tool_name.as_deref(),
-                                                    session.pending_tool_input.as_deref(),
+                                                    session.actionable_tool_name(),
+                                                    session.actionable_tool_input(),
                                                     &suggestion,
                                                     "auto",
                                                     Some(session),
@@ -315,8 +448,8 @@ impl BrainEngine {
                                             super::decisions::log_decision(
                                                 result.pid,
                                                 session.display_name(),
-                                                session.pending_tool_name.as_deref(),
-                                                session.pending_tool_input.as_deref(),
+                                                session.actionable_tool_name(),
+                                                session.actionable_tool_input(),
                                                 &suggestion,
                                                 "auto",
                                                 Some(session),
@@ -410,7 +543,7 @@ impl BrainEngine {
 
         if few_shot_limit > 0 {
             let similar = super::decisions::retrieve_similar(
-                session.pending_tool_name.as_deref(),
+                session.actionable_tool_name(),
                 session.display_name(),
                 few_shot_limit,
                 Some(DecisionType::Session),
@@ -747,12 +880,12 @@ fn build_orchestration_prompt(sessions: &[CodexSession], _config: &BrainConfig) 
 /// running session has in its `files_modified` map.
 /// Returns a warning message if a conflict is found, or None if clear.
 fn check_file_conflicts(session: &CodexSession, all_sessions: &[CodexSession]) -> Option<String> {
-    let tool = session.pending_tool_name.as_deref()?;
+    let tool = session.actionable_tool_name()?;
     if !matches!(tool, "Write" | "Edit" | "NotebookEdit") {
         return None;
     }
 
-    let input = session.pending_tool_input.as_deref()?;
+    let input = session.actionable_tool_input()?;
 
     // Extract file path from the tool input.
     // Write/Edit inputs typically start with or contain the absolute file path.
@@ -862,6 +995,7 @@ mod tests {
             endpoint: "http://localhost:11434/api/generate".into(),
             model: "test".into(),
             auto_mode: false,
+            terminal_auto_approve_fallback: false,
             timeout_ms: 1000,
             max_context_tokens: 1000,
             few_shot_count: 5,
@@ -926,6 +1060,45 @@ mod tests {
             prompt_fingerprint: 42,
         });
         session
+    }
+
+    fn confirmed_wrapper_session(command: &str, fingerprint: u64) -> CodexSession {
+        let mut session = confirmed_shell_session("call-wrapper", command);
+        session.pending_tool_name = Some("exec".into());
+        session.pending_tool_input = Some("await tools.exec_command(args);".into());
+        let ApprovalObservation::Confirmed(evidence) = &mut session.approval else {
+            unreachable!();
+        };
+        evidence.prompt_fingerprint = fingerprint;
+        session
+    }
+
+    #[test]
+    fn brain_target_uses_actionable_wrapper_identity() {
+        let session = confirmed_wrapper_session("cargo test", 41);
+        let target = BrainTargetIdentity::from_session(&session);
+
+        assert_eq!(target.pending_tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(target.pending_tool_input.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn wrapper_prompt_change_expires_pending_suggestion() {
+        let mut engine = BrainEngine::new(make_config());
+        let original = confirmed_wrapper_session("cargo test", 41);
+        let replacement = confirmed_wrapper_session("cargo clippy", 42);
+        engine.pending.insert(
+            original.pid,
+            PendingBrainSuggestion::bound(
+                suggestion(RuleAction::Approve, 1.0),
+                Some(BrainTargetIdentity::from_session(&original)),
+            ),
+        );
+
+        let message = engine.accept(original.pid, &replacement).unwrap();
+
+        assert!(message.contains("expired"));
+        assert!(engine.pending.is_empty());
     }
 
     #[test]
@@ -1022,6 +1195,281 @@ mod tests {
 
         assert!(actions[0].1.contains("deny rule"));
         assert!(!engine.pending.contains_key(&100));
+    }
+
+    fn successful_guarded_approval(
+        _suggestion: &BrainSuggestion,
+        _session: &CodexSession,
+    ) -> Result<String, String> {
+        Ok("guarded terminal approval attempted".into())
+    }
+
+    fn failed_guarded_approval(
+        _suggestion: &BrainSuggestion,
+        _session: &CodexSession,
+    ) -> Result<String, String> {
+        Err("approval identity changed; action cancelled".into())
+    }
+
+    fn unexpected_guarded_approval(
+        _suggestion: &BrainSuggestion,
+        _session: &CodexSession,
+    ) -> Result<String, String> {
+        panic!("guarded terminal input must not run without confirmed evidence")
+    }
+
+    fn fallback_engine(auto: bool, fallback: bool, hook_blocks: bool) -> BrainEngine {
+        let mut config = make_config();
+        config.auto_mode = auto;
+        config.terminal_auto_approve_fallback = fallback;
+        let mut engine = BrainEngine::new(config);
+        engine.set_terminal_fallback_blocker(move |_| hook_blocks);
+        engine.set_shell_approval_executor_for_test(successful_guarded_approval);
+        engine
+    }
+
+    #[test]
+    fn shell_fallback_requires_double_opt_in_and_hook_absence() {
+        for (auto, fallback, hook_blocks, attempted) in [
+            (false, true, false, false),
+            (true, false, false, false),
+            (true, true, true, false),
+            (true, true, false, true),
+        ] {
+            let mut engine = fallback_engine(auto, fallback, hook_blocks);
+            let session = confirmed_shell_session("call-a", "cargo test");
+            inject(
+                &engine,
+                session.pid,
+                Ok(suggestion(RuleAction::Approve, 1.0)),
+            );
+
+            let actions = engine.tick(&[session], &[]);
+
+            assert_eq!(
+                actions
+                    .iter()
+                    .any(|(_, message)| message.contains("attempted")),
+                attempted,
+                "auto={auto}, fallback={fallback}, hook_blocks={hook_blocks}"
+            );
+            assert_eq!(engine.pending.contains_key(&100), !attempted);
+        }
+    }
+
+    #[test]
+    fn shell_fallback_never_injects_for_brain_deny() {
+        let mut engine = fallback_engine(true, true, false);
+        let session = confirmed_shell_session("call-a", "cargo test");
+        inject(&engine, session.pid, Ok(suggestion(RuleAction::Deny, 1.0)));
+
+        let pid = session.pid;
+        let actions = engine.tick(&[session], &[]);
+
+        assert!(actions.is_empty());
+        assert!(engine.pending.contains_key(&pid));
+    }
+
+    #[test]
+    fn shell_fallback_ignores_codexctl_static_approve_and_deny_rules() {
+        let mut engine = fallback_engine(true, true, false);
+        let session = confirmed_shell_session("call-a", "rm -rf build");
+        let approve = crate::rules::AutoRule::new("approve shell".into(), RuleAction::Approve);
+        let mut deny = crate::rules::AutoRule::new("deny rm".into(), RuleAction::Deny);
+        deny.match_command = vec!["rm -rf".into()];
+        inject(
+            &engine,
+            session.pid,
+            Ok(suggestion(RuleAction::Approve, 1.0)),
+        );
+
+        let pid = session.pid;
+        let actions = engine.tick(&[session], &[approve, deny]);
+
+        assert_eq!(actions[0].1, "guarded terminal approval attempted");
+        assert!(!engine.pending.contains_key(&pid));
+    }
+
+    #[test]
+    fn guarded_recapture_failure_leaves_shell_suggestion_pending() {
+        let mut engine = fallback_engine(true, true, false);
+        engine.set_shell_approval_executor_for_test(failed_guarded_approval);
+        let session = confirmed_shell_session("call-a", "cargo test");
+        inject(
+            &engine,
+            session.pid,
+            Ok(suggestion(RuleAction::Approve, 1.0)),
+        );
+
+        let pid = session.pid;
+        let actions = engine.tick(&[session], &[]);
+
+        assert!(actions[0].1.contains("approval identity changed"));
+        assert!(engine.pending.contains_key(&pid));
+    }
+
+    #[test]
+    fn unsupported_terminal_capture_reports_unavailable_and_stays_pending() {
+        let mut engine = fallback_engine(true, true, false);
+        engine.set_shell_approval_executor_for_test(unexpected_guarded_approval);
+        let mut session = confirmed_shell_session("call-a", "cargo test");
+        session.approval =
+            ApprovalObservation::Unknown("no supported terminal pane matched the session".into());
+        inject(
+            &engine,
+            session.pid,
+            Ok(suggestion(RuleAction::Approve, 1.0)),
+        );
+
+        let pid = session.pid;
+        let actions = engine.tick(&[session], &[]);
+
+        assert!(actions[0].1.contains("Brain approval pending"));
+        assert!(actions[0].1.contains("terminal fallback unavailable"));
+        assert!(actions[0].1.contains("no supported terminal pane"));
+        assert!(!actions[0].1.contains("denied"));
+        assert!(engine.pending.contains_key(&pid));
+    }
+
+    #[test]
+    fn unknown_shell_approve_ignores_static_deny_and_stays_pending() {
+        let mut engine = fallback_engine(true, true, false);
+        let mut session = confirmed_shell_session("call-a", "cargo test");
+        session.approval = ApprovalObservation::Unknown("capture unavailable".into());
+        let deny = crate::rules::AutoRule::new("deny all".into(), RuleAction::Deny);
+        inject(
+            &engine,
+            session.pid,
+            Ok(suggestion(RuleAction::Approve, 1.0)),
+        );
+
+        let pid = session.pid;
+        let actions = engine.tick(&[session], &[deny]);
+
+        assert!(actions[0].1.contains("terminal fallback unavailable"));
+        assert!(!actions[0].1.contains("deny rule"));
+        assert!(!actions[0].1.contains("denied"));
+        assert!(engine.pending.contains_key(&pid));
+    }
+
+    #[test]
+    fn not_checked_shell_approve_reports_unavailable_and_stays_pending() {
+        let mut engine = fallback_engine(true, true, false);
+        engine.set_shell_approval_executor_for_test(unexpected_guarded_approval);
+        let mut session = confirmed_shell_session("call-a", "cargo test");
+        session.approval = ApprovalObservation::NotChecked;
+        let deny = crate::rules::AutoRule::new("deny all".into(), RuleAction::Deny);
+        inject(
+            &engine,
+            session.pid,
+            Ok(suggestion(RuleAction::Approve, 1.0)),
+        );
+
+        let pid = session.pid;
+        let actions = engine.tick(&[session], &[deny]);
+
+        assert!(actions[0].1.contains("Brain approval pending"));
+        assert!(actions[0].1.contains("terminal fallback unavailable"));
+        assert!(actions[0].1.contains("not checked"));
+        assert!(!actions[0].1.contains("denied"));
+        assert!(engine.pending.contains_key(&pid));
+    }
+
+    #[test]
+    fn low_confidence_shell_approve_keeps_existing_silent_deferral() {
+        let mut engine = fallback_engine(true, true, false);
+        engine.set_shell_approval_executor_for_test(unexpected_guarded_approval);
+        let mut session = confirmed_shell_session("call-a", "cargo test");
+        session.approval = ApprovalObservation::Unknown("capture unavailable".into());
+        inject(
+            &engine,
+            session.pid,
+            Ok(suggestion(RuleAction::Approve, 0.0)),
+        );
+
+        let pid = session.pid;
+        let actions = engine.tick(&[session], &[]);
+
+        assert!(actions.is_empty());
+        assert!(engine.pending.contains_key(&pid));
+    }
+
+    #[test]
+    fn not_checked_shell_deny_stays_pending_without_generic_execution() {
+        let mut engine = fallback_engine(true, true, false);
+        let mut session = confirmed_shell_session("call-a", "cargo test");
+        session.approval = ApprovalObservation::NotChecked;
+        inject(&engine, session.pid, Ok(suggestion(RuleAction::Deny, 1.0)));
+
+        let pid = session.pid;
+        let actions = engine.tick(&[session], &[]);
+
+        assert!(actions.is_empty());
+        assert!(engine.pending.contains_key(&pid));
+    }
+
+    #[test]
+    fn hook_blocking_is_resolved_from_each_session_project() {
+        let mut config = make_config();
+        config.auto_mode = true;
+        config.terminal_auto_approve_fallback = true;
+        let mut engine = BrainEngine::new(config);
+        engine.set_terminal_fallback_blocker(|cwd| cwd.ends_with("blocked"));
+        engine.set_shell_approval_executor_for_test(successful_guarded_approval);
+
+        let mut allowed = confirmed_shell_session("call-a", "cargo test");
+        allowed.cwd = "/work/allowed".into();
+        inject(
+            &engine,
+            allowed.pid,
+            Ok(suggestion(RuleAction::Approve, 1.0)),
+        );
+        let allowed_actions = engine.tick(&[allowed], &[]);
+        assert!(allowed_actions[0].1.contains("attempted"));
+
+        let mut blocked = confirmed_shell_session("call-b", "cargo test");
+        blocked.pid = 101;
+        blocked.cwd = "/work/blocked".into();
+        inject(
+            &engine,
+            blocked.pid,
+            Ok(suggestion(RuleAction::Approve, 1.0)),
+        );
+        let blocked_actions = engine.tick(&[blocked], &[]);
+        assert!(blocked_actions.is_empty());
+        assert!(engine.pending.contains_key(&101));
+    }
+
+    #[test]
+    fn changed_hook_state_is_observed_on_the_next_decision() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let blocked = Arc::new(AtomicBool::new(false));
+        let resolver_state = Arc::clone(&blocked);
+        let mut engine = fallback_engine(true, true, true);
+        engine.set_terminal_fallback_blocker(move |_| resolver_state.load(Ordering::SeqCst));
+
+        let allowed = confirmed_shell_session("call-a", "cargo test");
+        inject(
+            &engine,
+            allowed.pid,
+            Ok(suggestion(RuleAction::Approve, 1.0)),
+        );
+        assert!(engine.tick(&[allowed], &[])[0].1.contains("attempted"));
+
+        blocked.store(true, Ordering::SeqCst);
+        let mut now_blocked = confirmed_shell_session("call-b", "cargo test");
+        now_blocked.pid = 101;
+        inject(
+            &engine,
+            now_blocked.pid,
+            Ok(suggestion(RuleAction::Approve, 1.0)),
+        );
+        assert!(engine.tick(&[now_blocked], &[]).is_empty());
+        assert!(engine.pending.contains_key(&101));
     }
 
     #[test]
