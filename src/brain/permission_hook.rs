@@ -311,6 +311,7 @@ mod tests {
 
     use super::*;
     use crate::brain::client::BrainSuggestion;
+    use crate::brain::decisions::decisions_dir;
     use crate::config::BrainConfig;
     use crate::rules::RuleAction;
 
@@ -443,11 +444,6 @@ mod tests {
 
     #[test]
     fn confident_approve_emits_allow_after_persisting() {
-        let _guard = crate::config::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let home = tempfile::tempdir().unwrap();
-        let _restore_home = set_test_home(home.path());
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -472,8 +468,7 @@ mod tests {
             "allow"
         );
         assert!(stderr.is_empty());
-        let log =
-            std::fs::read_to_string(home.path().join(".codexctl/brain/decisions.jsonl")).unwrap();
+        let log = std::fs::read_to_string(decisions_dir().join("decisions.jsonl")).unwrap();
         let record: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
         assert_eq!(record["project"], "codexctl");
         assert_eq!(record["tool"], "Bash");
@@ -487,11 +482,6 @@ mod tests {
 
     #[test]
     fn confident_deny_emits_deny() {
-        let _guard = crate::config::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let home = tempfile::tempdir().unwrap();
-        let _restore_home = set_test_home(home.path());
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -505,8 +495,7 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         assert_eq!(output["hookSpecificOutput"]["decision"]["behavior"], "deny");
-        let log =
-            std::fs::read_to_string(home.path().join(".codexctl/brain/decisions.jsonl")).unwrap();
+        let log = std::fs::read_to_string(decisions_dir().join("decisions.jsonl")).unwrap();
         let record: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
         assert_eq!(record["user_action"], "hook_deny");
     }
@@ -582,13 +571,9 @@ mod tests {
 
     #[test]
     fn persistence_failure_leaves_stdout_empty() {
-        let _guard = crate::config::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let home_file = dir.path().join("not-a-directory");
-        std::fs::write(&home_file, "occupied").unwrap();
-        let _restore_home = set_test_home(&home_file);
+        let brain_dir = decisions_dir();
+        std::fs::create_dir_all(brain_dir.parent().unwrap()).unwrap();
+        std::fs::write(&brain_dir, "occupied").unwrap();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -606,11 +591,6 @@ mod tests {
 
     #[test]
     fn identical_payloads_are_evaluated_independently() {
-        let _guard = crate::config::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let home = tempfile::tempdir().unwrap();
-        let _restore_home = set_test_home(home.path());
         let calls = AtomicUsize::new(0);
 
         for _ in 0..2 {
@@ -630,8 +610,7 @@ mod tests {
         }
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
-        let log =
-            std::fs::read_to_string(home.path().join(".codexctl/brain/decisions.jsonl")).unwrap();
+        let log = std::fs::read_to_string(decisions_dir().join("decisions.jsonl")).unwrap();
         let records = log
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())

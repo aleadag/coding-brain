@@ -36,6 +36,8 @@ static DECISION_COUNT: AtomicU32 = AtomicU32::new(0);
 static DISTILLING: AtomicBool = AtomicBool::new(false);
 /// Monotonic counter for decision_id uniqueness within a process.
 static DECISION_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+static TEST_RUN_ID: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
 
 /// How often to re-distill preferences (every N decisions).
 const DISTILL_INTERVAL: u32 = 10;
@@ -253,8 +255,28 @@ impl DecisionStats {
 // ────────────────────────────────────────────────────────────────────────────
 
 pub(super) fn decisions_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".codexctl").join("brain")
+    #[cfg(test)]
+    {
+        let thread = std::thread::current();
+        let scope = project_slug(thread.name().unwrap_or("unnamed-test"));
+        let run_id = TEST_RUN_ID.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        });
+        return std::env::temp_dir()
+            .join("codexctl-tests")
+            .join(std::process::id().to_string())
+            .join(format!("{run_id}-{scope}"))
+            .join("brain");
+    }
+
+    #[cfg(not(test))]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home).join(".codexctl").join("brain")
+    }
 }
 
 fn decisions_path() -> PathBuf {
@@ -809,6 +831,30 @@ pub fn read_canonical_ids() -> std::collections::HashSet<String> {
 mod tests {
     use super::*;
     use crate::rules::RuleAction;
+
+    #[test]
+    fn unit_test_decision_paths_are_thread_scoped() {
+        let path_for = |name: &str| {
+            std::thread::Builder::new()
+                .name(name.into())
+                .spawn(decisions_dir)
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+
+        let first = path_for("brain-test-first");
+        let second = path_for("brain-test-second");
+        let root = std::env::temp_dir()
+            .join("codexctl-tests")
+            .join(std::process::id().to_string());
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(&root));
+        assert!(second.starts_with(&root));
+        assert!(first.ends_with("brain"));
+        assert!(second.ends_with("brain"));
+    }
 
     fn make_suggestion() -> BrainSuggestion {
         BrainSuggestion {
