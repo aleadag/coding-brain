@@ -1,15 +1,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The hooks we install into Codex hooks.json.
+/// The current hook codexctl installs into Codex hooks.json.
 ///
-/// We use `PostToolUse` with a wildcard matcher so codexctl sees every tool
-/// completion, and `Stop` to catch session endings. The commands call
-/// `codexctl --json` which is a lightweight, non-TUI snapshot that the
-/// brain / hooks system can consume.
-///
-/// We also wire up `PermissionRequest` for Bash commands so codexctl's brain
-/// can return a native allow or deny decision before execution.
+/// PermissionRequest is the only active integration. Legacy PostToolUse and
+/// Stop snapshot commands remain recognized below solely for exact cleanup
+/// during init and uninit.
 struct HookSpec {
     event: &'static str,
     matcher: &'static str,
@@ -18,29 +14,13 @@ struct HookSpec {
     status_message: Option<&'static str>,
 }
 
-const HOOKS: &[HookSpec] = &[
-    HookSpec {
-        event: "PermissionRequest",
-        matcher: "Bash",
-        command: "codexctl --permission-hook",
-        timeout: 30,
-        status_message: Some("Brain reviewing permission…"),
-    },
-    HookSpec {
-        event: "PostToolUse",
-        matcher: "*",
-        command: "codexctl --json 2>/dev/null || true",
-        timeout: 5,
-        status_message: None,
-    },
-    HookSpec {
-        event: "Stop",
-        matcher: "",
-        command: "codexctl --json 2>/dev/null || true",
-        timeout: 5,
-        status_message: None,
-    },
-];
+const HOOKS: &[HookSpec] = &[HookSpec {
+    event: "PermissionRequest",
+    matcher: "Bash",
+    command: "codexctl --permission-hook",
+    timeout: 30,
+    status_message: Some("Brain reviewing permission…"),
+}];
 
 const PERMISSION_STATUS_MESSAGE: &str = "Brain reviewing permission…";
 
@@ -240,7 +220,9 @@ fn inspect_permission_handlers(value: &serde_json::Value, scope: &mut Permission
             let Some(command) = handler.get("command").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            if !is_managed_permission_command(matcher_name, command) {
+            if !contains_managed_permission_flag(command)
+                && !is_managed_permission_command(matcher_name, command)
+            {
                 continue;
             }
             scope.configured = true;
@@ -353,7 +335,7 @@ fn is_managed_snapshot_command(command: &str) -> bool {
 }
 
 fn is_managed_permission_command(matcher: &str, command: &str) -> bool {
-    contains_managed_permission_flag(command)
+    is_current_permission_command(command)
         || (matcher == "Bash" && is_managed_snapshot_command(command))
 }
 
@@ -368,6 +350,7 @@ fn is_managed_command(event: &str, matcher: &str, command: &str) -> bool {
 /// Merge codexctl hooks into existing settings, preserving all other keys
 /// and any non-codexctl hooks already defined.
 fn merge_hooks(existing: &mut serde_json::Value) {
+    remove_codexctl_hooks(existing);
     let new_hooks = build_hooks_value();
 
     let hooks_obj = existing
@@ -579,8 +562,6 @@ fn print_success(path: &Path) {
     println!();
     println!("Hooks installed:");
     println!("  PermissionRequest (Bash) — lets the brain allow or deny requests");
-    println!("  PostToolUse (*)          — notifies codexctl after every tool completion");
-    println!("  Stop                     — notifies codexctl when a session ends");
     println!();
     println!("Restart Codex, then open `/hooks` to review and trust the command.");
     println!("Codex will then ask the brain to review Bash permission requests.");
@@ -596,24 +577,10 @@ mod tests {
         let hooks = build_hooks_value();
         let obj = hooks.as_object().unwrap();
 
-        // Should have entries for PermissionRequest, PostToolUse, and Stop
+        assert_eq!(obj.len(), 1);
         assert!(obj.contains_key("PermissionRequest"));
-        assert!(obj.contains_key("PostToolUse"));
-        assert!(obj.contains_key("Stop"));
-
-        // Each event should have an array of matcher entries
-        for (_event, matchers) in obj {
-            let arr = matchers.as_array().unwrap();
-            assert!(!arr.is_empty());
-            for entry in arr {
-                assert!(entry.get("matcher").is_some());
-                assert!(entry.get("hooks").is_some());
-                let inner = entry["hooks"].as_array().unwrap();
-                assert_eq!(inner[0]["type"], "command");
-                let command = inner[0]["command"].as_str().unwrap();
-                assert!(command.contains("codexctl"));
-            }
-        }
+        assert!(!obj.contains_key("PostToolUse"));
+        assert!(!obj.contains_key("Stop"));
     }
 
     #[test]
@@ -663,9 +630,10 @@ mod tests {
 
         assert!(settings.get("hooks").is_some());
         let hooks = settings["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), 1);
         assert!(hooks.contains_key("PermissionRequest"));
-        assert!(hooks.contains_key("PostToolUse"));
-        assert!(hooks.contains_key("Stop"));
+        assert!(!hooks.contains_key("PostToolUse"));
+        assert!(!hooks.contains_key("Stop"));
     }
 
     #[test]
@@ -698,9 +666,8 @@ mod tests {
         assert_eq!(pre[0]["matcher"], "Write");
         assert_eq!(pre[1]["matcher"], "Bash");
 
-        // New hooks added
-        assert!(settings["hooks"]["PostToolUse"].is_array());
-        assert!(settings["hooks"]["Stop"].is_array());
+        assert!(settings["hooks"].get("PostToolUse").is_none());
+        assert!(settings["hooks"].get("Stop").is_none());
     }
 
     #[test]
@@ -746,7 +713,7 @@ mod tests {
         assert!(has_codexctl_hooks(&settings));
 
         let removed = remove_codexctl_hooks(&mut settings);
-        assert_eq!(removed, 3); // PermissionRequest, PostToolUse, Stop
+        assert_eq!(removed, 1); // PermissionRequest
         assert!(!has_codexctl_hooks(&settings));
         // hooks key removed entirely when empty
         assert!(settings.get("hooks").is_none());
@@ -927,7 +894,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_replaces_absolute_managed_hooks_without_duplicates() {
+    fn merge_removes_legacy_lifecycle_hooks_and_preserves_external_stop() {
+        let external_stop = serde_json::json!({
+            "type": "command",
+            "command": "/nix/store/test-codex-jj-stop-hook",
+        });
         let mut settings = serde_json::json!({
             "hooks": {
                 "PermissionRequest": [{
@@ -948,12 +919,14 @@ mod tests {
                     }]
                 }],
                 "Stop": [{
-                    "matcher": "",
-                    "hooks": [{
-                        "type": "command",
-                        "command": "/nix/store/test-codexctl/bin/codexctl --json 2>/dev/null || true",
-                        "timeout": 5
-                    }]
+                    "hooks": [
+                        external_stop.clone(),
+                        {
+                            "type": "command",
+                            "command": "codexctl --json",
+                            "timeout": 5
+                        }
+                    ]
                 }]
             }
         });
@@ -963,9 +936,15 @@ mod tests {
         merge_hooks(&mut settings);
 
         assert_eq!(settings, once);
-        for event in ["PermissionRequest", "PostToolUse", "Stop"] {
-            assert_eq!(settings["hooks"][event].as_array().unwrap().len(), 1);
-        }
+        assert!(settings["hooks"].get("PostToolUse").is_none());
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"],
+            serde_json::json!([external_stop])
+        );
+        assert_eq!(
+            settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
+            "codexctl --permission-hook"
+        );
     }
 
     #[test]
@@ -989,11 +968,32 @@ mod tests {
         merge_hooks(&mut settings);
 
         assert_eq!(settings, once);
-        let refresh = settings["hooks"]["PostToolUse"].as_array().unwrap();
-        assert_eq!(refresh.len(), 1);
+        assert!(settings["hooks"].get("PostToolUse").is_none());
+    }
+
+    #[test]
+    fn merge_preserves_permission_hook_with_extra_arguments() {
+        let custom = serde_json::json!({
+            "type": "command",
+            "command": "/nix/store/test-codexctl/bin/codexctl --permission-hook --unexpected",
+            "timeout": 45,
+            "custom": "preserve"
+        });
+        let mut settings = serde_json::json!({
+            "hooks": { "PermissionRequest": [{
+                "matcher": "Bash",
+                "hooks": [custom.clone()]
+            }] }
+        });
+
+        merge_hooks(&mut settings);
+
+        let permission = settings["hooks"]["PermissionRequest"].as_array().unwrap();
+        assert_eq!(permission.len(), 2);
+        assert_eq!(permission[0]["hooks"], serde_json::json!([custom]));
         assert_eq!(
-            refresh[0]["hooks"][0]["command"],
-            "codexctl --json 2>/dev/null || true"
+            permission[1]["hooks"][0]["command"],
+            "codexctl --permission-hook"
         );
     }
 
@@ -1506,6 +1506,27 @@ mod tests {
             settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
             "echo keep"
         );
+    }
+
+    #[test]
+    fn uninit_preserves_permission_hook_with_extra_arguments() {
+        let mut settings = serde_json::json!({
+            "hooks": { "PermissionRequest": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "/nix/store/test-codexctl/bin/codexctl --permission-hook --unexpected",
+                    "timeout": 45,
+                    "custom": "preserve"
+                }]
+            }] }
+        });
+        let original = settings.clone();
+
+        let removed = remove_codexctl_hooks(&mut settings);
+
+        assert_eq!(removed, 0);
+        assert_eq!(settings, original);
     }
 
     #[test]
