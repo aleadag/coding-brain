@@ -23,7 +23,7 @@ homeManagerModules.default
 homeModules.default
 ```
 
-Both names reference the same module. Per-system package and development-shell outputs remain unchanged.
+Both names reference the same module. Existing per-system package and development-shell outputs remain available, and the flake adds a Nix formatter output so the module has a reproducible formatting gate.
 
 The flake adds a `home-manager` input that follows the existing `nixpkgs` input. The public module remains consumer-importable, while the pinned input provides the real Home Manager module system used by flake checks.
 
@@ -71,6 +71,8 @@ The module contributes each event list with `lib.mkAfter`. Nix list merging pres
 
 All generated commands use `${lib.getExe cfg.package}`. This guarantees that Codex invokes the same immutable Nix package selected by Home Manager, including when Codex starts outside an interactive shell.
 
+When hook integration is enabled, Home Manager activation prints a non-mutating reminder to restart Codex and review `/hooks` after codexctl package changes. The message does not attempt to bypass or automate Codex's trust decision.
+
 Declarative and imperative installation remain idempotent with each other. The Rust installer recognizes the exact supported absolute command shapes for both the permission handler and lightweight JSON refresh handlers, so running `codexctl init` after Home Manager activation does not append duplicate managed hooks.
 
 ## Compatibility And Diagnostics
@@ -100,6 +102,7 @@ Implementation follows test-first development.
    - TOML contains the configured Brain values;
    - all codexctl hooks use the absolute package executable;
    - an unrelated existing `Stop` hook remains present and ordered before codexctl's hook;
+   - the activation output includes the `/hooks` trust reminder;
    - both exported module names reference the same module behavior.
 2. Add evaluation coverage for package-only use when `programs.codex.hooks` is unavailable, plus focused assertion coverage for explicitly enabled hooks with unavailable or disabled Codex integration.
 3. Add Rust regression coverage proving exact absolute Nix-store permission and JSON-refresh commands are managed/current, extra arguments are stale, and imperative initialization does not duplicate declarative hooks.
