@@ -174,11 +174,7 @@ let
   cfg = configured.config;
   permission = lib.last cfg.programs.codex.hooks.PermissionRequest;
   permissionHandler = builtins.elemAt permission.hooks 0;
-  postToolUse = lib.last cfg.programs.codex.hooks.PostToolUse;
-  postToolUseHandler = builtins.elemAt postToolUse.hooks 0;
   stopHooks = cfg.programs.codex.hooks.Stop;
-  generatedStop = lib.last stopHooks;
-  generatedStopHandler = builtins.elemAt generatedStop.hooks 0;
   trustNotice = cfg.home.activation.codexctlHookTrustNotice.data;
   unsupportedFailures = builtins.filter (item: !item.assertion) unsupportedHooks.config.assertions;
   enableOnlyFailures = builtins.filter (item: !item.assertion) enableOnlyCodex.config.assertions;
@@ -187,8 +183,8 @@ in
 assert builtins.elem testPackage cfg.home.packages;
 assert aliasConfigured.config.programs.codexctl.enable;
 assert builtins.length dualAliasConfigured.config.programs.codex.hooks.PermissionRequest == 1;
-assert builtins.length dualAliasConfigured.config.programs.codex.hooks.PostToolUse == 1;
-assert builtins.length dualAliasConfigured.config.programs.codex.hooks.Stop == 1;
+assert !(dualAliasConfigured.config.programs.codex.hooks ? PostToolUse);
+assert !(dualAliasConfigured.config.programs.codex.hooks ? Stop);
 assert packageOnly.config.programs.codexctl.codexHooks.enable == false;
 assert enableOnlyCodex.config.programs.codexctl.codexHooks.enable == false;
 assert enableOnlyFailures == [ ];
@@ -203,15 +199,7 @@ assert permissionHandler.type == "command";
 assert permissionHandler.command == "${expectedExe} --permission-hook";
 assert permissionHandler.timeout == 30;
 assert permissionHandler.statusMessage == "Brain reviewing permission…";
-assert postToolUse.matcher == "*";
-assert postToolUseHandler.type == "command";
-assert postToolUseHandler.command == "${expectedExe} --json 2>/dev/null || true";
-assert postToolUseHandler.timeout == 5;
-assert (builtins.head stopHooks) == existingStop;
-assert generatedStop.matcher == "";
-assert generatedStopHandler.type == "command";
-assert generatedStopHandler.command == "${expectedExe} --json 2>/dev/null || true";
-assert generatedStopHandler.timeout == 5;
+assert stopHooks == [ existingStop ];
 assert
   trustNotice == ''
     echo "codexctl hooks use ${expectedExe}; restart Codex and review /hooks after package changes."

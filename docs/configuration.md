@@ -36,7 +36,7 @@ Apply the configuration with your Home Manager configuration name in place of `<
 home-manager switch --flake .#<profile>
 ```
 
-The module installs its selected package, writes the settings as TOML, and merges `PermissionRequest`, `PostToolUse`, and `Stop` handlers into `programs.codex.hooks`. Each handler calls the selected codexctl package by its immutable Nix store path rather than relying on `PATH`.
+The module installs its selected package, writes the settings as TOML, and merges a `PermissionRequest` handler into `programs.codex.hooks`. The handler calls the selected codexctl package by its immutable Nix store path rather than relying on `PATH`. Hooks configured by other Home Manager modules remain independent and are preserved.
 
 `programs.codexctl.settings` is visible in the Nix store. Do not put secrets, tokens, credentials, or token-bearing URLs in it.
 
