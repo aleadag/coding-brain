@@ -9,6 +9,10 @@ use codexctl_core::helpers::{
 };
 use codexctl_core::hooks::{HookEvent, HookRegistry};
 use codexctl_core::launch::{self, LaunchRequest};
+use codexctl_core::lifecycle::{
+    LifecycleStore, StoreError, StoreView, apply_store_view, compatibility_state_root,
+    retain_after_store_error,
+};
 use codexctl_core::monitor;
 use codexctl_core::process;
 use codexctl_core::session::{ApprovalObservation, CodexSession, SessionStatus};
@@ -300,6 +304,7 @@ fn brain_decision_notice_message(
 pub struct App {
     pub sessions: Vec<CodexSession>,
     transcript_assignments: discovery::TranscriptAssignmentState,
+    lifecycle_store: LifecycleStore,
     pub table_state: TableState,
     pub should_quit: bool,
     pub status_msg: String,
@@ -509,6 +514,13 @@ fn has_matching_deny_rule(
     )
 }
 
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn merge_discovered_session(mut prev: CodexSession, new: CodexSession) -> CodexSession {
     let has_new_session_id = !new.session_id.starts_with("codex-");
     let session_changed = has_new_session_id && new.session_id != prev.session_id;
@@ -535,9 +547,19 @@ fn merge_discovered_session(mut prev: CodexSession, new: CodexSession) -> CodexS
 
 impl App {
     pub fn new() -> Self {
-        let mut app = Self {
+        let mut app = Self::build(LifecycleStore::at(compatibility_state_root()));
+        app.refresh();
+        if app.visible_session_count() > 0 {
+            app.table_state.select(Some(0));
+        }
+        app
+    }
+
+    fn build(lifecycle_store: LifecycleStore) -> Self {
+        Self {
             sessions: Vec::new(),
             transcript_assignments: discovery::TranscriptAssignmentState::default(),
+            lifecycle_store,
             table_state: TableState::default(),
             should_quit: false,
             status_msg: String::new(),
@@ -613,12 +635,12 @@ impl App {
             brain_note_buffer: String::new(),
             brain_decision_cursor: None,
             brain_decision_notice: None,
-        };
-        app.refresh();
-        if app.visible_session_count() > 0 {
-            app.table_state.select(Some(0));
         }
-        app
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lifecycle_store(lifecycle_store: LifecycleStore) -> Self {
+        Self::build(lifecycle_store)
     }
 
     pub fn terminal_auto_fallback_configured(&self) -> bool {
@@ -731,6 +753,8 @@ impl App {
 
         // Scan for subagents
         discovery::scan_subagents(&mut sessions);
+
+        self.reconcile_discovered_sessions(&mut sessions, epoch_ms());
 
         // Resolve git worktree identity (for conflict detection, runs once per session)
         discovery::resolve_worktree_ids(&mut sessions);
@@ -1106,6 +1130,31 @@ impl App {
                 jsonl_elapsed.as_secs_f64() * 1000.0,
                 total_elapsed.as_secs_f64() * 1000.0,
             );
+        }
+    }
+
+    fn reconcile_discovered_sessions(&self, sessions: &mut [CodexSession], now_ms: u64) {
+        self.reconcile_discovered_sessions_with(sessions, now_ms, || self.lifecycle_store.read());
+    }
+
+    fn reconcile_discovered_sessions_with<F>(
+        &self,
+        sessions: &mut [CodexSession],
+        now_ms: u64,
+        read: F,
+    ) where
+        F: FnOnce() -> Result<StoreView, StoreError>,
+    {
+        if !sessions.iter().any(|session| {
+            session.process_backed
+                && !session.is_remote()
+                && session.status != SessionStatus::Finished
+        }) {
+            return;
+        }
+        match read() {
+            Ok(view) => apply_store_view(sessions, &view, now_ms),
+            Err(error) => retain_after_store_error(sessions, &error, now_ms),
         }
     }
 
@@ -3160,6 +3209,14 @@ mod tests {
         prev.jsonl_offset = 512;
         prev.last_msg_type = "assistant".into();
         prev.last_stop_reason = "end_turn".into();
+        prev.lifecycle_evidence = Some(codexctl_core::lifecycle::LifecycleEvidence {
+            projected_status: codexctl_core::lifecycle::ProjectedStatus::Idle,
+            status_event: codexctl_core::lifecycle::LifecycleEventName::Stop,
+            status_received_at_ms: 1_000,
+            latest_event: codexctl_core::lifecycle::LifecycleEventName::Stop,
+            latest_received_at_ms: 1_000,
+            active_subagent_count: 0,
+        });
 
         let mut new = make_session(
             15,
@@ -3183,6 +3240,7 @@ mod tests {
         assert_eq!(merged.jsonl_offset, 0);
         assert!(merged.last_msg_type.is_empty());
         assert!(merged.last_stop_reason.is_empty());
+        assert!(merged.lifecycle_evidence.is_none());
     }
 
     #[test]
@@ -3200,6 +3258,14 @@ mod tests {
         prev.jsonl_path = Some("/tmp/stable.jsonl".into());
         prev.own_cost_usd = 4.25;
         prev.priced_total_tokens = 250_000;
+        prev.lifecycle_evidence = Some(codexctl_core::lifecycle::LifecycleEvidence {
+            projected_status: codexctl_core::lifecycle::ProjectedStatus::Processing,
+            status_event: codexctl_core::lifecycle::LifecycleEventName::PreToolUse,
+            status_received_at_ms: 1_000,
+            latest_event: codexctl_core::lifecycle::LifecycleEventName::PreToolUse,
+            latest_received_at_ms: 1_000,
+            active_subagent_count: 0,
+        });
 
         let mut new = make_session(
             15,
@@ -3218,5 +3284,42 @@ mod tests {
         assert_eq!(merged.cost_usd, 4.25);
         assert_eq!(merged.own_cost_usd, 4.25);
         assert_eq!(merged.priced_total_tokens, 250_000);
+        assert!(merged.lifecycle_evidence.is_some());
+    }
+
+    #[test]
+    fn lifecycle_store_read_is_once_for_local_sessions_and_skipped_otherwise() {
+        let root = tempfile::tempdir().unwrap();
+        let app =
+            App::with_lifecycle_store(codexctl_core::lifecycle::LifecycleStore::at(root.path()));
+        assert!(!root.path().join("hooks").exists());
+        let mut sessions = vec![
+            make_session(11, "one", "gpt", SessionStatus::Idle, 0.0, 0.0, false),
+            make_session(12, "two", "gpt", SessionStatus::Idle, 0.0, 0.0, false),
+        ];
+        let reads = std::cell::Cell::new(0);
+
+        app.reconcile_discovered_sessions_with(&mut sessions, 2_000, || {
+            reads.set(reads.get() + 1);
+            Ok(codexctl_core::lifecycle::StoreView {
+                snapshot: None,
+                condition: codexctl_core::lifecycle::StoreCondition::Missing,
+            })
+        });
+        assert_eq!(reads.get(), 1);
+
+        for session in &mut sessions {
+            session.process_backed = false;
+        }
+        app.reconcile_discovered_sessions_with(&mut sessions, 2_000, || {
+            panic!("non-process sessions must not read lifecycle state")
+        });
+        for session in &mut sessions {
+            session.process_backed = true;
+            session.worker_origin = Some("remote".into());
+        }
+        app.reconcile_discovered_sessions_with(&mut sessions, 2_000, || {
+            panic!("remote sessions must not read lifecycle state")
+        });
     }
 }

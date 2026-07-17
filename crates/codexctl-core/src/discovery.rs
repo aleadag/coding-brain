@@ -62,12 +62,12 @@ struct LiveCodexProcess {
 }
 
 #[derive(Debug, Clone)]
-struct CodexTranscriptSummary {
-    session_id: String,
-    cwd: String,
-    path: PathBuf,
-    started_at_ms: u64,
-    mtime_ms: u64,
+pub struct CodexTranscriptSummary {
+    pub session_id: String,
+    pub cwd: String,
+    pub path: PathBuf,
+    pub started_at_ms: u64,
+    pub mtime_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -737,7 +737,7 @@ fn collect_rollout_jsonls(dir: &PathBuf, paths: &mut Vec<PathBuf>) {
     }
 }
 
-fn transcript_summary_from_codex_jsonl(path: PathBuf) -> Option<CodexTranscriptSummary> {
+pub fn transcript_summary_from_codex_jsonl(path: PathBuf) -> Option<CodexTranscriptSummary> {
     let file = fs::File::open(&path).ok()?;
     let reader = std::io::BufReader::new(file);
     for line in reader.lines().map_while(Result::ok) {

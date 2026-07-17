@@ -326,6 +326,11 @@ fn check_lifecycle_state_with_store(store: &LifecycleStore) -> Check {
                 format!("lifecycle state uses newer schema {version}"),
                 Some("Upgrade codexctl before writing lifecycle state.".into()),
             ),
+            StoreCondition::Unavailable => (
+                CheckStatus::Advisory,
+                "lifecycle state is unavailable".into(),
+                Some("Check state-directory ownership and permissions.".into()),
+            ),
         },
         Err(error) => (
             CheckStatus::Advisory,

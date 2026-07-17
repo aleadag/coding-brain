@@ -65,6 +65,7 @@ pub fn render_detail_panel(frame: &mut Frame, area: Rect, session: &CodexSession
     } else {
         session.telemetry_label().to_string()
     };
+    let lifecycle = lifecycle_summary(session);
 
     let mut lines = vec![
         detail_line("PID", &pid, t),
@@ -74,6 +75,7 @@ pub fn render_detail_panel(frame: &mut Frame, area: Rect, session: &CodexSession
         detail_line("Model", &model, t),
         detail_line("Status", &status, t),
         detail_line("Telemetry", &telemetry, t),
+        detail_line("Lifecycle", &lifecycle, t),
         detail_line("TTY", &tty, t),
         detail_line("Elapsed", &elapsed, t),
         Line::from(""),
@@ -339,5 +341,117 @@ fn format_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn lifecycle_summary(session: &CodexSession) -> String {
+    let diagnostic = &session.lifecycle_diagnostic;
+    if !diagnostic.available {
+        return diagnostic
+            .ignored_reason
+            .as_deref()
+            .map(|reason| format!("unavailable: {reason}"))
+            .unwrap_or_else(|| "unavailable".into());
+    }
+    let event = diagnostic
+        .event
+        .map(|event| event.as_str())
+        .unwrap_or("unknown event");
+    let age = diagnostic
+        .age_ms
+        .map(format_age)
+        .unwrap_or_else(|| "unknown age".into());
+    let state = if diagnostic.contributing {
+        "contributing"
+    } else {
+        diagnostic.ignored_reason.as_deref().unwrap_or("observed")
+    };
+    format!("{event}, {age} ago, {state}")
+}
+
+fn format_age(age_ms: u64) -> String {
+    if age_ms < 1_000 {
+        format!("{age_ms}ms")
+    } else if age_ms < 60_000 {
+        format!("{}s", age_ms / 1_000)
+    } else {
+        format!("{}m", age_ms / 60_000)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use codexctl_core::lifecycle::{LifecycleDiagnostic, LifecycleEventName, StoreCondition};
+    use codexctl_core::session::{CodexSession, RawSession};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+
+    #[test]
+    fn lifecycle_summary_reports_provenance_and_unavailable_state() {
+        let mut session = CodexSession::from_raw(RawSession {
+            pid: 7,
+            session_id: "session-7".into(),
+            cwd: "/repo".into(),
+            started_at: 0,
+        });
+        assert_eq!(lifecycle_summary(&session), "unavailable");
+
+        session.lifecycle_diagnostic = LifecycleDiagnostic {
+            available: true,
+            event: Some(LifecycleEventName::PreToolUse),
+            age_ms: Some(125),
+            contributing: true,
+            ignored_reason: None,
+            store_condition: Some(StoreCondition::Healthy),
+        };
+        assert_eq!(
+            lifecycle_summary(&session),
+            "PreToolUse, 125ms ago, contributing"
+        );
+
+        session.lifecycle_diagnostic.contributing = false;
+        session.lifecycle_diagnostic.ignored_reason = Some("superseded by transcript".into());
+        assert_eq!(
+            lifecycle_summary(&session),
+            "PreToolUse, 125ms ago, superseded by transcript"
+        );
+    }
+
+    #[test]
+    fn detail_panel_renders_lifecycle_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let app =
+            App::with_lifecycle_store(codexctl_core::lifecycle::LifecycleStore::at(root.path()));
+        let mut session = CodexSession::from_raw(RawSession {
+            pid: 7,
+            session_id: "session-7".into(),
+            cwd: "/repo".into(),
+            started_at: 0,
+        });
+        session.lifecycle_diagnostic = LifecycleDiagnostic {
+            available: true,
+            event: Some(LifecycleEventName::PreToolUse),
+            age_ms: Some(125),
+            contributing: true,
+            ignored_reason: None,
+            store_condition: Some(StoreCondition::Healthy),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+
+        terminal
+            .draw(|frame| render_detail_panel(frame, frame.area(), &session, &app))
+            .unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Lifecycle"));
+        assert!(rendered.contains("PreToolUse, 125ms ago, contributing"));
     }
 }

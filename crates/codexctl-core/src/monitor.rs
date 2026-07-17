@@ -1123,6 +1123,7 @@ mod tests {
             status_received_at_ms: 1_000,
             latest_event: crate::lifecycle::LifecycleEventName::PreToolUse,
             latest_received_at_ms: 1_000,
+            active_subagent_count: 0,
         });
 
         infer_status_at(&mut session, "assistant", "tool_use", false, 2_000);
@@ -1140,6 +1141,7 @@ mod tests {
             status_received_at_ms: 1_000,
             latest_event: crate::lifecycle::LifecycleEventName::PreToolUse,
             latest_received_at_ms: 1_000,
+            active_subagent_count: 0,
         });
 
         infer_status_at(&mut session, "assistant", "tool_use", false, 2_000);
@@ -1189,6 +1191,7 @@ mod tests {
             status_received_at_ms: 1_000,
             latest_event: crate::lifecycle::LifecycleEventName::Stop,
             latest_received_at_ms: 1_000,
+            active_subagent_count: 0,
         });
         session.transcript_evidence =
             Some(crate::lifecycle::TranscriptEvidence::progress(Some(2_000)));
@@ -1219,6 +1222,7 @@ mod tests {
             status_received_at_ms: 1_000,
             latest_event: crate::lifecycle::LifecycleEventName::Stop,
             latest_received_at_ms: 1_000,
+            active_subagent_count: 0,
         });
         session.cpu_percent = 6.0;
 

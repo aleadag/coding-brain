@@ -832,6 +832,7 @@ impl CodexSession {
         } else {
             serde_json::Value::Null
         };
+        let lifecycle = &self.lifecycle_diagnostic;
 
         serde_json::json!({
             "pid": self.pid,
@@ -889,6 +890,14 @@ impl CodexSession {
             "tool_usage": self.tool_usage.iter().map(|(k, v)| {
                 (k.clone(), serde_json::json!({"calls": v.calls}))
             }).collect::<serde_json::Map<String, serde_json::Value>>(),
+            "lifecycle": {
+                "available": lifecycle.available,
+                "store_condition": lifecycle.store_condition.map(|condition| condition.as_str()),
+                "last_event": lifecycle.event.map(|event| event.as_str()),
+                "age_ms": lifecycle.age_ms,
+                "contributing": lifecycle.contributing,
+                "ignored_reason": lifecycle.ignored_reason,
+            },
             "worker_origin": self.worker_origin,
         })
     }
@@ -1269,5 +1278,29 @@ mod tests {
             output.get("worker_origin").and_then(|v| v.as_str()),
             Some("remote-w")
         );
+    }
+
+    #[test]
+    fn session_json_exposes_only_lifecycle_provenance() {
+        let mut session = make_session();
+        session.lifecycle_diagnostic = crate::lifecycle::LifecycleDiagnostic {
+            available: true,
+            event: Some(crate::lifecycle::LifecycleEventName::PreToolUse),
+            age_ms: Some(125),
+            contributing: true,
+            ignored_reason: None,
+            store_condition: Some(crate::lifecycle::StoreCondition::Healthy),
+        };
+
+        let lifecycle = session.to_json_value()["lifecycle"].clone();
+
+        assert_eq!(lifecycle["available"], true);
+        assert_eq!(lifecycle["store_condition"], "healthy");
+        assert_eq!(lifecycle["last_event"], "PreToolUse");
+        assert_eq!(lifecycle["age_ms"], 125);
+        assert_eq!(lifecycle["contributing"], true);
+        assert!(lifecycle.get("prompt").is_none());
+        assert!(lifecycle.get("tool_input").is_none());
+        assert!(lifecycle.get("tool_output").is_none());
     }
 }

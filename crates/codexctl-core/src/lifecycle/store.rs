@@ -225,6 +225,19 @@ pub enum StoreCondition {
     Missing,
     Corrupt,
     NewerSchema(u32),
+    Unavailable,
+}
+
+impl StoreCondition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Missing => "missing",
+            Self::Corrupt => "corrupt",
+            Self::NewerSchema(_) => "newer_schema",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
