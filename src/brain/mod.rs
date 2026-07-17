@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod autopsy;
 pub mod baseline;
 pub mod briefing;

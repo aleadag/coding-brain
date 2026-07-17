@@ -13,6 +13,7 @@
     clippy::io_other_error
 )]
 
+pub mod brain_activity;
 pub mod codex_transcript;
 pub mod config;
 pub mod discovery;
@@ -25,7 +26,9 @@ pub mod lifecycle;
 pub mod logger;
 pub mod models;
 pub mod monitor;
+pub mod paths;
 pub mod process;
+pub mod project;
 pub mod rules;
 pub mod runtime;
 pub mod session;
