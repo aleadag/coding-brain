@@ -23,6 +23,7 @@ mod commands;
 mod config;
 mod doctor;
 mod init;
+mod lifecycle_hook;
 mod runtime;
 
 use std::io;
@@ -302,6 +303,10 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) permission_hook: bool,
 
+    /// Internal Codex lifecycle hook adapter.
+    #[arg(long, hide = true)]
+    pub(crate) lifecycle_hook: bool,
+
     /// Tool name for --brain-query (e.g., "Bash", "Write", "Edit")
     #[arg(long, help_heading = "Brain (Local LLM)")]
     pub(crate) tool: Option<String>,
@@ -483,9 +488,9 @@ pub(crate) struct Cli {
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let is_demo = cli.demo;
-    let is_permission_hook = cli.permission_hook;
+    let is_internal_hook = cli.permission_hook || cli.lifecycle_hook;
     let result = run_main(cli);
-    if result.is_ok() && !is_permission_hook {
+    if result.is_ok() && !is_internal_hook {
         maybe_print_star_prompt(is_demo);
     }
     result
@@ -576,6 +581,11 @@ fn apply_brain_cli_overrides(cfg: &mut config::Config, cli: &Cli) {
 }
 
 fn run_main(cli: Cli) -> io::Result<()> {
+    if cli.lifecycle_hook {
+        lifecycle_hook::run();
+        return Ok(());
+    }
+
     // Initialize diagnostic logger if --log is set
     if let Some(ref log_path) = cli.log {
         if let Err(e) = logger::init(log_path) {
@@ -1348,6 +1358,14 @@ mod permission_hook_cli_tests {
         assert!(cli.permission_hook);
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--permission-hook"));
+    }
+
+    #[test]
+    fn lifecycle_hook_flag_is_hidden() {
+        let cli = Cli::try_parse_from(["codexctl", "--lifecycle-hook"]).unwrap();
+        assert!(cli.lifecycle_hook);
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--lifecycle-hook"));
     }
 
     #[test]

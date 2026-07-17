@@ -32,4 +32,5 @@ pub mod brain;
 pub mod brain_screen;
 pub mod doctor;
 pub mod init;
+mod lifecycle_hook;
 pub mod runtime;
