@@ -32,7 +32,7 @@ fn summary_from(r: brain::decisions::DecisionRecord) -> DecisionSummary {
     DecisionSummary::from(&r)
 }
 
-fn item_summary_from(item: brain::review::ReviewItem) -> ReviewItemSummary {
+pub(super) fn item_summary_from(item: brain::review::ReviewItem) -> ReviewItemSummary {
     ReviewItemSummary {
         decision: summary_from(item.record),
         reason: item.reason,

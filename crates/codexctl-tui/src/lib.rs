@@ -22,6 +22,7 @@
 )]
 
 pub mod app;
+pub mod brain_app;
 pub mod demo;
 pub mod recorder;
 pub mod session_recorder;

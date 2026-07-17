@@ -279,6 +279,7 @@ pub struct ActivityItem {
 pub struct AttentionItem {
     pub activity: ActivityItem,
     pub occurrences: usize,
+    pub unresolved_occurrences: usize,
 }
 
 impl std::ops::Deref for AttentionItem {
@@ -298,7 +299,7 @@ pub struct ActivityDiagnostics {
     pub discarded_tail_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ActivitySnapshot {
     pub attention: Vec<AttentionItem>,
     pub recent: Vec<ActivityItem>,

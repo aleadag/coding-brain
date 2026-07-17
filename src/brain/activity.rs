@@ -553,6 +553,9 @@ fn project_snapshot(log: ActivityLog, limits: SnapshotLimits, now_ms: u64) -> Ac
                 .entry(key)
                 .and_modify(|existing| {
                     existing.occurrences += 1;
+                    if needs_attention {
+                        existing.unresolved_occurrences += 1;
+                    }
                     let item_rank = activity_rank(&item);
                     let existing_rank = activity_rank(&existing.activity);
                     if item_rank > existing_rank
@@ -567,6 +570,7 @@ fn project_snapshot(log: ActivityLog, limits: SnapshotLimits, now_ms: u64) -> Ac
                 .or_insert(AttentionItem {
                     activity: item,
                     occurrences: 1,
+                    unresolved_occurrences: usize::from(needs_attention),
                 });
         } else {
             recent.push(item);
@@ -947,6 +951,7 @@ mod tests {
         let snapshot = store.snapshot(SnapshotLimits::default()).unwrap();
         assert_eq!(snapshot.attention.len(), 1);
         assert_eq!(snapshot.attention[0].occurrences, 2);
+        assert_eq!(snapshot.attention[0].unresolved_occurrences, 2);
         assert_eq!(store.read().unwrap().complete_lifecycles(), 2);
     }
 
@@ -1028,6 +1033,7 @@ mod tests {
         let snapshot = store.snapshot(SnapshotLimits::default()).unwrap();
         assert_eq!(snapshot.attention.len(), 1);
         assert_eq!(snapshot.unresolved_count, 0);
+        assert_eq!(snapshot.attention[0].unresolved_occurrences, 0);
     }
 
     #[test]
@@ -1100,6 +1106,14 @@ mod tests {
         let snapshot = store.snapshot(SnapshotLimits::default()).unwrap();
         assert_eq!(snapshot.attention.len(), 100);
         assert_eq!(snapshot.unresolved_count, 105);
+        assert_eq!(
+            snapshot
+                .attention
+                .iter()
+                .map(|item| item.unresolved_occurrences)
+                .sum::<usize>(),
+            100
+        );
     }
 
     #[test]

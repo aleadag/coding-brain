@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use codexctl_core::runtime::Runtime;
+use codexctl_core::runtime::{BrainRuntime, Runtime};
 
 mod actions;
 mod brain;
@@ -22,7 +22,7 @@ mod delivery;
 mod sessions;
 
 pub use actions::LiveActions;
-pub use brain::LiveBrainView;
+pub use brain::{LiveBrainSource, LiveBrainView};
 // LiveBrainDriver is the only stateful runtime adapter; the TUI's `App` is the
 // owner. Re-exported for tests and the future `App::new` wiring (next PR).
 #[allow(unused_imports)]
@@ -46,4 +46,8 @@ pub fn build_runtime() -> Runtime {
         Arc::new(LiveBrainReviewView),
         Arc::new(LiveBrainDelivery),
     )
+}
+
+pub fn build_brain_runtime() -> BrainRuntime {
+    BrainRuntime::new(Arc::new(LiveBrainSource::default()), Arc::new(LiveActions))
 }

@@ -6,7 +6,8 @@ use std::fs;
 use codexctl_core::discovery;
 use codexctl_core::helpers;
 use codexctl_core::runtime::{
-    Actions, BrainGateMode, DecisionScope, LogDecisionInput, ObservationInput,
+    Actions, BrainActions, BrainGateMode, CorrectionInput, DecisionScope, LogDecisionInput,
+    ObservationInput,
 };
 use codexctl_core::terminals;
 
@@ -101,6 +102,59 @@ impl Actions for LiveActions {
     }
 }
 
+impl BrainActions for LiveActions {
+    fn record_correction(&self, correction: CorrectionInput) -> Result<(), String> {
+        let paths = brain::distill::current_paths().map_err(|error| error.to_string())?;
+        let store = brain::activity::ActivityStore::at(paths.state_root().join("activity.jsonl"));
+        let source = store
+            .read()
+            .map_err(|error| error.to_string())?
+            .events()
+            .iter()
+            .rev()
+            .find(|event| event.activity_id == correction.activity_id)
+            .cloned()
+            .ok_or_else(|| format!("activity {} not found", correction.activity_id))?;
+        store
+            .append(codexctl_core::brain_activity::ActivityEvent {
+                schema_version: codexctl_core::brain_activity::ACTIVITY_SCHEMA_VERSION,
+                activity_id: correction.activity_id,
+                recorded_at_ms: epoch_ms(),
+                project: source.project,
+                session: source.session,
+                state: codexctl_core::brain_activity::ActivityState::Correction,
+                tool: None,
+                normalized_command: None,
+                fingerprint: None,
+                rule_id: None,
+                confidence: None,
+                threshold: None,
+                reasoning: None,
+                decision_id: source.decision_id,
+                outcome: None,
+                correction: Some(correction.disposition),
+                note: correction.note,
+                supersedes: None,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn mark_canonical(&self, decision_id: &str, note: Option<String>) -> Result<(), String> {
+        brain::review::mark_by_id(decision_id, note.as_deref())
+    }
+
+    fn set_gate_mode(&self, mode: BrainGateMode) -> Result<(), String> {
+        <Self as Actions>::set_gate_mode(self, mode)
+    }
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Inverse of `crate::runtime::brain::parse_gate_mode` — writes the canonical
 /// lowercased label the reader expects.
 fn gate_mode_label(mode: BrainGateMode) -> &'static str {
@@ -114,6 +168,13 @@ fn gate_mode_label(mode: BrainGateMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use codexctl_core::brain_activity::{
+        ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityState, CorrectionDisposition,
+        ProjectEvidence, SnapshotLimits,
+    };
+    use codexctl_core::paths::{CodingBrainPaths, PathEnvironment};
+    use codexctl_core::project::ProjectId;
 
     /// Round-trip the label format with the parser in the brain wrapper.
     #[test]
@@ -144,16 +205,101 @@ mod tests {
         unsafe { std::env::set_var("HOME", dir.path()) };
 
         let actions = LiveActions;
-        actions.set_gate_mode(BrainGateMode::Off).unwrap();
+        Actions::set_gate_mode(&actions, BrainGateMode::Off).unwrap();
         assert_eq!(brain::read_gate_mode().trim(), "off");
 
-        actions.set_gate_mode(BrainGateMode::Auto).unwrap();
+        Actions::set_gate_mode(&actions, BrainGateMode::Auto).unwrap();
         assert_eq!(brain::read_gate_mode().trim(), "auto");
 
         if let Some(home) = original {
             unsafe { std::env::set_var("HOME", home) };
         } else {
             unsafe { std::env::remove_var("HOME") };
+        }
+    }
+
+    #[test]
+    fn correction_is_append_only_redacted_and_resolves_attention() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_config = std::env::var_os("XDG_CONFIG_HOME");
+        let original_state = std::env::var_os("XDG_STATE_HOME");
+        unsafe {
+            std::env::set_var("HOME", root.path());
+            std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+            std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        }
+        let paths = CodingBrainPaths::resolve(&PathEnvironment::new(
+            Some(root.path().join("config")),
+            Some(root.path().join("state")),
+            Some(root.path().to_path_buf()),
+        ))
+        .unwrap();
+        let store = brain::activity::ActivityStore::at(paths.state_root().join("activity.jsonl"));
+        store.append(source_event()).unwrap();
+
+        BrainActions::record_correction(
+            &LiveActions,
+            CorrectionInput {
+                activity_id: "activity-1".into(),
+                disposition: CorrectionDisposition::BrainWrong,
+                note: Some("token=private-value wrong project".into()),
+            },
+        )
+        .unwrap();
+
+        let snapshot = store.snapshot(SnapshotLimits::default()).unwrap();
+        assert!(snapshot.attention.is_empty());
+        assert_eq!(snapshot.recent.len(), 1);
+        assert_eq!(
+            snapshot.recent[0].correction,
+            Some(CorrectionDisposition::BrainWrong)
+        );
+        assert_eq!(
+            snapshot.recent[0].note.as_deref(),
+            Some("[REDACTED] wrong project")
+        );
+
+        restore_env("HOME", original_home);
+        restore_env("XDG_CONFIG_HOME", original_config);
+        restore_env("XDG_STATE_HOME", original_state);
+    }
+
+    fn source_event() -> ActivityEvent {
+        ActivityEvent {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            activity_id: "activity-1".into(),
+            recorded_at_ms: 1,
+            project: ProjectEvidence {
+                project_id: ProjectId::Stable("project-1".into()),
+                cwd: "/work/project".into(),
+                label: Some("project".into()),
+            },
+            session: None,
+            state: ActivityState::Denied,
+            tool: Some("Bash".into()),
+            normalized_command: Some("cargo test".into()),
+            fingerprint: Some("fixture".into()),
+            rule_id: None,
+            confidence: Some(0.9),
+            threshold: Some(0.8),
+            reasoning: Some("fixture".into()),
+            decision_id: Some("decision-1".into()),
+            outcome: None,
+            correction: None,
+            note: None,
+            supersedes: None,
+        }
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            unsafe { std::env::set_var(key, value) };
+        } else {
+            unsafe { std::env::remove_var(key) };
         }
     }
 }

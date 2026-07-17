@@ -40,6 +40,9 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::brain_activity::{
+    ActivitySnapshot, CorrectionDisposition, SessionTarget, SnapshotLimits,
+};
 use crate::session::CodexSession;
 
 // ============================================================================
@@ -238,6 +241,107 @@ pub trait BrainReviewView: Send + Sync {
     /// brain's queue-building heuristics (counterfactual hits, Critical-tier
     /// safety cases, high-confidence misses).
     fn review_queue(&self) -> Vec<ReviewItemSummary>;
+}
+
+// ============================================================================
+// Coding Brain primary runtime
+// ============================================================================
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScorecardSummary {
+    pub total_decisions: usize,
+    pub brain_decisions: usize,
+    pub correct_decisions: usize,
+    pub accuracy_pct: f64,
+    pub abstentions: usize,
+    pub dangerous_false_approvals: usize,
+    pub override_rate_pct: f64,
+    pub canonical_decisions: usize,
+    pub risk_tiers: Vec<RiskTierSummary>,
+    pub latency: LatencySummary,
+    pub cache: CacheSummary,
+    pub counterfactuals: CounterfactualSummary,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RiskTierSummary {
+    pub tier: String,
+    pub samples: usize,
+    pub correct: usize,
+    pub false_approvals: usize,
+    pub false_denials: usize,
+    pub override_rate_pct: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LatencySummary {
+    pub samples: usize,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub mean_ms: u64,
+    pub max_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CacheSummary {
+    pub instrumented: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub hit_rate_pct: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CounterfactualSummary {
+    pub brain_was_right: usize,
+    pub user_was_right: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EndpointHealth {
+    pub reachable: bool,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectionInput {
+    pub activity_id: String,
+    pub disposition: CorrectionDisposition,
+    pub note: Option<String>,
+}
+
+pub trait BrainSource: Send + Sync {
+    fn snapshot(&self, limits: SnapshotLimits) -> Result<ActivitySnapshot, String>;
+    fn review_queue(&self) -> Result<Vec<ReviewItemSummary>, String>;
+    fn scorecard(&self) -> Result<ScorecardSummary, String>;
+    fn gate_mode(&self) -> BrainGateMode;
+    fn endpoint_health(&self) -> EndpointHealth;
+}
+
+pub trait BrainActions: Send + Sync {
+    fn record_correction(&self, correction: CorrectionInput) -> Result<(), String>;
+    fn mark_canonical(&self, decision_id: &str, note: Option<String>) -> Result<(), String>;
+    fn set_gate_mode(&self, mode: BrainGateMode) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub struct BrainRuntime {
+    pub source: Arc<dyn BrainSource>,
+    pub actions: Arc<dyn BrainActions>,
+}
+
+impl BrainRuntime {
+    pub fn new(source: Arc<dyn BrainSource>, actions: Arc<dyn BrainActions>) -> Self {
+        Self { source, actions }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrainEffect {
+    SwitchToSession(SessionTarget),
+    Exit,
 }
 
 // ============================================================================
@@ -502,6 +606,95 @@ pub struct MockRuntime {
     pub review_queue: Vec<ReviewItemSummary>,
     pub mailbox_deliveries: Vec<(u32, String)>,
     pub actions_log: std::sync::Mutex<Vec<MockAction>>,
+}
+
+#[derive(Default)]
+pub struct MockBrainRuntime {
+    pub activity_snapshot: ActivitySnapshot,
+    pub review_queue: Vec<ReviewItemSummary>,
+    pub scorecard: ScorecardSummary,
+    pub endpoint_health: EndpointHealth,
+    pub gate_mode: std::sync::Mutex<Option<BrainGateMode>>,
+    pub actions_log: std::sync::Mutex<Vec<MockBrainAction>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MockBrainAction {
+    RecordCorrection(CorrectionInput),
+    MarkCanonical {
+        decision_id: String,
+        note: Option<String>,
+    },
+    SetGateMode(BrainGateMode),
+}
+
+impl MockBrainRuntime {
+    pub fn into_runtime(self) -> BrainRuntime {
+        let runtime = Arc::new(self);
+        BrainRuntime::new(runtime.clone(), runtime)
+    }
+
+    pub fn actions(&self) -> Vec<MockBrainAction> {
+        self.actions_log
+            .lock()
+            .expect("brain actions_log poisoned")
+            .clone()
+    }
+}
+
+impl BrainSource for MockBrainRuntime {
+    fn snapshot(&self, _limits: SnapshotLimits) -> Result<ActivitySnapshot, String> {
+        Ok(self.activity_snapshot.clone())
+    }
+
+    fn review_queue(&self) -> Result<Vec<ReviewItemSummary>, String> {
+        Ok(self.review_queue.clone())
+    }
+
+    fn scorecard(&self) -> Result<ScorecardSummary, String> {
+        Ok(self.scorecard.clone())
+    }
+
+    fn gate_mode(&self) -> BrainGateMode {
+        self.gate_mode
+            .lock()
+            .expect("brain gate_mode poisoned")
+            .unwrap_or(BrainGateMode::On)
+    }
+
+    fn endpoint_health(&self) -> EndpointHealth {
+        self.endpoint_health.clone()
+    }
+}
+
+impl BrainActions for MockBrainRuntime {
+    fn record_correction(&self, correction: CorrectionInput) -> Result<(), String> {
+        self.actions_log
+            .lock()
+            .expect("brain actions_log poisoned")
+            .push(MockBrainAction::RecordCorrection(correction));
+        Ok(())
+    }
+
+    fn mark_canonical(&self, decision_id: &str, note: Option<String>) -> Result<(), String> {
+        self.actions_log
+            .lock()
+            .expect("brain actions_log poisoned")
+            .push(MockBrainAction::MarkCanonical {
+                decision_id: decision_id.into(),
+                note,
+            });
+        Ok(())
+    }
+
+    fn set_gate_mode(&self, mode: BrainGateMode) -> Result<(), String> {
+        *self.gate_mode.lock().expect("brain gate_mode poisoned") = Some(mode);
+        self.actions_log
+            .lock()
+            .expect("brain actions_log poisoned")
+            .push(MockBrainAction::SetGateMode(mode));
+        Ok(())
+    }
 }
 
 /// Recorded `Actions` calls. Tests use this to assert side-effect ordering
@@ -855,6 +1048,52 @@ mod tests {
                     note: Some("nice catch".into()),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn brain_runtime_records_exact_correction_and_canonical_inputs() {
+        let mock = Arc::new(MockBrainRuntime::default());
+        let runtime = BrainRuntime::new(mock.clone(), mock.clone());
+        let correction = CorrectionInput {
+            activity_id: "activity-42".into(),
+            disposition: crate::brain_activity::CorrectionDisposition::BrainWrong,
+            note: Some("wrong project".into()),
+        };
+
+        runtime
+            .actions
+            .record_correction(correction.clone())
+            .unwrap();
+        runtime
+            .actions
+            .mark_canonical("decision-42", Some("teach this".into()))
+            .unwrap();
+
+        assert_eq!(
+            mock.actions(),
+            vec![
+                MockBrainAction::RecordCorrection(correction),
+                MockBrainAction::MarkCanonical {
+                    decision_id: "decision-42".into(),
+                    note: Some("teach this".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn brain_runtime_exposes_only_brain_source_and_actions() {
+        let runtime = MockBrainRuntime::default().into_runtime();
+
+        assert_eq!(runtime.source.gate_mode(), BrainGateMode::On);
+        assert!(
+            runtime
+                .source
+                .snapshot(crate::brain_activity::SnapshotLimits::default())
+                .unwrap()
+                .recent
+                .is_empty()
         );
     }
 }
