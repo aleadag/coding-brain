@@ -54,7 +54,7 @@ in
         lib.hasAttrByPath [ "programs" "codex" "hooks" ] options
         && config.programs.codex.enable
       '';
-      description = "Whether to merge the codexctl permission hook into programs.codex.hooks.";
+      description = "Whether to merge the codexctl lifecycle and permission hooks into programs.codex.hooks.";
     };
   };
 
@@ -78,19 +78,103 @@ in
       }
       (lib.mkIf cfg.codexHooks.enable (
         lib.optionalAttrs hasCodexHooks {
-          programs.codex.hooks.PermissionRequest = lib.mkAfter [
-            {
-              matcher = "Bash";
-              hooks = [
-                {
-                  type = "command";
-                  command = "${executable} --permission-hook";
-                  timeout = 30;
-                  statusMessage = "Brain reviewing permission…";
-                }
-              ];
-            }
-          ];
+          programs.codex.hooks = {
+            SessionStart = lib.mkAfter [
+              {
+                matcher = "startup|resume|clear|compact";
+                hooks = [
+                  {
+                    type = "command";
+                    command = "${executable} --lifecycle-hook";
+                    timeout = 2;
+                  }
+                ];
+              }
+            ];
+            UserPromptSubmit = lib.mkAfter [
+              {
+                hooks = [
+                  {
+                    type = "command";
+                    command = "${executable} --lifecycle-hook";
+                    timeout = 2;
+                  }
+                ];
+              }
+            ];
+            PreToolUse = lib.mkAfter [
+              {
+                matcher = "*";
+                hooks = [
+                  {
+                    type = "command";
+                    command = "${executable} --lifecycle-hook";
+                    timeout = 2;
+                  }
+                ];
+              }
+            ];
+            PermissionRequest = lib.mkAfter [
+              {
+                matcher = "*";
+                hooks = [
+                  {
+                    type = "command";
+                    command = "${executable} --permission-hook";
+                    timeout = 30;
+                    statusMessage = "Brain reviewing permission…";
+                  }
+                ];
+              }
+            ];
+            PostToolUse = lib.mkAfter [
+              {
+                matcher = "*";
+                hooks = [
+                  {
+                    type = "command";
+                    command = "${executable} --lifecycle-hook";
+                    timeout = 2;
+                  }
+                ];
+              }
+            ];
+            SubagentStart = lib.mkAfter [
+              {
+                matcher = "*";
+                hooks = [
+                  {
+                    type = "command";
+                    command = "${executable} --lifecycle-hook";
+                    timeout = 2;
+                  }
+                ];
+              }
+            ];
+            SubagentStop = lib.mkAfter [
+              {
+                matcher = "*";
+                hooks = [
+                  {
+                    type = "command";
+                    command = "${executable} --lifecycle-hook";
+                    timeout = 2;
+                  }
+                ];
+              }
+            ];
+            Stop = lib.mkAfter [
+              {
+                hooks = [
+                  {
+                    type = "command";
+                    command = "${executable} --lifecycle-hook";
+                    timeout = 2;
+                  }
+                ];
+              }
+            ];
+          };
           home.activation.codexctlHookTrustNotice = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
             echo "codexctl hooks use ${executable}; restart Codex and review /hooks after package changes."
           '';

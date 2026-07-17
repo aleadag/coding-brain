@@ -16,6 +16,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use codexctl_core::lifecycle::{LifecycleStore, StoreCondition, compatibility_state_root};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
@@ -60,6 +62,8 @@ pub fn run_all_checks() -> Vec<Check> {
     vec![
         check_binary_on_path(),
         check_codex_hooks(),
+        check_codex_hook_trust(),
+        check_lifecycle_state(),
         check_brain_endpoint(),
         check_session_discovery(),
         check_terminal_integration(),
@@ -192,12 +196,12 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
             fix_hint: None,
         };
     };
-    let discovery = crate::init::hooks::discover_permission_hooks_at(Some(home), cwd);
+    let discovery = crate::init::hooks::discover_lifecycle_hooks_at(Some(home), cwd);
     if !discovery.configured() {
         return Check {
             name: "Codex hooks".into(),
             status: CheckStatus::Fail,
-            message: "managed PermissionRequest hook not found".into(),
+            message: "managed lifecycle definitions missing".into(),
             fix_hint: Some("Run `codexctl init` (or `codexctl init --plugin-only`).".into()),
         };
     }
@@ -206,44 +210,134 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
         return Check {
             name: "Codex hooks".into(),
             status: CheckStatus::Advisory,
-            message: "managed permission hook is installed in global and project scopes".into(),
+            message: "managed definitions duplicated in global and project scopes".into(),
             fix_hint: Some(
-                "Keep the managed PermissionRequest hook in one scope, restart Codex, and verify it with `/hooks`."
+                "Keep the managed hook set in one scope, restart Codex, and review `/hooks`."
                     .into(),
             ),
         };
     }
 
-    let scope = if discovery.global.configured {
+    let scope = if discovery.global.configured() {
         (&discovery.global, "global")
     } else {
         (&discovery.project, "project")
     };
-    if scope.0.stale {
-        return Check {
-            name: "Codex hooks".into(),
-            status: CheckStatus::Advisory,
-            message: format!("{0} managed permission hook is outdated", scope.1),
-            fix_hint: Some(
-                "Run `codexctl init`, restart Codex, and verify the changed command with `/hooks`."
-                    .into(),
-            ),
-        };
+    for event in crate::init::hooks::ManagedHookEvent::ALL {
+        let state = &scope.0.events[&event];
+        if !state.configured {
+            return Check {
+                name: "Codex hooks".into(),
+                status: CheckStatus::Fail,
+                message: format!("{} {} definition missing", scope.1, event.as_str()),
+                fix_hint: Some("Run `codexctl init`, restart Codex, and review `/hooks`.".into()),
+            };
+        }
+        if state.unavailable {
+            return Check {
+                name: "Codex hooks".into(),
+                status: CheckStatus::Fail,
+                message: format!("{} {} executable unavailable", scope.1, event.as_str()),
+                fix_hint: Some(
+                    "Reinstall codexctl or rerun `codexctl init`, then review `/hooks`.".into(),
+                ),
+            };
+        }
+        if state.disabled {
+            return Check {
+                name: "Codex hooks".into(),
+                status: CheckStatus::Advisory,
+                message: format!("{} {} definition disabled", scope.1, event.as_str()),
+                fix_hint: Some(
+                    "Enable the definition and review it through Codex `/hooks`.".into(),
+                ),
+            };
+        }
+        if state.stale || !state.current {
+            return Check {
+                name: "Codex hooks".into(),
+                status: CheckStatus::Advisory,
+                message: format!("{} {} definition stale", scope.1, event.as_str()),
+                fix_hint: Some(
+                    "Run `codexctl init`, restart Codex, and review the changed definition with `/hooks`."
+                        .into(),
+                ),
+            };
+        }
     }
-    if scope.0.disabled {
-        return Check {
-            name: "Codex hooks".into(),
-            status: CheckStatus::Advisory,
-            message: format!("{} managed permission hook is disabled", scope.1),
-            fix_hint: Some("Enable and trust the hook through Codex `/hooks`.".into()),
-        };
-    }
+    debug_assert!(scope.0.definitions_current());
 
     Check {
         name: "Codex hooks".into(),
         status: CheckStatus::Pass,
-        message: format!("{} managed permission hook is current", scope.1),
+        message: format!("{} definitions current", scope.1),
         fix_hint: None,
+    }
+}
+
+fn check_codex_hook_trust() -> Check {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    check_codex_hook_trust_at(home.as_deref(), &cwd)
+}
+
+fn check_codex_hook_trust_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -> Check {
+    let discovery = crate::init::hooks::discover_lifecycle_hooks_at(home, cwd);
+    if !discovery.trust_unverified {
+        return Check {
+            name: "Codex hook trust".into(),
+            status: CheckStatus::Skipped,
+            message: "no enabled managed definitions".into(),
+            fix_hint: None,
+        };
+    }
+
+    Check {
+        name: "Codex hook trust".into(),
+        status: CheckStatus::Advisory,
+        message: "trust unverified; review /hooks".into(),
+        fix_hint: Some("Restart Codex and confirm the managed commands through `/hooks`.".into()),
+    }
+}
+
+fn check_lifecycle_state() -> Check {
+    check_lifecycle_state_with_store(&LifecycleStore::at(compatibility_state_root()))
+}
+
+fn check_lifecycle_state_with_store(store: &LifecycleStore) -> Check {
+    let (status, message, fix_hint) = match store.read() {
+        Ok(view) => match view.condition {
+            StoreCondition::Healthy => (CheckStatus::Pass, "state readable".into(), None),
+            StoreCondition::Missing => (
+                CheckStatus::Advisory,
+                "state not created yet".into(),
+                Some("Run a Codex turn after enabling and trusting the managed hooks.".into()),
+            ),
+            StoreCondition::Corrupt => (
+                CheckStatus::Advisory,
+                "lifecycle state is corrupt".into(),
+                Some(
+                    "Let the next lifecycle event quarantine and rebuild it, or remove only the corrupt snapshot."
+                        .into(),
+                ),
+            ),
+            StoreCondition::NewerSchema(version) => (
+                CheckStatus::Advisory,
+                format!("lifecycle state uses newer schema {version}"),
+                Some("Upgrade codexctl before writing lifecycle state.".into()),
+            ),
+        },
+        Err(error) => (
+            CheckStatus::Advisory,
+            format!("lifecycle state unavailable: {error}"),
+            Some("Check state-directory ownership and permissions.".into()),
+        ),
+    };
+    Check {
+        name: "lifecycle state".into(),
+        status,
+        message,
+        fix_hint,
     }
 }
 
@@ -520,30 +614,51 @@ mod tests {
         ));
     }
 
-    fn write_permission_hook(path: &std::path::Path, timeout: u64) {
+    fn current_hooks() -> serde_json::Value {
+        serde_json::json!({
+            "hooks": {
+                "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
+                "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
+                "PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
+                "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "codexctl --permission-hook", "timeout": 30, "statusMessage": "Brain reviewing permission…" }] }],
+                "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
+                "SubagentStart": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
+                "SubagentStop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
+                "Stop": [{ "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }]
+            }
+        })
+    }
+
+    fn write_hooks(path: &std::path::Path, value: &serde_json::Value) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let value = serde_json::json!({
-            "hooks": { "PermissionRequest": [{
-                "matcher": "Bash",
-                "hooks": [{
-                    "type": "command",
-                    "command": "codexctl --permission-hook",
-                    "timeout": timeout,
-                    "statusMessage": "Brain reviewing permission…"
-                }]
-            }] }
-        });
         std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
     }
 
     #[test]
-    fn duplicate_global_and_project_permission_hooks_are_advisory() {
+    fn current_definitions_pass_while_trust_remains_advisory() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         let cwd = temp.path().join("project");
         std::fs::create_dir_all(cwd.join(".git")).unwrap();
-        write_permission_hook(&home.join(".codex/hooks.json"), 30);
-        write_permission_hook(&cwd.join(".codex/hooks.json"), 30);
+        write_hooks(&home.join(".codex/hooks.json"), &current_hooks());
+
+        let definitions = check_codex_hooks_at(Some(&home), &cwd);
+        let trust = check_codex_hook_trust_at(Some(&home), &cwd);
+
+        assert_eq!(definitions.status, CheckStatus::Pass);
+        assert_eq!(definitions.message, "global definitions current");
+        assert_eq!(trust.status, CheckStatus::Advisory);
+        assert_eq!(trust.message, "trust unverified; review /hooks");
+    }
+
+    #[test]
+    fn duplicate_global_and_project_hook_sets_are_advisory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        write_hooks(&home.join(".codex/hooks.json"), &current_hooks());
+        write_hooks(&cwd.join(".codex/hooks.json"), &current_hooks());
 
         let check = check_codex_hooks_at(Some(&home), &cwd);
 
@@ -553,18 +668,85 @@ mod tests {
     }
 
     #[test]
-    fn stale_permission_hook_is_configured_but_advisory() {
+    fn missing_stale_disabled_and_unavailable_definitions_name_the_event() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         let cwd = temp.path().join("project");
         std::fs::create_dir_all(cwd.join(".git")).unwrap();
-        write_permission_hook(&home.join(".codex/hooks.json"), 5);
+        let path = home.join(".codex/hooks.json");
+
+        let mut missing = current_hooks();
+        missing["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("PostToolUse");
+        write_hooks(&path, &missing);
+        let check = check_codex_hooks_at(Some(&home), &cwd);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("PostToolUse definition missing"));
+
+        let mut stale = current_hooks();
+        stale["hooks"]["PermissionRequest"][0]["matcher"] = serde_json::json!("Bash");
+        write_hooks(&path, &stale);
+        let check = check_codex_hooks_at(Some(&home), &cwd);
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert!(check.message.contains("PermissionRequest definition stale"));
+
+        let mut disabled = current_hooks();
+        disabled["hooks"]["SubagentStop"][0]["disabled"] = serde_json::json!(true);
+        write_hooks(&path, &disabled);
+        let check = check_codex_hooks_at(Some(&home), &cwd);
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert!(check.message.contains("SubagentStop definition disabled"));
+
+        let mut unavailable = current_hooks();
+        unavailable["hooks"]["SessionStart"][0]["hooks"][0]["command"] =
+            serde_json::json!("/definitely/missing/codexctl --lifecycle-hook");
+        write_hooks(&path, &unavailable);
+        let check = check_codex_hooks_at(Some(&home), &cwd);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check
+                .message
+                .contains("SessionStart executable unavailable")
+        );
+    }
+
+    #[test]
+    fn lifecycle_state_diagnoses_corrupt_and_newer_schema_separately() {
+        let temp = tempfile::tempdir().unwrap();
+        let corrupt = LifecycleStore::at(temp.path().join("corrupt"));
+        std::fs::create_dir_all(corrupt.hooks_dir()).unwrap();
+        std::fs::write(corrupt.snapshot_path(), b"not json").unwrap();
+        let check = check_lifecycle_state_with_store(&corrupt);
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert!(check.message.contains("corrupt"));
+        assert!(check.fix_hint.unwrap().contains("quarantine"));
+
+        let newer = LifecycleStore::at(temp.path().join("newer"));
+        std::fs::create_dir_all(newer.hooks_dir()).unwrap();
+        std::fs::write(newer.snapshot_path(), br#"{"schema_version":99}"#).unwrap();
+        let check = check_lifecycle_state_with_store(&newer);
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert!(check.message.contains("newer schema 99"));
+        assert!(check.fix_hint.unwrap().contains("Upgrade"));
+    }
+
+    #[test]
+    fn unrelated_hooks_only_are_reported_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        write_hooks(
+            &home.join(".codex/hooks.json"),
+            &serde_json::json!({ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "echo stop" }] }] } }),
+        );
 
         let check = check_codex_hooks_at(Some(&home), &cwd);
 
-        assert_eq!(check.status, CheckStatus::Advisory);
-        assert!(check.message.contains("outdated"));
-        assert!(check.fix_hint.unwrap().contains("codexctl init"));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("definitions missing"));
     }
 
     #[test]
@@ -577,11 +759,11 @@ mod tests {
         std::fs::create_dir_all(jj_root.join(".jj")).unwrap();
         std::fs::create_dir_all(git_root.join(".git")).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
-        write_permission_hook(&jj_root.join(".codex/hooks.json"), 30);
+        write_hooks(&jj_root.join(".codex/hooks.json"), &current_hooks());
 
         let check = check_codex_hooks_at(Some(&home), &cwd);
 
         assert_eq!(check.status, CheckStatus::Fail);
-        assert!(check.message.contains("not found"));
+        assert!(check.message.contains("definitions missing"));
     }
 }

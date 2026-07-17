@@ -118,14 +118,17 @@ fn detect_plugin_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -> Ph
     if !discovery.configured() {
         return PhaseStatus::NotInstalled;
     }
-    let scope = match (discovery.global.configured, discovery.project.configured) {
-        (true, true) => "global and project scopes",
-        (true, false) => "global scope",
-        (false, true) => "project scope",
-        (false, false) => unreachable!("configured state checked above"),
+    let scope = if discovery.duplicate_scopes() {
+        "global and project scopes"
+    } else if discovery.global.configured {
+        "global scope"
+    } else if discovery.project.configured {
+        "project scope"
+    } else {
+        unreachable!("configured state checked above")
     };
     PhaseStatus::Installed {
-        details: format!("permission hook in {scope}"),
+        details: format!("managed hooks in {scope}"),
     }
 }
 
@@ -220,7 +223,7 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".codex")).unwrap();
         std::fs::write(
             cwd.join(".codex/hooks.json"),
-            r#"{"hooks":{"PermissionRequest":[{"matcher":"Bash","hooks":[{"type":"command","command":"codexctl --permission-hook","timeout":30,"statusMessage":"Brain reviewing permission…"}]}]}}"#,
+            r#"{"hooks":{"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"codexctl --permission-hook","timeout":30,"statusMessage":"Brain reviewing permission…"}]}]}}"#,
         )
         .unwrap();
 
@@ -262,7 +265,7 @@ mod tests {
         std::fs::create_dir_all(jj_root.join(".codex")).unwrap();
         std::fs::write(
             jj_root.join(".codex/hooks.json"),
-            r#"{"hooks":{"PermissionRequest":[{"matcher":"Bash","hooks":[{"type":"command","command":"codexctl --permission-hook","timeout":30,"statusMessage":"Brain reviewing permission…"}]}]}}"#,
+            r#"{"hooks":{"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"codexctl --permission-hook","timeout":30,"statusMessage":"Brain reviewing permission…"}]}]}}"#,
         )
         .unwrap();
 

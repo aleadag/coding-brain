@@ -58,6 +58,22 @@ let
       }
     ];
   };
+  rollbackConfigured = home-manager.lib.homeManagerConfiguration {
+    inherit pkgs;
+    modules = [
+      self.homeManagerModules.default
+      baseHome
+      {
+        programs.codex.enable = true;
+        programs.codex.hooks.Stop = [ existingStop ];
+        programs.codexctl = {
+          enable = true;
+          package = testPackage;
+          codexHooks.enable = false;
+        };
+      }
+    ];
+  };
   dualAliasConfigured = home-manager.lib.homeManagerConfiguration {
     inherit pkgs;
     modules = [
@@ -172,9 +188,25 @@ let
     ];
   };
   cfg = configured.config;
+  sessionStart = lib.last cfg.programs.codex.hooks.SessionStart;
+  userPromptSubmit = lib.last cfg.programs.codex.hooks.UserPromptSubmit;
+  preToolUse = lib.last cfg.programs.codex.hooks.PreToolUse;
   permission = lib.last cfg.programs.codex.hooks.PermissionRequest;
+  postToolUse = lib.last cfg.programs.codex.hooks.PostToolUse;
+  subagentStart = lib.last cfg.programs.codex.hooks.SubagentStart;
+  subagentStop = lib.last cfg.programs.codex.hooks.SubagentStop;
   permissionHandler = builtins.elemAt permission.hooks 0;
   stopHooks = cfg.programs.codex.hooks.Stop;
+  managedStop = lib.last stopHooks;
+  lifecycleEntries = [
+    sessionStart
+    userPromptSubmit
+    preToolUse
+    postToolUse
+    subagentStart
+    subagentStop
+    managedStop
+  ];
   trustNotice = cfg.home.activation.codexctlHookTrustNotice.data;
   unsupportedFailures = builtins.filter (item: !item.assertion) unsupportedHooks.config.assertions;
   enableOnlyFailures = builtins.filter (item: !item.assertion) enableOnlyCodex.config.assertions;
@@ -183,8 +215,8 @@ in
 assert builtins.elem testPackage cfg.home.packages;
 assert aliasConfigured.config.programs.codexctl.enable;
 assert builtins.length dualAliasConfigured.config.programs.codex.hooks.PermissionRequest == 1;
-assert !(dualAliasConfigured.config.programs.codex.hooks ? PostToolUse);
-assert !(dualAliasConfigured.config.programs.codex.hooks ? Stop);
+assert dualAliasConfigured.config.programs.codex.hooks ? PostToolUse;
+assert dualAliasConfigured.config.programs.codex.hooks ? Stop;
 assert packageOnly.config.programs.codexctl.codexHooks.enable == false;
 assert enableOnlyCodex.config.programs.codexctl.codexHooks.enable == false;
 assert enableOnlyFailures == [ ];
@@ -194,12 +226,40 @@ assert
   == "programs.codexctl.codexHooks.enable requires Home Manager programs.codex.hooks; disable it or upgrade Home Manager";
 assert builtins.length disabledFailures == 1;
 assert lib.hasInfix "programs.codex.enable = true" (builtins.head disabledFailures).message;
-assert permission.matcher == "Bash";
+assert permission.matcher == "*";
 assert permissionHandler.type == "command";
 assert permissionHandler.command == "${expectedExe} --permission-hook";
 assert permissionHandler.timeout == 30;
 assert permissionHandler.statusMessage == "Brain reviewing permission…";
-assert stopHooks == [ existingStop ];
+assert sessionStart.matcher == "startup|resume|clear|compact";
+assert !(userPromptSubmit ? matcher);
+assert preToolUse.matcher == "*";
+assert postToolUse.matcher == "*";
+assert subagentStart.matcher == "*";
+assert subagentStop.matcher == "*";
+assert !(managedStop ? matcher);
+assert builtins.all (
+  entry:
+  let
+    handler = builtins.elemAt entry.hooks 0;
+  in
+  handler.type == "command"
+  && handler.command == "${expectedExe} --lifecycle-hook"
+  && handler.timeout == 2
+) lifecycleEntries;
+assert
+  stopHooks == [
+    existingStop
+    managedStop
+  ];
+assert rollbackConfigured.config.programs.codex.hooks.Stop == [ existingStop ];
+assert !(rollbackConfigured.config.programs.codex.hooks ? SessionStart);
+assert !(rollbackConfigured.config.programs.codex.hooks ? UserPromptSubmit);
+assert !(rollbackConfigured.config.programs.codex.hooks ? PreToolUse);
+assert !(rollbackConfigured.config.programs.codex.hooks ? PermissionRequest);
+assert !(rollbackConfigured.config.programs.codex.hooks ? PostToolUse);
+assert !(rollbackConfigured.config.programs.codex.hooks ? SubagentStart);
+assert !(rollbackConfigured.config.programs.codex.hooks ? SubagentStop);
 assert
   trustNotice == ''
     echo "codexctl hooks use ${expectedExe}; restart Codex and review /hooks after package changes."

@@ -1,28 +1,168 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The current hook codexctl installs into Codex hooks.json.
-///
-/// PermissionRequest is the only active integration. Legacy PostToolUse and
-/// Stop snapshot commands remain recognized below solely for exact cleanup
-/// during init and uninit.
+/// One managed Codex hook definition.
 struct HookSpec {
     event: &'static str,
-    matcher: &'static str,
+    matcher: Option<&'static str>,
     command: &'static str,
     timeout: u32,
     status_message: Option<&'static str>,
 }
 
-const HOOKS: &[HookSpec] = &[HookSpec {
-    event: "PermissionRequest",
-    matcher: "Bash",
-    command: "codexctl --permission-hook",
-    timeout: 30,
-    status_message: Some("Brain reviewing permission…"),
-}];
+const HOOKS: &[HookSpec] = &[
+    HookSpec {
+        event: "SessionStart",
+        matcher: Some("startup|resume|clear|compact"),
+        command: "codexctl --lifecycle-hook",
+        timeout: 2,
+        status_message: None,
+    },
+    HookSpec {
+        event: "UserPromptSubmit",
+        matcher: None,
+        command: "codexctl --lifecycle-hook",
+        timeout: 2,
+        status_message: None,
+    },
+    HookSpec {
+        event: "PreToolUse",
+        matcher: Some("*"),
+        command: "codexctl --lifecycle-hook",
+        timeout: 2,
+        status_message: None,
+    },
+    HookSpec {
+        event: "PermissionRequest",
+        matcher: Some("*"),
+        command: "codexctl --permission-hook",
+        timeout: 30,
+        status_message: Some("Brain reviewing permission…"),
+    },
+    HookSpec {
+        event: "PostToolUse",
+        matcher: Some("*"),
+        command: "codexctl --lifecycle-hook",
+        timeout: 2,
+        status_message: None,
+    },
+    HookSpec {
+        event: "SubagentStart",
+        matcher: Some("*"),
+        command: "codexctl --lifecycle-hook",
+        timeout: 2,
+        status_message: None,
+    },
+    HookSpec {
+        event: "SubagentStop",
+        matcher: Some("*"),
+        command: "codexctl --lifecycle-hook",
+        timeout: 2,
+        status_message: None,
+    },
+    HookSpec {
+        event: "Stop",
+        matcher: None,
+        command: "codexctl --lifecycle-hook",
+        timeout: 2,
+        status_message: None,
+    },
+];
 
 const PERMISSION_STATUS_MESSAGE: &str = "Brain reviewing permission…";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ManagedHookEvent {
+    SessionStart,
+    UserPromptSubmit,
+    PreToolUse,
+    PermissionRequest,
+    PostToolUse,
+    SubagentStart,
+    SubagentStop,
+    Stop,
+}
+
+impl ManagedHookEvent {
+    pub const ALL: [Self; 8] = [
+        Self::SessionStart,
+        Self::UserPromptSubmit,
+        Self::PreToolUse,
+        Self::PermissionRequest,
+        Self::PostToolUse,
+        Self::SubagentStart,
+        Self::SubagentStop,
+        Self::Stop,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionStart => "SessionStart",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::PreToolUse => "PreToolUse",
+            Self::PermissionRequest => "PermissionRequest",
+            Self::PostToolUse => "PostToolUse",
+            Self::SubagentStart => "SubagentStart",
+            Self::SubagentStop => "SubagentStop",
+            Self::Stop => "Stop",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedHookEventState {
+    pub configured: bool,
+    pub current: bool,
+    pub stale: bool,
+    pub disabled: bool,
+    pub unavailable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleHookScope {
+    pub events: BTreeMap<ManagedHookEvent, ManagedHookEventState>,
+}
+
+impl Default for LifecycleHookScope {
+    fn default() -> Self {
+        Self {
+            events: ManagedHookEvent::ALL
+                .into_iter()
+                .map(|event| (event, ManagedHookEventState::default()))
+                .collect(),
+        }
+    }
+}
+
+impl LifecycleHookScope {
+    pub fn configured(&self) -> bool {
+        self.events.values().any(|state| state.configured)
+    }
+
+    pub fn definitions_current(&self) -> bool {
+        self.events
+            .values()
+            .all(|state| state.current && !state.stale && !state.disabled && !state.unavailable)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LifecycleHookDiscovery {
+    pub global: LifecycleHookScope,
+    pub project: LifecycleHookScope,
+    pub trust_unverified: bool,
+}
+
+impl LifecycleHookDiscovery {
+    pub fn configured(&self) -> bool {
+        self.global.configured() || self.project.configured()
+    }
+
+    pub fn duplicate_scopes(&self) -> bool {
+        self.global.configured() && self.project.configured()
+    }
+}
 
 /// Managed PermissionRequest hook state in one Codex configuration scope.
 ///
@@ -82,6 +222,28 @@ fn settings_path(project: bool) -> PathBuf {
 pub fn discover_permission_hooks(cwd: &Path) -> PermissionHookDiscovery {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     discover_permission_hooks_at(home.as_deref(), cwd)
+}
+
+pub(crate) fn discover_lifecycle_hooks_at(
+    home: Option<&Path>,
+    cwd: &Path,
+) -> LifecycleHookDiscovery {
+    let global = home
+        .map(|home| lifecycle_scope_from_paths([home.join(".codex/hooks.json")]))
+        .unwrap_or_default();
+    let markers = project_root_markers(home);
+    let project = lifecycle_scope_from_paths(applicable_project_hook_paths(cwd, &markers));
+    let trust_unverified = [&global, &project].into_iter().any(|scope| {
+        scope
+            .events
+            .values()
+            .any(|state| state.configured && !state.disabled)
+    });
+    LifecycleHookDiscovery {
+        global,
+        project,
+        trust_unverified,
+    }
 }
 
 pub(crate) fn discover_permission_hooks_at(
@@ -199,6 +361,114 @@ fn scope_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> PermissionHookS
     scope
 }
 
+fn lifecycle_scope_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> LifecycleHookScope {
+    let mut scope = LifecycleHookScope::default();
+    for path in paths {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        inspect_lifecycle_handlers(&value, &mut scope);
+    }
+    scope
+}
+
+fn inspect_lifecycle_handlers(value: &serde_json::Value, scope: &mut LifecycleHookScope) {
+    let Some(hooks) = value.get("hooks").and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    for event in ManagedHookEvent::ALL {
+        let Some(matchers) = hooks
+            .get(event.as_str())
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        let spec = HOOKS
+            .iter()
+            .find(|spec| spec.event == event.as_str())
+            .expect("managed hook event must have a specification");
+        let state = scope
+            .events
+            .get_mut(&event)
+            .expect("all events initialized");
+        for matcher_entry in matchers {
+            let matcher_disabled = entry_is_disabled(matcher_entry);
+            let matcher = matcher_entry
+                .get("matcher")
+                .and_then(serde_json::Value::as_str);
+            let Some(handlers) = matcher_entry
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            for handler in handlers {
+                let Some(command) = handler.get("command").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if !is_discoverable_managed_command(event, command) {
+                    continue;
+                }
+                state.configured = true;
+                state.disabled |= matcher_disabled || entry_is_disabled(handler);
+                state.unavailable |= command_uses_missing_absolute_binary(command);
+                let current = matcher == spec.matcher
+                    && handler.get("type").and_then(serde_json::Value::as_str) == Some("command")
+                    && is_exact_codexctl_command(
+                        command,
+                        if event == ManagedHookEvent::PermissionRequest {
+                            &["--permission-hook"]
+                        } else {
+                            &["--lifecycle-hook"]
+                        },
+                    )
+                    && handler.get("timeout").and_then(serde_json::Value::as_u64)
+                        == Some(u64::from(spec.timeout))
+                    && spec.status_message.is_none_or(|expected| {
+                        handler
+                            .get("statusMessage")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(expected)
+                    });
+                state.current |= current;
+                state.stale |= !current;
+            }
+        }
+    }
+}
+
+fn is_discoverable_managed_command(event: ManagedHookEvent, command: &str) -> bool {
+    let expected = if event == ManagedHookEvent::PermissionRequest {
+        "--permission-hook"
+    } else {
+        "--lifecycle-hook"
+    };
+    let mut words = command.split_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    if !is_codexctl_program(program) {
+        return false;
+    }
+    words.any(|argument| argument == expected)
+        || (matches!(
+            event,
+            ManagedHookEvent::PostToolUse | ManagedHookEvent::Stop
+        ) && is_managed_snapshot_command(command))
+}
+
+fn command_uses_missing_absolute_binary(command: &str) -> bool {
+    let Some(program) = command.split_whitespace().next() else {
+        return false;
+    };
+    let path = Path::new(program);
+    path.is_absolute() && !path.exists()
+}
+
 fn inspect_permission_handlers(value: &serde_json::Value, scope: &mut PermissionHookScope) {
     let Some(matchers) = value
         .get("hooks")
@@ -220,14 +490,13 @@ fn inspect_permission_handlers(value: &serde_json::Value, scope: &mut Permission
             let Some(command) = handler.get("command").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            if !contains_managed_permission_flag(command)
-                && !is_managed_permission_command(matcher_name, command)
+            if !contains_managed_permission_flag(command) && !is_managed_permission_command(command)
             {
                 continue;
             }
             scope.configured = true;
             scope.disabled |= matcher_disabled || entry_is_disabled(handler);
-            let current = matcher_name == "Bash"
+            let current = matcher_name == "*"
                 && handler.get("type").and_then(serde_json::Value::as_str) == Some("command")
                 && is_current_permission_command(command)
                 && handler.get("timeout").and_then(serde_json::Value::as_u64) == Some(30)
@@ -259,10 +528,10 @@ fn build_hooks_value() -> serde_json::Value {
             hook_entry["statusMessage"] = serde_json::Value::String(status_message.to_owned());
         }
 
-        let matcher_entry = serde_json::json!({
-            "matcher": spec.matcher,
-            "hooks": [hook_entry],
-        });
+        let mut matcher_entry = serde_json::json!({ "hooks": [hook_entry] });
+        if let Some(matcher) = spec.matcher {
+            matcher_entry["matcher"] = serde_json::Value::String(matcher.to_owned());
+        }
 
         let array = hooks_map
             .entry(spec.event)
@@ -287,11 +556,7 @@ fn has_codexctl_hooks(existing: &serde_json::Value) -> bool {
                                 for hook in inner_arr {
                                     if let Some(cmd) = hook.get("command") {
                                         if let Some(s) = cmd.as_str() {
-                                            let matcher = matcher_entry
-                                                .get("matcher")
-                                                .and_then(serde_json::Value::as_str)
-                                                .unwrap_or_default();
-                                            if is_managed_command(event, matcher, s) {
+                                            if is_managed_command(event, s) {
                                                 return true;
                                             }
                                         }
@@ -323,6 +588,10 @@ fn is_current_permission_command(command: &str) -> bool {
     is_exact_codexctl_command(command, &["--permission-hook"])
 }
 
+fn is_current_lifecycle_command(command: &str) -> bool {
+    is_exact_codexctl_command(command, &["--lifecycle-hook"])
+}
+
 fn contains_managed_permission_flag(command: &str) -> bool {
     let mut words = command.split_whitespace();
     words.next().is_some_and(is_codexctl_program)
@@ -334,15 +603,18 @@ fn is_managed_snapshot_command(command: &str) -> bool {
         || is_exact_codexctl_command(command, &["--json", "2>/dev/null", "||", "true"])
 }
 
-fn is_managed_permission_command(matcher: &str, command: &str) -> bool {
+fn is_managed_permission_command(command: &str) -> bool {
     is_current_permission_command(command)
-        || (matcher == "Bash" && is_managed_snapshot_command(command))
 }
 
-fn is_managed_command(event: &str, matcher: &str, command: &str) -> bool {
+fn is_managed_command(event: &str, command: &str) -> bool {
     match event {
-        "PermissionRequest" => is_managed_permission_command(matcher, command),
-        "PostToolUse" | "Stop" => is_managed_snapshot_command(command),
+        "PermissionRequest" => is_managed_permission_command(command),
+        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart"
+        | "SubagentStop" | "Stop" => {
+            is_current_lifecycle_command(command)
+                || (matches!(event, "PostToolUse" | "Stop") && is_managed_snapshot_command(command))
+        }
         _ => false,
     }
 }
@@ -378,18 +650,13 @@ fn merge_hooks(existing: &mut serde_json::Value) {
 /// Remove codexctl hooks from a matcher entry's inner hooks array.
 /// Returns the number removed and whether any hooks remain after filtering.
 fn filter_managed_hooks(event: &str, matcher_entry: &mut serde_json::Value) -> (usize, bool) {
-    let matcher = matcher_entry
-        .get("matcher")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
     if let Some(inner_hooks) = matcher_entry.get_mut("hooks") {
         if let Some(arr) = inner_hooks.as_array_mut() {
             let before = arr.len();
             arr.retain(|hook| {
                 hook.get("command")
                     .and_then(|c| c.as_str())
-                    .is_none_or(|command| !is_managed_command(event, &matcher, command))
+                    .is_none_or(|command| !is_managed_command(event, command))
             });
             return (before - arr.len(), !arr.is_empty());
         }
@@ -561,10 +828,11 @@ fn print_success(path: &Path) {
     println!("Initialized codexctl hooks in {}", path.display());
     println!();
     println!("Hooks installed:");
-    println!("  PermissionRequest (Bash) — lets the brain allow or deny requests");
+    println!("  Lifecycle events — keep dashboard status current");
+    println!("  PermissionRequest (*) — observes every tool; brain decisions remain Bash-only");
     println!();
     println!("Restart Codex, then open `/hooks` to review and trust the command.");
-    println!("Codex will then ask the brain to review Bash permission requests.");
+    println!("Codex will then report lifecycle changes and ask the brain to review Bash requests.");
     println!("Run `codexctl` to start the dashboard.");
 }
 
@@ -576,11 +844,33 @@ mod tests {
     fn test_build_hooks_value() {
         let hooks = build_hooks_value();
         let obj = hooks.as_object().unwrap();
+        let expected = [
+            (
+                "SessionStart",
+                Some("startup|resume|clear|compact"),
+                "--lifecycle-hook",
+                2,
+            ),
+            ("UserPromptSubmit", None, "--lifecycle-hook", 2),
+            ("PreToolUse", Some("*"), "--lifecycle-hook", 2),
+            ("PermissionRequest", Some("*"), "--permission-hook", 30),
+            ("PostToolUse", Some("*"), "--lifecycle-hook", 2),
+            ("SubagentStart", Some("*"), "--lifecycle-hook", 2),
+            ("SubagentStop", Some("*"), "--lifecycle-hook", 2),
+            ("Stop", None, "--lifecycle-hook", 2),
+        ];
 
-        assert_eq!(obj.len(), 1);
-        assert!(obj.contains_key("PermissionRequest"));
-        assert!(!obj.contains_key("PostToolUse"));
-        assert!(!obj.contains_key("Stop"));
+        assert_eq!(obj.len(), expected.len());
+        for (event, matcher, argument, timeout) in expected {
+            let entry = &hooks[event][0];
+            assert_eq!(
+                entry.get("matcher").and_then(serde_json::Value::as_str),
+                matcher
+            );
+            let handler = &entry["hooks"][0];
+            assert_eq!(handler["command"], format!("codexctl {argument}"));
+            assert_eq!(handler["timeout"], timeout);
+        }
     }
 
     #[test]
@@ -611,7 +901,7 @@ mod tests {
         let settings = serde_json::json!({
             "hooks": {
                 "PermissionRequest": [{
-                    "matcher": "Bash",
+                    "matcher": "*",
                     "hooks": [{
                         "type": "command",
                         "command": "echo hello",
@@ -630,10 +920,10 @@ mod tests {
 
         assert!(settings.get("hooks").is_some());
         let hooks = settings["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks.len(), 8);
         assert!(hooks.contains_key("PermissionRequest"));
-        assert!(!hooks.contains_key("PostToolUse"));
-        assert!(!hooks.contains_key("Stop"));
+        assert!(hooks.contains_key("PostToolUse"));
+        assert!(hooks.contains_key("Stop"));
     }
 
     #[test]
@@ -662,12 +952,12 @@ mod tests {
 
         // Existing PermissionRequest Write hook preserved
         let pre = settings["hooks"]["PermissionRequest"].as_array().unwrap();
-        assert_eq!(pre.len(), 2); // original Write + new Bash
+        assert_eq!(pre.len(), 2); // original Write + new wildcard
         assert_eq!(pre[0]["matcher"], "Write");
-        assert_eq!(pre[1]["matcher"], "Bash");
+        assert_eq!(pre[1]["matcher"], "*");
 
-        assert!(settings["hooks"].get("PostToolUse").is_none());
-        assert!(settings["hooks"].get("Stop").is_none());
+        assert!(settings["hooks"].get("PostToolUse").is_some());
+        assert!(settings["hooks"].get("Stop").is_some());
     }
 
     #[test]
@@ -713,7 +1003,7 @@ mod tests {
         assert!(has_codexctl_hooks(&settings));
 
         let removed = remove_codexctl_hooks(&mut settings);
-        assert_eq!(removed, 1); // PermissionRequest
+        assert_eq!(removed, 8);
         assert!(!has_codexctl_hooks(&settings));
         // hooks key removed entirely when empty
         assert!(settings.get("hooks").is_none());
@@ -734,11 +1024,11 @@ mod tests {
                         }]
                     },
                     {
-                        "matcher": "Bash",
+                        "matcher": "*",
                         "hooks": [{
                             "type": "command",
-                            "command": "codexctl --json 2>/dev/null || true",
-                            "timeout": 5
+                            "command": "codexctl --permission-hook",
+                            "timeout": 30
                         }]
                     }
                 ],
@@ -754,7 +1044,7 @@ mod tests {
         });
 
         let removed = remove_codexctl_hooks(&mut settings);
-        assert_eq!(removed, 2); // Bash from PermissionRequest + PostToolUse entry
+        assert_eq!(removed, 2); // PermissionRequest + legacy PostToolUse
 
         // Write hook in PermissionRequest preserved
         let pre = settings["hooks"]["PermissionRequest"].as_array().unwrap();
@@ -856,6 +1146,7 @@ mod tests {
     #[test]
     fn permission_hook_spec_uses_native_decision_adapter() {
         let hooks = build_hooks_value();
+        assert_eq!(hooks["PermissionRequest"][0]["matcher"], "*");
         let handler = &hooks["PermissionRequest"][0]["hooks"][0];
 
         assert_eq!(handler["command"], "codexctl --permission-hook");
@@ -864,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_upgrades_legacy_permission_handler_and_is_idempotent() {
+    fn merge_preserves_unowned_legacy_permission_snapshot_and_is_idempotent() {
         let mut settings = serde_json::json!({
             "custom": { "keep": true },
             "hooks": {
@@ -886,9 +1177,9 @@ mod tests {
         assert_eq!(settings, once);
         assert_eq!(settings["custom"], serde_json::json!({ "keep": true }));
         let permission = settings["hooks"]["PermissionRequest"].as_array().unwrap();
-        assert_eq!(permission.len(), 1);
+        assert_eq!(permission.len(), 2);
         assert_eq!(
-            permission[0]["hooks"][0]["command"],
+            permission[1]["hooks"][0]["command"],
             "codexctl --permission-hook"
         );
     }
@@ -936,10 +1227,17 @@ mod tests {
         merge_hooks(&mut settings);
 
         assert_eq!(settings, once);
-        assert!(settings["hooks"].get("PostToolUse").is_none());
+        assert_eq!(
+            settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "codexctl --lifecycle-hook"
+        );
         assert_eq!(
             settings["hooks"]["Stop"][0]["hooks"],
             serde_json::json!([external_stop])
+        );
+        assert_eq!(
+            settings["hooks"]["Stop"][1]["hooks"][0]["command"],
+            "codexctl --lifecycle-hook"
         );
         assert_eq!(
             settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
@@ -968,7 +1266,10 @@ mod tests {
         merge_hooks(&mut settings);
 
         assert_eq!(settings, once);
-        assert!(settings["hooks"].get("PostToolUse").is_none());
+        assert_eq!(
+            settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "codexctl --lifecycle-hook"
+        );
     }
 
     #[test]
@@ -1066,14 +1367,14 @@ mod tests {
             "topLevel": [1, 2, 3],
             "hooks": {
                 "PermissionRequest": [{
-                    "matcher": "Bash",
+                    "matcher": "*",
                     "customMatcherKey": "keep",
                     "hooks": [
                         unrelated.clone(),
                         {
                             "type": "command",
-                            "command": "codexctl --json 2>/dev/null || true",
-                            "timeout": 5
+                            "command": "codexctl --permission-hook",
+                            "timeout": 30
                         }
                     ]
                 }]
@@ -1092,6 +1393,115 @@ mod tests {
     fn write_hooks(path: &Path, value: serde_json::Value) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    fn lifecycle_discovery(
+        hooks: serde_json::Value,
+    ) -> (tempfile::TempDir, LifecycleHookDiscovery) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        write_hooks(
+            &home.join(".codex/hooks.json"),
+            serde_json::json!({ "hooks": hooks }),
+        );
+        let discovery = discover_lifecycle_hooks_at(Some(&home), &cwd);
+        (temp, discovery)
+    }
+
+    #[test]
+    fn lifecycle_discovery_reports_complete_current_definitions() {
+        let (_, discovery) = lifecycle_discovery(build_hooks_value());
+
+        assert!(discovery.global.definitions_current());
+        assert!(!discovery.project.configured());
+        assert!(discovery.trust_unverified);
+    }
+
+    #[test]
+    fn lifecycle_discovery_reports_missing_stale_disabled_and_unavailable_events() {
+        let mut missing = build_hooks_value();
+        missing.as_object_mut().unwrap().remove("SessionStart");
+        let (_, discovery) = lifecycle_discovery(missing);
+        assert!(!discovery.global.events[&ManagedHookEvent::SessionStart].configured);
+
+        let mut stale = build_hooks_value();
+        stale["PostToolUse"][0]["hooks"][0]["timeout"] = serde_json::json!(7);
+        let (_, discovery) = lifecycle_discovery(stale);
+        assert!(discovery.global.events[&ManagedHookEvent::PostToolUse].stale);
+
+        let mut bash_matcher = build_hooks_value();
+        bash_matcher["PermissionRequest"][0]["matcher"] = serde_json::json!("Bash");
+        let (_, discovery) = lifecycle_discovery(bash_matcher);
+        assert!(discovery.global.events[&ManagedHookEvent::PermissionRequest].stale);
+
+        let mut disabled = build_hooks_value();
+        disabled["SubagentStart"][0]["hooks"][0]["enabled"] = serde_json::json!(false);
+        let (_, discovery) = lifecycle_discovery(disabled);
+        assert!(discovery.global.events[&ManagedHookEvent::SubagentStart].disabled);
+
+        let mut unavailable = build_hooks_value();
+        unavailable["Stop"][0]["hooks"][0]["command"] =
+            serde_json::json!("/definitely/missing/codexctl --lifecycle-hook");
+        let (_, discovery) = lifecycle_discovery(unavailable);
+        assert!(discovery.global.events[&ManagedHookEvent::Stop].unavailable);
+    }
+
+    #[test]
+    fn lifecycle_discovery_reports_duplicate_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        let current = serde_json::json!({ "hooks": build_hooks_value() });
+        write_hooks(&home.join(".codex/hooks.json"), current.clone());
+        write_hooks(&cwd.join(".codex/hooks.json"), current);
+
+        let discovery = discover_lifecycle_hooks_at(Some(&home), &cwd);
+
+        assert!(discovery.duplicate_scopes());
+    }
+
+    #[test]
+    fn uninit_removes_exact_lifecycle_handlers_and_preserves_lookalikes() {
+        let lookalike = serde_json::json!({
+            "type": "command",
+            "command": "bin/codexctl --lifecycle-hook",
+            "timeout": 2
+        });
+        let user_handler = serde_json::json!({
+            "type": "command",
+            "command": "echo validate",
+            "timeout": 3
+        });
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "*",
+                    "hooks": [
+                        user_handler.clone(),
+                        lookalike.clone(),
+                        { "type": "command", "command": "/nix/store/test/bin/codexctl --lifecycle-hook", "timeout": 2 }
+                    ]
+                }],
+                "PostToolUse": [{
+                    "matcher": "*",
+                    "hooks": [{ "type": "command", "command": "codexctl --json", "timeout": 5 }]
+                }],
+                "Stop": [{
+                    "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }]
+                }]
+            }
+        });
+
+        assert_eq!(remove_codexctl_hooks(&mut settings), 3);
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"],
+            serde_json::json!([user_handler, lookalike])
+        );
+        assert!(settings["hooks"].get("PostToolUse").is_none());
+        assert!(settings["hooks"].get("Stop").is_none());
     }
 
     #[test]
@@ -1136,7 +1546,7 @@ mod tests {
             &home.join(".codex/hooks.json"),
             serde_json::json!({
                 "hooks": { "PermissionRequest": [{
-                    "matcher": "Bash",
+                    "matcher": "*",
                     "hooks": [{
                         "type": "command",
                         "command": "/nix/store/test-codexctl/bin/codexctl --permission-hook",
@@ -1212,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_treats_legacy_permission_handler_as_configured() {
+    fn discovery_ignores_legacy_permission_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         let cwd = temp.path().join("project");
@@ -1233,8 +1643,8 @@ mod tests {
 
         let discovery = discover_permission_hooks_at(Some(&home), &cwd);
 
-        assert!(discovery.configured());
-        assert!(discovery.global.stale);
+        assert!(!discovery.configured());
+        assert!(!discovery.global.stale);
         assert!(!discovery.global.current);
     }
 
@@ -1250,7 +1660,7 @@ mod tests {
             &root.join(".codex/hooks.json"),
             serde_json::json!({
                 "hooks": { "PermissionRequest": [{
-                    "matcher": "Bash",
+                    "matcher": "*",
                     "hooks": [{
                         "type": "command",
                         "command": "codexctl --permission-hook",
@@ -1278,7 +1688,7 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".git")).unwrap();
         let current = serde_json::json!({
             "hooks": { "PermissionRequest": [{
-                "matcher": "Bash",
+                "matcher": "*",
                 "hooks": [{
                     "type": "command",
                     "command": "codexctl --permission-hook",
@@ -1316,7 +1726,7 @@ mod tests {
             &root.join(".codex/hooks.json"),
             serde_json::json!({
                 "hooks": { "PermissionRequest": [{
-                    "matcher": "Bash",
+                    "matcher": "*",
                     "hooks": [{
                         "type": "command",
                         "command": "codexctl --permission-hook",
@@ -1345,7 +1755,7 @@ mod tests {
             &root.join(".codex/hooks.json"),
             serde_json::json!({
                 "hooks": { "PermissionRequest": [{
-                    "matcher": "Bash",
+                    "matcher": "*",
                     "hooks": [{
                         "type": "command",
                         "command": "codexctl --permission-hook",
