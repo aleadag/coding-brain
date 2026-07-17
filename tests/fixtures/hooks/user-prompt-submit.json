@@ -1,0 +1,1 @@
+{"session_id":"session-1","turn_id":"turn-1","transcript_path":"/tmp/rollout-1.jsonl","cwd":"/work/codexctl","hook_event_name":"UserPromptSubmit","permission_mode":"default","prompt":"do not persist me"}

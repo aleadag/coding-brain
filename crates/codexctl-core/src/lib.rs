@@ -21,6 +21,7 @@ pub mod helpers;
 pub mod history;
 pub mod hooks;
 pub mod launch;
+pub mod lifecycle;
 pub mod logger;
 pub mod models;
 pub mod monitor;
