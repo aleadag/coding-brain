@@ -308,7 +308,7 @@ fn environment_notes(is_wsl: bool, has_windows_terminal_bridge: bool) -> Vec<Str
         );
     } else {
         notes.push(
-            "Windows Terminal launch is not available from this WSL shell, so codexctl currently relies on Linux-native terminals inside WSL."
+            "Windows Terminal launch is not available from this WSL shell, so Coding Brain currently relies on Linux-native terminals inside WSL."
                 .to_string(),
         );
     }
@@ -698,7 +698,8 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
     }
     let mut actions = Vec::new();
     let mut notes = vec![
-        "Run `codexctl doctor` inside the same terminal family that launches Codex.".to_string(),
+        "Run `coding-brain doctor` inside the same terminal family that launches Codex."
+            .to_string(),
         "`n` and `--new` use the same launch capability shown here.".to_string(),
     ];
     notes.extend(environment_notes(is_wsl, windows_terminal_bridge_ready()));
@@ -738,7 +739,7 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                     DoctorStatus::Unsupported,
                     "GNOME Terminal launch is supported, but reliable remote focus/input automation is not currently available.",
                     Some(
-                        "Use tmux or Kitty when you need remote switching, input, or approval from codexctl."
+                        "Use tmux or Kitty when you need remote switching, input, or approval from Coding Brain."
                             .to_string(),
                     ),
                 ));
@@ -769,7 +770,7 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                 "Windows Terminal launch needs both `cmd.exe` and `wt.exe` reachable from this WSL shell."
             };
             let launch_fix = Some(
-                "Enable WSL Windows interop, ensure Windows Terminal is installed, then rerun `codexctl doctor`."
+                "Enable WSL Windows interop, ensure Windows Terminal is installed, then rerun `coding-brain doctor`."
                     .to_string(),
             );
             actions.push(action_check(
@@ -841,7 +842,7 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                 "Kitty support is configured, but remote control is not currently available."
             };
             let fix = Some(
-                "Enable Kitty remote control in kitty.conf and rerun `codexctl doctor`."
+                "Enable Kitty remote control in kitty.conf and rerun `coding-brain doctor`."
                     .to_string(),
             );
 
@@ -864,7 +865,7 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                         "tmux session access",
                         format!("tmux is installed, but pane discovery failed: {err}"),
                         Some(
-                            "Run codexctl from inside the tmux session that owns the Codex panes."
+                            "Run Coding Brain from inside the tmux session that owns the Codex panes."
                                 .to_string(),
                         ),
                     ),
@@ -873,7 +874,7 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                 DoctorCheck::blocked(
                     "tmux session access",
                     "tmux is unavailable, so pane discovery cannot run.",
-                    Some("Install tmux and rerun `codexctl doctor`.".to_string()),
+                    Some("Install tmux and rerun `coding-brain doctor`.".to_string()),
                 )
             };
             let session_ready = session_check.status == DoctorStatus::Ready;
@@ -889,8 +890,9 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
             } else {
                 "tmux support needs a reachable tmux server from this shell."
             };
-            let fix =
-                Some("Run codexctl inside tmux or connect it to the same tmux server.".to_string());
+            let fix = Some(
+                "Run Coding Brain inside tmux or connect it to the same tmux server.".to_string(),
+            );
 
             for action in supported_actions(&Terminal::Tmux) {
                 actions.push(action_check(action, action_status, detail, fix.clone()));
@@ -911,7 +913,8 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                         "wezterm cli",
                         format!("WezTerm CLI is installed, but pane discovery failed: {err}"),
                         Some(
-                            "Run codexctl inside WezTerm with a reachable mux server.".to_string(),
+                            "Run Coding Brain inside WezTerm with a reachable mux server."
+                                .to_string(),
                         ),
                     ),
                 }
@@ -936,7 +939,7 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                 "WezTerm support needs a reachable mux server from this shell."
             };
             let fix = Some(
-                "Start codexctl from the same WezTerm environment that owns the Codex panes."
+                "Start Coding Brain from the same WezTerm environment that owns the Codex panes."
                     .to_string(),
             );
 
@@ -1001,7 +1004,7 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                         "System Events access",
                         format!("macOS UI scripting is not currently available: {err}"),
                         Some(
-                            "Grant Automation/Accessibility access in System Settings > Privacy & Security, then rerun `codexctl doctor`."
+                            "Grant Automation/Accessibility access in System Settings > Privacy & Security, then rerun `coding-brain doctor`."
                                 .to_string(),
                         ),
                     ),
@@ -1036,7 +1039,7 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                 terminal_name(&terminal)
             );
             let fix = Some(
-                "Grant Automation/Accessibility permissions to the terminal and rerun `codexctl doctor`."
+                "Grant Automation/Accessibility permissions to the terminal and rerun `coding-brain doctor`."
                     .to_string(),
             );
             for action in [
@@ -1108,7 +1111,7 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
 
 pub fn format_doctor_report(report: &DoctorReport) -> String {
     let mut lines = vec![
-        "codexctl doctor".to_string(),
+        "coding-brain doctor".to_string(),
         String::new(),
         format!("Platform: {}", report.platform),
         format!("Detected terminal: {}", report.terminal),
@@ -1167,7 +1170,7 @@ pub(crate) fn launch_session(
         Terminal::WezTerm => wezterm::launch(cwd, prompt, resume),
         Terminal::WindowsTerm => windows_terminal::launch(cwd, prompt, resume),
         other => Err(format!(
-            "Visible session launch is not supported in {}. Start `codex` manually, use tmux/Kitty/WezTerm/GNOME Terminal/Windows Terminal on WSL, or run `codexctl doctor` for setup guidance.",
+            "Visible session launch is not supported in {}. Start `codex` manually, use tmux/Kitty/WezTerm/GNOME Terminal/Windows Terminal on WSL, or run `coding-brain doctor` for setup guidance.",
             terminal_name(&other)
         )),
     }
@@ -1213,10 +1216,10 @@ pub fn switch_to_terminal(session: &CodexSession) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         Terminal::Apple => apple::switch(session),
         Terminal::Unknown(name) => Err(format!(
-            "Unsupported terminal: {name}. Supported: GNOME Terminal, Windows Terminal on WSL (launch only), Ghostty, Warp, iTerm2, Kitty, WezTerm, Terminal.app, tmux. Run `codexctl doctor` for details."
+            "Unsupported terminal: {name}. Supported: GNOME Terminal, Windows Terminal on WSL (launch only), Ghostty, Warp, iTerm2, Kitty, WezTerm, Terminal.app, tmux. Run `coding-brain doctor` for details."
         )),
         #[cfg(not(target_os = "macos"))]
-        _ => Err("Terminal switching not supported on this platform. Run `codexctl doctor` for details.".into()),
+        _ => Err("Terminal switching not supported on this platform. Run `coding-brain doctor` for details.".into()),
     }
 }
 
@@ -1245,7 +1248,7 @@ pub(crate) fn send_input(session: &CodexSession, text: &str) -> Result<(), Strin
             ))
         }
         #[cfg(not(target_os = "macos"))]
-        _ => Err("Input injection not supported for this terminal. Run `codexctl doctor` for details.".into()),
+        _ => Err("Input injection not supported for this terminal. Run `coding-brain doctor` for details.".into()),
     }
 }
 

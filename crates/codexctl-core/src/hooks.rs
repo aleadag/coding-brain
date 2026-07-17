@@ -117,12 +117,12 @@ impl HookRegistry {
         }
     }
 
-    /// List all configured hooks (for `codexctl --hooks`).
+    /// List all configured hooks (for `coding-brain --hooks`).
     pub fn print_list(&self) {
         if self.hooks.is_empty() {
             println!("No hooks configured.");
             println!();
-            println!("Add hooks in ~/.config/codexctl/config.toml:");
+            println!("Add hooks in ~/.config/coding-brain/config.toml:");
             println!();
             println!("  [hooks.on_needs_input]");
             println!("  run = \"say 'Codex needs input'\"");

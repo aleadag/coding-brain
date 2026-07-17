@@ -26,13 +26,13 @@ pub mod sequences;
 
 use std::path::PathBuf;
 
-/// Path to the brain gate mode file (`~/.codexctl/brain/gate-mode`).
+/// Path to the Brain gate mode file in the Coding Brain state root.
 pub fn gate_mode_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".codexctl")
-        .join("brain")
-        .join("gate-mode")
+    codexctl_core::paths::CodingBrainPaths::resolve(
+        &codexctl_core::paths::PathEnvironment::current(),
+    )
+    .map(|paths| paths.state_root().join("brain/gate-mode"))
+    .unwrap_or_else(|_| std::env::temp_dir().join("coding-brain/brain/gate-mode"))
 }
 
 /// Read the current brain gate mode from disk. Returns `"on"` if no file exists.

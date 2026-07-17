@@ -388,7 +388,7 @@ fn format_insights(insights: &[Insight], header: &str) -> String {
 pub fn print_insights() {
     let decisions = super::decisions::read_learning_decisions();
     if decisions.is_empty() {
-        println!("No decision history yet. Use codexctl with --brain to build history.");
+        println!("No decision history yet. Use coding-brain with --brain to build history.");
         return;
     }
 
@@ -401,7 +401,7 @@ pub fn print_insights() {
     let _ = save_state(&state);
 
     if state.current_insights.is_empty() {
-        println!("No insights detected. Keep using codexctl to build more history.");
+        println!("No insights detected. Keep using Coding Brain to build more history.");
         return;
     }
 
@@ -409,7 +409,7 @@ pub fn print_insights() {
     println!(
         "Insights mode: {mode}{}",
         if mode == "off" {
-            " (run codexctl --brain --insights on to enable auto-generation)"
+            " (run coding-brain --brain --insights on to enable auto-generation)"
         } else {
             ""
         }

@@ -1,7 +1,5 @@
 #![allow(dead_code)]
 
-use std::path::PathBuf;
-
 use codexctl_core::paths::{CodingBrainPaths, PathEnvironment};
 
 use super::preferences::{
@@ -139,12 +137,7 @@ pub fn load_preferences_for_project(project: &str) -> Option<DistilledPreference
 }
 
 fn current_paths() -> Option<CodingBrainPaths> {
-    CodingBrainPaths::resolve(&PathEnvironment::new(
-        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    ))
-    .ok()
+    CodingBrainPaths::resolve(&PathEnvironment::current()).ok()
 }
 
 /// Get the adaptive confidence threshold for a specific tool.

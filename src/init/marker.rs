@@ -1,17 +1,17 @@
-//! `~/.codexctl/onboarding.json` — the durable record of which init phases
-//! ran, when, and against which codexctl version.
+//! Coding Brain's durable onboarding record.
+//! ran, when, and against which Coding Brain version.
 //!
 //! The marker exists so:
 //!
-//! * `codexctl init` (no args) on an already-onboarded environment can skip
+//! * `coding-brain init` (no args) on an already-onboarded environment can skip
 //!   the wizard and report status instead of re-prompting.
-//! * `codexctl init --check` has a baseline to diff against environment
+//! * `coding-brain init --check` has a baseline to diff against environment
 //!   detection (drift = recorded as installed but no longer detected).
-//! * `codexctl init --remove` knows exactly which artifacts to clean up.
+//! * `coding-brain init --remove` knows exactly which artifacts to clean up.
 //!
 //! Lives outside the SQLite stores (coord, bus, history) so it's
 //! human-readable and trivially deletable when someone wants to factory-reset
-//! their codexctl install.
+//! their Coding Brain install.
 
 use std::fs;
 use std::io;
@@ -37,7 +37,7 @@ pub struct PhaseRecord {
 /// so older marker files still parse.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OnboardingMarker {
-    /// codexctl version that last completed onboarding.
+    /// Coding Brain version that last completed onboarding.
     pub version: String,
     /// ISO timestamp when onboarding last completed.
     pub completed_at: String,
@@ -46,13 +46,14 @@ pub struct OnboardingMarker {
     pub phases: std::collections::BTreeMap<String, PhaseRecord>,
 }
 
-/// Default location: `$HOME/.codexctl/onboarding.json`. Used in production;
+/// Default location: `<state-root>/onboarding.json`. Used in production;
 /// tests inject their own path.
 pub fn default_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".codexctl").join("onboarding.json")
+    codexctl_core::paths::CodingBrainPaths::resolve(
+        &codexctl_core::paths::PathEnvironment::current(),
+    )
+    .map(|paths| paths.state_root().join("onboarding.json"))
+    .unwrap_or_else(|_| std::env::temp_dir().join("coding-brain/onboarding.json"))
 }
 
 /// Load the marker, returning `None` when the file doesn't exist (i.e. the

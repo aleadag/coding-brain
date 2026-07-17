@@ -1,25 +1,25 @@
-//! `codexctl init` — opinionated onboarding wizard.
+//! `coding-brain init` — opinionated onboarding wizard.
 //!
 //! Tracking issue: <https://github.com/aleadag/codexctl/issues/257>.
 //!
 //! This module owns the single canonical first-run flow for getting a
-//! codexctl install ready: local-LLM brain detection, Codex hook install, and
+//! Coding Brain install ready: local-LLM brain detection, Codex hook install, and
 //! curated skill suggestions.
 //!
 //! Public surface:
 //!
-//! * [`run_wizard`] — interactive flow. The default `codexctl init`.
+//! * [`run_wizard`] — interactive flow. The default `coding-brain init`.
 //! * [`run_non_interactive`] — same flow with pre-filled answers. For CI and
 //!   dotfile automation.
 //! * [`run_check`] — drift report comparing the recorded marker against
 //!   current environment detection.
-//! * [`run_remove`] — uninstall every codexctl-managed artifact.
+//! * [`run_remove`] — uninstall every Coding Brain-managed artifact.
 //! * [`run_reset`] — clear the marker so the next `init` run prompts again.
 //!
 //! Module layout:
 //!
 //! * `hooks.rs` — managed Codex hook installation.
-//! * `marker.rs` — `~/.codexctl/onboarding.json` read/write.
+//! * `marker.rs` — Coding Brain onboarding marker read/write.
 //! * `prompt.rs` — minimal stdin/stdout prompt helpers.
 //! * `state.rs` — environment detection (probes ollama and hooks.json).
 //! * `phases.rs` — `Phase` trait + Brain/Plugin/Skills impls.
@@ -31,6 +31,9 @@ pub mod prompt;
 pub mod state;
 
 use std::io;
+use std::path::{Component, Path, PathBuf};
+
+use codexctl_core::paths::{CodingBrainPaths, PathEnvironment};
 
 use marker::{OnboardingMarker, PhaseRecord};
 use phases::{Answers, Phase};
@@ -60,9 +63,12 @@ pub fn run_wizard() -> io::Result<()> {
         );
     }
 
+    ensure_project_identity()?;
     persist_marker(new_records, &stamp)?;
     println!();
-    println!("Onboarding complete. Re-run with `codexctl init --check` any time to inspect drift.");
+    println!(
+        "Onboarding complete. Re-run with `coding-brain init --check` any time to inspect drift."
+    );
     Ok(())
 }
 
@@ -90,8 +96,18 @@ pub fn run_non_interactive(answers: &Answers) -> io::Result<()> {
             phases::record_from_status(&status, &stamp),
         );
     }
+    ensure_project_identity()?;
     persist_marker(new_records, &stamp)?;
     Ok(())
+}
+
+fn ensure_project_identity() -> io::Result<()> {
+    let paths = CodingBrainPaths::resolve(&PathEnvironment::current())
+        .map_err(|error| io::Error::other(format!("path resolution failed: {error:?}")))?;
+    let cwd = std::env::current_dir()?;
+    codexctl_core::project::ProjectManifest::create(&cwd, &paths)
+        .map(|_| ())
+        .map_err(|error| io::Error::other(format!("project identity setup failed: {error}")))
 }
 
 /// Drift report: detect each phase's current state and diff against the
@@ -102,12 +118,12 @@ pub fn run_check() -> io::Result<()> {
     let recorded = marker::load(&marker::default_path())?;
 
     if recorded.is_none() {
-        println!("codexctl has not been onboarded — run `codexctl init` to begin.");
+        println!("Coding Brain has not been onboarded — run `coding-brain init` to begin.");
         return Err(io::Error::other("not onboarded"));
     }
     let recorded = recorded.unwrap();
 
-    println!("codexctl init --check");
+    println!("coding-brain init --check");
     println!(
         "  recorded version : {}",
         if recorded.version.is_empty() {
@@ -152,7 +168,9 @@ pub fn run_check() -> io::Result<()> {
     if drift_count > 0 {
         println!();
         println!("⚠  {drift_count} phase(s) have drifted from the recorded onboarding.");
-        println!("   Run `codexctl init` to re-apply, or `codexctl init --reset` to start over.");
+        println!(
+            "   Run `coding-brain init` to re-apply, or `coding-brain init --reset` to start over."
+        );
         return Err(io::Error::other(format!("{drift_count} phase(s) drifted")));
     }
     println!();
@@ -160,7 +178,7 @@ pub fn run_check() -> io::Result<()> {
     Ok(())
 }
 
-/// Remove every codexctl-managed artifact without erasing user-owned setup.
+/// Remove every Coding Brain-managed artifact without erasing user-owned setup.
 pub fn run_remove() -> io::Result<()> {
     let registry = phases::registry();
     let mut errors = Vec::new();
@@ -187,13 +205,13 @@ pub fn run_remove() -> io::Result<()> {
 /// installed artifacts.
 pub fn run_reset() -> io::Result<()> {
     marker::clear(&marker::default_path())?;
-    println!("Cleared onboarding marker — `codexctl init` will start from scratch next run.");
+    println!("Cleared onboarding marker — `coding-brain init` will start from scratch next run.");
     Ok(())
 }
 
 /// Re-sync everything the previous `init` wrote so it tracks the current
-/// binary (#327). Used after `brew upgrade codexctl` / `cargo install
-/// codexctl --force` — the new binary may expect a different schema and might
+/// binary (#327). Used after upgrading or reinstalling `coding-brain` — the
+/// new binary may expect a different schema and might
 /// have a fresher marker version, but the on-disk artifacts were written by
 /// the old binary.
 ///
@@ -206,7 +224,7 @@ pub fn run_reset() -> io::Result<()> {
 ///    from the running binary's `CARGO_PKG_VERSION`, rewrite the version
 ///    field (other phase records preserved).
 pub fn run_upgrade() -> io::Result<()> {
-    println!("codexctl init upgrade");
+    println!("coding-brain init upgrade");
     println!("======================");
     println!();
 
@@ -238,10 +256,10 @@ pub fn run_upgrade() -> io::Result<()> {
     println!();
     if had_error {
         return Err(io::Error::other(
-            "one or more upgrade steps failed — run `codexctl doctor` for details",
+            "one or more upgrade steps failed — run `coding-brain doctor` for details",
         ));
     }
-    println!("Upgrade complete. Run `codexctl doctor` to verify.");
+    println!("Upgrade complete. Run `coding-brain doctor` to verify.");
     Ok(())
 }
 
@@ -263,28 +281,18 @@ fn upgrade_marker_version() -> io::Result<Option<(String, String)>> {
     Ok(Some((from, current)))
 }
 
-/// Hard uninstall: `--remove` plus delete `~/.codexctl/` and
-/// `~/.config/codexctl/config.toml`. Used to start from a truly clean
-/// slate (e.g. for reinstall testing or recovering from corrupted state).
-///
-/// User confirms before any deletion unless `assume_yes` is set. Each
-/// path that's missing is silently skipped so re-running `--purge` after
-/// a successful one is a no-op rather than an error.
 pub fn run_purge(assume_yes: bool) -> io::Result<()> {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let codexctl_dir = home.as_ref().map(|h| h.join(".codexctl"));
-    let config_path = crate::config::Config::global_path();
+    let environment = PathEnvironment::current();
+    let targets = preview_purge_targets(&environment)?;
 
     println!("This will delete:");
-    println!("  • Codex hooks codexctl installed (`~/.codex/hooks.json` entries)");
-    if let Some(dir) = codexctl_dir.as_ref() {
+    println!("  • exact managed Coding Brain and legacy codexctl Codex hook entries");
+    for target in &targets {
         println!(
-            "  • {} (brain data and legacy codexctl state)",
-            dir.display()
+            "  • {} ({})",
+            target.path.display(),
+            target.identity.label()
         );
-    }
-    if let Some(cfg) = config_path.as_ref() {
-        println!("  • {} (codexctl config file)", cfg.display());
     }
     println!();
     println!("User-edited files outside these paths are preserved. To remove only");
@@ -296,40 +304,23 @@ pub fn run_purge(assume_yes: bool) -> io::Result<()> {
         return Ok(());
     }
 
-    // First, the soft uninstall — strips hook entries and clears the marker.
-    // We run this with `?` only after the destructive deletions so a failure
-    // here (e.g. hooks.json edit conflict) doesn't abort the directory
-    // wipes that follow.
-    let remove_errors = match run_remove_silent() {
+    let remove_errors = match remove_managed_hooks_silent() {
         Ok(()) => Vec::new(),
         Err(e) => vec![format!("hook/marker removal: {e}")],
     };
 
     let mut errors = remove_errors;
-    if let Some(dir) = codexctl_dir.as_ref() {
-        if let Err(e) = remove_dir_if_present(dir) {
-            errors.push(format!("{}: {e}", dir.display()));
+    for target in &targets {
+        if let Err(error) = remove_previewed_target(target) {
+            errors.push(format!("{}: {error}", target.path.display()));
         } else {
-            println!("  removed: {}", dir.display());
-        }
-    }
-    if let Some(cfg) = config_path.as_ref() {
-        if let Err(e) = remove_file_if_present(cfg) {
-            errors.push(format!("{}: {e}", cfg.display()));
-        } else {
-            println!("  removed: {}", cfg.display());
-        }
-        // Also try the parent ~/.config/codexctl/ dir — only succeeds if
-        // it's now empty (we don't recursively delete the parent because
-        // it could contain user-authored files we don't know about).
-        if let Some(parent) = cfg.parent() {
-            let _ = std::fs::remove_dir(parent);
+            println!("  removed: {}", target.path.display());
         }
     }
 
     if errors.is_empty() {
         println!();
-        println!("Purge complete. `codexctl init` will start fresh.");
+        println!("Purge complete. `coding-brain init` will start fresh.");
         Ok(())
     } else {
         Err(io::Error::other(format!(
@@ -339,43 +330,136 @@ pub fn run_purge(assume_yes: bool) -> io::Result<()> {
     }
 }
 
-/// `run_remove` without printing the per-phase progress lines — used by
-/// `run_purge` so its UI doesn't have duplicated "removed: X" rows.
-fn run_remove_silent() -> io::Result<()> {
-    let registry = phases::registry();
-    let mut errors = Vec::new();
-    for phase in &registry {
-        if let Err(e) = phase.remove() {
-            errors.push(format!("{}: {e}", phase.id()));
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PurgeIdentity {
+    Missing,
+    File(u128),
+    Directory(u128),
+    Symlink(u128),
+}
+
+impl PurgeIdentity {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Missing => "not present",
+            Self::File(_) => "file",
+            Self::Directory(_) => "directory",
+            Self::Symlink(_) => "symlink",
         }
     }
-    marker::clear(&marker::default_path())?;
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "remove errors: {}",
-            errors.join("; ")
-        )))
+}
+
+#[derive(Debug, Clone)]
+struct PurgeTarget {
+    path: PathBuf,
+    identity: PurgeIdentity,
+}
+
+fn preview_purge_targets(environment: &PathEnvironment) -> io::Result<Vec<PurgeTarget>> {
+    for (name, base) in [
+        ("HOME", environment.home()),
+        ("XDG_CONFIG_HOME", environment.xdg_config_home()),
+        ("XDG_STATE_HOME", environment.xdg_state_home()),
+    ] {
+        if let Some(base) = base {
+            validate_purge_base(name, base)?;
+        }
+    }
+    let home = environment
+        .home()
+        .ok_or_else(|| io::Error::other("HOME is required for purge"))?;
+    let paths = CodingBrainPaths::resolve(environment)
+        .map_err(|error| io::Error::other(format!("unsafe purge environment: {error:?}")))?;
+    [
+        paths.state_root().to_path_buf(),
+        paths.config_file().to_path_buf(),
+        home.join(".codexctl"),
+        home.join(".config/codexctl/config.toml"),
+    ]
+    .into_iter()
+    .map(|path| {
+        validate_purge_target(&path)?;
+        Ok(PurgeTarget {
+            identity: purge_identity(&path)?,
+            path,
+        })
+    })
+    .collect()
+}
+
+fn validate_purge_base(name: &str, base: &Path) -> io::Result<()> {
+    if !base.is_absolute() || base.parent().is_none() || base == Path::new("/") {
+        return Err(io::Error::other(format!(
+            "{name} must be an absolute non-root path"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_purge_target(path: &Path) -> io::Result<()> {
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(io::Error::other(format!(
+            "refusing unsafe purge target {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn purge_identity(path: &Path) -> io::Result<PurgeIdentity> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(PurgeIdentity::Symlink(metadata_identity(&metadata)))
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            Ok(PurgeIdentity::Directory(metadata_identity(&metadata)))
+        }
+        Ok(metadata) => Ok(PurgeIdentity::File(metadata_identity(&metadata))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(PurgeIdentity::Missing),
+        Err(error) => Err(error),
     }
 }
 
-/// `remove_dir_all` that treats a missing directory as success — same
-/// semantics as `rm -rf` without erroring on non-existence.
-fn remove_dir_if_present(path: &std::path::Path) -> io::Result<()> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+#[cfg(unix)]
+fn metadata_identity(metadata: &std::fs::Metadata) -> u128 {
+    use std::os::unix::fs::MetadataExt;
+    (u128::from(metadata.dev()) << 64) | u128::from(metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn metadata_identity(metadata: &std::fs::Metadata) -> u128 {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    modified ^ u128::from(metadata.len())
+}
+
+fn remove_previewed_target(target: &PurgeTarget) -> io::Result<()> {
+    let current = purge_identity(&target.path)?;
+    if current != target.identity {
+        return Err(io::Error::other(
+            "target identity or type changed after preview",
+        ));
+    }
+    match current {
+        PurgeIdentity::Missing => Ok(()),
+        PurgeIdentity::Symlink(_) | PurgeIdentity::File(_) => std::fs::remove_file(&target.path),
+        PurgeIdentity::Directory(_) => std::fs::remove_dir_all(&target.path),
     }
 }
 
-fn remove_file_if_present(path: &std::path::Path) -> io::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+/// Remove only the managed hook entries. The marker lives under the previewed
+/// state root, so purge must not access it before the target identity check.
+fn remove_managed_hooks_silent() -> io::Result<()> {
+    phases::PluginPhase.remove()
 }
 
 // ---------------- internal helpers ------------------------------------------
@@ -383,7 +467,7 @@ fn remove_file_if_present(path: &std::path::Path) -> io::Result<()> {
 fn print_banner(registry: &[Box<dyn Phase>]) {
     println!();
     println!(
-        "codexctl init — opinionated onboarding ({} phases)",
+        "coding-brain init — opinionated onboarding ({} phases)",
         registry.len()
     );
     println!("══════════════════════════════════════════════════════════════");
@@ -531,46 +615,73 @@ mod tests {
     }
 
     #[test]
-    fn remove_helpers_treat_missing_paths_as_success() {
-        // `remove_dir_if_present` / `remove_file_if_present` are the
-        // building blocks of --purge. Idempotency matters: re-running
-        // --purge after a successful one must not error.
-        let tmp = tempfile::tempdir().unwrap();
-        let missing_dir = tmp.path().join("nope");
-        let missing_file = tmp.path().join("nope.txt");
-        assert!(remove_dir_if_present(&missing_dir).is_ok());
-        assert!(remove_file_if_present(&missing_file).is_ok());
-    }
+    fn purge_targets_are_exact_and_preserve_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config = temp.path().join("config");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(state.join("coding-brain")).unwrap();
+        std::fs::create_dir_all(config.join("coding-brain")).unwrap();
+        std::fs::create_dir_all(home.join(".codexctl")).unwrap();
+        std::fs::create_dir_all(home.join(".config/codexctl")).unwrap();
+        std::fs::write(config.join("coding-brain/config.toml"), "current").unwrap();
+        std::fs::write(home.join(".config/codexctl/config.toml"), "legacy").unwrap();
+        std::fs::write(config.join("sibling.toml"), "keep").unwrap();
 
-    #[test]
-    fn remove_dir_if_present_wipes_existing_tree() {
-        let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("codexctl");
-        std::fs::create_dir_all(target.join("brain")).unwrap();
-        std::fs::create_dir_all(target.join("bus")).unwrap();
-        std::fs::write(target.join("brain").join("d.jsonl"), "{}").unwrap();
-        std::fs::write(target.join("bus").join("bus.db"), "x").unwrap();
+        let environment = PathEnvironment::new(Some(config.clone()), Some(state), Some(home));
+        let targets = preview_purge_targets(&environment).unwrap();
+        assert_eq!(targets.len(), 4);
+        for target in &targets {
+            remove_previewed_target(target).unwrap();
+        }
 
-        assert!(target.exists());
-        remove_dir_if_present(&target).unwrap();
-        assert!(
-            !target.exists(),
-            "expected tree to be gone, but {} still exists",
-            target.display()
+        assert_eq!(
+            std::fs::read_to_string(config.join("sibling.toml")).unwrap(),
+            "keep"
         );
     }
 
     #[test]
-    fn remove_file_if_present_removes_just_that_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = tmp.path().join("config.toml");
-        let sibling = tmp.path().join("other.toml");
-        std::fs::write(&cfg, "budget = 25").unwrap();
-        std::fs::write(&sibling, "keep me").unwrap();
+    fn purge_rejects_unsafe_or_changed_targets() {
+        let relative = PathEnvironment::new(None, None, Some(PathBuf::from("relative")));
+        assert!(preview_purge_targets(&relative).is_err());
+        let root = PathEnvironment::new(None, None, Some(PathBuf::from("/")));
+        assert!(preview_purge_targets(&root).is_err());
 
-        remove_file_if_present(&cfg).unwrap();
-        assert!(!cfg.exists(), "config.toml should be gone");
-        assert!(sibling.exists(), "sibling untouched");
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let environment = PathEnvironment::new(None, None, Some(home));
+        let targets = preview_purge_targets(&environment).unwrap();
+        let config_target = &targets[1];
+        std::fs::create_dir_all(config_target.path.parent().unwrap()).unwrap();
+        std::fs::write(&config_target.path, "appeared after preview").unwrap();
+        assert!(remove_previewed_target(config_target).is_err());
+        assert!(config_target.path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_unlinks_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "safe").unwrap();
+        let link = temp.path().join("state-link");
+        symlink(&outside, &link).unwrap();
+        let target = PurgeTarget {
+            identity: purge_identity(&link).unwrap(),
+            path: link.clone(),
+        };
+
+        remove_previewed_target(&target).unwrap();
+        assert!(!link.exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("keep")).unwrap(),
+            "safe"
+        );
     }
 
     #[test]

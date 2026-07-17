@@ -40,14 +40,13 @@ pub(crate) enum Command {
         /// Clear the onboarding marker so the next `init` starts fresh.
         #[arg(long, conflicts_with_all = ["check", "remove", "non_interactive"])]
         reset: bool,
-        /// Uninstall every codexctl-managed artifact (hooks, marker).
-        /// Preserves brain decision logs, legacy codexctl state, and the config
+        /// Uninstall every Coding Brain-managed artifact (hooks, marker).
+        /// Preserves Brain decision logs, legacy codexctl state, and the config
         /// file. Pair with `--purge` to wipe everything.
         #[arg(long, conflicts_with_all = ["check", "reset", "non_interactive", "purge"])]
         remove: bool,
-        /// Hard uninstall: `--remove` PLUS delete `~/.codexctl/` entirely
-        /// (brain data and legacy codexctl state) and
-        /// `~/.config/codexctl/config.toml`. Use to start over from a clean
+        /// Hard uninstall: remove current Coding Brain config/state plus
+        /// documented legacy codexctl global config/state. Use to start over from a clean
         /// slate. Requires `--yes` to proceed without prompt.
         #[arg(long, conflicts_with_all = ["check", "reset", "non_interactive", "remove"])]
         purge: bool,
@@ -57,7 +56,7 @@ pub(crate) enum Command {
         /// Install (or re-install) just Codex hooks (#325).
         /// Skip every other phase. Useful for users who already configured
         /// brain and just want to refresh hook entries
-        /// after `brew upgrade codexctl`.
+        /// after upgrading Coding Brain.
         #[arg(
             long,
             conflicts_with_all = ["check", "reset", "remove", "purge", "non_interactive"]
@@ -65,7 +64,7 @@ pub(crate) enum Command {
         plugin_only: bool,
         /// Re-sync everything the previous `init` wrote to match the
         /// running binary (#327): hook entries and the onboarding marker version. Use
-        /// after `brew upgrade codexctl` / `cargo install ... --force`.
+        /// after upgrading or reinstalling Coding Brain.
         #[arg(
             long,
             conflicts_with_all = ["check", "reset", "remove", "purge", "plugin_only", "non_interactive"]
@@ -118,7 +117,7 @@ pub(crate) enum Command {
 
 #[derive(Parser)]
 #[command(
-    name = "codexctl",
+    name = "coding-brain",
     version,
     about = "Supervise Codex sessions with a local brain that learns from you."
 )]
@@ -308,7 +307,7 @@ pub(crate) struct Cli {
     #[arg(long, help_heading = "History & Diagnostics")]
     pub(crate) config_validate: bool,
 
-    /// Write a sample .codexctl.toml in the current directory
+    /// Write a sample .coding-brain.toml in the current directory
     #[arg(long, help_heading = "Setup")]
     pub(crate) config_init: bool,
 
@@ -346,16 +345,19 @@ fn main() -> io::Result<()> {
 }
 
 fn maybe_print_star_prompt() {
-    let marker = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join(".codexctl/.star-prompted");
+    let marker = codexctl_core::paths::CodingBrainPaths::resolve(
+        &codexctl_core::paths::PathEnvironment::current(),
+    )
+    .map(|paths| paths.state_root().join(".star-prompted"))
+    .unwrap_or_else(|_| std::env::temp_dir().join("coding-brain/.star-prompted"));
 
     let first_run = !marker.exists();
 
     if first_run {
         eprintln!();
-        eprintln!("\u{2b50} If codexctl is useful, star it: https://github.com/aleadag/codexctl");
+        eprintln!(
+            "\u{2b50} If Coding Brain is useful, star it: https://github.com/aleadag/codexctl"
+        );
 
         if first_run {
             if let Some(parent) = marker.parent() {
@@ -367,19 +369,18 @@ fn maybe_print_star_prompt() {
 }
 
 /// First-run detection for the activation nudge (#322). Returns true when
-/// the user has neither onboarded (`~/.codexctl/onboarding.json` absent)
-/// nor installed Codex hooks (`~/.codex/hooks.json` lacks any `codexctl`
+/// the user has neither onboarded nor installed Coding Brain Codex hooks.
 /// entries). When either is present, we assume the operator
 /// knows what they're doing and stay quiet.
 fn is_first_run() -> bool {
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return false;
     };
-    let marker = home.join(".codexctl").join("onboarding.json");
+    let marker = init::marker::default_path();
     let settings = home.join(".codex").join("hooks.json");
     let onboarded = marker.exists();
     let hooked = std::fs::read_to_string(&settings)
-        .map(|s| s.contains("codexctl"))
+        .map(|s| s.contains("coding-brain"))
         .unwrap_or(false);
     !onboarded && !hooked
 }
@@ -390,14 +391,14 @@ fn is_first_run() -> bool {
 fn print_first_run_banner() {
     eprintln!();
     eprintln!("┌─────────────────────────────────────────────────────────────────┐");
-    eprintln!("│  Welcome to codexctl.                                           │");
+    eprintln!("│  Welcome to Coding Brain.                                       │");
     eprintln!("│                                                                 │");
     eprintln!("│  Brain activity will be empty until Codex hooks are installed.  │");
     eprintln!("│  Quit and run:                                                   │");
     eprintln!("│                                                                 │");
-    eprintln!("│    codexctl init        Interactive setup wizard                │");
+    eprintln!("│    coding-brain init    Interactive setup wizard                │");
     eprintln!("│                                                                 │");
-    eprintln!("│  Silence this with CODEXCTL_SKIP_FIRST_RUN=1.                  │");
+    eprintln!("│  Silence this with CODING_BRAIN_SKIP_FIRST_RUN=1.             │");
     eprintln!("└─────────────────────────────────────────────────────────────────┘");
     eprintln!();
     // Tiny delay so the user actually reads the banner before the TUI
@@ -456,11 +457,8 @@ fn run_main(cli: Cli) -> io::Result<()> {
         return Ok(());
     }
     if let Some(brain) = cfg.brain.as_ref().filter(|brain| brain.enabled) {
-        if !doctor::is_loopback_endpoint(&brain.endpoint) {
-            eprintln!(
-                "Warning: brain endpoint {} is not loopback; transcript context may leave this machine",
-                brain.endpoint
-            );
+        if let Some(warning) = doctor::endpoint_warning(&brain.endpoint) {
+            eprintln!("Warning: {warning}");
         }
     }
 
@@ -497,7 +495,7 @@ fn run_main(cli: Cli) -> io::Result<()> {
             println!("  {name}: {source}");
         }
         println!();
-        println!("Override: create ~/.codexctl/brain/prompts/<name>.md");
+        println!("Override: create a prompt under the Coding Brain state directory.");
         return Ok(());
     }
 
@@ -689,7 +687,7 @@ fn run_main(cli: Cli) -> io::Result<()> {
 
     // #322 — first-run nudge. If the user has neither onboarded nor installed
     // hooks, explain why Brain activity will initially be empty.
-    if std::env::var("CODEXCTL_SKIP_FIRST_RUN").is_err() && is_first_run() {
+    if std::env::var("CODING_BRAIN_SKIP_FIRST_RUN").is_err() && is_first_run() {
         print_first_run_banner();
     }
 
@@ -767,14 +765,14 @@ mod default_brain_cli_tests {
 
     #[test]
     fn no_mode_selects_brain_tui() {
-        let cli = Cli::try_parse_from(["codexctl"]).unwrap();
+        let cli = Cli::try_parse_from(["coding-brain"]).unwrap();
 
         assert_eq!(select_mode(&cli), RunMode::BrainTui);
     }
 
     #[test]
     fn headless_is_the_only_continuous_non_tui_mode() {
-        let cli = Cli::try_parse_from(["codexctl", "--headless", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["coding-brain", "--headless", "--json"]).unwrap();
 
         assert_eq!(select_mode(&cli), RunMode::Headless { json: true });
     }
@@ -783,6 +781,12 @@ mod default_brain_cli_tests {
 #[cfg(test)]
 mod brain_only_cli_tests {
     use super::*;
+
+    #[test]
+    fn clap_and_cargo_expose_only_coding_brain() {
+        assert_eq!(Cli::command().get_name(), "coding-brain");
+        assert_eq!(env!("CARGO_BIN_NAME"), "coding-brain");
+    }
 
     const REMOVED_ARGS: &[&str] = &[
         "--interval",
@@ -864,7 +868,7 @@ mod brain_only_cli_tests {
     fn removed_args_fail_and_retained_args_are_in_long_help() {
         let help = Cli::command().render_long_help().to_string();
         for arg in REMOVED_ARGS {
-            assert!(Cli::try_parse_from(["codexctl", arg]).is_err(), "{arg}");
+            assert!(Cli::try_parse_from(["coding-brain", arg]).is_err(), "{arg}");
             assert!(!help_has_long_flag(&help, arg), "{arg}");
         }
         for arg in RETAINED_ARGS {
@@ -894,18 +898,18 @@ mod brain_only_cli_tests {
             "ingest",
         ] {
             assert!(
-                Cli::try_parse_from(["codexctl", command]).is_err(),
+                Cli::try_parse_from(["coding-brain", command]).is_err(),
                 "{command}"
             );
         }
 
-        assert!(Cli::try_parse_from(["codexctl", "--run", "tasks.json"]).is_err());
-        assert!(Cli::try_parse_from(["codexctl", "--parallel"]).is_err());
-        assert!(Cli::try_parse_from(["codexctl", "--decompose", "split this work"]).is_err());
+        assert!(Cli::try_parse_from(["coding-brain", "--run", "tasks.json"]).is_err());
+        assert!(Cli::try_parse_from(["coding-brain", "--parallel"]).is_err());
+        assert!(Cli::try_parse_from(["coding-brain", "--decompose", "split this work"]).is_err());
 
-        let advisory = Cli::try_parse_from(["codexctl"]).unwrap();
+        let advisory = Cli::try_parse_from(["coding-brain"]).unwrap();
         assert!(!advisory.auto_run);
-        let automatic = Cli::try_parse_from(["codexctl", "--auto-run"]).unwrap();
+        let automatic = Cli::try_parse_from(["coding-brain", "--auto-run"]).unwrap();
         assert!(automatic.auto_run);
     }
 
@@ -967,8 +971,12 @@ mod first_run_tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join(".codexctl")).unwrap();
-        fs::write(tmp.path().join(".codexctl").join("onboarding.json"), "{}").unwrap();
+        fs::create_dir_all(tmp.path().join(".local/state/coding-brain")).unwrap();
+        fs::write(
+            tmp.path().join(".local/state/coding-brain/onboarding.json"),
+            "{}",
+        )
+        .unwrap();
         set_home(tmp.path());
         assert!(
             !is_first_run(),
@@ -977,7 +985,7 @@ mod first_run_tests {
     }
 
     #[test]
-    fn not_first_run_when_settings_mentions_codexctl() {
+    fn not_first_run_when_settings_mentions_coding_brain() {
         let _g = config::HOME_ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -985,7 +993,7 @@ mod first_run_tests {
         fs::create_dir_all(tmp.path().join(".codex")).unwrap();
         fs::write(
             tmp.path().join(".codex").join("hooks.json"),
-            r#"{"hooks":{"PostToolUse":[{"hooks":[{"command":"codexctl --json"}]}]}}"#,
+            r#"{"hooks":{"PostToolUse":[{"hooks":[{"command":"coding-brain --lifecycle-hook"}]}]}}"#,
         )
         .unwrap();
         set_home(tmp.path());
@@ -1016,7 +1024,7 @@ mod permission_hook_cli_tests {
 
     #[test]
     fn permission_hook_flag_is_hidden() {
-        let cli = Cli::try_parse_from(["codexctl", "--permission-hook"]).unwrap();
+        let cli = Cli::try_parse_from(["coding-brain", "--permission-hook"]).unwrap();
         assert!(cli.permission_hook);
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--permission-hook"));
@@ -1024,7 +1032,7 @@ mod permission_hook_cli_tests {
 
     #[test]
     fn lifecycle_hook_flag_is_hidden() {
-        let cli = Cli::try_parse_from(["codexctl", "--lifecycle-hook"]).unwrap();
+        let cli = Cli::try_parse_from(["coding-brain", "--lifecycle-hook"]).unwrap();
         assert!(cli.lifecycle_hook);
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--lifecycle-hook"));
@@ -1032,7 +1040,7 @@ mod permission_hook_cli_tests {
 
     #[test]
     fn distill_once_flag_is_hidden() {
-        let cli = Cli::try_parse_from(["codexctl", "--distill-once"]).unwrap();
+        let cli = Cli::try_parse_from(["coding-brain", "--distill-once"]).unwrap();
         assert!(cli.distill_once);
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--distill-once"));

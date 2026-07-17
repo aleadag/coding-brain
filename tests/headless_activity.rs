@@ -43,12 +43,12 @@ fn headless_emits_activity_without_a_session_roster() {
         format!("{}\n", serde_json::to_string(&event).unwrap()),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coding-brain"))
         .args(["--headless", "--json"])
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_STATE_HOME", &state)
-        .env("CODEXCTL_SKIP_FIRST_RUN", "1")
+        .env("CODING_BRAIN_SKIP_FIRST_RUN", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

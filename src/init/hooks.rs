@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// One managed Codex hook definition.
 struct HookSpec {
     event: &'static str,
     matcher: Option<&'static str>,
-    command: &'static str,
+    argument: &'static str,
     timeout: u32,
     status_message: Option<&'static str>,
 }
@@ -15,56 +15,56 @@ const HOOKS: &[HookSpec] = &[
     HookSpec {
         event: "SessionStart",
         matcher: Some("startup|resume|clear|compact"),
-        command: "codexctl --lifecycle-hook",
+        argument: "--lifecycle-hook",
         timeout: 2,
         status_message: None,
     },
     HookSpec {
         event: "UserPromptSubmit",
         matcher: None,
-        command: "codexctl --lifecycle-hook",
+        argument: "--lifecycle-hook",
         timeout: 2,
         status_message: None,
     },
     HookSpec {
         event: "PreToolUse",
         matcher: Some("*"),
-        command: "codexctl --lifecycle-hook",
+        argument: "--lifecycle-hook",
         timeout: 2,
         status_message: None,
     },
     HookSpec {
         event: "PermissionRequest",
         matcher: Some("*"),
-        command: "codexctl --permission-hook",
+        argument: "--permission-hook",
         timeout: 30,
         status_message: Some("Brain reviewing permission…"),
     },
     HookSpec {
         event: "PostToolUse",
         matcher: Some("*"),
-        command: "codexctl --lifecycle-hook",
+        argument: "--lifecycle-hook",
         timeout: 2,
         status_message: None,
     },
     HookSpec {
         event: "SubagentStart",
         matcher: Some("*"),
-        command: "codexctl --lifecycle-hook",
+        argument: "--lifecycle-hook",
         timeout: 2,
         status_message: None,
     },
     HookSpec {
         event: "SubagentStop",
         matcher: Some("*"),
-        command: "codexctl --lifecycle-hook",
+        argument: "--lifecycle-hook",
         timeout: 2,
         status_message: None,
     },
     HookSpec {
         event: "Stop",
         matcher: None,
-        command: "codexctl --lifecycle-hook",
+        argument: "--lifecycle-hook",
         timeout: 2,
         status_message: None,
     },
@@ -393,7 +393,7 @@ fn inspect_lifecycle_handlers(value: &serde_json::Value, scope: &mut LifecycleHo
                 state.unavailable |= command_uses_missing_absolute_binary(command);
                 let current = matcher == spec.matcher
                     && handler.get("type").and_then(serde_json::Value::as_str) == Some("command")
-                    && is_exact_codexctl_command(
+                    && is_exact_current_command(
                         command,
                         if event == ManagedHookEvent::PermissionRequest {
                             &["--permission-hook"]
@@ -426,7 +426,7 @@ fn is_discoverable_managed_command(event: ManagedHookEvent, command: &str) -> bo
     let Some(program) = words.next() else {
         return false;
     };
-    if !is_codexctl_program(program) {
+    if !is_managed_program(program) {
         return false;
     }
     words.any(|argument| argument == expected)
@@ -491,12 +491,28 @@ fn entry_is_disabled(value: &serde_json::Value) -> bool {
 }
 
 fn build_hooks_value() -> serde_json::Value {
+    let executable = managed_executable();
+    build_hooks_value_for(&executable)
+}
+
+#[cfg(not(test))]
+fn managed_executable() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("coding-brain"))
+}
+
+#[cfg(test)]
+fn managed_executable() -> PathBuf {
+    PathBuf::from("coding-brain")
+}
+
+fn build_hooks_value_for(executable: &Path) -> serde_json::Value {
     let mut hooks_map = serde_json::Map::new();
 
     for spec in HOOKS {
+        let command = format!("{} {}", executable.display(), spec.argument);
         let mut hook_entry = serde_json::json!({
             "type": "command",
-            "command": spec.command,
+            "command": command,
             "timeout": spec.timeout,
         });
         if let Some(status_message) = spec.status_message {
@@ -547,39 +563,52 @@ fn has_codexctl_hooks(existing: &serde_json::Value) -> bool {
     false
 }
 
-fn is_codexctl_program(program: &str) -> bool {
+fn is_current_program(program: &str) -> bool {
+    program == "coding-brain"
+        || (Path::new(program).is_absolute() && program.ends_with("/coding-brain"))
+}
+
+fn is_legacy_program(program: &str) -> bool {
     program == "codexctl" || (Path::new(program).is_absolute() && program.ends_with("/codexctl"))
 }
 
-fn is_exact_codexctl_command(command: &str, expected_args: &[&str]) -> bool {
+fn is_managed_program(program: &str) -> bool {
+    is_current_program(program) || is_legacy_program(program)
+}
+
+fn is_exact_command(command: &str, expected_args: &[&str], predicate: fn(&str) -> bool) -> bool {
     let mut words = command.split_whitespace();
-    let Some(program) = words.next() else {
+    let Some(executable) = words.next() else {
         return false;
     };
-    is_codexctl_program(program) && words.eq(expected_args.iter().copied())
+    predicate(executable) && words.eq(expected_args.iter().copied())
+}
+
+fn is_exact_current_command(command: &str, expected_args: &[&str]) -> bool {
+    is_exact_command(command, expected_args, is_current_program)
+}
+
+fn is_exact_managed_command(command: &str, expected_args: &[&str]) -> bool {
+    is_exact_command(command, expected_args, is_managed_program)
 }
 
 fn is_current_permission_command(command: &str) -> bool {
-    is_exact_codexctl_command(command, &["--permission-hook"])
-}
-
-fn is_current_lifecycle_command(command: &str) -> bool {
-    is_exact_codexctl_command(command, &["--lifecycle-hook"])
+    is_exact_current_command(command, &["--permission-hook"])
 }
 
 fn contains_managed_permission_flag(command: &str) -> bool {
     let mut words = command.split_whitespace();
-    words.next().is_some_and(is_codexctl_program)
+    words.next().is_some_and(is_managed_program)
         && words.any(|argument| argument == "--permission-hook")
 }
 
 fn is_managed_snapshot_command(command: &str) -> bool {
-    is_exact_codexctl_command(command, &["--json"])
-        || is_exact_codexctl_command(command, &["--json", "2>/dev/null", "||", "true"])
+    is_exact_managed_command(command, &["--json"])
+        || is_exact_managed_command(command, &["--json", "2>/dev/null", "||", "true"])
 }
 
 fn is_managed_permission_command(command: &str) -> bool {
-    is_current_permission_command(command)
+    is_exact_managed_command(command, &["--permission-hook"])
 }
 
 fn is_managed_command(event: &str, command: &str) -> bool {
@@ -587,7 +616,7 @@ fn is_managed_command(event: &str, command: &str) -> bool {
         "PermissionRequest" => is_managed_permission_command(command),
         "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart"
         | "SubagentStop" | "Stop" => {
-            is_current_lifecycle_command(command)
+            is_exact_managed_command(command, &["--lifecycle-hook"])
                 || (matches!(event, "PostToolUse" | "Stop") && is_managed_snapshot_command(command))
         }
         _ => false,
@@ -681,6 +710,27 @@ fn remove_codexctl_hooks(settings: &mut serde_json::Value) -> usize {
     removed
 }
 
+fn write_hooks_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("json.coding-brain.tmp");
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Run the uninit command: remove codexctl hooks from hooks.json.
 pub fn run_uninit(project: bool) -> io::Result<()> {
     let path = settings_path(project);
@@ -707,7 +757,7 @@ pub fn run_uninit(project: bool) -> io::Result<()> {
 
     if !has_codexctl_hooks(&settings) {
         println!(
-            "No codexctl hooks found in {} — nothing to remove.",
+            "No managed Coding Brain hooks found in {} — nothing to remove.",
             path.display()
         );
         return Ok(());
@@ -721,14 +771,17 @@ pub fn run_uninit(project: bool) -> io::Result<()> {
     if is_empty {
         std::fs::remove_file(&path)?;
         println!(
-            "Removed {removed} codexctl hook(s) — {} was empty and has been deleted.",
+            "Removed {removed} managed Coding Brain hook(s) — {} was empty and has been deleted.",
             path.display()
         );
     } else {
         let json = serde_json::to_string_pretty(&settings)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        std::fs::write(&path, format!("{json}\n"))?;
-        println!("Removed {removed} codexctl hook(s) from {}", path.display());
+        write_hooks_atomically(&path, format!("{json}\n").as_bytes())?;
+        println!(
+            "Removed {removed} Coding Brain hook(s) from {}",
+            path.display()
+        );
     }
 
     Ok(())
@@ -780,7 +833,7 @@ pub fn run_init(project: bool, dry_run: bool) -> io::Result<()> {
     }
 
     if !changed {
-        println!("codexctl hooks are current in {}", path.display());
+        println!("Coding Brain hooks are current in {}", path.display());
         return Ok(());
     }
 
@@ -789,10 +842,10 @@ pub fn run_init(project: bool, dry_run: bool) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Write
+    // Write a complete sibling and atomically replace the original.
     let json = serde_json::to_string_pretty(&settings)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    std::fs::write(&path, format!("{json}\n"))?;
+    write_hooks_atomically(&path, format!("{json}\n").as_bytes())?;
 
     print_success(&path);
 
@@ -800,15 +853,15 @@ pub fn run_init(project: bool, dry_run: bool) -> io::Result<()> {
 }
 
 fn print_success(path: &Path) {
-    println!("Initialized codexctl hooks in {}", path.display());
+    println!("Initialized Coding Brain hooks in {}", path.display());
     println!();
     println!("Hooks installed:");
-    println!("  Lifecycle events — keep dashboard status current");
+    println!("  Lifecycle events — keep Brain activity current");
     println!("  PermissionRequest (*) — observes every tool; brain decisions remain Bash-only");
     println!();
     println!("Restart Codex, then open `/hooks` to review and trust the command.");
     println!("Codex will then report lifecycle changes and ask the brain to review Bash requests.");
-    println!("Run `codexctl` to start the dashboard.");
+    println!("Run `coding-brain` to open the Brain TUI.");
 }
 
 #[cfg(test)]
@@ -843,9 +896,20 @@ mod tests {
                 matcher
             );
             let handler = &entry["hooks"][0];
-            assert_eq!(handler["command"], format!("codexctl {argument}"));
+            assert_eq!(handler["command"], format!("coding-brain {argument}"));
             assert_eq!(handler["timeout"], timeout);
         }
+    }
+
+    #[test]
+    fn failed_pre_rename_write_preserves_original_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("hooks.json");
+        std::fs::write(&path, b"original\n").unwrap();
+        std::fs::create_dir(path.with_extension("json.coding-brain.tmp")).unwrap();
+
+        assert!(write_hooks_atomically(&path, b"replacement\n").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original\n");
     }
 
     #[test]
@@ -1124,7 +1188,7 @@ mod tests {
         assert_eq!(hooks["PermissionRequest"][0]["matcher"], "*");
         let handler = &hooks["PermissionRequest"][0]["hooks"][0];
 
-        assert_eq!(handler["command"], "codexctl --permission-hook");
+        assert_eq!(handler["command"], "coding-brain --permission-hook");
         assert_eq!(handler["timeout"], 30);
         assert_eq!(handler["statusMessage"], "Brain reviewing permission…");
     }
@@ -1155,7 +1219,7 @@ mod tests {
         assert_eq!(permission.len(), 2);
         assert_eq!(
             permission[1]["hooks"][0]["command"],
-            "codexctl --permission-hook"
+            "coding-brain --permission-hook"
         );
     }
 
@@ -1204,7 +1268,7 @@ mod tests {
         assert_eq!(settings, once);
         assert_eq!(
             settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-            "codexctl --lifecycle-hook"
+            "coding-brain --lifecycle-hook"
         );
         assert_eq!(
             settings["hooks"]["Stop"][0]["hooks"],
@@ -1212,11 +1276,11 @@ mod tests {
         );
         assert_eq!(
             settings["hooks"]["Stop"][1]["hooks"][0]["command"],
-            "codexctl --lifecycle-hook"
+            "coding-brain --lifecycle-hook"
         );
         assert_eq!(
             settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
-            "codexctl --permission-hook"
+            "coding-brain --permission-hook"
         );
     }
 
@@ -1243,7 +1307,7 @@ mod tests {
         assert_eq!(settings, once);
         assert_eq!(
             settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-            "codexctl --lifecycle-hook"
+            "coding-brain --lifecycle-hook"
         );
     }
 
@@ -1269,7 +1333,7 @@ mod tests {
         assert_eq!(permission[0]["hooks"], serde_json::json!([custom]));
         assert_eq!(
             permission[1]["hooks"][0]["command"],
-            "codexctl --permission-hook"
+            "coding-brain --permission-hook"
         );
     }
 
@@ -1523,7 +1587,7 @@ mod tests {
                     "matcher": "*",
                     "hooks": [{
                         "type": "command",
-                        "command": "/nix/store/test-codexctl/bin/codexctl --permission-hook",
+                        "command": "/nix/store/test-coding-brain/bin/coding-brain --permission-hook",
                         "timeout": 30,
                         "statusMessage": "Brain reviewing permission…"
                     }]
@@ -1635,7 +1699,7 @@ mod tests {
                     "matcher": "*",
                     "hooks": [{
                         "type": "command",
-                        "command": "codexctl --permission-hook",
+                        "command": "coding-brain --permission-hook",
                         "timeout": 30,
                         "statusMessage": "Brain reviewing permission…"
                     }]

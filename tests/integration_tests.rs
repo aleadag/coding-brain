@@ -1507,7 +1507,7 @@ fn isolated_home() -> HomeGuard {
 
 fn write_decision_jsonl(line: &str) {
     let path = std::env::var("HOME").unwrap();
-    let dir = std::path::PathBuf::from(path).join(".codexctl/brain");
+    let dir = std::path::PathBuf::from(path).join(".local/state/coding-brain/brain");
     std::fs::create_dir_all(&dir).unwrap();
     let mut f = std::fs::OpenOptions::new()
         .create(true)

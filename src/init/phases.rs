@@ -150,7 +150,7 @@ fn print_ollama_install_hint() {
     println!("  To enable the brain, install ollama and a small model:");
     println!("    brew install ollama && ollama serve &");
     println!("    ollama pull gemma4:e4b");
-    println!("  Then re-run `codexctl init` to wire it up.");
+    println!("  Then re-run `coding-brain init` to wire it up.");
 }
 
 // ===================== Codex hooks ======================================
@@ -170,7 +170,7 @@ impl Phase for PluginPhase {
     }
 
     fn run_interactive(&self) -> io::Result<PhaseStatus> {
-        println!("Wire codexctl hooks into ~/.codex/hooks.json. Existing hooks are preserved.");
+        println!("Wire Coding Brain hooks into ~/.codex/hooks.json. Existing hooks are preserved.");
         if !prompt::yes_no("Install Codex hooks?", true)? {
             return Ok(PhaseStatus::Skipped);
         }
@@ -241,7 +241,7 @@ impl Phase for SkillsPhase {
         }
         println!();
         println!(
-            "  (Run these inside any Codex session. codexctl does not install \
+            "  (Run these inside any Codex session. Coding Brain does not install \
              skills automatically.)"
         );
         Ok(PhaseStatus::Installed {

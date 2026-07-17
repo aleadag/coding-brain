@@ -126,12 +126,8 @@ pub fn run_after_outcome_change(paths: &CodingBrainPaths) -> Result<DistillOutco
 }
 
 pub fn current_paths() -> io::Result<CodingBrainPaths> {
-    CodingBrainPaths::resolve(&PathEnvironment::new(
-        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    ))
-    .map_err(|error| io::Error::other(format!("{error:?}")))
+    CodingBrainPaths::resolve(&PathEnvironment::current())
+        .map_err(|error| io::Error::other(format!("{error:?}")))
 }
 
 #[cfg(test)]

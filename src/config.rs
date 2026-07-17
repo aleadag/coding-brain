@@ -1,5 +1,8 @@
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
+
+use codexctl_core::paths::{CodingBrainPaths, PathEnvironment, PathError};
 
 #[cfg(test)]
 pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -45,26 +48,36 @@ enum ConfigSource {
 impl Config {
     /// Load configuration from global and project config files.
     pub fn load() -> Self {
+        Self::load_from(
+            &PathEnvironment::current(),
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+        .unwrap_or_default()
+    }
+
+    pub fn load_from(env: &PathEnvironment, cwd: &Path) -> Result<Self, PathError> {
+        let paths = CodingBrainPaths::resolve(env)?;
         let mut config = Config::default();
 
-        // Layer 1: Global config
-        if let Some(global) = global_config_path() {
-            if let Some(raw) = parse_config_file(&global) {
-                config.apply_from(raw, ConfigSource::User);
-            }
+        // Layer 1: User config.
+        if let Some(raw) = parse_config_file(&paths.config_file().to_path_buf()) {
+            config.apply_from(raw, ConfigSource::User);
         }
 
-        // Layer 2: Project config (.codexctl.toml in cwd)
-        if let Some(raw) = parse_config_file(&PathBuf::from(".codexctl.toml")) {
+        // Layer 2: Project config.
+        let project_path = paths.project_config(cwd);
+        if let Some(raw) = parse_config_file(&project_path) {
             for warning in config.apply_from(raw, ConfigSource::Project) {
                 eprintln!(
-                    "Warning: .codexctl.toml:{}: {}",
-                    warning.line, warning.message
+                    "Warning: {}:{}: {}",
+                    project_path.display(),
+                    warning.line,
+                    warning.message
                 );
             }
         }
 
-        config
+        Ok(config)
     }
 
     /// Apply a raw config layer on top, overriding only set fields.
@@ -117,24 +130,24 @@ impl Config {
         warnings
     }
 
-    /// Show resolved config and file locations (for `codexctl config`).
+    /// Show resolved config and file locations (for `coding-brain --config`).
     pub fn print_resolved(&self) {
         println!("Resolved configuration:");
         println!();
 
-        if let Some(p) = global_config_path() {
-            if p.exists() {
-                println!("  Global config: {}", p.display());
-            } else {
-                println!("  Global config: {} (not found)", p.display());
-            }
+        if let Some(p) = Self::global_path() {
+            println!(
+                "  User config: {}{}",
+                p.display(),
+                if p.exists() { "" } else { " (not found)" }
+            );
         }
 
-        let project_path = PathBuf::from(".codexctl.toml");
+        let project_path = PathBuf::from(".coding-brain.toml");
         if project_path.exists() {
             println!("  Project config: {}", project_path.display());
         } else {
-            println!("  Project config: .codexctl.toml (not found)");
+            println!("  Project config: .coding-brain.toml (not found)");
         }
 
         println!();
@@ -156,10 +169,10 @@ impl Config {
 
     /// Return the config template as a string.
     pub fn template_string() -> &'static str {
-        r#"# codexctl configuration
+        r#"# Coding Brain configuration
 # Place this file at:
-#   Project: .codexctl.toml (in your project root)
-#   User:    ~/.config/codexctl/config.toml
+#   Project: .coding-brain.toml (in your project root)
+#   User:    ~/.config/coding-brain/config.toml
 #
 # Priority: CLI flags > project config > user config > defaults
 # Project config cannot override brain.endpoint.
@@ -184,12 +197,9 @@ impl Config {
 }
 
 fn global_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("codexctl")
-            .join("config.toml")
-    })
+    CodingBrainPaths::resolve(&PathEnvironment::current())
+        .ok()
+        .map(|paths| paths.config_file().to_path_buf())
 }
 
 impl Config {
@@ -448,7 +458,7 @@ pub fn legacy_config_warnings() -> Vec<(PathBuf, ConfigWarning)> {
     if let Some(global) = global_config_path() {
         paths.push(global);
     }
-    paths.push(PathBuf::from(".codexctl.toml"));
+    paths.push(PathBuf::from(".coding-brain.toml"));
     legacy_config_warnings_for_paths(&paths)
 }
 
@@ -459,7 +469,7 @@ pub fn load_hooks() -> crate::hooks::HookRegistry {
     if let Some(global) = global_config_path() {
         parse_hooks_from_file(&global, &mut registry);
     }
-    parse_hooks_from_file(&PathBuf::from(".codexctl.toml"), &mut registry);
+    parse_hooks_from_file(&PathBuf::from(".coding-brain.toml"), &mut registry);
 
     registry
 }
@@ -554,7 +564,7 @@ mod tests {
         writeln!(
             file,
             r#"
-# User codexctl config
+# User Coding Brain config
 [defaults]
 theme = "dark"
 
@@ -767,5 +777,56 @@ auto_restart = true
                 .message
                 .contains("project configuration cannot select brain.endpoint")
         }));
+    }
+
+    #[test]
+    fn project_config_cannot_redirect_endpoint() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let config_home = fixture.path().join("config");
+        let state_home = fixture.path().join("state");
+        let cwd = fixture.path().join("project");
+        std::fs::create_dir_all(config_home.join("coding-brain")).unwrap();
+        std::fs::create_dir_all(&state_home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            config_home.join("coding-brain/config.toml"),
+            "[brain]\nendpoint = \"http://127.0.0.1:11434\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".coding-brain.toml"),
+            "[brain]\nendpoint = \"https://remote.invalid\"\n",
+        )
+        .unwrap();
+
+        let environment = PathEnvironment::new(Some(config_home), Some(state_home), Some(home));
+        let loaded = Config::load_from(&environment, &cwd).unwrap();
+
+        assert_eq!(loaded.brain.unwrap().endpoint, "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn old_config_and_state_are_ignored_and_untouched() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let cwd = fixture.path().join("project");
+        std::fs::create_dir_all(home.join(".config/codexctl")).unwrap();
+        std::fs::create_dir_all(home.join(".codexctl/brain")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let old_config = home.join(".config/codexctl/config.toml");
+        let old_state = home.join(".codexctl/brain/decisions.jsonl");
+        std::fs::write(&old_config, "[brain]\nenabled = true\n").unwrap();
+        std::fs::write(&old_state, "legacy\n").unwrap();
+
+        let environment = PathEnvironment::new(None, None, Some(home));
+        let loaded = Config::load_from(&environment, &cwd).unwrap();
+
+        assert!(loaded.brain.is_none());
+        assert_eq!(
+            std::fs::read_to_string(old_config).unwrap(),
+            "[brain]\nenabled = true\n"
+        );
+        assert_eq!(std::fs::read_to_string(old_state).unwrap(), "legacy\n");
     }
 }

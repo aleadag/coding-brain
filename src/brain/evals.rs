@@ -43,7 +43,7 @@ pub struct EvalResult {
     pub error: Option<String>,
 }
 
-/// Load eval scenarios from ~/.codexctl/brain/evals/ directory.
+/// Load eval scenarios from the Coding Brain state directory.
 pub fn load_scenarios() -> Vec<EvalScenario> {
     let dir = evals_dir();
     let entries = match fs::read_dir(&dir) {
@@ -210,11 +210,11 @@ fn format_eval_decision_prompt(eval: &EvalSession) -> String {
 }
 
 fn evals_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".codexctl")
-        .join("brain")
-        .join("evals")
+    codexctl_core::paths::CodingBrainPaths::resolve(
+        &codexctl_core::paths::PathEnvironment::current(),
+    )
+    .map(|paths| paths.state_root().join("brain/evals"))
+    .unwrap_or_else(|_| std::env::temp_dir().join("coding-brain/brain/evals"))
 }
 
 fn parse_scenario(json: &str) -> Result<EvalScenario, String> {

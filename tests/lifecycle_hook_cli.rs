@@ -17,7 +17,7 @@ fn run_hook(home: &std::path::Path, input: &[u8]) -> Output {
             serde_json::to_vec(&value).unwrap()
         })
         .unwrap_or_else(|_| input.to_vec());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coding-brain"))
         .arg("--lifecycle-hook")
         .env("HOME", home)
         .current_dir(home)
@@ -36,7 +36,7 @@ fn run_hook(home: &std::path::Path, input: &[u8]) -> Output {
 }
 
 fn run_cli(home: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_codexctl"))
+    Command::new(env!("CARGO_BIN_EXE_coding-brain"))
         .args(args)
         .env("HOME", home)
         .current_dir(home)
@@ -52,7 +52,7 @@ fn prompt_payload(index: usize) -> Vec<u8> {
 
 #[cfg(unix)]
 fn run_permission_hook(home: &std::path::Path, input: &[u8]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coding-brain"))
         .arg("--permission-hook")
         .env("HOME", home)
         .env("PATH", home.join("bin"))
@@ -68,7 +68,7 @@ fn run_permission_hook(home: &std::path::Path, input: &[u8]) -> Output {
 
 #[cfg(unix)]
 fn write_brain_config(home: &std::path::Path) {
-    let config_dir = home.join(".config/codexctl");
+    let config_dir = home.join(".config/coding-brain");
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.toml"),
@@ -97,9 +97,14 @@ fn lifecycle_hook_binary_is_silent_and_records_under_temporary_home() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
-    assert!(!home.path().join(".codexctl/.star-prompted").exists());
+    assert!(
+        !home
+            .path()
+            .join(".local/state/coding-brain/.star-prompted")
+            .exists()
+    );
 
-    let snapshot = LifecycleStore::at(home.path().join(".codexctl"))
+    let snapshot = LifecycleStore::at(home.path().join(".local/state/coding-brain"))
         .read()
         .unwrap()
         .snapshot
@@ -117,9 +122,14 @@ fn lifecycle_hook_binary_fails_open_with_empty_stdout() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     let diagnostic = String::from_utf8(output.stderr).unwrap();
-    assert!(diagnostic.starts_with("codexctl lifecycle hook:"));
+    assert!(diagnostic.starts_with("coding-brain lifecycle hook:"));
     assert!(!diagnostic.contains("secret"));
-    assert!(!home.path().join(".codexctl/.star-prompted").exists());
+    assert!(
+        !home
+            .path()
+            .join(".local/state/coding-brain/.star-prompted")
+            .exists()
+    );
 }
 
 #[test]
@@ -144,8 +154,12 @@ fn permission_response_is_stable_across_lifecycle_failure() {
 
     let blocked = tempfile::tempdir().unwrap();
     write_brain_config(blocked.path());
-    fs::create_dir_all(blocked.path().join(".codexctl")).unwrap();
-    fs::write(blocked.path().join(".codexctl/hooks"), b"occupied").unwrap();
+    fs::create_dir_all(blocked.path().join(".local/state/coding-brain")).unwrap();
+    fs::write(
+        blocked.path().join(".local/state/coding-brain/hooks"),
+        b"occupied",
+    )
+    .unwrap();
     let blocked_request = request(blocked.path());
     let blocked_output = run_permission_hook(blocked.path(), blocked_request.as_bytes());
 
@@ -163,8 +177,18 @@ fn permission_response_is_stable_across_lifecycle_failure() {
             .unwrap()
             .contains("lifecycle")
     );
-    assert!(!healthy.path().join(".codexctl/.star-prompted").exists());
-    assert!(!blocked.path().join(".codexctl/.star-prompted").exists());
+    assert!(
+        !healthy
+            .path()
+            .join(".local/state/coding-brain/.star-prompted")
+            .exists()
+    );
+    assert!(
+        !blocked
+            .path()
+            .join(".local/state/coding-brain/.star-prompted")
+            .exists()
+    );
 }
 
 #[test]
@@ -272,7 +296,7 @@ fn warm_lifecycle_hook_latency_and_roundtrip() {
         response["hookSpecificOutput"]["decision"]["behavior"],
         "allow"
     );
-    let store = LifecycleStore::at(home.path().join(".codexctl"));
+    let store = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
     let view = store.read().unwrap();
     assert_eq!(
         view.condition,

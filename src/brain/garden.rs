@@ -2,7 +2,7 @@
 
 //! AGENTS.md gardening (#199).
 //!
-//! Distilled preferences live in `~/.codexctl/brain/preferences/`. They're
+//! Distilled preferences live under the Coding Brain state root. They're
 //! used by the brain prompt builder but invisible to Codex itself. This
 //! module promotes high-confidence patterns into proposed `AGENTS.md` additions
 //! so the project's permanent instructions reflect what the user has actually
@@ -25,8 +25,8 @@ const MIN_CONFIDENCE: f64 = 0.90;
 const MIN_SAMPLES: u32 = 20;
 
 /// Mark the appended block so we can find it again and avoid double-writing.
-const HEADER: &str = "<!-- codexctl-garden: auto-codified from brain preferences -->";
-const FOOTER: &str = "<!-- /codexctl-garden -->";
+const HEADER: &str = "<!-- coding-brain-garden: auto-codified from brain preferences -->";
+const FOOTER: &str = "<!-- /coding-brain-garden -->";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Suggestion model
@@ -69,7 +69,7 @@ pub struct GardenReport {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Find the project's AGENTS.md. We prefer the file in the current working
-/// directory (where the user invoked codexctl), then walk up.
+/// directory (where the user invoked Coding Brain), then walk up.
 pub fn find_agents_md(start: &Path) -> Option<PathBuf> {
     let mut cur = start.canonicalize().ok()?;
     loop {

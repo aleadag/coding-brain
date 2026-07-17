@@ -10,7 +10,7 @@ fn final_runtime_exposes_only_brain_source_actions_and_navigation() {
 
 #[test]
 fn removed_dashboard_and_management_flags_are_rejected() {
-    let binary = env!("CARGO_BIN_EXE_codexctl");
+    let binary = env!("CARGO_BIN_EXE_coding-brain");
     for flag in [
         "--list",
         "--watch",

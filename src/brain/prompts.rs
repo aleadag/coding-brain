@@ -9,7 +9,7 @@ pub const AUTOPSY: &str = "autopsy";
 
 /// Load a prompt template by name. Checks user overrides first, falls back to built-in.
 pub fn load(name: &str) -> String {
-    // Check user override: ~/.codexctl/brain/prompts/{name}.md
+    // Check a user override under the Coding Brain state root.
     if let Some(path) = user_prompt_path(name) {
         if let Ok(content) = fs::read_to_string(&path) {
             if !content.trim().is_empty() {
@@ -33,14 +33,16 @@ pub fn expand(template: &str, vars: &[(&str, &str)]) -> String {
 
 /// Get the user override path for a prompt.
 fn user_prompt_path(name: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(
-        PathBuf::from(home)
-            .join(".codexctl")
-            .join("brain")
-            .join("prompts")
-            .join(format!("{name}.md")),
+    codexctl_core::paths::CodingBrainPaths::resolve(
+        &codexctl_core::paths::PathEnvironment::current(),
     )
+    .ok()
+    .map(|paths| {
+        paths
+            .state_root()
+            .join("brain/prompts")
+            .join(format!("{name}.md"))
+    })
 }
 
 /// Return the built-in default prompt for a given name.

@@ -865,7 +865,7 @@ fn autopsies_dir() -> PathBuf {
     super::decisions::decisions_dir().join("autopsies")
 }
 
-/// Save an autopsy report to ~/.codexctl/brain/autopsies/{session_id}.json.
+/// Save an autopsy report under the Coding Brain state root.
 pub fn save_report(report: &AutopsyReport) -> Result<PathBuf, String> {
     let dir = autopsies_dir();
     let _ = fs::create_dir_all(&dir);

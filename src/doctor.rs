@@ -1,10 +1,10 @@
-//! `codexctl doctor` — install + runtime health check (#326).
+//! `coding-brain doctor` — install + runtime health check.
 //!
 //! Top-down checklist that answers "is everything wired up?" in one
 //! command. Replaces what was scattered across:
 //!
-//! * `codexctl --doctor` (terminal compat only)
-//! * `codexctl init --check` (onboarding-marker drift only)
+//! * `coding-brain doctor` (complete install and runtime health)
+//! * `coding-brain init --check` (onboarding-marker drift only)
 //! * scattered "is X reachable?" probes the user had to chain manually
 //!
 //! Each check returns a `Check` with status + a fix hint. The renderer
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use codexctl_core::lifecycle::{LifecycleStore, StoreCondition, compatibility_state_root};
+use codexctl_core::lifecycle::{LifecycleStore, StoreCondition, coding_brain_state_root};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,6 +64,7 @@ pub fn run_all_checks() -> Vec<Check> {
         check_codex_hooks(),
         check_codex_hook_trust(),
         check_lifecycle_state(),
+        check_project_identity(),
         check_brain_endpoint(),
         check_session_discovery(),
         check_terminal_integration(),
@@ -74,7 +75,7 @@ pub fn run_all_checks() -> Vec<Check> {
 /// indent, fixed-width name column so messages align.
 pub fn render_checks(checks: &[Check]) -> String {
     let mut out = String::new();
-    out.push_str("codexctl doctor\n");
+    out.push_str("coding-brain doctor\n");
     out.push_str("=================\n\n");
     let max_name = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
     for c in checks {
@@ -130,13 +131,13 @@ fn counts(checks: &[Check]) -> (usize, usize, usize) {
 // ─── individual checks ──────────────────────────────────────────────────────
 
 fn check_binary_on_path() -> Check {
-    // Compare the running binary against what `which codexctl` resolves
+    // Compare the running binary against what `which coding-brain` resolves
     // to. Mismatches mean the user is running one binary while their
     // hooks resolve a different one (typical after `cargo install` on top
     // of a previous `brew install`).
     let running = std::env::current_exe().ok();
     let on_path = std::process::Command::new("which")
-        .arg("codexctl")
+        .arg("coding-brain")
         .output()
         .ok()
         .and_then(|o| {
@@ -159,8 +160,7 @@ fn check_binary_on_path() -> Check {
             status: CheckStatus::Advisory,
             message: format!("running {}, PATH resolves {}", r.display(), p.display()),
             fix_hint: Some(
-                "Two installs detected. Hooks call `codexctl` by name — \
-                 verify they use the version you expect."
+                "Two installs detected. Re-run `coding-brain init` so hooks use the running immutable executable."
                     .into(),
             ),
         },
@@ -169,7 +169,7 @@ fn check_binary_on_path() -> Check {
             status: CheckStatus::Fail,
             message: format!("{} not on PATH", r.display()),
             fix_hint: Some(
-                "Add the install dir to PATH so hooks can find `codexctl` by name.".into(),
+                "Add the install dir to PATH so `coding-brain` is directly available.".into(),
             ),
         },
         _ => Check {
@@ -202,7 +202,9 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
             name: "Codex hooks".into(),
             status: CheckStatus::Fail,
             message: "managed lifecycle definitions missing".into(),
-            fix_hint: Some("Run `codexctl init` (or `codexctl init --plugin-only`).".into()),
+            fix_hint: Some(
+                "Run `coding-brain init` (or `coding-brain init --plugin-only`).".into(),
+            ),
         };
     }
 
@@ -230,7 +232,9 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                 name: "Codex hooks".into(),
                 status: CheckStatus::Fail,
                 message: format!("{} {} definition missing", scope.1, event.as_str()),
-                fix_hint: Some("Run `codexctl init`, restart Codex, and review `/hooks`.".into()),
+                fix_hint: Some(
+                    "Run `coding-brain init`, restart Codex, and review `/hooks`.".into(),
+                ),
             };
         }
         if state.unavailable {
@@ -239,7 +243,8 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                 status: CheckStatus::Fail,
                 message: format!("{} {} executable unavailable", scope.1, event.as_str()),
                 fix_hint: Some(
-                    "Reinstall codexctl or rerun `codexctl init`, then review `/hooks`.".into(),
+                    "Reinstall Coding Brain or rerun `coding-brain init`, then review `/hooks`."
+                        .into(),
                 ),
             };
         }
@@ -259,7 +264,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                 status: CheckStatus::Advisory,
                 message: format!("{} {} definition stale", scope.1, event.as_str()),
                 fix_hint: Some(
-                    "Run `codexctl init`, restart Codex, and review the changed definition with `/hooks`."
+                    "Run `coding-brain init`, restart Codex, and review the changed definition with `/hooks`."
                         .into(),
                 ),
             };
@@ -301,7 +306,7 @@ fn check_codex_hook_trust_at(home: Option<&std::path::Path>, cwd: &std::path::Pa
 }
 
 fn check_lifecycle_state() -> Check {
-    check_lifecycle_state_with_store(&LifecycleStore::at(compatibility_state_root()))
+    check_lifecycle_state_with_store(&LifecycleStore::at(coding_brain_state_root()))
 }
 
 fn check_lifecycle_state_with_store(store: &LifecycleStore) -> Check {
@@ -324,7 +329,7 @@ fn check_lifecycle_state_with_store(store: &LifecycleStore) -> Check {
             StoreCondition::NewerSchema(version) => (
                 CheckStatus::Advisory,
                 format!("lifecycle state uses newer schema {version}"),
-                Some("Upgrade codexctl before writing lifecycle state.".into()),
+                Some("Upgrade Coding Brain before writing lifecycle state.".into()),
             ),
             StoreCondition::Unavailable => (
                 CheckStatus::Advisory,
@@ -377,6 +382,49 @@ fn check_brain_endpoint() -> Check {
     }
 }
 
+fn check_project_identity() -> Check {
+    let paths = match codexctl_core::paths::CodingBrainPaths::resolve(
+        &codexctl_core::paths::PathEnvironment::current(),
+    ) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return Check {
+                name: "project identity".into(),
+                status: CheckStatus::Advisory,
+                message: format!("path resolution failed: {error:?}"),
+                fix_hint: Some("Set HOME or absolute XDG config/state directories.".into()),
+            };
+        }
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match codexctl_core::project::ProjectIdentity::load(&cwd, &paths) {
+        Ok(identity) if identity.is_durable() => Check {
+            name: "project identity".into(),
+            status: CheckStatus::Pass,
+            message: "stable project UUID loaded".into(),
+            fix_hint: None,
+        },
+        Ok(_) => Check {
+            name: "project identity".into(),
+            status: CheckStatus::Advisory,
+            message: ".coding-brain/project.toml is missing; memory is temporary".into(),
+            fix_hint: Some(
+                "Run `coding-brain init` to create an identity. Removing .coding-brain/project.toml before rerunning init deliberately creates a new identity."
+                    .into(),
+            ),
+        },
+        Err(error) => Check {
+            name: "project identity".into(),
+            status: CheckStatus::Advisory,
+            message: format!("project manifest is malformed: {error}"),
+            fix_hint: Some(
+                "Fix .coding-brain/project.toml, or remove it before `coding-brain init` to deliberately create a new identity."
+                    .into(),
+            ),
+        },
+    }
+}
+
 fn endpoint_host(endpoint: &str) -> Option<&str> {
     let authority = endpoint.split_once("://")?.1.split('/').next()?;
     let authority = authority
@@ -403,16 +451,29 @@ fn check_brain_endpoint_url(endpoint: &str) -> Check {
             fix_hint: None,
         }
     } else {
+        let message = endpoint_warning(endpoint).unwrap_or_default();
         Check {
             name: "brain endpoint privacy".into(),
             status: CheckStatus::Advisory,
-            message: format!(
-                "{endpoint} is not loopback; transcript context may leave this machine"
-            ),
+            message,
             fix_hint: Some(
                 "Use a loopback endpoint or confirm the remote endpoint's privacy policy.".into(),
             ),
         }
+    }
+}
+
+pub(crate) fn endpoint_warning(endpoint: &str) -> Option<String> {
+    if is_loopback_endpoint(endpoint) {
+        None
+    } else if endpoint.to_ascii_lowercase().starts_with("http://") {
+        Some(format!(
+            "{endpoint} is remote plaintext HTTP; transcript context and credentials may be exposed in transit"
+        ))
+    } else {
+        Some(format!(
+            "{endpoint} is not loopback; transcript context may leave this machine"
+        ))
     }
 }
 
@@ -428,7 +489,7 @@ fn check_session_discovery() -> Check {
             status: CheckStatus::Advisory,
             message: "0 sessions discovered (no Codex running?)".into(),
             fix_hint: Some(
-                "Start a Codex session in another terminal (`codex`) and re-run `codexctl doctor`."
+                "Start a Codex session in another terminal (`codex`) and re-run `coding-brain doctor`."
                     .into(),
             ),
         }
@@ -477,7 +538,7 @@ mod tests {
     #[test]
     fn render_handles_empty_check_list() {
         let out = render_checks(&[]);
-        assert!(out.contains("codexctl doctor"));
+        assert!(out.contains("coding-brain doctor"));
         assert!(out.contains("0 passed"));
     }
 
@@ -610,6 +671,15 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_remote_endpoint_has_stronger_warning() {
+        let plaintext = endpoint_warning("http://brain.example.com/v1/chat").unwrap();
+        let tls = endpoint_warning("https://brain.example.com/v1/chat").unwrap();
+        assert!(plaintext.contains("plaintext HTTP"));
+        assert!(plaintext.contains("exposed in transit"));
+        assert!(!tls.contains("plaintext HTTP"));
+    }
+
+    #[test]
     fn loopback_endpoint_detection_is_exact_and_case_insensitive() {
         assert!(is_loopback_endpoint("http://LOCALHOST:11434/api/generate"));
         assert!(is_loopback_endpoint("http://127.0.0.1:8080/v1/chat"));
@@ -622,14 +692,14 @@ mod tests {
     fn current_hooks() -> serde_json::Value {
         serde_json::json!({
             "hooks": {
-                "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
-                "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
-                "PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
-                "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "codexctl --permission-hook", "timeout": 30, "statusMessage": "Brain reviewing permission…" }] }],
-                "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
-                "SubagentStart": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
-                "SubagentStop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }],
-                "Stop": [{ "hooks": [{ "type": "command", "command": "codexctl --lifecycle-hook", "timeout": 2 }] }]
+                "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
+                "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
+                "PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
+                "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --permission-hook", "timeout": 30, "statusMessage": "Brain reviewing permission…" }] }],
+                "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
+                "SubagentStart": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
+                "SubagentStop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
+                "Stop": [{ "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }]
             }
         })
     }
@@ -706,7 +776,7 @@ mod tests {
 
         let mut unavailable = current_hooks();
         unavailable["hooks"]["SessionStart"][0]["hooks"][0]["command"] =
-            serde_json::json!("/definitely/missing/codexctl --lifecycle-hook");
+            serde_json::json!("/definitely/missing/coding-brain --lifecycle-hook");
         write_hooks(&path, &unavailable);
         let check = check_codex_hooks_at(Some(&home), &cwd);
         assert_eq!(check.status, CheckStatus::Fail);

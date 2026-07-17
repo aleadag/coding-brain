@@ -215,8 +215,10 @@ impl LifecycleStore {
     }
 }
 
-pub fn compatibility_state_root() -> PathBuf {
-    crate::helpers::dirs_home().join(".codexctl")
+pub fn coding_brain_state_root() -> PathBuf {
+    crate::paths::CodingBrainPaths::resolve(&crate::paths::PathEnvironment::current())
+        .map(|paths| paths.state_root().to_path_buf())
+        .unwrap_or_else(|_| std::env::temp_dir().join("coding-brain"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

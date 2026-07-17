@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn write_decisions(home: &Path, count: usize) {
-    let root = home.join(".codexctl/brain");
+    let root = home.join("state/coding-brain/brain");
     fs::create_dir_all(&root).unwrap();
     let mut file = fs::File::create(root.join("decisions.jsonl")).unwrap();
     for index in 1..=count {
@@ -34,7 +34,7 @@ fn write_decisions(home: &Path, count: usize) {
 }
 
 fn command(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
     command
         .arg("--distill-once")
         .env("HOME", home)

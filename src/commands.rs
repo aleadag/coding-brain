@@ -16,7 +16,7 @@ pub(crate) fn validate_config() -> io::Result<()> {
 
     let files: Vec<PathBuf> = [
         config::Config::global_path(),
-        Some(PathBuf::from(".codexctl.toml")),
+        Some(PathBuf::from(".coding-brain.toml")),
     ]
     .into_iter()
     .flatten()
@@ -67,16 +67,16 @@ pub(crate) fn validate_config() -> io::Result<()> {
 }
 
 pub(crate) fn write_config_init() -> io::Result<()> {
-    let path = std::path::PathBuf::from(".codexctl.toml");
+    let path = std::path::PathBuf::from(".coding-brain.toml");
     if path.exists() {
-        eprintln!("Error: .codexctl.toml already exists. Remove it first or edit directly.");
-        return Err(io::Error::other(".codexctl.toml already exists"));
+        eprintln!("Error: .coding-brain.toml already exists. Remove it first or edit directly.");
+        return Err(io::Error::other(".coding-brain.toml already exists"));
     }
 
     let template = config::Config::template_string();
     std::fs::write(&path, template).map_err(|e| io::Error::other(format!("write: {e}")))?;
-    println!("Created .codexctl.toml with annotated defaults.");
-    println!("Edit the file to customize, then run `codexctl --config-validate` to check.");
+    println!("Created .coding-brain.toml with annotated defaults.");
+    println!("Edit the file to customize, then run `coding-brain --config-validate` to check.");
     Ok(())
 }
 
@@ -427,13 +427,13 @@ pub(crate) fn run_insights(cfg: &config::Config, cli: &Cli, arg: &str) -> io::Re
             let _ = brain::insights::write_insights_mode("on");
             println!("Insights mode: on");
             println!("  Auto-generating insights every 10 decisions during brain distillation.");
-            println!("  Run `codexctl --brain --insights` to view.");
+            println!("  Run `coding-brain --brain --insights` to view.");
         }
         "off" => {
             let _ = brain::insights::write_insights_mode("off");
             println!("Insights mode: off");
             println!(
-                "  Auto-generation disabled. Run `codexctl --brain --insights` to generate on demand."
+                "  Auto-generation disabled. Run `coding-brain --brain --insights` to generate on demand."
             );
         }
         "status" => {
@@ -704,7 +704,7 @@ fn digest_from_hook_payload(
 
 /// Try to parse a `DiffDigest` from stdin (the raw Codex hook payload).
 ///
-/// Hook scripts can pipe full tool call JSON to `codexctl --brain-query`.
+/// Hook scripts can pipe full tool call JSON to `coding-brain --brain-query`.
 /// We only read when stdin is not a TTY — otherwise `read_to_string` would
 /// block waiting for EOF. Failures here are not fatal: missing stdin just
 /// means we degrade to pre-#237 behaviour.

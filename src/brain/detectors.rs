@@ -249,7 +249,7 @@ pub(crate) fn detect_missing_rules(
                     p.sample_count,
                 ),
                 suggestion: Some(format!(
-                    "add to .codexctl.toml: [[rules]] match_tool=\"{}\" match_command=\"{}\" action=\"approve\"",
+                    "consider recording this approval preference in AGENTS.md: tool={} command contains {:?}",
                     p.tool,
                     p.command_pattern.as_deref().unwrap_or("*"),
                 )),
@@ -281,7 +281,7 @@ pub(crate) fn detect_missing_rules(
                     p.sample_count,
                 ),
                 suggestion: Some(format!(
-                    "add to .codexctl.toml: [[rules]] match_tool=\"{}\" match_command=\"{}\" action=\"deny\"",
+                    "consider recording this denial preference in AGENTS.md: tool={} command contains {:?}",
                     p.tool,
                     p.command_pattern.as_deref().unwrap_or("*"),
                 )),

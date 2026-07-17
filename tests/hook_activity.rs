@@ -32,7 +32,7 @@ fn run_permission_hook(home: &Path, payload: &[u8]) -> Output {
 }
 
 fn spawn_permission_hook(home: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_codexctl"))
+    Command::new(env!("CARGO_BIN_EXE_coding-brain"))
         .arg("--permission-hook")
         .env("HOME", home)
         .env("PATH", home.join("bin"))
@@ -45,7 +45,7 @@ fn spawn_permission_hook(home: &Path) -> Child {
 }
 
 fn run_lifecycle_hook(home: &Path, payload: &[u8]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coding-brain"))
         .arg("--lifecycle-hook")
         .env("HOME", home)
         .current_dir(home)
@@ -71,7 +71,7 @@ fn install_model_fixture_with_confidence(home: &Path, action: &str, confidence: 
 }
 
 fn install_model_fixture_full(home: &Path, action: &str, confidence: f64, message: Option<&str>) {
-    let config = home.join(".config/codexctl/config.toml");
+    let config = home.join(".config/coding-brain/config.toml");
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     fs::write(
         config,
@@ -142,8 +142,12 @@ fn overwrite_curl(home: &Path, script: &str) {
 #[test]
 fn deterministic_deny_is_delivered_when_decision_audit_is_down() {
     let home = tempfile::tempdir().unwrap();
-    fs::create_dir_all(home.path().join(".codexctl")).unwrap();
-    fs::write(home.path().join(".codexctl/brain"), b"occupied").unwrap();
+    fs::create_dir_all(home.path().join(".local/state/coding-brain")).unwrap();
+    fs::write(
+        home.path().join(".local/state/coding-brain/brain"),
+        b"occupied",
+    )
+    .unwrap();
 
     let output = run_permission_hook(home.path(), &permission_payload(home.path(), "rm -rf /"));
 
@@ -169,10 +173,13 @@ fn deterministic_deny_is_delivered_when_decision_audit_is_down() {
 #[test]
 fn deterministic_deny_survives_both_audits_being_down() {
     let home = tempfile::tempdir().unwrap();
-    fs::create_dir_all(home.path().join(".codexctl")).unwrap();
-    fs::write(home.path().join(".codexctl/brain"), b"occupied").unwrap();
-    fs::create_dir_all(home.path().join(".local/state")).unwrap();
-    fs::write(home.path().join(".local/state/coding-brain"), b"occupied").unwrap();
+    fs::create_dir_all(home.path().join(".local/state/coding-brain")).unwrap();
+    fs::write(
+        home.path().join(".local/state/coding-brain/brain"),
+        b"occupied",
+    )
+    .unwrap();
+    fs::create_dir_all(home.path().join(".local/state/coding-brain/activity.jsonl")).unwrap();
 
     let output = run_permission_hook(home.path(), &permission_payload(home.path(), "rm -rf /"));
 
@@ -217,8 +224,12 @@ fn model_action_requires_proposal_and_terminal_before_delivery() {
 fn model_proposal_failure_abstains_before_terminal_commit() {
     let home = tempfile::tempdir().unwrap();
     install_model_fixture(home.path(), "approve");
-    fs::create_dir_all(home.path().join(".codexctl")).unwrap();
-    fs::write(home.path().join(".codexctl/brain"), b"occupied").unwrap();
+    fs::create_dir_all(home.path().join(".local/state/coding-brain")).unwrap();
+    fs::write(
+        home.path().join(".local/state/coding-brain/brain"),
+        b"occupied",
+    )
+    .unwrap();
 
     let output = run_permission_hook(home.path(), &permission_payload(home.path(), "cargo test"));
 
@@ -250,7 +261,11 @@ fn model_terminal_failure_abstains_with_proposal_only() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("terminal activity"));
-    let proposal = fs::read_to_string(home.path().join(".codexctl/brain/decisions.jsonl")).unwrap();
+    let proposal = fs::read_to_string(
+        home.path()
+            .join(".local/state/coding-brain/brain/decisions.jsonl"),
+    )
+    .unwrap();
     assert_eq!(proposal.lines().count(), 1);
     let events = activity(home.path()).read().unwrap().events().to_vec();
     assert_eq!(events.len(), 2);

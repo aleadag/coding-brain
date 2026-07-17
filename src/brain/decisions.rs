@@ -92,7 +92,7 @@ pub struct DecisionRecord {
     /// cache without an LLM call. None for records before the field existed.
     pub cache_hit: Option<bool>,
     /// True when the user has marked this decision as canonical training
-    /// material via `codexctl brain review`. Canonical decisions get a
+    /// material via `coding-brain --brain-review`. Canonical decisions get a
     /// large score boost in few-shot retrieval. None == not reviewed.
     pub canonical: Option<bool>,
 }
@@ -257,8 +257,9 @@ pub(super) fn decisions_dir() -> PathBuf {
 
     #[cfg(not(test))]
     {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home).join(".codexctl").join("brain")
+        CodingBrainPaths::resolve(&PathEnvironment::current())
+            .map(|paths| paths.state_root().join("brain"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("coding-brain/brain"))
     }
 }
 
@@ -659,11 +660,7 @@ fn append_hook_audit(audit: &HookDecisionAudit<'_>, user_action: &str) -> io::Re
 }
 
 fn trigger_distill() {
-    let environment = PathEnvironment::new(
-        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    );
+    let environment = PathEnvironment::current();
     if let Ok(paths) = CodingBrainPaths::resolve(&environment) {
         let _ = super::distill::spawn_one_shot_if_due(&paths);
     }
@@ -715,11 +712,7 @@ pub fn read_stats() -> DecisionStats {
 
 /// Clear all decision history and distilled preferences.
 pub fn forget() -> Result<(), String> {
-    let environment = PathEnvironment::new(
-        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    );
+    let environment = PathEnvironment::current();
     let paths = CodingBrainPaths::resolve(&environment)
         .map_err(|error| format!("failed to resolve Coding Brain state: {error:?}"))?;
     forget_at(&paths, &decisions_dir())

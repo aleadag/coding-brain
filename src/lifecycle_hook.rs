@@ -9,7 +9,7 @@ use codexctl_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityOutcome, ActivityState, ProjectEvidence,
     SessionTarget,
 };
-use codexctl_core::lifecycle::{LifecycleEvent, LifecycleStore, compatibility_state_root};
+use codexctl_core::lifecycle::{LifecycleEvent, LifecycleStore, coding_brain_state_root};
 use codexctl_core::paths::{CodingBrainPaths, PathEnvironment};
 use codexctl_core::project::ProjectIdentity;
 use serde::Deserialize;
@@ -50,7 +50,7 @@ pub(crate) fn read_bounded_hook_input(mut reader: impl Read) -> Result<Vec<u8>, 
 }
 
 fn write_diagnostic(stderr: &mut impl Write, diagnostic: impl fmt::Display) {
-    let _ = writeln!(stderr, "codexctl lifecycle hook: {diagnostic}");
+    let _ = writeln!(stderr, "coding-brain lifecycle hook: {diagnostic}");
 }
 
 pub(crate) fn run_with<R: Read, W: Write, E: Write>(
@@ -295,7 +295,7 @@ fn current_paths() -> Option<CodingBrainPaths> {
 }
 
 pub(crate) fn run() {
-    let store = LifecycleStore::at(compatibility_state_root());
+    let store = LifecycleStore::at(coding_brain_state_root());
     let activity = activity_store();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -398,7 +398,7 @@ mod tests {
             run_with(Cursor::new(input), &mut stdout, &mut stderr, &store);
             assert!(stdout.is_empty());
             let diagnostic = String::from_utf8(stderr).unwrap();
-            assert!(diagnostic.starts_with("codexctl lifecycle hook:"));
+            assert!(diagnostic.starts_with("coding-brain lifecycle hook:"));
             assert!(diagnostic.len() < 256);
             assert!(!diagnostic.contains("secret"));
             assert!(!store.snapshot_path().exists());

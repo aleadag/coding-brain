@@ -1,10 +1,10 @@
 //! Interactive review of brain decisions.
 //!
-//! `codexctl brain review` surfaces the highest-value decisions to triage:
+//! `coding-brain --brain-review` surfaces the highest-value decisions to triage:
 //! brain-was-right counterfactuals, Critical-tier safety hits, and
 //! high-confidence calibration misses. The user marks each as canonical
 //! (teaching material) or skips. Canonical marks are stored in
-//! `~/.codexctl/brain/canonical.jsonl` and get a large score boost in
+//! the Coding Brain canonical decision log and get a large score boost in
 //! few-shot retrieval — turning each review pass into supervised training.
 //!
 //! Implementation is plain stdin/stdout. A full ratatui screen integrated
@@ -110,7 +110,7 @@ pub fn run_interactive() -> usize {
         println!("  - The brain has been right on every confident call (great).");
         println!("  - Outcome attribution hasn't kicked in yet (try after more usage).");
         println!();
-        println!("Run `codexctl --brain-stats scorecard` to see overall health.");
+        println!("Run `coding-brain --brain-stats scorecard` to see overall health.");
         return 0;
     }
 

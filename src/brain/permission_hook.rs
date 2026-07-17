@@ -15,7 +15,7 @@ use codexctl_core::brain_activity::{
 };
 use codexctl_core::lifecycle::{
     LifecycleEvent, LifecycleIdentity, LifecycleStore, PermissionDisposition,
-    compatibility_state_root,
+    coding_brain_state_root,
 };
 use codexctl_core::paths::{CodingBrainPaths, PathEnvironment};
 use codexctl_core::project::ProjectIdentity;
@@ -382,7 +382,7 @@ fn parse_request(input: &str) -> Result<PermissionRequest, HookDiagnostic> {
 
 fn write_diagnostic(stderr: &mut impl Write, diagnostic: impl fmt::Display) {
     let diagnostic = bounded_redacted(&diagnostic.to_string());
-    let _ = writeln!(stderr, "codexctl permission hook: {diagnostic}");
+    let _ = writeln!(stderr, "coding-brain permission hook: {diagnostic}");
 }
 
 fn record_permission(
@@ -743,7 +743,7 @@ fn run_with_gate<R, W, E, F>(
     E: Write,
     F: FnOnce(&BrainConfig, &str) -> Result<BrainSuggestion, String>,
 {
-    let lifecycle_store = LifecycleStore::at(compatibility_state_root());
+    let lifecycle_store = LifecycleStore::at(coding_brain_state_root());
     let activity_store = current_paths()
         .ok()
         .map(|paths| ActivityStore::at(paths.state_root().join("activity.jsonl")));

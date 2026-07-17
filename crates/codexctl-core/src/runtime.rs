@@ -25,7 +25,7 @@ pub enum BrainGateMode {
 
 impl BrainGateMode {
     /// Canonical lowercase label — the form persisted to
-    /// `~/.codexctl/brain/gate-mode` and emitted by the TUI status messages.
+    /// the Coding Brain state root and emitted by the TUI status messages.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::On => "on",

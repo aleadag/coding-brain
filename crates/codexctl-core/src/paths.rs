@@ -19,6 +19,26 @@ impl PathEnvironment {
             home,
         }
     }
+
+    pub fn current() -> Self {
+        Self::new(
+            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )
+    }
+
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
+    pub fn xdg_config_home(&self) -> Option<&Path> {
+        self.xdg_config_home.as_deref()
+    }
+
+    pub fn xdg_state_home(&self) -> Option<&Path> {
+        self.xdg_state_home.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

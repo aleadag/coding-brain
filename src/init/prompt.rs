@@ -1,4 +1,4 @@
-//! Minimal interactive-prompt helpers for the `codexctl init` wizard.
+//! Minimal interactive-prompt helpers for the `coding-brain init` wizard.
 //!
 //! Intentionally thin: stdin/stdout only, no TUI library. Every prompt has a
 //! default so a user can mash enter through the wizard and land at sensible
