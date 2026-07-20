@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use coding_brain::brain::activity::ActivityStore;
 use coding_brain_core::brain_activity::{ActivityState, DeliveryState, SnapshotLimits};
+use coding_brain_core::lifecycle::{LifecycleStore, ProjectedStatus};
 use fs2::FileExt;
 
 fn permission_payload(cwd: &Path, command: &str) -> Vec<u8> {
@@ -91,6 +92,22 @@ fn install_model_fixture_full(home: &Path, action: &str, confidence: f64, messag
         "[brain]\nenabled = true\nendpoint = \"http://brain.example.test/api/generate\"\n",
     )
     .unwrap();
+    install_gate_mode_fixture(home, "auto");
+    install_fake_model(home, action, confidence, message);
+}
+
+fn install_default_model_fixture(home: &Path, mode: &str, action: &str) {
+    install_gate_mode_fixture(home, mode);
+    install_fake_model(home, action, 0.9, None);
+}
+
+fn install_gate_mode_fixture(home: &Path, mode: &str) {
+    let gate_mode = home.join(".local/state/coding-brain/brain/gate-mode");
+    fs::create_dir_all(gate_mode.parent().unwrap()).unwrap();
+    fs::write(gate_mode, format!("{mode}\n")).unwrap();
+}
+
+fn install_fake_model(home: &Path, action: &str, confidence: f64, message: Option<&str>) {
     let suggestion = serde_json::json!({
         "action": action,
         "message": message,
@@ -104,10 +121,29 @@ fn install_model_fixture_full(home: &Path, action: &str, confidence: f64, messag
     let curl = bin.join("curl");
     fs::write(
         &curl,
-        format!("#!/bin/sh\nset -eu\ndd of=/dev/null 2>/dev/null\nprintf '%s' '{response}'\n"),
+        format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"${{0}}.args\"\ndd of=\"${{0}}.stdin\" 2>/dev/null\nprintf '%s' '{response}'\n"
+        ),
     )
     .unwrap();
     fs::set_permissions(curl, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn assert_default_model_request(home: &Path) {
+    assert!(
+        !home.join(".config/coding-brain/config.toml").exists(),
+        "default-model fixture unexpectedly wrote TOML"
+    );
+    let args = fs::read_to_string(home.join("bin/curl.args")).unwrap();
+    assert!(
+        args.contains("http://localhost:11434/api/generate"),
+        "missing default endpoint in curl args: {args}"
+    );
+    let stdin = fs::read_to_string(home.join("bin/curl.stdin")).unwrap();
+    assert!(
+        stdin.contains("\"model\":\"gemma4:e4b\""),
+        "missing default model in curl request: {stdin}"
+    );
 }
 
 fn read_json_envelope(reader: &mut impl Read) -> Vec<u8> {
@@ -231,6 +267,58 @@ fn model_action_requires_proposal_and_terminal_before_delivery() {
     let snapshot = store.snapshot(SnapshotLimits::default()).unwrap();
     assert_eq!(snapshot.recent[0].delivery, DeliveryState::Delivered);
     assert!(!snapshot.recent[0].tool_execution_confirmed);
+}
+
+#[test]
+fn explicit_on_without_toml_uses_defaults_and_audits_without_response() {
+    let home = tempfile::tempdir().unwrap();
+    install_default_model_fixture(home.path(), "on", "approve");
+
+    let output = run_permission_hook(home.path(), &permission_payload(home.path(), "cargo test"));
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert_default_model_request(home.path());
+    let proposal = fs::read_to_string(
+        home.path()
+            .join(".local/state/coding-brain/brain/decisions.jsonl"),
+    )
+    .unwrap();
+    let proposal: serde_json::Value = serde_json::from_str(proposal.trim()).unwrap();
+    assert_eq!(proposal["brain_action"], "approve");
+    assert_eq!(proposal["user_action"], "hook_proposal");
+    let events = activity(home.path()).read().unwrap().events().to_vec();
+    assert_eq!(
+        events.iter().map(|event| event.state).collect::<Vec<_>>(),
+        [
+            ActivityState::Observed,
+            ActivityState::Evaluating,
+            ActivityState::Abstained,
+        ]
+    );
+    let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
+    assert_eq!(
+        lifecycle.read().unwrap().snapshot.unwrap().sessions["session-1"].projected_status,
+        Some(ProjectedStatus::NeedsInput)
+    );
+}
+
+#[test]
+fn explicit_auto_without_toml_uses_defaults_and_emits_allow() {
+    let home = tempfile::tempdir().unwrap();
+    install_default_model_fixture(home.path(), "auto", "approve");
+
+    let output = run_permission_hook(home.path(), &permission_payload(home.path(), "cargo test"));
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_default_model_request(home.path());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response["hookSpecificOutput"]["decision"]["behavior"],
+        "allow"
+    );
 }
 
 #[test]

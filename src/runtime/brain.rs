@@ -152,7 +152,9 @@ impl BrainSource for LiveBrainSource {
     }
 
     fn endpoint_health(&self) -> EndpointHealth {
-        let Some(brain_config) = config::Config::load().brain else {
+        let config = config::Config::load();
+        let gate_mode = brain::resolve_gate_mode(config.brain.as_ref()).mode;
+        let Some(brain_config) = endpoint_config_for_mode(config.brain.as_ref(), gate_mode) else {
             return EndpointHealth {
                 detail: Some("Local model is not configured".into()),
                 ..EndpointHealth::default()
@@ -160,6 +162,15 @@ impl BrainSource for LiveBrainSource {
         };
         self.endpoint_health_for(&brain_config.endpoint, &brain_config.model)
     }
+}
+
+fn endpoint_config_for_mode(
+    config: Option<&config::BrainConfig>,
+    gate_mode: BrainGateMode,
+) -> Option<config::BrainConfig> {
+    config
+        .cloned()
+        .or_else(|| (gate_mode != BrainGateMode::Off).then(config::BrainConfig::default))
 }
 
 fn scorecard_from(decisions: &[DecisionSummary], events: &[ActivityEvent]) -> ScorecardSummary {
@@ -417,6 +428,17 @@ mod tests {
 
         assert_eq!(resolved.mode, BrainGateMode::Off);
         assert!(resolved.warning.is_some());
+    }
+
+    #[test]
+    fn active_mode_without_config_uses_default_endpoint_config() {
+        for mode in [BrainGateMode::On, BrainGateMode::Auto] {
+            let config = endpoint_config_for_mode(None, mode).unwrap();
+
+            assert_eq!(config.endpoint, config::BrainConfig::default().endpoint);
+            assert_eq!(config.model, config::BrainConfig::default().model);
+        }
+        assert!(endpoint_config_for_mode(None, BrainGateMode::Off).is_none());
     }
 
     #[test]

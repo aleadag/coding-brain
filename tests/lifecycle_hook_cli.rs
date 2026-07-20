@@ -75,6 +75,9 @@ fn write_brain_config(home: &std::path::Path) {
         "[brain]\nenabled = true\nendpoint = \"http://localhost/api/generate\"\n",
     )
     .unwrap();
+    let gate_mode = home.join(".local/state/coding-brain/brain/gate-mode");
+    fs::create_dir_all(gate_mode.parent().unwrap()).unwrap();
+    fs::write(gate_mode, "auto\n").unwrap();
     let suggestion = serde_json::json!({
         "action": "approve",
         "message": "reviewed by brain",

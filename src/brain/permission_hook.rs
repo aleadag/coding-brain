@@ -248,17 +248,21 @@ where
             terminal_state: ActivityState::Abstained,
         };
     }
-    let Some(config) = config else {
-        return HookEvaluation::Abstain {
-            brain: None,
-            reason: "Brain model is not configured".into(),
-            terminal_state: ActivityState::Abstained,
-        };
-    };
-
-    let mut hook_config = config.clone();
+    let mut hook_config = config.cloned().unwrap_or_default();
     hook_config.timeout_ms = hook_config.timeout_ms.min(HOOK_INFERENCE_TIMEOUT_MS);
     let brain = query::evaluate_with(request, &hook_config, gate_mode.as_str(), infer);
+    if gate_mode == BrainGateMode::On {
+        let reason = brain.reasoning.clone();
+        return HookEvaluation::Abstain {
+            terminal_state: if brain.source == "error" {
+                ActivityState::Error
+            } else {
+                ActivityState::Abstained
+            },
+            brain: Some(brain),
+            reason,
+        };
+    }
     if brain.source == "brain" && brain.below_threshold == Some(false) {
         return match brain.action.as_str() {
             "approve" => HookEvaluation::Allow {
@@ -1096,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn confident_approve_emits_allow_after_persisting() {
+    fn auto_approve_emits_allow_after_persisting() {
         let temp = tempfile::tempdir().unwrap();
         let store = LifecycleStore::at(temp.path());
         let mut stdout = Vec::new();
@@ -1107,7 +1111,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             Some(&enabled_config()),
-            BrainGateMode::On,
+            BrainGateMode::Auto,
             &store,
             |config, _| {
                 assert_eq!(config.timeout_ms, 25_000);
@@ -1160,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn confident_deny_emits_deny() {
+    fn auto_deny_emits_deny() {
         let temp = tempfile::tempdir().unwrap();
         let store = LifecycleStore::at(temp.path());
         let mut stdout = Vec::new();
@@ -1171,7 +1175,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             Some(&enabled_config()),
-            BrainGateMode::On,
+            BrainGateMode::Auto,
             &store,
             |_, _| Ok(suggestion(RuleAction::Deny, 0.9)),
         );
@@ -1229,7 +1233,39 @@ mod tests {
     }
 
     #[test]
-    fn explicit_mode_on_overrides_legacy_disabled_config() {
+    fn active_modes_without_config_use_defaults() {
+        for mode in [BrainGateMode::On, BrainGateMode::Auto] {
+            let evaluation = evaluate_request(
+                &BrainDecisionRequest {
+                    project: "project".into(),
+                    tool_name: "Bash".into(),
+                    tool_input: "cargo test".into(),
+                    diff_digest: None,
+                },
+                None,
+                mode,
+                true,
+                true,
+                |config, _| {
+                    let defaults = BrainConfig::default();
+                    assert_eq!(config.endpoint, defaults.endpoint);
+                    assert_eq!(config.model, defaults.model);
+                    assert_eq!(config.timeout_ms, defaults.timeout_ms);
+                    Ok(suggestion(RuleAction::Approve, 0.9))
+                },
+            );
+
+            assert!(match mode {
+                BrainGateMode::On =>
+                    matches!(evaluation, HookEvaluation::Abstain { brain: Some(_), .. }),
+                BrainGateMode::Auto => matches!(evaluation, HookEvaluation::Allow { .. }),
+                BrainGateMode::Off => unreachable!(),
+            });
+        }
+    }
+
+    #[test]
+    fn explicit_mode_on_overrides_legacy_disabled_config_advisorially() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("gate-mode");
         std::fs::write(&path, "on").unwrap();
@@ -1251,7 +1287,61 @@ mod tests {
             |_, _| Ok(suggestion(RuleAction::Approve, 0.9)),
         );
 
-        assert!(matches!(evaluation, HookEvaluation::Allow { .. }));
+        assert!(matches!(
+            evaluation,
+            HookEvaluation::Abstain { brain: Some(_), .. }
+        ));
+    }
+
+    #[test]
+    fn on_approve_is_audited_without_executable_response() {
+        assert_advisory_suggestion(RuleAction::Approve);
+    }
+
+    #[test]
+    fn on_deny_is_audited_without_executable_response() {
+        assert_advisory_suggestion(RuleAction::Deny);
+    }
+
+    fn assert_advisory_suggestion(action: RuleAction) {
+        let action_label = action.label();
+        let temp = tempfile::tempdir().unwrap();
+        let store = LifecycleStore::at(temp.path());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_with_gate_and_store(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::On,
+            &store,
+            |_, _| Ok(suggestion(action, 0.9)),
+        );
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        let log = std::fs::read_to_string(decisions_dir().join("decisions.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(record["brain_action"], action_label);
+        assert_eq!(record["user_action"], "hook_proposal");
+        assert_eq!(projected_status(&store), Some(ProjectedStatus::NeedsInput));
+        let activity = ActivityStore::at(store.hooks_dir().join("activity.jsonl"));
+        assert_eq!(
+            activity
+                .read()
+                .unwrap()
+                .events()
+                .iter()
+                .map(|event| event.state)
+                .collect::<Vec<_>>(),
+            [
+                ActivityState::Observed,
+                ActivityState::Evaluating,
+                ActivityState::Abstained,
+            ]
+        );
     }
 
     #[test]
@@ -1388,7 +1478,7 @@ mod tests {
             FailingWriter,
             &mut stderr,
             Some(&enabled_config()),
-            BrainGateMode::On,
+            BrainGateMode::Auto,
             &lifecycle,
             Some(&activity),
             |_, _| Ok(suggestion(RuleAction::Approve, 0.9)),
@@ -1413,7 +1503,7 @@ mod tests {
             FailingFlushWriter,
             &mut stderr,
             Some(&enabled_config()),
-            BrainGateMode::On,
+            BrainGateMode::Auto,
             &lifecycle,
             Some(&activity),
             |_, _| Ok(suggestion(RuleAction::Approve, 0.9)),
@@ -1455,11 +1545,12 @@ mod tests {
         for _ in 0..2 {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            run_test(
+            run_test_with_gate(
                 Cursor::new(payload()),
                 &mut stdout,
                 &mut stderr,
                 Some(&enabled_config()),
+                BrainGateMode::Auto,
                 |_, _| {
                     calls.fetch_add(1, Ordering::Relaxed);
                     Ok(suggestion(RuleAction::Approve, 0.9))
