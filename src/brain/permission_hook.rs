@@ -860,6 +860,15 @@ mod tests {
         payload_with_command("cargo test")
     }
 
+    fn expected_project() -> String {
+        std::env::current_dir()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn payload_with_command(command: &str) -> String {
         let cwd = std::env::current_dir().unwrap();
         serde_json::json!({
@@ -931,7 +940,7 @@ mod tests {
         assert_eq!(request.lifecycle.cwd(), std::env::current_dir().unwrap());
         assert_eq!(request.tool_name, "Bash");
         assert_eq!(request.command.as_deref(), Some("cargo test"));
-        assert_eq!(request.project, "codexctl");
+        assert_eq!(request.project, expected_project());
     }
 
     #[test]
@@ -1118,7 +1127,7 @@ mod tests {
         assert!(stderr.is_empty());
         let log = std::fs::read_to_string(decisions_dir().join("decisions.jsonl")).unwrap();
         let record: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
-        assert_eq!(record["project"], "codexctl");
+        assert_eq!(record["project"], expected_project());
         assert_eq!(record["tool"], "Bash");
         assert_eq!(record["command"], "cargo test");
         assert_eq!(record["brain_action"], "approve");

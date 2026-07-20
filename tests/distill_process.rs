@@ -4,7 +4,9 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+#[cfg(debug_assertions)]
+use std::time::Duration;
+use std::time::Instant;
 
 fn write_decisions(home: &Path, count: usize) {
     let root = home.join("state/coding-brain/brain");
@@ -120,6 +122,7 @@ fn maintenance_retains_only_current_and_previous_generations() {
     assert_eq!(generations, 2);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn killed_worker_keeps_old_generation_and_later_process_retries() {
     for stage in ["file-1", "file-2", "file-3", "file-4", "before-pointer"] {

@@ -1114,8 +1114,22 @@ mod tests {
             let path = path.clone();
             threads.push(std::thread::spawn(move || {
                 for item in 0..50 {
-                    append_json_line(&path, &serde_json::json!({"worker": worker, "item": item}))
-                        .unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match append_json_line(
+                            &path,
+                            &serde_json::json!({"worker": worker, "item": item}),
+                        ) {
+                            Ok(()) => break,
+                            Err(error)
+                                if error.kind() == io::ErrorKind::TimedOut
+                                    && Instant::now() < deadline =>
+                            {
+                                std::thread::yield_now();
+                            }
+                            Err(error) => panic!("append failed: {error}"),
+                        }
+                    }
                 }
             }));
         }

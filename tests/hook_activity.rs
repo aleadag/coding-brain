@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -35,7 +36,9 @@ fn spawn_permission_hook(home: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_coding-brain"))
         .arg("--permission-hook")
         .env("HOME", home)
-        .env("PATH", home.join("bin"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", isolated_path(home))
         .current_dir(home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -44,10 +47,20 @@ fn spawn_permission_hook(home: &Path) -> Child {
         .unwrap()
 }
 
+fn isolated_path(home: &Path) -> OsString {
+    let mut paths = vec![home.join("bin")];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).unwrap()
+}
+
 fn run_lifecycle_hook(home: &Path, payload: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_coding-brain"))
         .arg("--lifecycle-hook")
         .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
         .current_dir(home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -91,7 +104,7 @@ fn install_model_fixture_full(home: &Path, action: &str, confidence: f64, messag
     let curl = bin.join("curl");
     fs::write(
         &curl,
-        format!("#!/bin/sh\n/bin/dd of=/dev/null 2>/dev/null\nprintf '%s' '{response}'\n"),
+        format!("#!/bin/sh\nset -eu\ndd of=/dev/null 2>/dev/null\nprintf '%s' '{response}'\n"),
     )
     .unwrap();
     fs::set_permissions(curl, fs::Permissions::from_mode(0o700)).unwrap();
@@ -135,7 +148,7 @@ fn read_json_envelope(reader: &mut impl Read) -> Vec<u8> {
 
 fn overwrite_curl(home: &Path, script: &str) {
     let curl = home.join("bin/curl");
-    fs::write(&curl, format!("#!/bin/sh\n{script}\n")).unwrap();
+    fs::write(&curl, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
     fs::set_permissions(curl, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
@@ -248,11 +261,16 @@ fn model_terminal_failure_abstains_with_proposal_only() {
     let home = tempfile::tempdir().unwrap();
     install_model_fixture(home.path(), "approve");
     let activity_path = home.path().join(".local/state/coding-brain/activity.jsonl");
+    let saved_activity_path = home
+        .path()
+        .join(".local/state/coding-brain/activity-before-failure.jsonl");
     overwrite_curl(
         home.path(),
         &format!(
-            "/bin/dd of=/dev/null 2>/dev/null\n/bin/chmod 400 '{}'\nprintf '%s' '{{\"response\":\"{{\\\"action\\\":\\\"approve\\\",\\\"reasoning\\\":\\\"fixture\\\",\\\"confidence\\\":0.9}}\"}}'",
-            activity_path.display()
+            "dd of=/dev/null 2>/dev/null\nmv '{}' '{}'\nmkdir '{}'\nprintf '%s' '{{\"response\":\"{{\\\"action\\\":\\\"approve\\\",\\\"reasoning\\\":\\\"fixture\\\",\\\"confidence\\\":0.9}}\"}}'",
+            activity_path.display(),
+            saved_activity_path.display(),
+            activity_path.display(),
         ),
     );
 
@@ -267,7 +285,11 @@ fn model_terminal_failure_abstains_with_proposal_only() {
     )
     .unwrap();
     assert_eq!(proposal.lines().count(), 1);
-    let events = activity(home.path()).read().unwrap().events().to_vec();
+    let events = ActivityStore::at(saved_activity_path)
+        .read()
+        .unwrap()
+        .events()
+        .to_vec();
     assert_eq!(events.len(), 2);
 }
 
