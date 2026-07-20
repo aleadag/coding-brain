@@ -29,15 +29,16 @@ Selecting "switch to session" suspends the TUI, focuses or attaches to the selec
 ```bash
 ollama pull gemma4:e4b
 ollama serve
-coding-brain --brain
+coding-brain config set mode on
+coding-brain
 ```
 
-The default is advisory. Review suggestions and corrections before opting into automatic decisions:
+The mode setting is global and persists after the command exits. New installs default to `off`, which disables model evaluation while keeping deterministic safety checks and lifecycle recording active. Use `on` for advisory model evaluation, review its suggestions and corrections, then choose `auto` if you want high-confidence automatic decisions:
 
 ```bash
 coding-brain --brain-review list
 coding-brain --brain-stats scorecard
-coding-brain --brain --auto-run
+coding-brain config set mode auto
 ```
 
 ## Cutover from an older build

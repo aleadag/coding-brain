@@ -32,13 +32,11 @@ let
         programs.coding-brain = {
           enable = true;
           package = testPackage;
+          settings.theme = "dark";
           settings.brain = {
-            enabled = true;
             endpoint = "http://localhost:11434/api/generate";
             model = "gemma4:e4b";
-            auto = false;
             timeout_ms = 25000;
-            terminal_auto_approve_fallback = false;
           };
         };
       }
@@ -278,18 +276,17 @@ assert
     "coding-brain-headless"
   ] cfg);
 pkgs.runCommand "coding-brain-home-manager-module-check" { } ''
-  grep -F 'enabled = true' \
-    ${cfg.xdg.configFile."coding-brain/config.toml".source}
   grep -F 'endpoint = "http://localhost:11434/api/generate"' \
     ${cfg.xdg.configFile."coding-brain/config.toml".source}
   grep -F 'model = "gemma4:e4b"' \
     ${cfg.xdg.configFile."coding-brain/config.toml".source}
-  grep -F 'auto = false' \
-    ${cfg.xdg.configFile."coding-brain/config.toml".source}
   grep -F 'timeout_ms = 25000' \
     ${cfg.xdg.configFile."coding-brain/config.toml".source}
-  grep -F 'terminal_auto_approve_fallback = false' \
+  grep -F 'theme = "dark"' \
     ${cfg.xdg.configFile."coding-brain/config.toml".source}
+  ! grep -F 'enabled =' ${cfg.xdg.configFile."coding-brain/config.toml".source}
+  ! grep -F 'auto =' ${cfg.xdg.configFile."coding-brain/config.toml".source}
+  ! grep -F 'terminal_auto_approve_fallback' ${cfg.xdg.configFile."coding-brain/config.toml".source}
   grep -F 'restart Codex' ${configured.activationPackage}/activate
   grep -F '/hooks' ${configured.activationPackage}/activate
   touch "$out"

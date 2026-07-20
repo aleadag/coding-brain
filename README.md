@@ -33,10 +33,11 @@ To enable local-model evaluation with Ollama:
 ```bash
 ollama pull gemma4:e4b
 ollama serve
-coding-brain --brain
+coding-brain config set mode on
+coding-brain
 ```
 
-Suggestions are advisory by default. `--auto-run` opts into high-confidence automatic actions and requires `--brain`.
+Mode is global and persists after `config set` exits. New installs default to `off`; use `on` for advisory model evaluation or `auto` for high-confidence automatic decisions. Deterministic safety checks and lifecycle recording remain active in every mode, including `off`.
 
 ## State and configuration
 

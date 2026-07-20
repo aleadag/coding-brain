@@ -10,6 +10,9 @@
 #[derive(Debug, Clone)]
 pub struct BrainConfig {
     pub enabled: bool,
+    /// Compatibility marker set when legacy `enabled` or `auto` TOML is explicit.
+    #[doc(hidden)]
+    pub legacy_mode_configured: bool,
     pub endpoint: String,
     pub model: String,
     pub auto_mode: bool,
@@ -51,6 +54,7 @@ impl Default for BrainConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            legacy_mode_configured: false,
             endpoint: "http://localhost:11434/api/generate".into(),
             model: "gemma4:e4b".into(),
             auto_mode: false,

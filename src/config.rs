@@ -92,7 +92,10 @@ impl Config {
             self.theme = Some(theme);
         }
         if let Some(raw_brain) = raw.brain {
+            let legacy_mode_configured =
+                raw_brain.enabled.is_some() || raw_brain.auto_mode.is_some();
             let brain = self.brain.get_or_insert_with(BrainConfig::default);
+            brain.legacy_mode_configured |= legacy_mode_configured;
             if let Some(value) = raw_brain.enabled {
                 brain.enabled = value;
             }
@@ -130,7 +133,7 @@ impl Config {
         warnings
     }
 
-    /// Show resolved config and file locations (for `coding-brain --config`).
+    /// Show resolved config and file locations.
     pub fn print_resolved(&self) {
         println!("Resolved configuration:");
         println!();
@@ -155,10 +158,8 @@ impl Config {
         if let Some(brain) = &self.brain {
             println!();
             println!("  [brain]");
-            println!("  enabled:  {}", brain.enabled);
             println!("  endpoint: {}", brain.endpoint);
             println!("  model:    {}", brain.model);
-            println!("  auto:     {}", brain.auto_mode);
         }
     }
 
@@ -184,10 +185,8 @@ impl Config {
 # ── Brain (Local LLM) ──────────────────────────────────────────────
 
 # [brain]
-# enabled = true
 # endpoint = "http://localhost:11434/api/generate"
 # model = "gemma4:e4b"
-# auto = false
 # timeout_ms = 5000
 # max_context_tokens = 4000
 # few_shot_count = 5
@@ -606,15 +605,18 @@ test_runners = ["just test", "cargo test"]
         // Apply another layer that overrides only fields it sets.
         config.apply(RawConfig {
             brain: Some(RawBrainConfig {
-                auto_mode: Some(true),
+                timeout_ms: Some(7500),
+                test_runners: Some(vec!["just test".into()]),
                 ..RawBrainConfig::default()
             }),
             ..RawConfig::default()
         });
         assert_eq!(config.theme.as_deref(), Some("dark"));
         let brain = config.brain.unwrap();
+        assert!(!brain.legacy_mode_configured);
         assert_eq!(brain.model, "user-model");
-        assert!(brain.auto_mode);
+        assert_eq!(brain.timeout_ms, 7500);
+        assert_eq!(brain.test_runners, vec!["just test"]);
     }
 
     #[test]
@@ -640,12 +642,34 @@ max_context_tokens = 8000
         let mut config = Config::default();
         config.apply(raw);
         let brain = config.brain.expect("brain config should be parsed");
+        assert!(brain.legacy_mode_configured);
         assert!(brain.enabled);
         assert_eq!(brain.endpoint, "http://localhost:8080/v1/chat");
         assert_eq!(brain.model, "llama3:8b");
         assert!(brain.auto_mode);
         assert_eq!(brain.timeout_ms, 3000);
         assert_eq!(brain.max_context_tokens, 8000);
+    }
+
+    #[test]
+    fn legacy_mode_presence_survives_later_config_layers() {
+        let mut config = Config::default();
+        config.apply(RawConfig {
+            brain: Some(RawBrainConfig {
+                enabled: Some(true),
+                ..RawBrainConfig::default()
+            }),
+            ..RawConfig::default()
+        });
+        config.apply(RawConfig {
+            brain: Some(RawBrainConfig {
+                model: Some("project-model".into()),
+                ..RawBrainConfig::default()
+            }),
+            ..RawConfig::default()
+        });
+
+        assert!(config.brain.unwrap().legacy_mode_configured);
     }
 
     #[test]
@@ -672,10 +696,8 @@ max_context_tokens = 8000
             global,
             r#"
 [brain]
-enabled = true
 endpoint = "http://localhost:8080/v1/chat"
 model = "local-model"
-auto = true
 timeout_ms = 3210
 max_context_tokens = 7654
 few_shot_count = 7
@@ -693,10 +715,8 @@ test_runners = ["just test", "cargo test"]
         config.apply(parse_config_file(&project.path().to_path_buf()).unwrap());
 
         let brain = config.brain.unwrap();
-        assert!(brain.enabled);
         assert_eq!(brain.endpoint, "http://localhost:8080/v1/chat");
         assert_eq!(brain.model, "project-model");
-        assert!(brain.auto_mode);
         assert_eq!(brain.timeout_ms, 3210);
         assert_eq!(brain.max_context_tokens, 7654);
         assert_eq!(brain.few_shot_count, 7);

@@ -31,10 +31,11 @@ Deterministic rules work without a model. For local-model evaluation:
 ```bash
 ollama pull gemma4:e4b
 ollama serve
-coding-brain --brain
+coding-brain config set mode on
+coding-brain
 ```
 
-Advisory mode is the default. `--auto-run` explicitly enables high-confidence automatic actions.
+Mode is global and persistent. New installs start in `off`; choose `on` for advisory model evaluation or `auto` for high-confidence automatic decisions. Deterministic safety checks and lifecycle recording stay active in every mode.
 
 ## Boundaries and privacy
 

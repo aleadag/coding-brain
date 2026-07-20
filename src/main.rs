@@ -268,7 +268,7 @@ pub(crate) struct Cli {
     pub(crate) top: Option<usize>,
 
     /// Show auto-generated insights, or set mode (on/off/status).
-    /// Requires brain.enabled in config.
+    /// Requires Brain mode on or auto.
     /// Without argument: show current insights.
     /// With argument: set insights mode (on = auto-generate, off = disable).
     #[arg(long, help_heading = "Brain (Local LLM)", num_args = 0..=1, default_missing_value = "")]
@@ -471,7 +471,12 @@ fn run_main(cli: Cli) -> io::Result<()> {
         brain::permission_hook::run(cfg.brain.as_ref());
         return Ok(());
     }
-    if let Some(brain) = cfg.brain.as_ref().filter(|brain| brain.enabled) {
+    let model_active = matches!(
+        brain::resolve_gate_mode(cfg.brain.as_ref()).mode,
+        coding_brain_core::runtime::BrainGateMode::On
+            | coding_brain_core::runtime::BrainGateMode::Auto
+    );
+    if let Some(brain) = cfg.brain.as_ref().filter(|_| model_active) {
         if let Some(warning) = doctor::endpoint_warning(&brain.endpoint) {
             eprintln!("Warning: {warning}");
         }

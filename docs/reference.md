@@ -18,14 +18,13 @@ Session navigation is intentionally narrow: Coding Brain can switch to the selec
 ## Brain evaluation
 
 ```bash
-coding-brain --brain
-coding-brain --brain --auto-run
-coding-brain --brain --url <endpoint> --brain-model <model>
+coding-brain config get mode
+coding-brain config set mode off|on|auto
+coding-brain --url <endpoint> --brain-model <model>
 coding-brain --brain-query --tool Bash --tool-input "cargo test"
-coding-brain --mode on|off|auto
 ```
 
-`--brain` enables local-model evaluation. `--auto-run` is a separate opt-in for high-confidence automatic decisions. `--brain-query` is the non-interactive permission-hook path and normally receives structured hook input rather than being typed manually.
+The mode is global, persists after the settings command exits, and defaults to `off` on a new install. `off` disables model evaluation, `on` enables advisory evaluation, and `auto` allows high-confidence automatic decisions. Deterministic safety checks and lifecycle recording remain active in every mode. `--brain-query` is the non-interactive permission-hook path and normally receives structured hook input rather than being typed manually.
 
 ## Learning and diagnostics
 
@@ -68,9 +67,12 @@ coding-brain man
 ## Configuration helpers
 
 ```bash
-coding-brain --config
-coding-brain --config-template
-coding-brain --config-validate
+coding-brain config show
+coding-brain config get mode
+coding-brain config set mode on
+coding-brain config template
+coding-brain config validate
+coding-brain config init
 coding-brain --hooks
 ```
 

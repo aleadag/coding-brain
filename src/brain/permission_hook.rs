@@ -894,6 +894,7 @@ mod tests {
     fn enabled_config() -> BrainConfig {
         BrainConfig {
             enabled: true,
+            legacy_mode_configured: true,
             timeout_ms: 60_000,
             ..BrainConfig::default()
         }

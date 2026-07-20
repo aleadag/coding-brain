@@ -6,7 +6,7 @@ Coding Brain merges configuration in this order, with later values winning:
 2. project config at `.coding-brain.toml`
 3. CLI flags
 
-On a typical Linux system, the user file is `~/.config/coding-brain/config.toml`. Inspect the effective values with `coding-brain --config`, print a template with `coding-brain --config-template`, and validate known config files with `coding-brain --config-validate`.
+On a typical Linux system, the user file is `~/.config/coding-brain/config.toml`. Inspect effective values with `coding-brain config show`, print a template with `coding-brain config template`, and validate known config files with `coding-brain config validate`.
 
 Project config may tune model behavior, but it cannot select `brain.endpoint`. Endpoint choice is restricted to user config or an explicit CLI flag because it determines where transcript context is sent.
 
@@ -16,17 +16,17 @@ Project config may tune model behavior, but it cannot select `brain.endpoint`. E
 theme = "dark"
 
 [brain]
-enabled = true
 endpoint = "http://localhost:11434/api/generate"
 model = "gemma4:e4b"
-auto = false
 timeout_ms = 5000
 max_context_tokens = 4000
 few_shot_count = 5
 test_runners = ["cargo test", "npm test", "pytest", "go test", "bun test"]
 ```
 
-`auto = false` keeps decisions advisory. CLI `--auto-run` is the explicit runtime opt-in for automatic high-confidence actions.
+Brain mode is separate from TOML configuration. Set it with `coding-brain config set mode off|on|auto` and inspect it with `coding-brain config get mode`. The setting is global, persists under `$XDG_STATE_HOME/coding-brain/`, and takes effect after the settings command exits. New installs default to `off`; `on` enables advisory model evaluation, while `auto` permits high-confidence automatic decisions.
+
+`off` disables model evaluation, not the safety system. Deterministic safety checks and lifecycle recording remain active in all three modes. Existing `brain.enabled` and `brain.auto` values are read only as a compatibility fallback when no explicit mode state exists; new templates and managed configuration do not emit them.
 
 Loopback endpoints keep model requests on the machine. Coding Brain warns when an endpoint is not loopback and gives plaintext remote HTTP a stronger warning. These advisories do not override an endpoint the user selected in CLI or user config.
 
@@ -41,16 +41,16 @@ Import the module from the `codexctl` flake input, then configure the public `pr
   programs.coding-brain = {
     enable = true;
     settings.brain = {
-      enabled = true;
       endpoint = "http://localhost:11434/api/generate";
       model = "gemma4:e4b";
-      auto = false;
     };
   };
 }
 ```
 
 The module installs its selected package, writes `coding-brain/config.toml`, and can merge eight managed lifecycle and permission definitions into `programs.codex.hooks`. Each hook uses the package's immutable Nix store executable rather than `PATH`, and unrelated hooks remain independent.
+
+Home Manager owns the read-only TOML settings above. Select the writable global mode separately with `coding-brain config set mode on`; an explicit mode state overrides legacy TOML mode fields without modifying the Home Manager file.
 
 Settings rendered by Nix are world-readable in the Nix store. Do not put tokens, credentials, or token-bearing URLs in `programs.coding-brain.settings`.
 

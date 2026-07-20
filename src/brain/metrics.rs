@@ -77,7 +77,9 @@ pub fn print_learning_curve() {
 
     if total < 10 {
         println!("  Not enough decisions yet ({total}). Need at least 10.");
-        println!("  Use coding-brain with --brain and accept/reject suggestions to build history.");
+        println!(
+            "  Run `coding-brain config set mode on`, then accept or reject suggestions to build history."
+        );
         return;
     }
 
@@ -1307,7 +1309,7 @@ pub fn print_impact() {
 
     if total < 5 {
         println!("Not enough decisions yet ({total}). Need at least 5.");
-        println!("Use coding-brain with --brain to build history.");
+        println!("Run `coding-brain config set mode on` to build history.");
         return;
     }
 
@@ -1537,7 +1539,7 @@ pub fn print_evolution() {
 
     if total < 10 {
         println!("Not enough decisions yet ({total}). Need at least 10.");
-        println!("Use coding-brain with --brain to build history.");
+        println!("Run `coding-brain config set mode on` to build history.");
         return;
     }
 

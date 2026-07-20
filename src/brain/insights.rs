@@ -388,7 +388,9 @@ fn format_insights(insights: &[Insight], header: &str) -> String {
 pub fn print_insights() {
     let decisions = super::decisions::read_learning_decisions();
     if decisions.is_empty() {
-        println!("No decision history yet. Use coding-brain with --brain to build history.");
+        println!(
+            "No decision history yet. Run `coding-brain config set mode on` to enable model evaluation and build history."
+        );
         return;
     }
 
@@ -409,7 +411,7 @@ pub fn print_insights() {
     println!(
         "Insights mode: {mode}{}",
         if mode == "off" {
-            " (run coding-brain --brain --insights on to enable auto-generation)"
+            " (run coding-brain --insights on to enable auto-generation)"
         } else {
             ""
         }

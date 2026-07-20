@@ -421,12 +421,17 @@ fn emit_activity(event: &coding_brain_core::brain_activity::ActivityEvent, json_
 }
 
 /// Handle --insights: show insights or set mode (on/off/status).
-/// Requires brain to be enabled.
+/// Requires Brain mode on or auto.
 pub(crate) fn run_insights(cfg: &config::Config, arg: &str) -> io::Result<()> {
-    let brain_enabled = cfg.brain.as_ref().map(|b| b.enabled).unwrap_or(false);
+    let mode = brain::resolve_gate_mode(cfg.brain.as_ref()).mode;
+    let model_active = matches!(
+        mode,
+        coding_brain_core::runtime::BrainGateMode::On
+            | coding_brain_core::runtime::BrainGateMode::Auto
+    );
 
-    if !brain_enabled {
-        eprintln!("Insights requires brain.enabled = true in config.");
+    if !model_active {
+        eprintln!("Insights requires Brain mode on or auto.");
         std::process::exit(1);
     }
 

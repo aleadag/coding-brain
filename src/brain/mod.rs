@@ -103,6 +103,7 @@ pub(crate) fn resolve_gate_mode_at(
 
 fn legacy_gate_mode(config: Option<&BrainConfig>) -> BrainGateMode {
     match config {
+        Some(config) if !config.legacy_mode_configured => BrainGateMode::Off,
         Some(config) if !config.enabled => BrainGateMode::Off,
         Some(config) if config.auto_mode => BrainGateMode::Auto,
         Some(_) => BrainGateMode::On,
@@ -147,16 +148,22 @@ mod tests {
         let path = temp.path().join("gate-mode");
         let advisory = BrainConfig {
             enabled: true,
+            legacy_mode_configured: true,
             auto_mode: false,
             ..BrainConfig::default()
         };
         let automatic = BrainConfig {
             enabled: true,
+            legacy_mode_configured: true,
             auto_mode: true,
             ..BrainConfig::default()
         };
 
         assert_eq!(resolve_gate_mode_at(&path, None).mode, BrainGateMode::Off);
+        assert_eq!(
+            resolve_gate_mode_at(&path, Some(&BrainConfig::default())).mode,
+            BrainGateMode::Off
+        );
         assert_eq!(
             resolve_gate_mode_at(&path, Some(&advisory)).mode,
             BrainGateMode::On
