@@ -26,10 +26,12 @@ The approved design and its twelve-branch stress test are recorded in the
 
 The product is renamed **Coding Brain**, with `coding-brain` as its only
 executable. It does not install `cb` or retain a `codexctl` compatibility
-executable. The repository and Rust crate names may remain `codexctl`
-internally until a later change needs to rename them.
+executable. The later Rust package, crate, and source-directory rename is now
+adopted under the accepted
+[Coding Brain crate namespace design](https://github.com/aleadag/codexctl/blob/main/.internal/specs/2026-07-20-coding-brain-crate-namespace-design.md);
+the GitHub repository remains named `codexctl`.
 
-Brain becomes the default and only interactive TUI in `codexctl-tui`. It has
+Brain becomes the default and only interactive TUI in `coding-brain-tui`. It has
 three tabs: Live, Review, and Scorecard. Live is an attention-first view over
 persisted activity rather than a session list. Review remains the teaching
 queue, and Scorecard remains the quality and safety view.

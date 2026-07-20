@@ -18,7 +18,7 @@
 
 ```bash
 brew upgrade coding-brain                 # Homebrew
-cargo install codexctl                    # Cargo package; installs coding-brain
+cargo install coding-brain                # crates.io
 curl -fsSL https://raw.githubusercontent.com/aleadag/codexctl/main/install.sh | sh
 coding-brain init
 coding-brain doctor

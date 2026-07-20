@@ -18,19 +18,19 @@ Run `cargo fmt` and `cargo clippy -- -D warnings` before committing.
 This is a three-crate Cargo workspace. Dependencies flow downward:
 
 ```text
-codexctl -> codexctl-tui -> codexctl-core
+coding-brain -> coding-brain-tui -> coding-brain-core
 ```
 
-The workspace crates are `codexctl-core` and `codexctl-tui`; the runtime integration is Codex-only.
+The workspace crates are `coding-brain-core` and `coding-brain-tui`; the runtime integration is Codex-only.
 
 ```text
 crates/
-├── codexctl-core/    # session types, Codex transcript discovery, monitor, runtime traits
-└── codexctl-tui/     # terminal UI, recording, demo fixtures
-src/                   # codexctl binary: brain, config, init, runtime
+├── coding-brain-core/    # session types, Codex transcript discovery, monitor, runtime traits
+└── coding-brain-tui/     # Live/Review/Scorecard UI, terminal suspend/restore
+src/                   # coding-brain binary: brain, config, init, runtime
 ```
 
-`codexctl-core` must not depend on binary-only modules. The TUI communicates with the binary through runtime traits in `crates/codexctl-core/src/runtime.rs`.
+`coding-brain-core` must not depend on binary-only modules. The TUI communicates with the binary through runtime traits in `crates/coding-brain-core/src/runtime.rs`.
 
 ## Codex Integration
 
@@ -52,8 +52,8 @@ src/                   # codexctl binary: brain, config, init, runtime
 - In jj repos, honor the exact user-provided revset for commit-message work; do not assume `@`.
 - For jj commit messages, inspect with `jj --no-pager show --git <revset>` or `jj --no-pager diff --git`, apply with `jj describe -r <revset> -m "<emoji> <type>: <imperative summary>"`, then verify with `jj --no-pager st` and `jj --no-pager log -r '<revset>|@' --no-graph`.
 - Status inference logic has extensive coverage; update tests when changing it.
-- Health checks in `crates/codexctl-core/src/health.rs` have unit coverage; add tests for new checks.
-- Terminal backends implement the pattern in `crates/codexctl-core/src/terminals/mod.rs`.
+- Health checks in `crates/coding-brain-core/src/health.rs` have unit coverage; add tests for new checks.
+- Terminal backends implement the pattern in `crates/coding-brain-core/src/terminals/mod.rs`.
 
 ## Compatibility Notes
 

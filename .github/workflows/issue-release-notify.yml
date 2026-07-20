@@ -51,8 +51,8 @@ jobs:
           Fixed in [v${VERSION}](${RELEASE_URL}) — now available via:
 
           \`\`\`
-          brew upgrade codexctl    # Homebrew
-          cargo install codexctl   # crates.io
+          brew upgrade coding-brain     # Homebrew
+          cargo install coding-brain    # crates.io
           \`\`\`
           BODY
             )"

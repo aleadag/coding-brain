@@ -6,12 +6,12 @@
 
 ## Context
 
-Coding Brain now exposes `coding-brain` as its only executable and uses the
-`coding-brain` namespace for configuration and state, but its publishable Rust
-packages and source directories still use the former `codexctl` name. This
-leaves `cargo install codexctl` as an inconsistent public installation path and
-makes internal dependency names disagree with the product boundary established
-by ADR-0002.
+Before this decision, Coding Brain exposed `coding-brain` as its only executable
+and used the `coding-brain` namespace for configuration and state, but its
+publishable Rust packages and source directories still used the former
+`codexctl` name. This left `cargo install codexctl` as an inconsistent public
+installation path and made internal dependency names disagree with the product
+boundary established by ADR-0002.
 
 A separate codename would introduce a third vocabulary without identifying a
 new architectural boundary. Names such as Dream remain appropriate for future

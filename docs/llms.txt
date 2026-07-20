@@ -17,13 +17,13 @@ Current paths:
 - Stable project identity: .coding-brain/project.toml
 
 Install and activate:
-- cargo install codexctl
+- cargo install coding-brain
 - coding-brain init
 - coding-brain doctor
 - restart Codex and inspect /hooks
 - coding-brain
 
-The crates.io package and internal Rust crates remain named codexctl. Only the executable and public runtime namespace are named coding-brain. There is no automatic migration or compatibility executable. Confirmed purge is irreversible; old global data remains available for rollback until purge.
+The crates.io package, executable, and internal Rust crates use the coding-brain namespace. There is no automatic migration or compatibility executable. Confirmed purge is irreversible; old global data remains available for rollback until purge.
 
 Documentation:
 - https://aleadag.github.io/codexctl/

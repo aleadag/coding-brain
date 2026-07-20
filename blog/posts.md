@@ -139,8 +139,8 @@ No `unsafe`. Uses `ratatui` for the TUI. Config is layered TOML (CLI flags > pro
 [showcase GIF]
 
 ```
-cargo install codexctl
-codexctl --demo    # fake sessions, no Codex needed
+cargo install coding-brain
+coding-brain
 ```
 
 GitHub: https://github.com/aleadag/codexctl

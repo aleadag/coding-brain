@@ -19,9 +19,8 @@ serde_json = "1"
 libc = "0.2"
 crossterm = "0.28"
 time = { version = "0.3", features = ["parsing"] }
-# theme.rs uses ratatui::style::Color. Pulling the whole ratatui crate is a
-# touch heavier than we'd like — when coding-brain-tui is extracted (#275) theme
-# may move with it and we can drop this dep.
+# theme.rs exposes Theme with ratatui::style::Color fields through Core's public
+# API, so Core retains ratatui for its consumers.
 ratatui = "0.29"
 fs2 = "0.4"
 tempfile = "3"

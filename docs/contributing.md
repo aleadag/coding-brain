@@ -1,16 +1,16 @@
 # Contributing
 
-The repository keeps the internal `codexctl` crate names even though the public executable is `coding-brain`. It is a three-crate Rust workspace with one dependency direction:
+Coding Brain is a three-crate Rust workspace with one dependency direction:
 
 ```text
-codexctl -> codexctl-tui -> codexctl-core
+coding-brain -> coding-brain-tui -> coding-brain-core
 ```
 
-- `codexctl-core` owns session evidence, transcript discovery, health checks, Coding Brain paths, project identity, terminal backends, and runtime contracts.
-- `codexctl-tui` owns the Live, Review, and Scorecard application and terminal suspend/restore behavior.
+- `coding-brain-core` owns session evidence, transcript discovery, health checks, Coding Brain paths, project identity, terminal backends, and runtime contracts.
+- `coding-brain-tui` owns the Live, Review, and Scorecard application and terminal suspend/restore behavior.
 - the root package owns local Brain evaluation, persistence, config parsing, onboarding, hooks, and the `coding-brain` CLI.
 
-Core must not import root-package modules. The TUI communicates with the binary through runtime traits in `codexctl-core`; optional Agent Deck navigation is represented as a navigation plan rather than a direct dependency on binary internals.
+Core must not import root-package modules. The TUI communicates with the binary through runtime traits in `coding-brain-core`; optional Agent Deck navigation is represented as a navigation plan rather than a direct dependency on binary internals.
 
 ## Build and test
 

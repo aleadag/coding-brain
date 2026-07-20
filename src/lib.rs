@@ -5,13 +5,9 @@
     clippy::io_other_error
 )]
 
-// ---- Foundational modules now living in coding-brain-core (epic #279, PRs for
-// #273 + #276 + the hooks/launch/skills move below).
-//
-// Re-exported under their original names so existing `crate::session::*`
-// (etc.) paths keep resolving without rewriting 50+ import sites. Once #275
-// extracts the TUI into its own crate it will depend on coding-brain-core
-// directly and these aliases can disappear.
+// Foundational modules live in coding-brain-core and are re-exported here under
+// their original names so root-package and internal `crate::session::*` paths
+// continue to resolve. coding-brain-tui depends on Core directly.
 pub use coding_brain_core::{
     discovery, health, helpers, history, hooks, logger, models, monitor, process, rules, session,
     skills, terminals, theme, transcript,

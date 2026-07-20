@@ -69,14 +69,14 @@ cargo fmt --check
 
 ## Architecture Overview
 
-codexctl is a three-crate Rust workspace:
+Coding Brain is a three-crate Rust workspace:
 
 ```text
-codexctl -> codexctl-tui -> codexctl-core
+coding-brain -> coding-brain-tui -> coding-brain-core
 ```
 
 The binary owns the local brain, configuration, onboarding, and runtime adapters.
-The TUI consumes runtime traits from `codexctl-core`; core must not depend on
+The TUI consumes runtime traits from `coding-brain-core`; core must not depend on
 binary-only modules.
 
 ## Conventions & Patterns

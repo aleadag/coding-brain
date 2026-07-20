@@ -12,10 +12,10 @@ Coding Brain can switch to a selected terminal session. [Agent Deck](https://git
 
 ## Start here
 
-The Cargo package is named `codexctl`, while the installed command is `coding-brain`:
+The Cargo package and installed command are both named `coding-brain`:
 
 ```bash
-cargo install codexctl
+cargo install coding-brain
 coding-brain init
 coding-brain doctor
 # Restart Codex after doctor reports the new managed hooks.

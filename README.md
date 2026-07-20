@@ -12,10 +12,10 @@ From Live or Review, you can switch to the selected session. If [Agent Deck](htt
 
 ## Install and activate
 
-The crates.io package is still named `codexctl`, but it installs one executable named `coding-brain`:
+The crates.io package and its executable are both named `coding-brain`:
 
 ```bash
-cargo install codexctl
+cargo install coding-brain
 coding-brain init
 coding-brain doctor
 # Restart Codex after doctor reports the new managed hooks.
@@ -70,14 +70,14 @@ To make a fork learn independently, remove `.coding-brain/project.toml` in that 
 
 ## Architecture
 
-The repository and Rust crates retain their internal `codexctl` names:
+Coding Brain is a three-crate Rust workspace:
 
 ```text
-codexctl -> codexctl-tui -> codexctl-core
+coding-brain -> coding-brain-tui -> coding-brain-core
 
 crates/
-├── codexctl-core/    # session evidence, paths, project identity, runtime contracts
-└── codexctl-tui/     # Live, Review, and Scorecard terminal UI
+├── coding-brain-core/    # session evidence, paths, project identity, runtime contracts
+└── coding-brain-tui/     # Live, Review, and Scorecard terminal UI
 src/                   # coding-brain binary wiring, local brain, config, init
 ```
 

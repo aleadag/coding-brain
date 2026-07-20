@@ -25,7 +25,7 @@ The TUI has three views:
 It reads local Codex hook and transcript evidence. Switching to a session uses the terminal directly or Agent Deck when that optional integration owns the session.
 
 ```bash
-cargo install codexctl
+cargo install coding-brain
 coding-brain init
 coding-brain doctor
 coding-brain
@@ -40,7 +40,7 @@ Coding Brain is a local judgment and learning TUI for Codex: Live shows what nee
 It can switch to sessions through native terminal support or optional Agent Deck, but it deliberately leaves durable task tracking to external tools.
 
 ```bash
-cargo install codexctl
+cargo install coding-brain
 coding-brain init
 coding-brain doctor
 coding-brain

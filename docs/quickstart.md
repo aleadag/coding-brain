@@ -3,14 +3,14 @@
 ## Install and activate
 
 ```bash
-cargo install codexctl
+cargo install coding-brain
 coding-brain init
 coding-brain doctor
 # Restart Codex after doctor reports the new managed hooks.
 coding-brain
 ```
 
-The package/executable distinction is intentional: crates.io retains the package name `codexctl`, but it installs only `coding-brain`.
+The crates.io package and installed executable are both named `coding-brain`.
 
 During init, Coding Brain detects a local model endpoint, installs managed Codex hooks, offers optional skill suggestions, and creates `.coding-brain/project.toml`. Restart Codex and inspect `/hooks` before trusting the new commands. For non-interactive setup:
 
@@ -45,7 +45,7 @@ coding-brain --brain --auto-run
 Coding Brain does not read the old config/state namespace and does not install a `codexctl` compatibility executable. Normal startup and doctor can diagnose exact stale managed hooks, but only init changes them:
 
 ```bash
-cargo install codexctl
+cargo install coding-brain
 coding-brain init
 coding-brain doctor
 # Restart Codex and review /hooks.

@@ -82,78 +82,78 @@ jobs:
             coding-brain-*.tar.gz.sha256
 
   publish-core:
-    name: Publish codexctl-core
+    name: Publish coding-brain-core
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish codexctl-core
+      - name: Publish coding-brain-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codexctl-core/Cargo.toml | head -n 1)
-          FOUND=$(curl -sS -A "codexctl-release-workflow" "https://crates.io/api/v1/crates/codexctl-core/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/coding-brain-core/Cargo.toml | head -n 1)
+          FOUND=$(curl -sS -A "coding-brain-release-workflow" "https://crates.io/api/v1/crates/coding-brain-core/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
           if [ -n "$FOUND" ]; then
-            echo "codexctl-core ${VERSION} already published"
+            echo "coding-brain-core ${VERSION} already published"
           else
-            cargo publish -p codexctl-core --locked --token "$CARGO_REGISTRY_TOKEN"
+            cargo publish -p coding-brain-core --locked --token "$CARGO_REGISTRY_TOKEN"
           fi
 
   publish-tui:
-    name: Publish codexctl-tui
+    name: Publish coding-brain-tui
     needs: publish-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Wait for codexctl-core
+      - name: Wait for coding-brain-core
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codexctl-core/Cargo.toml | head -n 1)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/coding-brain-core/Cargo.toml | head -n 1)
           for i in $(seq 1 30); do
-            FOUND=$(curl -sS -A "codexctl-release-workflow" "https://crates.io/api/v1/crates/codexctl-core/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
+            FOUND=$(curl -sS -A "coding-brain-release-workflow" "https://crates.io/api/v1/crates/coding-brain-core/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
             [ -n "$FOUND" ] && exit 0
-            echo "waiting for codexctl-core ${VERSION} (attempt ${i}/30)"
+            echo "waiting for coding-brain-core ${VERSION} (attempt ${i}/30)"
             sleep 10
           done
           exit 1
-      - name: Publish codexctl-tui
+      - name: Publish coding-brain-tui
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codexctl-tui/Cargo.toml | head -n 1)
-          FOUND=$(curl -sS -A "codexctl-release-workflow" "https://crates.io/api/v1/crates/codexctl-tui/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/coding-brain-tui/Cargo.toml | head -n 1)
+          FOUND=$(curl -sS -A "coding-brain-release-workflow" "https://crates.io/api/v1/crates/coding-brain-tui/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
           if [ -n "$FOUND" ]; then
-            echo "codexctl-tui ${VERSION} already published"
+            echo "coding-brain-tui ${VERSION} already published"
           else
-            cargo publish -p codexctl-tui --locked --token "$CARGO_REGISTRY_TOKEN"
+            cargo publish -p coding-brain-tui --locked --token "$CARGO_REGISTRY_TOKEN"
           fi
 
   publish:
-    name: Publish codexctl
+    name: Publish Coding Brain
     needs: publish-tui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Wait for codexctl-tui
+      - name: Wait for coding-brain-tui
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codexctl-tui/Cargo.toml | head -n 1)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/coding-brain-tui/Cargo.toml | head -n 1)
           for i in $(seq 1 30); do
-            FOUND=$(curl -sS -A "codexctl-release-workflow" "https://crates.io/api/v1/crates/codexctl-tui/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
+            FOUND=$(curl -sS -A "coding-brain-release-workflow" "https://crates.io/api/v1/crates/coding-brain-tui/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
             [ -n "$FOUND" ] && exit 0
-            echo "waiting for codexctl-tui ${VERSION} (attempt ${i}/30)"
+            echo "waiting for coding-brain-tui ${VERSION} (attempt ${i}/30)"
             sleep 10
           done
           exit 1
-      - name: Publish codexctl
+      - name: Publish Coding Brain
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
+        run: cargo publish -p coding-brain --locked --token "$CARGO_REGISTRY_TOKEN"
 
   release:
     name: Create GitHub release
