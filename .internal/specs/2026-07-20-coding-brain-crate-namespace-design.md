@@ -1,6 +1,6 @@
 # Coding Brain Crate Namespace Design
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-20
 - Bead: `codexctl-5ls`
 
@@ -62,4 +62,3 @@ The implementation is complete when:
 - each publishable package can be packaged independently;
 - workspace formatting, tests, clippy, and build pass; and
 - the final executable remains named `coding-brain`.
-
