@@ -554,7 +554,11 @@ fn project_snapshot(log: ActivityLog, limits: SnapshotLimits, now_ms: u64) -> Ac
             ) || matches!(
                 item.delivery,
                 DeliveryState::Unknown | DeliveryState::Failed
-            ));
+            ))
+            && !matches!(
+                (item.state, item.delivery),
+                (ActivityState::Denied, DeliveryState::Delivered)
+            );
         let failed_outcome = matches!(
             item.outcome,
             Some(coding_brain_core::brain_activity::ActivityOutcome::Failed)
@@ -1026,6 +1030,33 @@ mod tests {
         store.append(outcome).unwrap();
         let completed = store.snapshot(SnapshotLimits::default()).unwrap();
         assert!(completed.recent[0].tool_execution_confirmed);
+    }
+
+    #[test]
+    fn denial_delivery_controls_attention() {
+        let (_root, delivered_store) = fixture_store();
+        delivered_store
+            .append(event("delivered", ActivityState::Denied))
+            .unwrap();
+        delivered_store
+            .append(event_at("delivered", ActivityState::Delivered, 101))
+            .unwrap();
+
+        let delivered = delivered_store.snapshot(SnapshotLimits::default()).unwrap();
+        assert!(delivered.attention.is_empty());
+        assert_eq!(delivered.unresolved_count, 0);
+        assert_eq!(delivered.recent.len(), 1);
+        assert_eq!(delivered.recent[0].state, ActivityState::Denied);
+        assert_eq!(delivered.recent[0].delivery, DeliveryState::Delivered);
+
+        let (_root, unknown_store) = fixture_store();
+        unknown_store
+            .append(event("unknown", ActivityState::Denied))
+            .unwrap();
+        let unknown = unknown_store.snapshot(SnapshotLimits::default()).unwrap();
+        assert_eq!(unknown.attention.len(), 1);
+        assert_eq!(unknown.attention[0].delivery, DeliveryState::Unknown);
+        assert_eq!(unknown.unresolved_count, 1);
     }
 
     #[test]

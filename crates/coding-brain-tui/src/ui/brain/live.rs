@@ -177,6 +177,12 @@ pub(crate) fn activity_status(item: &ActivityItem) -> String {
             }
         );
     }
+    if matches!(
+        (item.state, item.delivery),
+        (ActivityState::Denied, DeliveryState::Delivered)
+    ) {
+        return "blocked · command did not execute".into();
+    }
     match item.delivery {
         DeliveryState::Failed => format!(
             "{} · delivery failed · execution not confirmed",

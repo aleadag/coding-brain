@@ -317,15 +317,10 @@ mod tests {
     }
 
     #[test]
-    fn delivered_deny_shows_decision_and_delivery_as_separate_evidence() {
+    fn delivered_deny_is_recent_and_reports_blocked_execution() {
         let mock = MockBrainRuntime {
             activity_snapshot: ActivitySnapshot {
-                attention: vec![AttentionItem {
-                    activity: activity("deny-1", DeliveryState::Delivered),
-                    occurrences: 1,
-                    unresolved_occurrences: 1,
-                }],
-                unresolved_count: 1,
+                recent: vec![activity("deny-1", DeliveryState::Delivered)],
                 ..ActivitySnapshot::default()
             },
             endpoint_health: online(),
@@ -334,7 +329,9 @@ mod tests {
 
         let text = render_text(&fixture_app(mock));
 
-        assert!(text.contains("denied · response delivered · execution not confirmed"));
+        assert!(text.contains("blocked · command did not execute"));
+        assert!(!text.contains("denied · response delivered · execution not confirmed"));
+        assert!(text.contains("No unresolved decisions"));
     }
 
     #[test]

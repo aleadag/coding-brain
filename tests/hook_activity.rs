@@ -217,6 +217,14 @@ fn deterministic_deny_is_delivered_when_decision_audit_is_down() {
             ActivityState::Delivered,
         ]
     );
+    let snapshot = activity(home.path())
+        .snapshot(SnapshotLimits::default())
+        .unwrap();
+    assert!(snapshot.attention.is_empty());
+    assert_eq!(snapshot.unresolved_count, 0);
+    assert_eq!(snapshot.recent.len(), 1);
+    assert_eq!(snapshot.recent[0].state, ActivityState::Denied);
+    assert_eq!(snapshot.recent[0].delivery, DeliveryState::Delivered);
 }
 
 #[test]
