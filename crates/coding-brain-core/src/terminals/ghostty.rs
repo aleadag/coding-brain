@@ -1,5 +1,5 @@
 use super::run_osascript;
-use crate::session::CodexSession;
+use crate::session::AgentSession;
 
 /// Escape a string for embedding inside an AppleScript double-quoted literal.
 fn applescript_escape(s: &str) -> String {
@@ -9,7 +9,7 @@ fn applescript_escape(s: &str) -> String {
 /// Find the best matching Ghostty terminal for a session.
 /// Ghostty's AppleScript API exposes: id, name, working directory (no tty/pid).
 /// Strategy: match by CWD, disambiguate by session name in terminal title.
-fn find_terminal_script(session: &CodexSession) -> String {
+fn find_terminal_script(session: &AgentSession) -> String {
     let cwd = applescript_escape(&session.cwd);
     let session_name = applescript_escape(&session.session_name);
 
@@ -45,7 +45,7 @@ fn find_terminal_script(session: &CodexSession) -> String {
     }
 }
 
-pub fn switch(session: &CodexSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     let find = find_terminal_script(session);
 
     let script = format!(
@@ -61,7 +61,7 @@ pub fn switch(session: &CodexSession) -> Result<(), String> {
     run_osascript(&script)
 }
 
-pub fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
+pub fn send_input(session: &AgentSession, text: &str) -> Result<(), String> {
     let find = find_terminal_script(session);
 
     // Strip trailing newline — we append AppleScript `return` instead so the
@@ -90,16 +90,18 @@ pub fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{CodexSession, RawSession};
+    use crate::session::{AgentSession, RawAgentSession};
 
-    fn make_session(cwd: &str, name: &str) -> CodexSession {
-        let raw = RawSession {
+    fn make_session(cwd: &str, name: &str) -> AgentSession {
+        let raw = RawAgentSession {
+            provider: crate::provider::AgentProvider::Codex,
             pid: 100,
+            process_start_identity: None,
             session_id: "test".into(),
             cwd: cwd.into(),
             started_at: 0,
         };
-        let mut s = CodexSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.session_name = name.into();
         s
     }

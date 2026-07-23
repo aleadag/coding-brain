@@ -242,6 +242,7 @@ mod tests {
 
     fn dec(project: &str, tool: &str, cmd: &str, action: &str, ts: u64) -> DecisionRecord {
         DecisionRecord {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             timestamp: ts.to_string(),
             pid: 1,
             project: project.into(),

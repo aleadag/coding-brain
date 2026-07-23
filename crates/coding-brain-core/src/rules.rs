@@ -1,4 +1,4 @@
-use crate::session::CodexSession;
+use crate::session::AgentSession;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleAction {
@@ -65,7 +65,7 @@ pub struct RuleMatch {
 
 /// Evaluate all rules against a session. Deny rules take precedence.
 /// Among non-deny rules, first match in config order wins.
-pub fn evaluate(rules: &[AutoRule], session: &CodexSession) -> Option<RuleMatch> {
+pub fn evaluate(rules: &[AutoRule], session: &AgentSession) -> Option<RuleMatch> {
     let mut first_non_deny: Option<RuleMatch> = None;
 
     for rule in rules {
@@ -95,7 +95,7 @@ pub fn evaluate(rules: &[AutoRule], session: &CodexSession) -> Option<RuleMatch>
 
 /// Check if all of a rule's conditions match the session.
 /// Omitted conditions (empty vec / None) are treated as wildcards.
-fn matches_rule(rule: &AutoRule, session: &CodexSession) -> bool {
+fn matches_rule(rule: &AutoRule, session: &AgentSession) -> bool {
     if !rule.match_status.is_empty() {
         let status_str = session.status.to_string().to_lowercase();
         let any_match = rule
@@ -171,19 +171,21 @@ fn matches_rule(rule: &AutoRule, session: &CodexSession) -> bool {
 mod tests {
     use super::*;
     use crate::session::{
-        ApprovalEvidence, ApprovalObservation, CodexSession, RawSession, SessionStatus,
+        AgentSession, ApprovalEvidence, ApprovalObservation, RawAgentSession, SessionStatus,
         TelemetryStatus,
     };
     use crate::terminals::Terminal;
 
-    fn make_session() -> CodexSession {
-        let raw = RawSession {
+    fn make_session() -> AgentSession {
+        let raw = RawAgentSession {
+            provider: crate::provider::AgentProvider::Codex,
             pid: 100,
+            process_start_identity: None,
             session_id: "test".into(),
             cwd: "/tmp/my-project".into(),
             started_at: 0,
         };
-        let mut s = CodexSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.status = SessionStatus::NeedsInput;
         s.telemetry_status = TelemetryStatus::Available;
         s.pending_tool_name = Some("Bash".into());

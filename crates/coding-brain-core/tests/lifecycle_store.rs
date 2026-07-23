@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use coding_brain_core::lifecycle::{ApplyOutcome, LifecycleEvent, LifecycleStore, StoreError};
+use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use fs2::FileExt;
 use serde_json::json;
 
@@ -69,7 +70,12 @@ fn concurrent_processes_preserve_all_accepted_updates() {
         .snapshot
         .unwrap();
     for index in &accepted {
-        assert!(snapshot.sessions.contains_key(&format!("session-{index}")));
+        assert!(
+            snapshot.sessions.contains_key(
+                &AgentSessionKey::native(AgentProvider::Codex, format!("session-{index}"))
+                    .storage_key()
+            )
+        );
     }
     assert_eq!(snapshot.sessions.len(), accepted.len());
     let mut sequences = snapshot

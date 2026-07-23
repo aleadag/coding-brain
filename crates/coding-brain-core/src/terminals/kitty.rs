@@ -1,4 +1,4 @@
-use crate::session::CodexSession;
+use crate::session::AgentSession;
 use crate::terminals::{PaneCapture, Terminal, checked_capture, run_bounded};
 
 const MAX_PID_TARGETS: usize = 16;
@@ -52,7 +52,7 @@ fn capture_with(
     Err(last_error.unwrap_or_else(|| "no Kitty PID target matched the session".into()))
 }
 
-pub fn capture(session: &CodexSession) -> Result<PaneCapture, String> {
+pub fn capture(session: &AgentSession) -> Result<PaneCapture, String> {
     capture_with(session.pid, parent_pid, capture_target)
 }
 
@@ -89,7 +89,7 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
     }
 }
 
-pub fn switch(session: &CodexSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     // Kitty has a powerful remote control protocol via `kitty @ focus-window`.
     // Requires `allow_remote_control yes` or `allow_remote_control socket-only` in kitty.conf.
     // Match by the PID of the foreground process in the window.
@@ -124,7 +124,7 @@ pub fn switch(session: &CodexSession) -> Result<(), String> {
     }
 }
 
-pub fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
+pub fn send_input(session: &AgentSession, text: &str) -> Result<(), String> {
     let output = std::process::Command::new("kitty")
         .args([
             "@",

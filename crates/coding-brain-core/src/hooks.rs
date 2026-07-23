@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use crate::session::CodexSession;
+use crate::session::AgentSession;
 
 /// Event types that can trigger hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,7 +69,7 @@ impl HookRegistry {
     }
 
     /// Fire all hooks for an event with session context.
-    pub fn fire(&self, event: HookEvent, session: &CodexSession) {
+    pub fn fire(&self, event: HookEvent, session: &AgentSession) {
         let Some(commands) = self.hooks.get(&event) else {
             return;
         };
@@ -93,7 +93,7 @@ impl HookRegistry {
     pub fn fire_with_status(
         &self,
         event: HookEvent,
-        session: &CodexSession,
+        session: &AgentSession,
         old_status: &str,
         new_status: &str,
     ) {
@@ -145,7 +145,7 @@ impl HookRegistry {
 }
 
 /// Replace template placeholders with session data.
-fn expand_template(template: &str, session: &CodexSession) -> String {
+fn expand_template(template: &str, session: &AgentSession) -> String {
     template
         .replace("{pid}", &session.pid.to_string())
         .replace("{project}", session.display_name())
@@ -166,16 +166,18 @@ fn expand_template(template: &str, session: &CodexSession) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{CodexSession, RawSession, TelemetryStatus};
+    use crate::session::{AgentSession, RawAgentSession, TelemetryStatus};
 
-    fn make_session() -> CodexSession {
-        let raw = RawSession {
+    fn make_session() -> AgentSession {
+        let raw = RawAgentSession {
+            provider: crate::provider::AgentProvider::Codex,
             pid: 12345,
+            process_start_identity: None,
             session_id: "abc-def-123".into(),
             cwd: "/Users/test/projects/my-app".into(),
             started_at: 0,
         };
-        let mut s = CodexSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.model = "gpt-5.5".into();
         s.cost_usd = 3.45;
         s.total_input_tokens = 500_000;

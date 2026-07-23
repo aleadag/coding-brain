@@ -22,6 +22,7 @@ use coding_brain_core::brain_activity::{
 };
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::project::ProjectId;
+use coding_brain_core::provider::AgentProvider;
 
 use super::activity::ActivityStore;
 use super::decisions::{DecisionRecord, decisions_dir, read_all_decisions};
@@ -61,6 +62,9 @@ const EDIT_LIKE_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"]
 /// What the PostToolUse hook saw, written before any decision attribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingOutcome {
+    /// Provider that emitted the hook outcome. Missing legacy values are Codex.
+    #[serde(default)]
+    pub provider: AgentProvider,
     /// Tool name (e.g., "Bash", "Edit").
     pub tool: String,
     /// Command or input summary captured by the hook.
@@ -68,10 +72,10 @@ pub struct PendingOutcome {
     pub command: Option<String>,
     /// Project slug (basename of cwd at hook time).
     pub project: String,
-    /// Codex session id, if the hook payload carried one.
+    /// Provider-native session id, if the hook payload carried one.
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Codex tool_use_id, if available — used for stricter joining later.
+    /// Provider-native tool-use id, if available — used for stricter joining later.
     #[serde(default)]
     pub tool_use_id: Option<String>,
     /// Tool exit code (0 = success). None when the hook can't infer one.
@@ -452,6 +456,9 @@ fn fanout_test_failures(
         let mut candidates: Vec<&DecisionRecord> = decisions
             .iter()
             .filter(|d| {
+                if d.provider != p.provider {
+                    return false;
+                }
                 let Some(_did) = d.decision_id.as_deref() else {
                     return false;
                 };
@@ -611,7 +618,8 @@ pub fn reap_with_runners(_test_runners: &[String]) -> ReapStats {
         }
 
         let best = decisions.iter().position(|decision| {
-            decision.decision_id.as_deref() == Some(strict_decision_id.as_str())
+            decision.provider == p.provider
+                && decision.decision_id.as_deref() == Some(strict_decision_id.as_str())
                 && !claimed.contains(&strict_decision_id)
         });
 
@@ -679,7 +687,8 @@ fn append_activity_outcome(
             event.state.is_terminal()
                 && event.decision_id.is_some()
                 && event.session.as_ref().is_some_and(|session| {
-                    session.session_id == session_id
+                    session.provider == pending.provider
+                        && session.session_id == session_id
                         && session.tool_use_id.as_deref() == Some(tool_use_id)
                 })
         })
@@ -741,8 +750,9 @@ fn append_orphan_activity(
     diagnostic: &str,
 ) -> Result<(), String> {
     let activity_id = format!(
-        "orphan_outcome_{}_{}_{}",
+        "orphan_outcome_{}_{}_{}_{}",
         pending.ts,
+        pending.provider.as_str(),
         pending.session_id.as_deref().unwrap_or("missing-session"),
         pending.tool_use_id.as_deref().unwrap_or("missing-tool-use")
     );
@@ -794,6 +804,7 @@ mod tests {
 
     fn decision_with_id(id: &str, project: &str, tool: &str, command: &str) -> DecisionRecord {
         DecisionRecord {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             timestamp: "2026-07-14T00:00:00Z".into(),
             pid: 1,
             project: project.into(),
@@ -917,6 +928,7 @@ mod tests {
     #[test]
     fn pending_outcome_round_trip_json() {
         let p = PendingOutcome {
+            provider: AgentProvider::Codex,
             tool: "Bash".into(),
             command: Some("cargo test".into()),
             project: "codexctl".into(),
@@ -945,6 +957,88 @@ mod tests {
     }
 
     #[test]
+    fn pending_outcome_defaults_legacy_provider_and_retains_explicit_provider() {
+        let legacy: PendingOutcome =
+            serde_json::from_str(r#"{"tool":"Bash","project":"p","ts":1}"#).unwrap();
+        let claude: PendingOutcome =
+            serde_json::from_str(r#"{"provider":"claude","tool":"Bash","project":"p","ts":1}"#)
+                .unwrap();
+
+        assert_eq!(serde_json::to_value(legacy).unwrap()["provider"], "codex");
+        assert_eq!(serde_json::to_value(claude).unwrap()["provider"], "claude");
+    }
+
+    #[test]
+    fn stable_hook_ids_join_only_the_matching_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let project_id = ProjectId::Temporary("project".into());
+        for (provider, activity_id, decision_id) in [
+            (
+                coding_brain_core::provider::AgentProvider::Claude,
+                "claude-activity",
+                "claude-decision",
+            ),
+            (
+                coding_brain_core::provider::AgentProvider::Codex,
+                "codex-activity",
+                "codex-decision",
+            ),
+        ] {
+            activity
+                .append(ActivityEvent {
+                    schema_version: ACTIVITY_SCHEMA_VERSION,
+                    kind: ActivityKind::Decision,
+                    activity_id: activity_id.into(),
+                    recorded_at_ms: 1,
+                    project: ProjectEvidence {
+                        project_id: project_id.clone(),
+                        cwd: temp.path().to_path_buf(),
+                        label: None,
+                    },
+                    session: Some(coding_brain_core::brain_activity::SessionTarget {
+                        provider,
+                        session_id: "same-session".into(),
+                        turn_id: Some("same-turn".into()),
+                        tool_use_id: Some("same-tool".into()),
+                        project_id: project_id.clone(),
+                        cwd: temp.path().to_path_buf(),
+                        provider_hints: Vec::new(),
+                    }),
+                    state: ActivityState::Allowed,
+                    tool: Some("Bash".into()),
+                    normalized_command: None,
+                    fingerprint: None,
+                    rule_id: None,
+                    confidence: None,
+                    threshold: None,
+                    reasoning: None,
+                    decision_id: Some(decision_id.into()),
+                    outcome: None,
+                    correction: None,
+                    note: None,
+                    supersedes: None,
+                })
+                .unwrap();
+        }
+        let pending: PendingOutcome = serde_json::from_value(serde_json::json!({
+            "provider": "claude",
+            "tool": "Bash",
+            "project": "project",
+            "session_id": "same-session",
+            "tool_use_id": "same-tool",
+            "exit_code": 0,
+            "ts": 2
+        }))
+        .unwrap();
+
+        assert_eq!(
+            append_activity_outcome(&activity, &pending).unwrap(),
+            Some("claude-decision".into())
+        );
+    }
+
+    #[test]
     fn stable_hook_ids_append_outcome_without_copying_command() {
         let temp = tempfile::tempdir().unwrap();
         let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
@@ -961,6 +1055,7 @@ mod tests {
                     label: None,
                 },
                 session: Some(coding_brain_core::brain_activity::SessionTarget {
+                    provider: coding_brain_core::provider::AgentProvider::Codex,
                     session_id: "session-1".into(),
                     turn_id: Some("turn-1".into()),
                     tool_use_id: Some("call-1".into()),
@@ -984,6 +1079,7 @@ mod tests {
             })
             .unwrap();
         let pending = PendingOutcome {
+            provider: AgentProvider::Codex,
             tool: "Bash".into(),
             command: Some("cargo test".into()),
             project: "wrong-project-name-must-not-matter".into(),
@@ -1016,6 +1112,7 @@ mod tests {
             label: None,
         };
         let session = coding_brain_core::brain_activity::SessionTarget {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             session_id: "session-1".into(),
             turn_id: Some("turn-1".into()),
             tool_use_id: Some("call-1".into()),
@@ -1070,6 +1167,7 @@ mod tests {
             })
             .unwrap();
         let pending = PendingOutcome {
+            provider: AgentProvider::Codex,
             tool: "Bash".into(),
             command: Some("cargo test".into()),
             project: "codexctl".into(),

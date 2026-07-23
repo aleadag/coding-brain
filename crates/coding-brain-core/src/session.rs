@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::lifecycle::{LifecycleDiagnostic, LifecycleEvidence, TranscriptEvidence};
+use crate::provider::{AgentProvider, AgentSessionKey, LiveProcessIdentity};
 use crate::terminals::Terminal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -110,8 +111,12 @@ impl TelemetryStatus {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RawSession {
+pub struct RawAgentSession {
+    #[serde(default)]
+    pub provider: AgentProvider,
     pub pid: u32,
+    #[serde(default, rename = "processStartIdentity")]
+    pub process_start_identity: Option<u64>,
     #[serde(rename = "sessionId")]
     pub session_id: String,
     pub cwd: String,
@@ -120,8 +125,10 @@ pub struct RawSession {
 }
 
 #[derive(Debug, Clone)]
-pub struct CodexSession {
+pub struct AgentSession {
+    pub provider: AgentProvider,
     pub pid: u32,
+    pub process_start_identity: Option<u64>,
     pub process_backed: bool,
     #[allow(dead_code)]
     pub session_id: String,
@@ -328,8 +335,8 @@ impl SubagentBreakdown {
     }
 }
 
-impl CodexSession {
-    pub fn from_raw(raw: RawSession) -> Self {
+impl AgentSession {
+    pub fn from_raw(raw: RawAgentSession) -> Self {
         let project_name = raw.cwd.rsplit('/').next().unwrap_or("unknown").to_string();
 
         let now_ms = std::time::SystemTime::now()
@@ -340,7 +347,9 @@ impl CodexSession {
         let elapsed = Duration::from_millis(elapsed_ms);
 
         Self {
+            provider: raw.provider,
             pid: raw.pid,
+            process_start_identity: raw.process_start_identity,
             process_backed: true,
             session_id: raw.session_id,
             cwd: raw.cwd,
@@ -422,6 +431,84 @@ impl CodexSession {
         }
     }
 
+    pub fn key(&self) -> AgentSessionKey {
+        AgentSessionKey::native(self.provider, &self.session_id)
+    }
+
+    pub fn live_process_identity(&self) -> Option<LiveProcessIdentity> {
+        if !self.process_backed || self.is_remote() {
+            return None;
+        }
+        LiveProcessIdentity::try_new(
+            self.provider,
+            self.pid,
+            self.process_start_identity?,
+            &self.tty,
+        )
+    }
+
+    pub fn supports_structured_discovery(&self) -> bool {
+        self.provider.supports_structured_discovery()
+    }
+
+    pub fn has_lifecycle_evidence(&self) -> bool {
+        self.lifecycle_evidence.is_some()
+    }
+
+    pub fn has_transcript_context(&self) -> bool {
+        self.transcript_evidence.is_some()
+    }
+
+    pub fn has_permission_observation(&self) -> bool {
+        self.explicit_input_required
+            || matches!(self.approval, ApprovalObservation::Confirmed(_))
+            || self.lifecycle_evidence.is_some_and(|evidence| {
+                evidence.status_event == crate::lifecycle::LifecycleEventName::PermissionRequest
+            })
+    }
+
+    pub fn supports_executable_permission_response(&self) -> bool {
+        self.has_permission_observation()
+            && (self.lifecycle_evidence.is_some_and(|evidence| {
+                matches!(
+                    evidence.status_event,
+                    crate::lifecycle::LifecycleEventName::PermissionRequest
+                        | crate::lifecycle::LifecycleEventName::PreToolUse
+                )
+            }) || self.live_process_identity().is_some())
+    }
+
+    pub fn has_outcome_evidence(&self) -> bool {
+        self.lifecycle_evidence.is_some_and(|evidence| {
+            matches!(
+                evidence.latest_event,
+                crate::lifecycle::LifecycleEventName::PostToolUse
+                    | crate::lifecycle::LifecycleEventName::Stop
+            )
+        }) || self.transcript_evidence.is_some_and(|evidence| {
+            matches!(
+                evidence.semantic,
+                crate::lifecycle::TranscriptSemantic::Complete
+            )
+        })
+    }
+
+    pub fn supports_native_attach(&self) -> bool {
+        self.provider.supports_native_attach()
+    }
+
+    pub fn supports_terminal_focus_fallback(&self) -> bool {
+        self.live_process_identity().is_some()
+    }
+
+    pub fn supports_guarded_terminal_input(&self) -> bool {
+        self.supports_terminal_focus_fallback() && self.has_permission_observation()
+    }
+
+    pub fn supports_guarded_recovery_response(&self) -> bool {
+        self.supports_terminal_focus_fallback() && self.has_outcome_evidence()
+    }
+
     /// Tool identity currently presented to consumers.
     ///
     /// This is a projection, not approval authorization. Guarded input still
@@ -477,8 +564,10 @@ impl CodexSession {
         jsonl_path: PathBuf,
     ) -> Self {
         let pid = stable_synthetic_pid(&session_id);
-        let mut session = Self::from_raw(RawSession {
+        let mut session = Self::from_raw(RawAgentSession {
+            provider: AgentProvider::Codex,
             pid,
+            process_start_identity: None,
             session_id,
             cwd,
             started_at,
@@ -553,7 +642,7 @@ impl CodexSession {
         self.worker_origin.is_some()
     }
 
-    /// Build a CodexSession from remote JSON (as received via heartbeat/HTTP).
+    /// Build a AgentSession from remote JSON (as received via heartbeat/HTTP).
     #[allow(dead_code)]
     pub fn from_remote_json(worker_id: &str, json: &serde_json::Value) -> Option<Self> {
         let pid = json.get("pid")?.as_u64()? as u32;
@@ -580,8 +669,10 @@ impl CodexSession {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let mut session = Self::from_raw(RawSession {
+        let mut session = Self::from_raw(RawAgentSession {
+            provider: AgentProvider::Codex,
             pid,
+            process_start_identity: None,
             session_id: format!("remote-{worker_id}-{pid}"),
             cwd: project.to_string(),
             started_at: now_ms.saturating_sub(elapsed_secs * 1000),
@@ -1000,14 +1091,92 @@ fn subagent_label(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::AgentProvider;
 
-    fn make_session() -> CodexSession {
-        CodexSession::from_raw(RawSession {
+    fn make_session() -> AgentSession {
+        AgentSession::from_raw(RawAgentSession {
+            provider: AgentProvider::Codex,
             pid: 1,
+            process_start_identity: None,
             session_id: "session-1".into(),
             cwd: "/tmp/project".into(),
             started_at: 0,
         })
+    }
+
+    #[test]
+    fn session_key_includes_provider() {
+        let mut session = make_session();
+        session.provider = AgentProvider::Claude;
+
+        assert_eq!(session.key().provider, AgentProvider::Claude);
+        assert_eq!(session.key().session_id, "session-1");
+    }
+
+    #[test]
+    fn legacy_raw_session_defaults_to_codex_without_process_start_evidence() {
+        let raw: RawAgentSession =
+            serde_json::from_str(r#"{"pid":7,"sessionId":"legacy","cwd":"/repo","startedAt":1}"#)
+                .unwrap();
+
+        assert_eq!(raw.provider, AgentProvider::Codex);
+        assert_eq!(raw.process_start_identity, None);
+    }
+
+    #[test]
+    fn live_process_identity_requires_current_process_evidence() {
+        let mut session = make_session();
+        session.tty = "/dev/pts/4".into();
+        assert_eq!(session.live_process_identity(), None);
+
+        session.process_start_identity = Some(99);
+        let identity = session.live_process_identity().unwrap();
+        assert_eq!(identity.provider, AgentProvider::Codex);
+        assert_eq!(identity.tty, "pts/4");
+    }
+
+    #[test]
+    fn evidence_capabilities_follow_current_session_evidence() {
+        let mut session = make_session();
+        assert!(session.supports_structured_discovery());
+        assert!(!session.has_lifecycle_evidence());
+        assert!(!session.has_transcript_context());
+        assert!(!session.has_permission_observation());
+        assert!(!session.supports_executable_permission_response());
+        assert!(!session.has_outcome_evidence());
+        assert!(!session.supports_native_attach());
+        assert!(!session.supports_terminal_focus_fallback());
+        assert!(!session.supports_guarded_terminal_input());
+        assert!(!session.supports_guarded_recovery_response());
+
+        session.provider = AgentProvider::Antigravity;
+        assert!(!session.supports_structured_discovery());
+        session.provider = AgentProvider::Claude;
+        assert!(session.supports_native_attach());
+        session.process_start_identity = Some(99);
+        session.tty = "/dev/pts/4".into();
+        assert!(session.supports_terminal_focus_fallback());
+        assert!(!session.supports_guarded_terminal_input());
+        assert!(!session.supports_guarded_recovery_response());
+
+        session.lifecycle_evidence = Some(LifecycleEvidence {
+            projected_status: crate::lifecycle::ProjectedStatus::NeedsInput,
+            status_event: crate::lifecycle::LifecycleEventName::PermissionRequest,
+            status_received_at_ms: 1,
+            latest_event: crate::lifecycle::LifecycleEventName::PostToolUse,
+            latest_received_at_ms: 2,
+            active_subagent_count: 0,
+        });
+        session.transcript_evidence = Some(TranscriptEvidence::complete(Some(2)));
+        session.explicit_input_required = true;
+
+        assert!(session.has_lifecycle_evidence());
+        assert!(session.has_transcript_context());
+        assert!(session.has_permission_observation());
+        assert!(session.supports_executable_permission_response());
+        assert!(session.has_outcome_evidence());
+        assert!(session.supports_guarded_terminal_input());
+        assert!(session.supports_guarded_recovery_response());
     }
 
     #[test]
@@ -1223,7 +1392,7 @@ mod tests {
             "tokens_in": 50000,
             "tokens_out": 10000,
         });
-        let session = CodexSession::from_remote_json("macbook-02", &json).unwrap();
+        let session = AgentSession::from_remote_json("macbook-02", &json).unwrap();
         assert!(session.is_remote());
         assert_eq!(session.worker_origin.as_deref(), Some("macbook-02"));
         assert_eq!(session.pid, 42);
@@ -1246,7 +1415,7 @@ mod tests {
             ("SomethingElse", SessionStatus::Unknown),
         ] {
             let json = serde_json::json!({"pid": 1, "project": "p", "status": label});
-            let session = CodexSession::from_remote_json("w", &json).unwrap();
+            let session = AgentSession::from_remote_json("w", &json).unwrap();
             assert_eq!(session.status, expected, "status mismatch for {label}");
         }
     }
@@ -1255,24 +1424,24 @@ mod tests {
     fn from_remote_json_returns_none_on_missing_fields() {
         // Missing pid
         let json = serde_json::json!({"project": "x", "status": "Idle"});
-        assert!(CodexSession::from_remote_json("w", &json).is_none());
+        assert!(AgentSession::from_remote_json("w", &json).is_none());
 
         // Missing project
         let json = serde_json::json!({"pid": 1, "status": "Idle"});
-        assert!(CodexSession::from_remote_json("w", &json).is_none());
+        assert!(AgentSession::from_remote_json("w", &json).is_none());
     }
 
     #[test]
     fn remote_session_display_name_shows_worker_prefix() {
         let json = serde_json::json!({"pid": 1, "project": "api-server", "status": "Idle"});
-        let session = CodexSession::from_remote_json("laptop-01", &json).unwrap();
+        let session = AgentSession::from_remote_json("laptop-01", &json).unwrap();
         assert_eq!(session.display_name(), "[laptop-01] api-server");
     }
 
     #[test]
     fn remote_session_json_includes_worker_origin() {
         let json = serde_json::json!({"pid": 1, "project": "test", "status": "Idle"});
-        let session = CodexSession::from_remote_json("remote-w", &json).unwrap();
+        let session = AgentSession::from_remote_json("remote-w", &json).unwrap();
         let output = session.to_json_value();
         assert_eq!(
             output.get("worker_origin").and_then(|v| v.as_str()),

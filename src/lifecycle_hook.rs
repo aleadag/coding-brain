@@ -197,6 +197,7 @@ fn observation_event(
             label: None,
         },
         session: Some(SessionTarget {
+            provider: lifecycle.identity().provider(),
             session_id: lifecycle.identity().session_id().to_string(),
             turn_id: lifecycle.identity().turn_id().map(str::to_string),
             tool_use_id: input
@@ -240,7 +241,8 @@ fn correlate_outcome(
     let exact_activity_ids = unique_activity_ids(log.events().iter().filter(|event| {
         event.kind == ActivityKind::Decision
             && event.session.as_ref().is_some_and(|session| {
-                session.session_id == identity.session_id()
+                session.provider == identity.provider()
+                    && session.session_id == identity.session_id()
                     && session.turn_id.as_deref() == identity.turn_id()
                     && session.tool_use_id.as_deref() == Some(tool_use_id.as_str())
             })
@@ -482,6 +484,7 @@ fn diagnostic_event(
             label: None,
         },
         session: Some(SessionTarget {
+            provider: lifecycle.identity().provider(),
             session_id: lifecycle.identity().session_id().to_string(),
             turn_id: lifecycle.identity().turn_id().map(str::to_string),
             tool_use_id: input.normalized_tool_use_id(),
@@ -836,7 +839,7 @@ mod tests {
 
         let store = LifecycleStore::at(temp.path().join("newer"));
         fs::create_dir_all(store.hooks_dir()).unwrap();
-        let newer = br#"{"schema_version":2}"#;
+        let newer = br#"{"schema_version":3}"#;
         fs::write(store.snapshot_path(), newer).unwrap();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -864,6 +867,7 @@ mod tests {
                     label: Some("project".into()),
                 },
                 session: Some(SessionTarget {
+                    provider: coding_brain_core::provider::AgentProvider::Codex,
                     session_id: "session-1".into(),
                     turn_id: Some("turn-1".into()),
                     tool_use_id: Some("call-1".into()),
@@ -1017,6 +1021,70 @@ mod tests {
     }
 
     #[test]
+    fn post_tool_use_does_not_join_another_providers_same_native_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let project_id = ProjectId::Temporary("project-1".into());
+        activity
+            .append(ActivityEvent {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                kind: ActivityKind::Decision,
+                activity_id: "claude-activity".into(),
+                recorded_at_ms: 1,
+                project: ProjectEvidence {
+                    project_id: project_id.clone(),
+                    cwd: temp.path().to_path_buf(),
+                    label: Some("project".into()),
+                },
+                session: Some(SessionTarget {
+                    provider: coding_brain_core::provider::AgentProvider::Claude,
+                    session_id: "session-1".into(),
+                    turn_id: Some("turn-1".into()),
+                    tool_use_id: Some("call-1".into()),
+                    project_id,
+                    cwd: temp.path().to_path_buf(),
+                    provider_hints: Vec::new(),
+                }),
+                state: ActivityState::Allowed,
+                tool: Some("Bash".into()),
+                normalized_command: Some("cargo test".into()),
+                fingerprint: None,
+                rule_id: None,
+                confidence: Some(0.9),
+                threshold: Some(0.6),
+                reasoning: Some("safe".into()),
+                decision_id: Some("decision-claude".into()),
+                outcome: None,
+                correction: None,
+                note: None,
+                supersedes: None,
+            })
+            .unwrap();
+        let input = serde_json::json!({
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "cwd": temp.path(),
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "call-1",
+            "tool_response": {"exit_code": 0}
+        });
+
+        run_with_activity(
+            Cursor::new(input.to_string()),
+            Vec::new(),
+            Vec::new(),
+            &lifecycle,
+            Some(&activity),
+        );
+
+        let events = activity.read().unwrap().events().to_vec();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].activity_id, "claude-activity");
+    }
+
+    #[test]
     fn post_tool_use_ignores_newer_lifecycle_observation_when_joining_outcome() {
         let temp = tempfile::tempdir().unwrap();
         let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
@@ -1034,6 +1102,7 @@ mod tests {
                     label: Some("project".into()),
                 },
                 session: Some(SessionTarget {
+                    provider: coding_brain_core::provider::AgentProvider::Codex,
                     session_id: "session-1".into(),
                     turn_id: Some("turn-1".into()),
                     tool_use_id: Some("call-1".into()),
@@ -1240,6 +1309,7 @@ mod tests {
                     label: Some("project".into()),
                 },
                 session: Some(SessionTarget {
+                    provider: coding_brain_core::provider::AgentProvider::Codex,
                     session_id: "session-1".into(),
                     turn_id: Some("turn-1".into()),
                     tool_use_id: Some("call-1".into()),
@@ -1314,6 +1384,7 @@ mod tests {
                     label: None,
                 },
                 session: Some(SessionTarget {
+                    provider: coding_brain_core::provider::AgentProvider::Codex,
                     session_id: "session-1".into(),
                     turn_id: Some("turn-1".into()),
                     tool_use_id: None,

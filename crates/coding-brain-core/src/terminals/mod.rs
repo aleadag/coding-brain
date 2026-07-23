@@ -12,7 +12,7 @@ mod warp;
 mod wezterm;
 mod windows_terminal;
 
-use crate::session::{ApprovalEvidence, ApprovalObservation, CodexSession};
+use crate::session::{AgentSession, ApprovalEvidence, ApprovalObservation};
 use std::io::Read;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -1176,7 +1176,7 @@ pub(crate) fn launch_session(
     }
 }
 
-pub fn switch_to_terminal(session: &CodexSession) -> Result<(), String> {
+pub fn switch_to_terminal(session: &AgentSession) -> Result<(), String> {
     let terminal = detect_terminal();
 
     // Only require a TTY for terminals that match sessions by TTY name.
@@ -1224,7 +1224,7 @@ pub fn switch_to_terminal(session: &CodexSession) -> Result<(), String> {
 }
 
 #[allow(dead_code)]
-pub(crate) fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
+pub(crate) fn send_input(session: &AgentSession, text: &str) -> Result<(), String> {
     match detect_terminal() {
         Terminal::Gnome => gnome_terminal::send_input(session, text),
         #[cfg(target_os = "macos")]
@@ -1293,10 +1293,10 @@ const APPROVAL_PROMPT_PATTERNS: &[ApprovalPromptPattern] = &[
 ];
 
 trait ApprovalIo {
-    fn capture(&self, session: &CodexSession) -> Result<PaneCapture, String>;
+    fn capture(&self, session: &AgentSession) -> Result<PaneCapture, String>;
     fn send_enter(
         &self,
-        session: &CodexSession,
+        session: &AgentSession,
         backend: Terminal,
         target: &str,
     ) -> Result<(), String>;
@@ -1305,13 +1305,13 @@ trait ApprovalIo {
 struct RealApprovalIo;
 
 impl ApprovalIo for RealApprovalIo {
-    fn capture(&self, session: &CodexSession) -> Result<PaneCapture, String> {
+    fn capture(&self, session: &AgentSession) -> Result<PaneCapture, String> {
         capture_session(session)
     }
 
     fn send_enter(
         &self,
-        _session: &CodexSession,
+        _session: &AgentSession,
         backend: Terminal,
         target: &str,
     ) -> Result<(), String> {
@@ -1319,7 +1319,7 @@ impl ApprovalIo for RealApprovalIo {
     }
 }
 
-fn capture_session(session: &CodexSession) -> Result<PaneCapture, String> {
+fn capture_session(session: &AgentSession) -> Result<PaneCapture, String> {
     let captures = [tmux::capture(session), kitty::capture(session)]
         .into_iter()
         .filter_map(Result::ok)
@@ -1471,7 +1471,7 @@ fn last_approval_prompt(text: &str) -> Option<(&'static ApprovalPromptPattern, S
 
 fn match_approval_prompt(
     capture: &PaneCapture,
-    session: &CodexSession,
+    session: &AgentSession,
 ) -> Option<ApprovalEvidence> {
     if !session.is_shell_permission_request() {
         return None;
@@ -1504,7 +1504,7 @@ fn match_approval_prompt(
 
 fn refresh_approval_observation_with(
     io: &impl ApprovalIo,
-    session: &mut CodexSession,
+    session: &mut AgentSession,
     checked_at_ms: u64,
 ) {
     session.approval_checked_at_ms = checked_at_ms;
@@ -1523,7 +1523,7 @@ fn refresh_approval_observation_with(
 }
 
 #[allow(dead_code)]
-pub(crate) fn refresh_approval_observation(session: &mut CodexSession) {
+pub(crate) fn refresh_approval_observation(session: &mut AgentSession) {
     let checked_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1533,7 +1533,7 @@ pub(crate) fn refresh_approval_observation(session: &mut CodexSession) {
 
 fn approve_shell_permission_with(
     io: &impl ApprovalIo,
-    session: &CodexSession,
+    session: &AgentSession,
 ) -> Result<(), String> {
     let ApprovalObservation::Confirmed(expected) = &session.approval else {
         return Err("approval is not terminal-confirmed".into());
@@ -1551,7 +1551,7 @@ fn approve_shell_permission_with(
 }
 
 #[allow(dead_code)]
-pub(crate) fn approve_shell_permission(session: &CodexSession) -> Result<(), String> {
+pub(crate) fn approve_shell_permission(session: &AgentSession) -> Result<(), String> {
     approve_shell_permission_with(&RealApprovalIo, session)
 }
 
@@ -1573,7 +1573,7 @@ pub(crate) fn run_osascript(script: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::RawSession;
+    use crate::session::RawAgentSession;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1600,9 +1600,11 @@ mod tests {
         }
     }
 
-    fn pending_shell_session(call_id: &str, command: &str) -> CodexSession {
-        let mut session = CodexSession::from_raw(RawSession {
+    fn pending_shell_session(call_id: &str, command: &str) -> AgentSession {
+        let mut session = AgentSession::from_raw(RawAgentSession {
+            provider: crate::provider::AgentProvider::Codex,
             pid: 7,
+            process_start_identity: None,
             session_id: "session-7".into(),
             cwd: "/repo".into(),
             started_at: 0,
@@ -1614,20 +1616,20 @@ mod tests {
         session
     }
 
-    fn pending_exec_wrapper_session(call_id: &str, input: &str) -> CodexSession {
+    fn pending_exec_wrapper_session(call_id: &str, input: &str) -> AgentSession {
         let mut session = pending_shell_session(call_id, input);
         session.pending_tool_name = Some("exec".into());
         session
     }
 
     impl ApprovalIo for FakeApprovalIo {
-        fn capture(&self, _session: &CodexSession) -> Result<PaneCapture, String> {
+        fn capture(&self, _session: &AgentSession) -> Result<PaneCapture, String> {
             self.captures.lock().unwrap().pop_front().unwrap()
         }
 
         fn send_enter(
             &self,
-            _session: &CodexSession,
+            _session: &AgentSession,
             _backend: Terminal,
             _target: &str,
         ) -> Result<(), String> {

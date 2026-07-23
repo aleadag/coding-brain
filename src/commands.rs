@@ -529,6 +529,7 @@ pub(crate) fn run_record_outcome(cli: &Cli) -> io::Result<()> {
                 .unwrap_or_else(|| "unknown".into())
         });
         PendingOutcome {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             tool,
             command: cli.tool_input.clone().filter(|s| !s.is_empty()),
             project,

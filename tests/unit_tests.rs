@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use coding_brain_core::provider::AgentProvider;
+
 // Test session status display and sorting
 #[test]
 fn test_session_status_sort_order() {
@@ -24,14 +26,16 @@ fn test_session_status_display() {
 
 #[test]
 fn test_session_from_raw() {
-    use coding_brain::session::{CodexSession, RawSession};
-    let raw = RawSession {
+    use coding_brain::session::{AgentSession, RawAgentSession};
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 12345,
+        process_start_identity: None,
         session_id: "abc-123".to_string(),
         cwd: "/Users/test/projects/my-app".to_string(),
         started_at: 0,
     };
-    let session = CodexSession::from_raw(raw);
+    let session = AgentSession::from_raw(raw);
     assert_eq!(session.pid, 12345);
     assert_eq!(session.project_name, "my-app");
     assert_eq!(session.display_name(), "my-app");
@@ -39,28 +43,32 @@ fn test_session_from_raw() {
 
 #[test]
 fn test_session_display_name_prefers_session_name() {
-    use coding_brain::session::{CodexSession, RawSession};
-    let raw = RawSession {
+    use coding_brain::session::{AgentSession, RawAgentSession};
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "x".to_string(),
         cwd: "/tmp/foo".to_string(),
         started_at: 0,
     };
-    let mut session = CodexSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     session.session_name = "my-custom-name".to_string();
     assert_eq!(session.display_name(), "my-custom-name");
 }
 
 #[test]
 fn test_format_elapsed() {
-    use coding_brain::session::{CodexSession, RawSession};
-    let raw = RawSession {
+    use coding_brain::session::{AgentSession, RawAgentSession};
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "x".to_string(),
         cwd: "/tmp".to_string(),
         started_at: 0,
     };
-    let mut session = CodexSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     session.elapsed = Duration::from_secs(3661);
     assert_eq!(session.format_elapsed(), "01:01:01");
 
@@ -70,14 +78,16 @@ fn test_format_elapsed() {
 
 #[test]
 fn test_format_tokens() {
-    use coding_brain::session::{CodexSession, RawSession, TelemetryStatus};
-    let raw = RawSession {
+    use coding_brain::session::{AgentSession, RawAgentSession, TelemetryStatus};
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "x".to_string(),
         cwd: "/tmp".to_string(),
         started_at: 0,
     };
-    let mut session = CodexSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
 
     assert_eq!(session.format_tokens(), "n/a");
 
@@ -90,14 +100,16 @@ fn test_format_tokens() {
 
 #[test]
 fn test_format_cost() {
-    use coding_brain::session::{CodexSession, RawSession, TelemetryStatus};
-    let raw = RawSession {
+    use coding_brain::session::{AgentSession, RawAgentSession, TelemetryStatus};
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "x".to_string(),
         cwd: "/tmp".to_string(),
         started_at: 0,
     };
-    let mut session = CodexSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
 
     assert_eq!(session.format_cost(), "n/a");
 
@@ -112,20 +124,22 @@ fn test_format_cost() {
 
 #[test]
 fn test_cwd_to_project_name() {
-    use coding_brain::session::{CodexSession, RawSession};
+    use coding_brain::session::{AgentSession, RawAgentSession};
     let cases = vec![
         ("/Users/foo/bar/my-project", "my-project"),
         ("/tmp", "tmp"),
         ("/a/b/c/deeply-nested", "deeply-nested"),
     ];
     for (cwd, expected) in cases {
-        let raw = RawSession {
+        let raw = RawAgentSession {
+            provider: AgentProvider::Codex,
             pid: 1,
+            process_start_identity: None,
             session_id: "x".to_string(),
             cwd: cwd.to_string(),
             started_at: 0,
         };
-        let session = CodexSession::from_raw(raw);
+        let session = AgentSession::from_raw(raw);
         assert_eq!(session.project_name, expected, "cwd={cwd}");
     }
 }

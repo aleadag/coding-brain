@@ -8,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 use serde::Deserialize;
 
+use crate::provider::{AgentProvider, AgentSessionKey};
+
 use super::{
     ApplyOutcome, LIFECYCLE_SCHEMA_VERSION, LifecycleEvent, LifecycleSnapshot,
     MAX_ACTIVE_SUBAGENTS, MAX_RECENT_TURNS,
@@ -93,10 +95,10 @@ impl LifecycleStore {
         snapshot.sessions.retain(|_, state| {
             received_at_ms.saturating_sub(state.latest_received_at_ms) <= SESSION_RETENTION_MS
         });
-        if !snapshot
-            .sessions
-            .contains_key(event.identity().session_id())
-            && snapshot.sessions.len() >= MAX_SESSIONS
+        let session_key =
+            AgentSessionKey::native(event.identity().provider(), event.identity().session_id())
+                .storage_key();
+        if !snapshot.sessions.contains_key(&session_key) && snapshot.sessions.len() >= MAX_SESSIONS
         {
             return Err(StoreError::SessionCapacity);
         }
@@ -143,12 +145,15 @@ impl LifecycleStore {
         if header.schema_version > LIFECYCLE_SCHEMA_VERSION {
             return Ok(LoadedSnapshot::NewerSchema(header.schema_version));
         }
-        if header.schema_version != LIFECYCLE_SCHEMA_VERSION {
+        if !matches!(header.schema_version, 1 | LIFECYCLE_SCHEMA_VERSION) {
             return Ok(LoadedSnapshot::Corrupt);
         }
-        let Ok(snapshot) = serde_json::from_slice::<LifecycleSnapshot>(&bytes) else {
+        let Ok(mut snapshot) = serde_json::from_slice::<LifecycleSnapshot>(&bytes) else {
             return Ok(LoadedSnapshot::Corrupt);
         };
+        if header.schema_version == 1 {
+            snapshot = project_schema_one(snapshot);
+        }
         if !valid_snapshot_shape(&snapshot) {
             return Ok(LoadedSnapshot::Corrupt);
         }
@@ -335,8 +340,9 @@ fn valid_snapshot_shape(snapshot: &LifecycleSnapshot) -> bool {
                 .map(|state| state.latest_sequence)
                 .max()
                 .unwrap_or(0)
-        && snapshot.sessions.iter().all(|(session_id, state)| {
-            valid_id(session_id)
+        && snapshot.sessions.iter().all(|(storage_key, state)| {
+            AgentSessionKey::from_storage_key(storage_key)
+                .is_some_and(|key| valid_id(&key.session_id))
                 && valid_path(&state.cwd)
                 && state.transcript_path.as_deref().is_none_or(valid_path)
                 && state.current_turn.as_deref().is_none_or(valid_id)
@@ -348,6 +354,21 @@ fn valid_snapshot_shape(snapshot: &LifecycleSnapshot) -> bool {
                     .keys()
                     .all(|agent_id| valid_id(agent_id))
         })
+}
+
+fn project_schema_one(mut snapshot: LifecycleSnapshot) -> LifecycleSnapshot {
+    snapshot.schema_version = LIFECYCLE_SCHEMA_VERSION;
+    snapshot.sessions = snapshot
+        .sessions
+        .into_iter()
+        .map(|(session_id, state)| {
+            (
+                AgentSessionKey::native(AgentProvider::Codex, session_id).storage_key(),
+                state,
+            )
+        })
+        .collect();
+    snapshot
 }
 
 fn valid_id(value: &str) -> bool {
@@ -413,6 +434,7 @@ mod tests {
 
     use super::super::ProjectedStatus;
     use super::*;
+    use crate::provider::{AgentProvider, AgentSessionKey};
 
     fn prompt(session: &str, turn: &str) -> LifecycleEvent {
         LifecycleEvent::parse(
@@ -426,6 +448,10 @@ mod tests {
             .as_bytes(),
         )
         .unwrap()
+    }
+
+    fn key(session_id: &str) -> String {
+        AgentSessionKey::native(AgentProvider::Codex, session_id).storage_key()
     }
 
     #[test]
@@ -456,9 +482,37 @@ mod tests {
         let healthy = store.read().unwrap();
         assert_eq!(healthy.condition, StoreCondition::Healthy);
         assert_eq!(
-            healthy.snapshot.unwrap().sessions["session-1"].projected_status,
+            healthy.snapshot.unwrap().sessions
+                [&AgentSessionKey::native(AgentProvider::Codex, "session-1").storage_key()]
+                .projected_status,
             Some(ProjectedStatus::Processing)
         );
+    }
+
+    #[test]
+    fn schema_one_snapshot_projects_bare_keys_as_codex_without_rewriting_on_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LifecycleStore::at(temp.path());
+        fs::create_dir_all(store.hooks_dir()).unwrap();
+        let mut legacy = LifecycleSnapshot {
+            schema_version: 1,
+            ..LifecycleSnapshot::default()
+        };
+        legacy.apply(prompt("legacy-session", "turn-1"), 1_000);
+        let qualified =
+            AgentSessionKey::native(AgentProvider::Codex, "legacy-session").storage_key();
+        let state = legacy.sessions.remove(&qualified).unwrap();
+        legacy.sessions.insert("legacy-session".into(), state);
+        let original = serde_json::to_vec(&legacy).unwrap();
+        fs::write(store.snapshot_path(), &original).unwrap();
+
+        let view = store.read().unwrap();
+
+        assert_eq!(view.condition, StoreCondition::Healthy);
+        let projected = view.snapshot.unwrap();
+        assert_eq!(projected.schema_version, LIFECYCLE_SCHEMA_VERSION);
+        assert!(projected.sessions.contains_key(&qualified));
+        assert_eq!(fs::read(store.snapshot_path()).unwrap(), original);
     }
 
     #[test]
@@ -466,15 +520,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = LifecycleStore::at(temp.path());
         fs::create_dir_all(store.hooks_dir()).unwrap();
-        let original = br#"{"schema_version":2}"#;
+        let original = br#"{"schema_version":3}"#;
         fs::write(store.snapshot_path(), original).unwrap();
 
         let view = store.read().unwrap();
-        assert_eq!(view.condition, StoreCondition::NewerSchema(2));
+        assert_eq!(view.condition, StoreCondition::NewerSchema(3));
         assert!(view.snapshot.is_none());
         assert_eq!(
             store.record_at(prompt("session-1", "turn-1"), 1_000),
-            Err(StoreError::NewerSchema(2))
+            Err(StoreError::NewerSchema(3))
         );
         assert_eq!(fs::read(store.snapshot_path()).unwrap(), original);
     }
@@ -530,8 +584,8 @@ mod tests {
             .record_at(prompt("fresh", "turn-1"), SESSION_RETENTION_MS + 1_001)
             .unwrap();
         let snapshot = store.read().unwrap().snapshot.unwrap();
-        assert!(!snapshot.sessions.contains_key("old"));
-        assert!(snapshot.sessions.contains_key("fresh"));
+        assert!(!snapshot.sessions.contains_key(&key("old")));
+        assert!(snapshot.sessions.contains_key(&key("fresh")));
 
         let temp = tempfile::tempdir().unwrap();
         let store = LifecycleStore::at(temp.path());
@@ -562,8 +616,11 @@ mod tests {
         fs::create_dir_all(store.hooks_dir()).unwrap();
         let mut snapshot = LifecycleSnapshot::default();
         snapshot.apply(prompt("session-1", "turn-1"), 1_000);
-        snapshot.sessions.get_mut("session-1").unwrap().current_turn =
-            Some("x".repeat(super::super::MAX_ID_BYTES + 1));
+        snapshot
+            .sessions
+            .get_mut(&key("session-1"))
+            .unwrap()
+            .current_turn = Some("x".repeat(super::super::MAX_ID_BYTES + 1));
         fs::write(
             store.snapshot_path(),
             serde_json::to_vec(&snapshot).unwrap(),

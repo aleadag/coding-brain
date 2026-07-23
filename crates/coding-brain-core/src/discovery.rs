@@ -9,7 +9,12 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::codex_transcript::{CodexEvent, parse_line};
-use crate::session::CodexSession;
+use crate::process::{ProcessSnapshot, ProcessSnapshotEntry, capture_process_snapshot};
+use crate::provider::AgentProvider;
+use crate::session::{AgentSession, RawAgentSession, SessionStatus};
+
+pub mod antigravity;
+pub mod claude;
 
 const TRANSCRIPT_INDEX_TTL: Duration = Duration::from_secs(10);
 
@@ -33,20 +38,129 @@ pub fn projects_dir() -> PathBuf {
     sessions_dir()
 }
 
-pub fn scan_sessions() -> Vec<CodexSession> {
+pub fn scan_sessions() -> Vec<AgentSession> {
     scan_sessions_with_state(&mut TranscriptAssignmentState::default())
 }
 
-pub fn scan_sessions_with_state(state: &mut TranscriptAssignmentState) -> Vec<CodexSession> {
-    let processes = scan_live_codex_processes();
+pub fn scan_sessions_with_state(state: &mut TranscriptAssignmentState) -> Vec<AgentSession> {
+    let snapshot = capture_process_snapshot();
+    scan_codex_sessions_from_snapshot(&snapshot, state)
+}
+
+#[derive(Debug, Default)]
+pub struct ProviderDiscoveryState {
+    pub transcript_assignments: TranscriptAssignmentState,
+    pub claude_inventory: claude::ClaudeInventoryCache,
+}
+
+pub fn scan_agent_sessions_with_state(state: &mut ProviderDiscoveryState) -> Vec<AgentSession> {
+    scan_agent_sessions_with_runners(
+        state,
+        Instant::now(),
+        capture_process_snapshot,
+        claude::run_inventory_command,
+    )
+}
+
+fn scan_agent_sessions_with_runners<P, C>(
+    state: &mut ProviderDiscoveryState,
+    now: Instant,
+    process_runner: P,
+    claude_runner: C,
+) -> Vec<AgentSession>
+where
+    P: FnOnce() -> ProcessSnapshot,
+    C: FnOnce(Duration, usize) -> Result<Vec<u8>, claude::InventoryError>,
+{
+    let snapshot = process_runner();
+    let inventory = claude::inventory_with_runner(&mut state.claude_inventory, now, claude_runner);
+    let stale_inventory = state.claude_inventory.last_error.is_some();
+
+    let mut sessions =
+        scan_codex_sessions_from_snapshot(&snapshot, &mut state.transcript_assignments);
+    sessions.extend(claude::sessions_from_inventory(
+        &inventory,
+        stale_inventory,
+        snapshot.succeeded,
+        &snapshot.entries,
+    ));
+    sessions.extend(antigravity::sessions_from_processes(&snapshot.entries));
+    sessions.sort_by_key(|session| Reverse(session.started_at));
+    sessions
+}
+
+fn scan_codex_sessions_from_snapshot(
+    snapshot: &ProcessSnapshot,
+    state: &mut TranscriptAssignmentState,
+) -> Vec<AgentSession> {
+    let processes = snapshot
+        .entries
+        .iter()
+        .filter(|process| process.has_executable_basename(&["codex", ".codex-wrapped"]))
+        .map(live_codex_process)
+        .collect::<Vec<_>>();
     if processes.is_empty() {
-        state.retained.clear();
-        state.transitions.clear();
-        state.unmatched_index_generations.clear();
+        clear_transcript_assignments(state);
         return Vec::new();
     }
 
     sessions_from_discovered_processes(processes, state)
+}
+
+fn clear_transcript_assignments(state: &mut TranscriptAssignmentState) {
+    state.retained.clear();
+    state.transitions.clear();
+    state.unmatched_index_generations.clear();
+}
+
+fn live_codex_process(process: &ProcessSnapshotEntry) -> LiveCodexProcess {
+    LiveCodexProcess {
+        pid: process.pid,
+        cwd: process.cwd.to_string_lossy().into_owned(),
+        started_at: process.started_at,
+        start_identity: process.start_identity,
+        tty: process.tty.clone(),
+        cpu_percent: process.cpu_percent,
+        mem_mb: process.mem_mb,
+        command_args: args_after_executable(&process.args, &["codex", ".codex-wrapped"]),
+    }
+}
+
+fn session_from_provider_process(
+    provider: AgentProvider,
+    process: &ProcessSnapshotEntry,
+) -> AgentSession {
+    let mut session = AgentSession::from_raw(RawAgentSession {
+        provider,
+        pid: process.pid,
+        process_start_identity: Some(process.start_identity),
+        session_id: process_session_id(process),
+        cwd: process.cwd.to_string_lossy().into_owned(),
+        started_at: process.started_at,
+    });
+    session.status = SessionStatus::Unknown;
+    apply_process_evidence(&mut session, process);
+    session
+}
+
+fn process_session_id(process: &ProcessSnapshotEntry) -> String {
+    format!(
+        "process:{}:{}:{}:{}",
+        process.pid,
+        process.start_identity,
+        process.tty.len(),
+        process.tty
+    )
+}
+
+fn apply_process_evidence(session: &mut AgentSession, process: &ProcessSnapshotEntry) {
+    session.pid = process.pid;
+    session.process_start_identity = Some(process.start_identity);
+    session.process_backed = true;
+    session.tty = process.tty.clone();
+    session.cpu_percent = process.cpu_percent;
+    session.mem_mb = process.mem_mb;
+    session.command_args = process.args.clone();
 }
 
 #[derive(Debug, Clone)]
@@ -107,121 +221,7 @@ fn transcript_index_cache() -> &'static Mutex<Option<CachedTranscriptIndex>> {
     TRANSCRIPT_INDEX_CACHE.get_or_init(|| Mutex::new(None))
 }
 
-fn scan_live_codex_processes() -> Vec<LiveCodexProcess> {
-    if std::env::var_os("CODEXCTL_DISABLE_PROCESS_DISCOVERY").is_some() {
-        return Vec::new();
-    }
-
-    let output = std::process::Command::new("ps")
-        .args(["-eo", "pid=,ppid=,tty=,%cpu=,rss=,etimes=,comm=,args="])
-        .env_clear()
-        .output();
-
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-
-    parse_live_codex_processes(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn parse_live_codex_processes(ps_stdout: &str) -> Vec<LiveCodexProcess> {
-    ps_stdout
-        .lines()
-        .filter_map(parse_live_codex_process)
-        .collect()
-}
-
-fn parse_live_codex_process(line: &str) -> Option<LiveCodexProcess> {
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    if fields.len() < 7 {
-        return None;
-    }
-
-    let pid = fields[0].parse::<u32>().ok()?;
-    let tty = fields[2].to_string();
-    let cpu_percent = fields[3].parse::<f32>().unwrap_or(0.0);
-    let rss_kb = fields[4].parse::<f64>().unwrap_or(0.0);
-    let elapsed_secs = fields[5].parse::<u64>().unwrap_or(0);
-    let comm = fields[6];
-    let args = fields.get(7..).unwrap_or_default().join(" ");
-
-    if !is_codex_process(comm, &args) {
-        return None;
-    }
-
-    let cwd = process_cwd(pid)?.to_string_lossy().to_string();
-    let command_args = args_after_codex(&args);
-
-    let started_at = process_started_at_ms(elapsed_secs);
-    Some(LiveCodexProcess {
-        pid,
-        cwd,
-        started_at,
-        start_identity: process_start_identity(pid).unwrap_or(started_at),
-        tty,
-        cpu_percent,
-        mem_mb: rss_kb / 1024.0,
-        command_args,
-    })
-}
-
-fn is_codex_process(comm: &str, args: &str) -> bool {
-    if matches!(comm, "codex" | ".codex-wrapped") {
-        return true;
-    }
-
-    args.split_whitespace()
-        .next()
-        .and_then(|arg| PathBuf::from(arg).file_name().map(|name| name.to_owned()))
-        .and_then(|name| name.to_str().map(str::to_owned))
-        .is_some_and(|name| matches!(name.as_str(), "codex" | ".codex-wrapped"))
-}
-
-fn process_cwd(pid: u32) -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        fs::read_link(format!("/proc/{pid}/cwd")).ok()
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-fn process_started_at_ms(elapsed_secs: u64) -> u64 {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    now_ms.saturating_sub(elapsed_secs.saturating_mul(1000))
-}
-
-fn process_start_identity(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        parse_proc_start_ticks(&stat)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-fn parse_proc_start_ticks(stat: &str) -> Option<u64> {
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
-}
-
-fn args_after_codex(args: &str) -> String {
+fn args_after_executable(args: &str, expected: &[&str]) -> String {
     let mut parts = args.split_whitespace();
     let Some(first) = parts.next() else {
         return String::new();
@@ -231,7 +231,7 @@ fn args_after_codex(args: &str) -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(first);
-    if matches!(first_name, "codex" | ".codex-wrapped") {
+    if expected.contains(&first_name) {
         parts.collect::<Vec<_>>().join(" ")
     } else {
         args.to_string()
@@ -286,9 +286,9 @@ fn collect_transcript_summaries_uncached(dir: &PathBuf) -> Vec<CodexTranscriptSu
 fn sessions_from_live_processes(
     processes: Vec<LiveCodexProcess>,
     transcripts: &[CodexTranscriptSummary],
-) -> Vec<CodexSession> {
+) -> Vec<AgentSession> {
     let assigned = assign_transcripts(&processes, transcripts, &HashMap::new());
-    let mut sessions: Vec<CodexSession> = processes
+    let mut sessions: Vec<AgentSession> = processes
         .into_iter()
         .map(|process| {
             let transcript = assigned.get(&process.pid).copied();
@@ -302,7 +302,7 @@ fn sessions_from_live_processes(
 fn sessions_from_discovered_processes(
     processes: Vec<LiveCodexProcess>,
     state: &mut TranscriptAssignmentState,
-) -> Vec<CodexSession> {
+) -> Vec<AgentSession> {
     let initializing_assignments = state.retained.is_empty();
     let had_pending_transition = !state.transitions.is_empty();
     let (mut transcripts, refreshed, mut generation) =
@@ -337,7 +337,7 @@ fn sessions_from_discovered_processes(
             .map(|process| (process.pid, generation)),
     );
 
-    let mut sessions: Vec<CodexSession> = processes
+    let mut sessions: Vec<AgentSession> = processes
         .into_iter()
         .map(|process| {
             let transcript = assigned.get(&process.pid).copied();
@@ -351,13 +351,15 @@ fn sessions_from_discovered_processes(
 fn session_from_live_process(
     process: LiveCodexProcess,
     transcript: Option<&CodexTranscriptSummary>,
-) -> CodexSession {
+) -> AgentSession {
     let session_id = transcript
         .map(|t| t.session_id.clone())
         .unwrap_or_else(|| format!("codex-{}", process.pid));
 
-    let mut session = CodexSession::from_raw(crate::session::RawSession {
+    let mut session = AgentSession::from_raw(crate::session::RawAgentSession {
+        provider: crate::provider::AgentProvider::Codex,
         pid: process.pid,
+        process_start_identity: Some(process.start_identity),
         session_id,
         cwd: process.cwd,
         started_at: process.started_at,
@@ -764,7 +766,7 @@ fn transcript_started_at_ms(timestamp: Option<&str>) -> Option<u64> {
 
 /// Resolve JSONL paths for sessions. Must be called AFTER command_args are populated
 /// (i.e., after fetch_ps_data), so we can use resume UUIDs for correct mapping.
-pub fn resolve_jsonl_paths(sessions: &mut [CodexSession]) {
+pub fn resolve_jsonl_paths(sessions: &mut [AgentSession]) {
     for session in sessions.iter_mut() {
         if !session.process_backed {
             continue;
@@ -868,7 +870,7 @@ fn file_mtime_ms(path: &PathBuf) -> Option<u64> {
 /// Feature #29: Scan for subagent task .jsonl files.
 /// Legacy sub-agent task files live in:
 ///   /tmp/codex-{uid}/{project_slug}/{sessionId}/tasks/
-pub fn scan_subagents(sessions: &mut [CodexSession]) {
+pub fn scan_subagents(sessions: &mut [AgentSession]) {
     let uid = unsafe { libc::getuid() };
     let tmp_base = PathBuf::from(format!("/tmp/codex-{uid}"));
 
@@ -923,7 +925,7 @@ fn collect_subagent_jsonls(dir: &PathBuf, jsonls: &mut Vec<PathBuf>) {
 /// Resolve git worktree identity for each session (for conflict detection).
 /// Sessions in different worktrees of the same repo get different IDs.
 /// Runs `git rev-parse --show-toplevel` once per unique cwd.
-pub fn resolve_worktree_ids(sessions: &mut [CodexSession]) {
+pub fn resolve_worktree_ids(sessions: &mut [AgentSession]) {
     // Cache results to avoid running git multiple times for the same cwd
     let mut cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
@@ -971,8 +973,321 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::provider::AgentProvider;
 
     static CODEX_HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn parses_tolerant_claude_inventory_fixtures() {
+        let interactive = claude::parse_inventory(include_bytes!(
+            "../../../tests/fixtures/claude-agents-interactive.json"
+        ))
+        .unwrap();
+        assert_eq!(interactive.len(), 1);
+        assert_eq!(interactive[0].provider, AgentProvider::Claude);
+        assert_eq!(
+            interactive[0].session_id.as_deref(),
+            Some("interactive-session-uuid")
+        );
+        assert_eq!(interactive[0].attach_id, None);
+
+        let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/claude-agents-background.json"
+        ))
+        .unwrap();
+        let entry = claude::parse_inventory_entry(&fixture["agents"][0]).unwrap();
+        assert_eq!(entry.provider, AgentProvider::Claude);
+        assert_eq!(entry.session_id.as_deref(), Some("session-uuid"));
+        assert_eq!(entry.attach_id.as_deref(), Some("agent-id"));
+    }
+
+    #[test]
+    fn rejects_malformed_and_oversized_claude_inventory() {
+        assert!(claude::parse_inventory(b"not json").is_err());
+        let oversized = vec![b' '; claude::MAX_INVENTORY_BYTES + 1];
+        assert!(claude::parse_inventory(&oversized).is_err());
+    }
+
+    #[test]
+    fn failed_claude_refresh_retains_timestamped_stale_inventory() {
+        let now = Instant::now();
+        let existing = claude::ClaudeInventoryEntry {
+            provider: AgentProvider::Claude,
+            session_id: Some("stale-session".into()),
+            attach_id: None,
+            cwd: PathBuf::from("/work/stale"),
+            pid: None,
+            started_at: Some(1),
+            status: None,
+        };
+        let mut cache = claude::ClaudeInventoryCache {
+            refreshed_at: None,
+            last_good: vec![existing.clone()],
+            last_error: None,
+        };
+
+        let entries = claude::inventory_with_runner(&mut cache, now, |timeout, output_cap| {
+            assert_eq!(timeout, Duration::from_secs(2));
+            assert_eq!(output_cap, claude::MAX_INVENTORY_BYTES);
+            Err(claude::InventoryError::Timeout)
+        });
+
+        assert_eq!(entries, vec![existing]);
+        assert_eq!(cache.refreshed_at, Some(now));
+        assert!(cache.last_error.as_deref().unwrap().contains("timed out"));
+    }
+
+    #[test]
+    fn fresh_claude_inventory_cache_skips_command_runner() {
+        let now = Instant::now();
+        let mut cache = claude::ClaudeInventoryCache {
+            refreshed_at: Some(now),
+            last_good: Vec::new(),
+            last_error: None,
+        };
+        let mut called = false;
+
+        let entries = claude::inventory_with_runner(&mut cache, now, |_, _| {
+            called = true;
+            Ok(Vec::new())
+        });
+
+        assert!(entries.is_empty());
+        assert!(!called);
+    }
+
+    #[test]
+    fn provider_scan_uses_one_snapshot_and_merges_structured_and_process_evidence() {
+        let now = Instant::now();
+        let mut state = ProviderDiscoveryState::default();
+        let mut process_scans = 0;
+        let sessions = scan_agent_sessions_with_runners(
+            &mut state,
+            now,
+            || {
+                process_scans += 1;
+                crate::process::ProcessSnapshot::from_entries(vec![
+                    crate::process::ProcessSnapshotEntry::fixture(
+                        11,
+                        "pts/1",
+                        "codex",
+                        "/work/codex",
+                        101,
+                    ),
+                    crate::process::ProcessSnapshotEntry::fixture(
+                        12,
+                        "pts/2",
+                        "/usr/local/bin/claude",
+                        "/work/claude-fallback",
+                        102,
+                    ),
+                    crate::process::ProcessSnapshotEntry::fixture(
+                        13,
+                        "pts/3",
+                        "agy",
+                        "/work/agy",
+                        103,
+                    ),
+                    crate::process::ProcessSnapshotEntry::fixture(
+                        14,
+                        "pts/4",
+                        "claude-helper",
+                        "/work/not-claude",
+                        104,
+                    ),
+                    crate::process::ProcessSnapshotEntry::fixture(
+                        15,
+                        "pts/5",
+                        "claude",
+                        "/work/claude-process-only",
+                        105,
+                    ),
+                ])
+            },
+            |_, _| {
+                Ok(br#"[{"kind":"interactive","cwd":"/work/claude","startedAt":"1970-01-01T00:00:00.102Z","pid":12,"sessionId":"claude-native"}]"#.to_vec())
+            },
+        );
+
+        assert_eq!(process_scans, 1);
+        assert_eq!(sessions.len(), 4);
+        let claude = sessions
+            .iter()
+            .find(|session| session.session_id == "claude-native")
+            .unwrap();
+        assert_eq!(claude.provider, AgentProvider::Claude);
+        assert_eq!(claude.session_id, "claude-native");
+        assert_eq!(claude.cwd, "/work/claude");
+        assert_eq!(claude.pid, 12);
+        assert_eq!(claude.process_start_identity, Some(102));
+        assert_eq!(claude.tty, "pts/2");
+
+        let claude_fallback = sessions.iter().find(|session| session.pid == 15).unwrap();
+        assert_eq!(claude_fallback.provider, AgentProvider::Claude);
+        assert_eq!(
+            claude_fallback.status,
+            crate::session::SessionStatus::Unknown
+        );
+        assert!(claude_fallback.live_process_identity().is_some());
+
+        let agy = sessions
+            .iter()
+            .find(|session| session.provider == AgentProvider::Antigravity)
+            .unwrap();
+        assert_eq!(agy.status, crate::session::SessionStatus::Unknown);
+        assert!(agy.live_process_identity().is_some());
+    }
+
+    #[test]
+    fn stale_claude_inventory_without_pid_survives_failed_refresh() {
+        let now = Instant::now();
+        let mut state = ProviderDiscoveryState {
+            transcript_assignments: TranscriptAssignmentState::default(),
+            claude_inventory: claude::ClaudeInventoryCache {
+                refreshed_at: None,
+                last_good: vec![claude::ClaudeInventoryEntry {
+                    provider: AgentProvider::Claude,
+                    session_id: Some("stale-session".into()),
+                    attach_id: None,
+                    cwd: PathBuf::from("/work/stale"),
+                    pid: None,
+                    started_at: Some(123_000),
+                    status: None,
+                }],
+                last_error: None,
+            },
+        };
+
+        let sessions = scan_agent_sessions_with_runners(
+            &mut state,
+            now,
+            crate::process::ProcessSnapshot::default,
+            |_, _| Err(claude::InventoryError::Oversized),
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].provider, AgentProvider::Claude);
+        assert_eq!(sessions[0].session_id, "stale-session");
+        assert!(!sessions[0].process_backed);
+        assert_eq!(state.claude_inventory.refreshed_at, Some(now));
+        assert!(
+            state
+                .claude_inventory
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("one MiB")
+        );
+    }
+
+    #[test]
+    fn failed_process_snapshot_retains_stale_claude_pid_without_live_evidence() {
+        let now = Instant::now();
+        let mut state = provider_state_with_stale_claude_pid();
+
+        let sessions = scan_agent_sessions_with_runners(
+            &mut state,
+            now,
+            crate::process::ProcessSnapshot::default,
+            |_, _| Err(claude::InventoryError::Timeout),
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "stale-pid-session");
+        assert_eq!(sessions[0].pid, 42);
+        assert!(!sessions[0].process_backed);
+        assert!(sessions[0].live_process_identity().is_none());
+    }
+
+    #[test]
+    fn successful_empty_process_snapshot_prunes_stale_claude_pid() {
+        let now = Instant::now();
+        let mut state = provider_state_with_stale_claude_pid();
+
+        let sessions = scan_agent_sessions_with_runners(
+            &mut state,
+            now,
+            || crate::process::ProcessSnapshot::from_entries(Vec::new()),
+            |_, _| Err(claude::InventoryError::Timeout),
+        );
+
+        assert!(sessions.is_empty());
+    }
+
+    fn provider_state_with_stale_claude_pid() -> ProviderDiscoveryState {
+        ProviderDiscoveryState {
+            transcript_assignments: TranscriptAssignmentState::default(),
+            claude_inventory: claude::ClaudeInventoryCache {
+                refreshed_at: None,
+                last_good: vec![claude::ClaudeInventoryEntry {
+                    provider: AgentProvider::Claude,
+                    session_id: Some("stale-pid-session".into()),
+                    attach_id: None,
+                    cwd: PathBuf::from("/work/stale"),
+                    pid: Some(42),
+                    started_at: Some(123_000),
+                    status: None,
+                }],
+                last_error: None,
+            },
+        }
+    }
+
+    #[test]
+    fn claude_inventory_does_not_bind_native_evidence_to_reused_pid() {
+        let inventory = claude::ClaudeInventoryEntry {
+            provider: AgentProvider::Claude,
+            session_id: Some("old-native-session".into()),
+            attach_id: None,
+            cwd: PathBuf::from("/old/session"),
+            pid: Some(42),
+            started_at: Some(100_000),
+            status: Some("working".into()),
+        };
+        let process = crate::process::ProcessSnapshotEntry {
+            pid: 42,
+            tty: "pts/42".into(),
+            cpu_percent: 4.2,
+            mem_mb: 64.0,
+            command: "claude".into(),
+            args: "claude".into(),
+            cwd: PathBuf::from("/new/process"),
+            started_at: 200_000,
+            start_identity: 9001,
+        };
+
+        for (stale, started_at) in [
+            (false, Some(100_000)),
+            (true, Some(100_000)),
+            (false, None),
+            (true, None),
+        ] {
+            let mut inventory = inventory.clone();
+            inventory.started_at = started_at;
+            let sessions = claude::sessions_from_inventory(
+                std::slice::from_ref(&inventory),
+                stale,
+                true,
+                std::slice::from_ref(&process),
+            );
+
+            assert_eq!(sessions.len(), 2);
+            let native = sessions
+                .iter()
+                .find(|session| session.session_id == "old-native-session")
+                .unwrap();
+            assert!(!native.process_backed);
+            assert_eq!(native.process_start_identity, None);
+            assert_eq!(native.cwd, "/old/session");
+            let fallback = sessions
+                .iter()
+                .find(|session| session.process_backed)
+                .unwrap();
+            assert_eq!(fallback.cwd, "/new/process");
+            assert_eq!(fallback.status, crate::session::SessionStatus::Unknown);
+            assert_ne!(fallback.session_id, "old-native-session");
+        }
+    }
 
     fn transcript(id: &str, cwd: &str, start: u64, path: &str) -> CodexTranscriptSummary {
         CodexTranscriptSummary {
@@ -1192,7 +1507,7 @@ mod tests {
     fn parses_linux_proc_start_ticks_after_parenthesized_command() {
         let stat = "123 (codex worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 20";
 
-        assert_eq!(parse_proc_start_ticks(stat), Some(4242));
+        assert_eq!(crate::process::parse_proc_start_ticks(stat), Some(4242));
     }
 
     #[test]

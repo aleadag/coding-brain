@@ -10,7 +10,7 @@ use crate::codex_transcript::{
 use crate::lifecycle::{TranscriptEvidence, contributing_status};
 use crate::models;
 use crate::session::{
-    ApprovalObservation, CodexSession, CodexTaskState, SessionStatus, SubagentRollup,
+    AgentSession, ApprovalObservation, CodexTaskState, SessionStatus, SubagentRollup,
     TelemetryStatus,
 };
 use crate::transcript::{TranscriptBlock, TranscriptEvent, TranscriptRole, parse_line};
@@ -33,7 +33,7 @@ impl UsageRollup {
 }
 
 /// Read new JSONL entries since last offset, accumulate token stats.
-pub fn update_tokens(session: &mut CodexSession) {
+pub fn update_tokens(session: &mut AgentSession) {
     if should_use_codex_parser(session) {
         update_codex_tokens(session);
         return;
@@ -282,7 +282,7 @@ pub fn update_tokens(session: &mut CodexSession) {
     );
 }
 
-fn should_use_codex_parser(session: &CodexSession) -> bool {
+fn should_use_codex_parser(session: &AgentSession) -> bool {
     !session.process_backed
         || session.model_profile_source == "codex-transcript"
         || session
@@ -293,7 +293,7 @@ fn should_use_codex_parser(session: &CodexSession) -> bool {
             .is_some_and(|name| name.starts_with("rollout-"))
 }
 
-fn update_codex_tokens(session: &mut CodexSession) {
+fn update_codex_tokens(session: &mut AgentSession) {
     let mut last_type = session.last_msg_type.clone();
     let mut last_stop_reason = session.last_stop_reason.clone();
     let mut saw_non_empty_line = false;
@@ -484,7 +484,7 @@ fn update_codex_tokens(session: &mut CodexSession) {
 }
 
 fn update_transcript_evidence(
-    session: &mut CodexSession,
+    session: &mut AgentSession,
     event: &CodexEvent,
     observed_at_ms: Option<u64>,
 ) {
@@ -525,7 +525,7 @@ fn update_transcript_evidence(
     }
 }
 
-fn apply_token_count(count: CodexTokenCount, session: &mut CodexSession) {
+fn apply_token_count(count: CodexTokenCount, session: &mut AgentSession) {
     let watermark = count.total.total_tokens;
     if watermark < session.priced_total_tokens {
         session.cost_ledger_frozen = true;
@@ -561,7 +561,7 @@ fn read_complete_lines(file: &mut File, offset: u64) -> std::io::Result<(Vec<Str
     Ok((lines, offset + complete.len() as u64))
 }
 
-fn apply_lifecycle(event: CodexLifecycleEvent, session: &mut CodexSession) {
+fn apply_lifecycle(event: CodexLifecycleEvent, session: &mut AgentSession) {
     match event {
         CodexLifecycleEvent::TaskStarted | CodexLifecycleEvent::UserMessage => {
             session.task_state = CodexTaskState::Processing;
@@ -586,7 +586,7 @@ fn apply_lifecycle(event: CodexLifecycleEvent, session: &mut CodexSession) {
     }
 }
 
-fn apply_codex_response_item(item: CodexResponseItem, session: &mut CodexSession) {
+fn apply_codex_response_item(item: CodexResponseItem, session: &mut AgentSession) {
     match item.kind {
         CodexResponseKind::Message | CodexResponseKind::Reasoning => {
             session.task_state = CodexTaskState::Processing;
@@ -633,7 +633,7 @@ fn apply_codex_response_item(item: CodexResponseItem, session: &mut CodexSession
     }
 }
 
-fn clear_pending_tool(session: &mut CodexSession) {
+fn clear_pending_tool(session: &mut AgentSession) {
     session.pending_tool_name = None;
     session.pending_tool_call_id = None;
     session.pending_tool_input = None;
@@ -643,7 +643,7 @@ fn clear_pending_tool(session: &mut CodexSession) {
 }
 
 fn finalize_usage(
-    session: &mut CodexSession,
+    session: &mut AgentSession,
     last_type: &str,
     last_stop_reason: &str,
     is_waiting_for_task: bool,
@@ -684,7 +684,7 @@ fn finalize_usage(
     infer_status(session, last_type, last_stop_reason, is_waiting_for_task);
 }
 
-pub fn refresh_status(session: &mut CodexSession) {
+pub fn refresh_status(session: &mut AgentSession) {
     let last_type = session.last_msg_type.clone();
     let stop_reason = session.last_stop_reason.clone();
     infer_status(
@@ -696,7 +696,7 @@ pub fn refresh_status(session: &mut CodexSession) {
 }
 
 pub fn infer_status(
-    session: &mut CodexSession,
+    session: &mut AgentSession,
     last_msg_type: &str,
     last_stop_reason: &str,
     is_waiting_for_task: bool,
@@ -711,7 +711,7 @@ pub fn infer_status(
 }
 
 pub fn infer_status_at(
-    session: &mut CodexSession,
+    session: &mut AgentSession,
     last_msg_type: &str,
     last_stop_reason: &str,
     is_waiting_for_task: bool,
@@ -805,7 +805,7 @@ fn recent_waiting_or_idle(last_message_ts: u64) -> SessionStatus {
 
 /// Estimate USD cost based on token usage and model.
 #[allow(dead_code)]
-pub fn estimate_cost(session: &CodexSession) -> f64 {
+pub fn estimate_cost(session: &AgentSession) -> f64 {
     estimate_cost_components(
         &session.model,
         session.total_input_tokens,
@@ -822,7 +822,7 @@ pub fn model_context_max(model: &str) -> u64 {
 }
 
 /// Extract tool usage stats and file paths from tool_use content blocks.
-fn record_tool_usage(tool_name: &str, input: &Value, session: &mut CodexSession) {
+fn record_tool_usage(tool_name: &str, input: &Value, session: &mut AgentSession) {
     if tool_name.is_empty() {
         return;
     }
@@ -865,7 +865,7 @@ pub fn shorten_model(model: &str) -> String {
     models::shorten_model(model)
 }
 
-fn refresh_subagent_rollups(session: &mut CodexSession) -> UsageRollup {
+fn refresh_subagent_rollups(session: &mut AgentSession) -> UsageRollup {
     for path in session.active_subagent_jsonl_paths.clone() {
         let rollup = session.subagent_rollups.entry(path.clone()).or_default();
         update_subagent_rollup(&path, rollup, &session.model);
@@ -1030,13 +1030,15 @@ fn estimate_cost_components(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{ApprovalEvidence, ApprovalObservation, RawSession};
+    use crate::session::{ApprovalEvidence, ApprovalObservation, RawAgentSession};
     use crate::terminals::Terminal;
     use std::io::{Seek, SeekFrom, Write};
 
-    fn session() -> CodexSession {
-        let mut session = CodexSession::from_raw(RawSession {
+    fn session() -> AgentSession {
+        let mut session = AgentSession::from_raw(RawAgentSession {
+            provider: crate::provider::AgentProvider::Codex,
             pid: 7,
+            process_start_identity: None,
             session_id: "session-7".into(),
             cwd: "/repo".into(),
             started_at: 0,

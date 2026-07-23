@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use crate::discovery::transcript_summary_from_codex_jsonl;
-use crate::session::{CodexSession, SessionStatus};
+use crate::provider::{AgentProvider, AgentSessionKey};
+use crate::session::{AgentSession, SessionStatus};
 
 use super::{
     LifecycleEventName, ProjectedStatus, SessionLifecycleState, StoreCondition, StoreError,
@@ -70,7 +71,7 @@ pub struct LifecycleDiagnostic {
     pub store_condition: Option<StoreCondition>,
 }
 
-pub fn contributing_status(session: &mut CodexSession, now_ms: u64) -> Option<SessionStatus> {
+pub fn contributing_status(session: &mut AgentSession, now_ms: u64) -> Option<SessionStatus> {
     let Some(evidence) = session.lifecycle_evidence else {
         session.lifecycle_diagnostic.contributing = false;
         return None;
@@ -153,7 +154,7 @@ pub fn contributing_status(session: &mut CodexSession, now_ms: u64) -> Option<Se
     Some(status)
 }
 
-pub fn apply_store_view(sessions: &mut [CodexSession], view: &StoreView, now_ms: u64) {
+pub fn apply_store_view(sessions: &mut [AgentSession], view: &StoreView, now_ms: u64) {
     for session in sessions
         .iter_mut()
         .filter(|session| eligible_local_session(session))
@@ -192,11 +193,19 @@ pub fn apply_store_view(sessions: &mut [CodexSession], view: &StoreView, now_ms:
         session.lifecycle_diagnostic.ignored_reason = None;
     }
 
-    let states: Vec<(&String, &SessionLifecycleState)> = snapshot.sessions.iter().collect();
+    let states: Vec<(AgentSessionKey, &SessionLifecycleState)> = snapshot
+        .sessions
+        .iter()
+        .filter_map(|(storage_key, state)| {
+            AgentSessionKey::from_storage_key(storage_key).map(|key| (key, state))
+        })
+        .collect();
     let mut claimed_paths = Vec::new();
-    for (session_id, state) in &states {
+    for (session_key, state) in &states {
         let Some(session) = sessions.iter_mut().find(|session| {
-            eligible_local_session(session) && session.session_id == session_id.as_str()
+            eligible_local_session(session)
+                && session.provider == session_key.provider
+                && session.session_id == session_key.session_id
         }) else {
             continue;
         };
@@ -230,8 +239,11 @@ pub fn apply_store_view(sessions: &mut [CodexSession], view: &StoreView, now_ms:
         });
 
     let mut pending_bindings = Vec::new();
-    for (session_id, state) in states {
+    for (session_key, state) in states {
         if state.latest_event != Some(LifecycleEventName::SessionStart) {
+            continue;
+        }
+        if session_key.provider != AgentProvider::Codex {
             continue;
         }
         let Some(path) = state.transcript_path.as_deref() else {
@@ -270,7 +282,9 @@ pub fn apply_store_view(sessions: &mut [CodexSession], view: &StoreView, now_ms:
             );
             continue;
         };
-        if summary.session_id != *session_id || !paths_match(Path::new(&summary.cwd), &state.cwd) {
+        if summary.session_id != session_key.session_id
+            || !paths_match(Path::new(&summary.cwd), &state.cwd)
+        {
             mark_placeholder_reason(
                 sessions,
                 &state.cwd,
@@ -284,6 +298,7 @@ pub fn apply_store_view(sessions: &mut [CodexSession], view: &StoreView, now_ms:
             .enumerate()
             .filter(|(_, session)| {
                 eligible_local_session(session)
+                    && session.provider == AgentProvider::Codex
                     && session.session_id.starts_with("codex-")
                     && paths_match(Path::new(&session.cwd), &state.cwd)
                     && summary.mtime_ms >= session.started_at
@@ -302,7 +317,7 @@ pub fn apply_store_view(sessions: &mut [CodexSession], view: &StoreView, now_ms:
             );
             continue;
         }
-        pending_bindings.push((candidates[0], session_id.clone(), summary, state));
+        pending_bindings.push((candidates[0], session_key.session_id, summary, state));
     }
 
     let process_claims =
@@ -326,7 +341,7 @@ pub fn apply_store_view(sessions: &mut [CodexSession], view: &StoreView, now_ms:
     }
 }
 
-pub fn retain_after_store_error(sessions: &mut [CodexSession], error: &StoreError, now_ms: u64) {
+pub fn retain_after_store_error(sessions: &mut [AgentSession], error: &StoreError, now_ms: u64) {
     let error_reason = error.to_string();
     for session in sessions
         .iter_mut()
@@ -346,7 +361,7 @@ pub fn retain_after_store_error(sessions: &mut [CodexSession], error: &StoreErro
     }
 }
 
-fn attach_state(session: &mut CodexSession, state: &SessionLifecycleState, now_ms: u64) {
+fn attach_state(session: &mut AgentSession, state: &SessionLifecycleState, now_ms: u64) {
     session.lifecycle_diagnostic.available = true;
     session.lifecycle_diagnostic.event = state.latest_event;
     session.lifecycle_diagnostic.age_ms = (state.latest_received_at_ms
@@ -382,7 +397,7 @@ fn attach_state(session: &mut CodexSession, state: &SessionLifecycleState, now_m
     }
 }
 
-fn clear_lifecycle(session: &mut CodexSession, reason: &str) {
+fn clear_lifecycle(session: &mut AgentSession, reason: &str) {
     session.lifecycle_evidence = None;
     session.lifecycle_diagnostic.available = false;
     session.lifecycle_diagnostic.event = None;
@@ -391,9 +406,10 @@ fn clear_lifecycle(session: &mut CodexSession, reason: &str) {
     session.lifecycle_diagnostic.ignored_reason = Some(reason.into());
 }
 
-fn mark_placeholder_reason(sessions: &mut [CodexSession], cwd: &Path, reason: &str) {
+fn mark_placeholder_reason(sessions: &mut [AgentSession], cwd: &Path, reason: &str) {
     for session in sessions.iter_mut().filter(|session| {
         eligible_local_session(session)
+            && session.provider == AgentProvider::Codex
             && session.session_id.starts_with("codex-")
             && paths_match(Path::new(&session.cwd), cwd)
     }) {
@@ -401,7 +417,7 @@ fn mark_placeholder_reason(sessions: &mut [CodexSession], cwd: &Path, reason: &s
     }
 }
 
-fn eligible_local_session(session: &CodexSession) -> bool {
+fn eligible_local_session(session: &AgentSession) -> bool {
     session.process_backed && !session.is_remote() && session.status != SessionStatus::Finished
 }
 
@@ -453,7 +469,7 @@ mod tests {
     use std::path::Path;
 
     use crate::session::{
-        ApprovalEvidence, ApprovalObservation, CodexSession, RawSession, SessionStatus,
+        AgentSession, ApprovalEvidence, ApprovalObservation, RawAgentSession, SessionStatus,
     };
     use crate::terminals::Terminal;
 
@@ -463,9 +479,11 @@ mod tests {
         status: ProjectedStatus,
         event: LifecycleEventName,
         received_at_ms: u64,
-    ) -> CodexSession {
-        let mut session = CodexSession::from_raw(RawSession {
+    ) -> AgentSession {
+        let mut session = AgentSession::from_raw(RawAgentSession {
+            provider: crate::provider::AgentProvider::Codex,
             pid: 7,
+            process_start_identity: None,
             session_id: "session-7".into(),
             cwd: "/repo".into(),
             started_at: 0,
@@ -482,9 +500,11 @@ mod tests {
         session
     }
 
-    fn raw_session(pid: u32, session_id: &str, cwd: &Path, started_at: u64) -> CodexSession {
-        CodexSession::from_raw(RawSession {
+    fn raw_session(pid: u32, session_id: &str, cwd: &Path, started_at: u64) -> AgentSession {
+        AgentSession::from_raw(RawAgentSession {
+            provider: crate::provider::AgentProvider::Codex,
             pid,
+            process_start_identity: None,
             session_id: session_id.into(),
             cwd: cwd.display().to_string(),
             started_at,
@@ -971,7 +991,7 @@ mod tests {
         for condition in [
             StoreCondition::Missing,
             StoreCondition::Corrupt,
-            StoreCondition::NewerSchema(2),
+            StoreCondition::NewerSchema(3),
         ] {
             let mut session = session_with_hook(
                 ProjectedStatus::Processing,
@@ -1034,7 +1054,7 @@ mod tests {
         );
         retain_after_store_error(
             std::slice::from_mut(&mut non_transient),
-            &StoreError::NewerSchema(2),
+            &StoreError::NewerSchema(3),
             2_000,
         );
         assert!(non_transient.lifecycle_evidence.is_none());

@@ -3,6 +3,8 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::provider::AgentProvider;
+
 pub const MAX_ID_BYTES: usize = 512;
 pub const MAX_PATH_BYTES: usize = 4 * 1024;
 
@@ -100,6 +102,7 @@ impl LifecycleEventKind {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LifecycleIdentity {
+    provider: AgentProvider,
     session_id: String,
     turn_id: Option<String>,
     transcript_path: Option<PathBuf>,
@@ -108,6 +111,7 @@ pub struct LifecycleIdentity {
 
 impl LifecycleIdentity {
     pub fn try_new(
+        provider: AgentProvider,
         session_id: String,
         turn_id: Option<String>,
         transcript_path: Option<PathBuf>,
@@ -122,11 +126,16 @@ impl LifecycleIdentity {
             .map(|path| validate_path("transcript_path", path))
             .transpose()?;
         Ok(Self {
+            provider,
             session_id,
             turn_id,
             transcript_path,
             cwd,
         })
+    }
+
+    pub fn provider(&self) -> AgentProvider {
+        self.provider
     }
 
     pub fn session_id(&self) -> &str {
@@ -160,6 +169,7 @@ impl LifecycleEvent {
         let cwd = required(raw.cwd, "cwd")?;
         let event_name = required(raw.hook_event_name, "hook_event_name")?;
         let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
             session_id,
             raw.turn_id,
             raw.transcript_path,
@@ -446,6 +456,7 @@ mod tests {
     fn identity_constructor_is_bounded_and_normalizes_paths() {
         assert_eq!(
             LifecycleIdentity::try_new(
+                AgentProvider::Codex,
                 "".into(),
                 Some("turn-1".into()),
                 None,
@@ -456,6 +467,7 @@ mod tests {
         );
         assert_eq!(
             LifecycleIdentity::try_new(
+                AgentProvider::Codex,
                 "x".repeat(513),
                 Some("turn-1".into()),
                 None,
@@ -466,6 +478,7 @@ mod tests {
         );
         assert_eq!(
             LifecycleIdentity::try_new(
+                AgentProvider::Codex,
                 "session-1".into(),
                 Some("turn-1".into()),
                 None,
@@ -476,12 +489,14 @@ mod tests {
         );
 
         let identity = LifecycleIdentity::try_new(
+            AgentProvider::Claude,
             "session-1".into(),
             Some("turn-1".into()),
             Some(PathBuf::from("/tmp/./nested/../rollout.jsonl")),
             PathBuf::from("/work/./repo/../codexctl"),
         )
         .unwrap();
+        assert_eq!(identity.provider(), AgentProvider::Claude);
         assert_eq!(identity.cwd(), Path::new("/work/codexctl"));
         assert_eq!(
             identity.transcript_path(),
@@ -491,9 +506,14 @@ mod tests {
 
     #[test]
     fn permission_constructor_requires_a_turn_bearing_validated_identity() {
-        let identity =
-            LifecycleIdentity::try_new("session-1".into(), None, None, PathBuf::from("/work"))
-                .unwrap();
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "session-1".into(),
+            None,
+            None,
+            PathBuf::from("/work"),
+        )
+        .unwrap();
         assert_eq!(
             LifecycleEvent::permission(identity, PermissionDisposition::Decided).unwrap_err(),
             LifecycleInputError::Missing("turn_id")

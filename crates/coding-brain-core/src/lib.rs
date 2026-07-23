@@ -28,10 +28,15 @@ pub mod monitor;
 pub mod paths;
 pub mod process;
 pub mod project;
+pub mod provider;
 pub mod rules;
 pub mod runtime;
 pub mod session;
+pub mod session_links;
 pub mod skills;
 pub mod terminals;
 pub mod theme;
 pub mod transcript;
+
+pub use discovery::claude::{ClaudeInventoryCache, ClaudeInventoryEntry};
+pub use discovery::{ProviderDiscoveryState, scan_agent_sessions_with_state};

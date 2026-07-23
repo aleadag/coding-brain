@@ -1,4 +1,4 @@
-use crate::session::CodexSession;
+use crate::session::AgentSession;
 
 pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<String, String> {
     let mut cmd = std::process::Command::new("gnome-terminal");
@@ -18,14 +18,14 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
     }
 }
 
-pub fn switch(_session: &CodexSession) -> Result<(), String> {
+pub fn switch(_session: &AgentSession) -> Result<(), String> {
     Err(
         "GNOME Terminal launch is supported, but remote focus/input control is not yet reliable. Use tmux or Kitty for session switching and input automation."
             .into(),
     )
 }
 
-pub fn send_input(_session: &CodexSession, _text: &str) -> Result<(), String> {
+pub fn send_input(_session: &AgentSession, _text: &str) -> Result<(), String> {
     Err(
         "GNOME Terminal launch is supported, but remote focus/input control is not yet reliable. Use tmux or Kitty for session input automation."
             .into(),

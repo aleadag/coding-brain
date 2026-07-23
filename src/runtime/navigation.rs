@@ -582,6 +582,7 @@ mod tests {
 
     fn target(id: &str, cwd: &str) -> SessionTarget {
         SessionTarget {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             session_id: id.into(),
             turn_id: None,
             tool_use_id: None,

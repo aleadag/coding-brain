@@ -1,4 +1,4 @@
-use crate::session::CodexSession;
+use crate::session::AgentSession;
 
 pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<String, String> {
     let mut cmd = std::process::Command::new("wezterm");
@@ -18,7 +18,7 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
     }
 }
 
-pub fn switch(session: &CodexSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     // WezTerm has `wezterm cli list` and `wezterm cli activate-pane`.
     // `wezterm cli list --format json` shows all panes with their cwd and tty.
     let output = std::process::Command::new("wezterm")

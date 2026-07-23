@@ -438,6 +438,7 @@ mod tests {
 
     fn make_d(pid: u32, tool: &str, cmd: &str, user_action: &str, error: bool) -> DecisionRecord {
         DecisionRecord {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             timestamp: "0".into(),
             pid,
             project: "test".into(),

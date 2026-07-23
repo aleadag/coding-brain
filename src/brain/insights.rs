@@ -450,6 +450,7 @@ mod tests {
 
     fn make_decision(tool: &str, command: &str, user_action: &str, pid: u32) -> DecisionRecord {
         DecisionRecord {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             timestamp: "0".to_string(),
             pid,
             project: "test".to_string(),

@@ -931,6 +931,7 @@ mod tests {
 
     fn make_decision(tool: &str, project: &str, user_action: &str) -> DecisionRecord {
         DecisionRecord {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             timestamp: "0".into(),
             pid: 1,
             project: project.into(),
@@ -960,6 +961,7 @@ mod tests {
         user_action: &str,
     ) -> DecisionRecord {
         DecisionRecord {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             timestamp: "0".into(),
             pid: 1,
             project: project.into(),
@@ -1024,6 +1026,7 @@ mod tests {
         ctx: DecisionContext,
     ) -> DecisionRecord {
         DecisionRecord {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             timestamp: "0".into(),
             pid: 1,
             project: project.into(),
@@ -1313,6 +1316,7 @@ mod tests {
         // Two consecutive same-PID records: first accept, second has error context
         let mut decisions = vec![
             DecisionRecord {
+                provider: coding_brain_core::provider::AgentProvider::Codex,
                 timestamp: "1".into(),
                 pid: 42,
                 project: "proj".into(),
@@ -1334,6 +1338,7 @@ mod tests {
                 canonical: None,
             },
             DecisionRecord {
+                provider: coding_brain_core::provider::AgentProvider::Codex,
                 timestamp: "2".into(),
                 pid: 42,
                 project: "proj".into(),
@@ -1374,6 +1379,7 @@ mod tests {
         // 4 consecutive errors (same PID)
         for _ in 0..4 {
             decisions.push(DecisionRecord {
+                provider: coding_brain_core::provider::AgentProvider::Codex,
                 timestamp: "0".into(),
                 pid: 1,
                 project: "proj".into(),
@@ -1397,6 +1403,7 @@ mod tests {
         }
         // Then user denies
         decisions.push(DecisionRecord {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             timestamp: "0".into(),
             pid: 1,
             project: "proj".into(),
@@ -1420,6 +1427,7 @@ mod tests {
         // Repeat the streak pattern to reach threshold of 2
         for _ in 0..4 {
             decisions.push(DecisionRecord {
+                provider: coding_brain_core::provider::AgentProvider::Codex,
                 timestamp: "0".into(),
                 pid: 1,
                 project: "proj".into(),
@@ -1442,6 +1450,7 @@ mod tests {
             });
         }
         decisions.push(DecisionRecord {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             timestamp: "0".into(),
             pid: 1,
             project: "proj".into(),

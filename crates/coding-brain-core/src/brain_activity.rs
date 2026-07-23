@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::project::ProjectId;
+use crate::provider::AgentProvider;
 
 pub const MIN_ACTIVITY_SCHEMA_VERSION: u32 = 1;
 pub const ACTIVITY_SCHEMA_VERSION: u32 = 2;
@@ -22,6 +23,8 @@ pub struct ProjectEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTarget {
+    #[serde(default)]
+    pub provider: AgentProvider,
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
@@ -30,7 +33,7 @@ pub struct SessionTarget {
     pub project_id: ProjectId,
     #[serde(with = "path_serde")]
     pub cwd: PathBuf,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub provider_hints: Vec<String>,
 }
 
@@ -588,6 +591,7 @@ mod tests {
         activity.project.project_id = ProjectId::Temporary("p".repeat(5_000));
         activity.project.cwd = PathBuf::from(format!("/{}", "c".repeat(5_000)));
         activity.session = Some(SessionTarget {
+            provider: AgentProvider::Codex,
             session_id: "s".repeat(5_000),
             turn_id: Some("t".repeat(5_000)),
             tool_use_id: Some("u".repeat(5_000)),
@@ -643,6 +647,7 @@ mod tests {
         let mut activity = event("command", "reason", "note");
         activity.project.cwd = opaque.clone();
         activity.session = Some(SessionTarget {
+            provider: AgentProvider::Codex,
             session_id: "session".into(),
             turn_id: Some("turn".into()),
             tool_use_id: Some("tool-use".into()),

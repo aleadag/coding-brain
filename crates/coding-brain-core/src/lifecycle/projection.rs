@@ -3,12 +3,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::provider::AgentSessionKey;
+
 use super::input::{
     LifecycleEvent, LifecycleEventKind, LifecycleEventName, PermissionDisposition, ProjectedStatus,
     SessionStartSource,
 };
 
-pub const LIFECYCLE_SCHEMA_VERSION: u32 = 1;
+pub const LIFECYCLE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_RECENT_TURNS: usize = 32;
 pub const MAX_ACTIVE_SUBAGENTS: usize = 64;
 
@@ -141,14 +143,16 @@ impl Default for LifecycleSnapshot {
 
 impl LifecycleSnapshot {
     pub fn apply(&mut self, event: LifecycleEvent, received_at_ms: u64) -> ApplyOutcome {
-        let session_id = event.identity().session_id().to_owned();
+        let session_key =
+            AgentSessionKey::native(event.identity().provider(), event.identity().session_id())
+                .storage_key();
         let signature = EventSignature {
             turn_id: event.identity().turn_id().map(str::to_owned),
             kind: event.kind().clone(),
         };
         let state = self
             .sessions
-            .entry(session_id)
+            .entry(session_key)
             .or_insert_with(|| SessionLifecycleState::new(&event));
 
         if state.last_signature.as_ref() == Some(&signature) {
@@ -296,6 +300,7 @@ mod tests {
 
     use super::super::input::LifecycleIdentity;
     use super::*;
+    use crate::provider::{AgentProvider, AgentSessionKey};
 
     fn event(name: LifecycleEventName, turn: Option<&str>, agent: Option<&str>) -> LifecycleEvent {
         let mut raw = Map::from_iter([
@@ -313,6 +318,10 @@ mod tests {
             raw.insert("source".into(), json!("startup"));
         }
         LifecycleEvent::parse(Value::Object(raw).to_string().as_bytes()).unwrap()
+    }
+
+    fn session_key() -> String {
+        AgentSessionKey::native(AgentProvider::Codex, "session-1").storage_key()
     }
 
     fn prompt(turn: &str) -> LifecycleEvent {
@@ -341,6 +350,7 @@ mod tests {
 
     fn permission(turn: &str, disposition: PermissionDisposition) -> LifecycleEvent {
         let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
             "session-1".into(),
             Some(turn.into()),
             None,
@@ -348,6 +358,37 @@ mod tests {
         )
         .unwrap();
         LifecycleEvent::permission(identity, disposition).unwrap()
+    }
+
+    #[test]
+    fn lifecycle_projection_is_provider_qualified() {
+        let event = |provider| {
+            let identity = LifecycleIdentity::try_new(
+                provider,
+                "same".into(),
+                Some("turn-1".into()),
+                None,
+                "/work/codexctl".into(),
+            )
+            .unwrap();
+            LifecycleEvent::permission(identity, PermissionDisposition::Decided).unwrap()
+        };
+        let mut snapshot = LifecycleSnapshot::default();
+
+        snapshot.apply(event(AgentProvider::Codex), 1);
+        snapshot.apply(event(AgentProvider::Claude), 2);
+
+        assert_eq!(snapshot.sessions.len(), 2);
+        assert!(
+            snapshot
+                .sessions
+                .contains_key(&AgentSessionKey::native(AgentProvider::Codex, "same").storage_key())
+        );
+        assert!(
+            snapshot.sessions.contains_key(
+                &AgentSessionKey::native(AgentProvider::Claude, "same").storage_key()
+            )
+        );
     }
 
     #[test]
@@ -362,7 +403,7 @@ mod tests {
             snapshot.apply(prompt("turn-2"), 3_000),
             ApplyOutcome::Applied
         );
-        let state = snapshot.sessions.get("session-1").unwrap();
+        let state = snapshot.sessions.get(&session_key()).unwrap();
         assert_eq!(state.current_turn.as_deref(), Some("turn-2"));
         assert!(state.recent_turns.iter().any(|turn| turn == "turn-1"));
     }
@@ -372,13 +413,13 @@ mod tests {
         let mut snapshot = LifecycleSnapshot::default();
         snapshot.apply(prompt("turn-1"), 1_000);
         snapshot.apply(subagent_start("turn-1", "agent-1"), 2_000);
-        let status_time = snapshot.sessions["session-1"].status_received_at_ms;
+        let status_time = snapshot.sessions[&session_key()].status_received_at_ms;
         snapshot.apply(subagent_stop("turn-1", "agent-1"), 3_000);
         assert_eq!(
             snapshot.apply(subagent_stop("turn-1", "agent-1"), 4_000),
             ApplyOutcome::Ignored(IgnoreReason::Duplicate)
         );
-        let state = snapshot.sessions.get("session-1").unwrap();
+        let state = snapshot.sessions.get(&session_key()).unwrap();
         assert!(state.turn_open);
         assert!(state.active_subagents.is_empty());
         assert_eq!(state.status_received_at_ms, status_time);
@@ -397,7 +438,10 @@ mod tests {
             ApplyOutcome::Ignored(IgnoreReason::Duplicate)
         );
         assert_eq!(snapshot.next_sequence, 2);
-        assert_eq!(snapshot.sessions["session-1"].latest_received_at_ms, 1_000);
+        assert_eq!(
+            snapshot.sessions[&session_key()].latest_received_at_ms,
+            1_000
+        );
     }
 
     #[test]
@@ -410,7 +454,7 @@ mod tests {
             ApplyOutcome::Ignored(IgnoreReason::RecentTurn)
         );
         assert_eq!(
-            snapshot.sessions["session-1"].projected_status,
+            snapshot.sessions[&session_key()].projected_status,
             Some(ProjectedStatus::Processing)
         );
     }
@@ -423,7 +467,7 @@ mod tests {
             snapshot.apply(subagent_stop("turn-1", "missing"), 2_000),
             ApplyOutcome::Ignored(IgnoreReason::Duplicate)
         );
-        let state = &snapshot.sessions["session-1"];
+        let state = &snapshot.sessions[&session_key()];
         assert_eq!(state.latest_event, Some(LifecycleEventName::PreToolUse));
         assert_eq!(state.projected_status, Some(ProjectedStatus::Processing));
     }
@@ -434,7 +478,7 @@ mod tests {
         for index in 0..34 {
             snapshot.apply(prompt(&format!("turn-{index}")), index + 1);
         }
-        let state = &snapshot.sessions["session-1"];
+        let state = &snapshot.sessions[&session_key()];
         assert_eq!(state.recent_turns.len(), 32);
         assert_eq!(
             state.recent_turns.front().map(String::as_str),
@@ -465,7 +509,7 @@ mod tests {
             ApplyOutcome::Ignored(IgnoreReason::ActiveSubagentCapacity)
         );
         assert_eq!(snapshot.next_sequence, next_sequence);
-        assert_eq!(snapshot.sessions["session-1"].active_subagents.len(), 64);
+        assert_eq!(snapshot.sessions[&session_key()].active_subagents.len(), 64);
     }
 
     #[test]
@@ -474,7 +518,7 @@ mod tests {
         snapshot.apply(prompt("turn-1"), 1_000);
         snapshot.apply(prompt("turn-2"), 2_000);
         snapshot.apply(event(LifecycleEventName::SessionStart, None, None), 3_000);
-        let state = &snapshot.sessions["session-1"];
+        let state = &snapshot.sessions[&session_key()];
         assert_eq!(state.current_turn, None);
         assert!(!state.turn_open);
         assert_eq!(state.projected_status, None);
@@ -509,7 +553,7 @@ mod tests {
         for (event, expected) in cases {
             let mut snapshot = LifecycleSnapshot::default();
             assert_eq!(snapshot.apply(event, 1_000), ApplyOutcome::Applied);
-            assert_eq!(snapshot.sessions["session-1"].projected_status, expected);
+            assert_eq!(snapshot.sessions[&session_key()].projected_status, expected);
         }
     }
 
@@ -590,7 +634,7 @@ mod tests {
                 "sequence: {sequence:?}"
             );
         }
-        let state = &snapshot.sessions["session-1"];
+        let state = &snapshot.sessions[&session_key()];
         assert_eq!(
             state.current_turn, reference.current_turn,
             "sequence: {sequence:?}"

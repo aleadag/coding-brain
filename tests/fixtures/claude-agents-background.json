@@ -1,0 +1,14 @@
+{
+  "agents": [
+    {
+      "kind": "background",
+      "id": "agent-id",
+      "cwd": "/work/background",
+      "startedAt": 1784707200000,
+      "pid": 4102,
+      "status": "idle",
+      "sessionId": "session-uuid",
+      "unknownArray": [1, 2, 3]
+    }
+  ]
+}

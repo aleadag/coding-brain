@@ -1,8 +1,8 @@
-use crate::session::CodexSession;
+use crate::session::AgentSession;
 
 /// Fire a webhook POST with session status change payload.
 /// Runs in a background thread to avoid blocking the TUI loop.
-pub fn fire_webhook(url: &str, session: &CodexSession, old_status: String) {
+pub fn fire_webhook(url: &str, session: &AgentSession, old_status: String) {
     let payload = serde_json::json!({
         "event": "status_change",
         "session": {
@@ -147,15 +147,17 @@ pub fn kill_process(pid: u32) -> Result<(), String> {
 
 /// Create a synthetic session for aggregate budget hook firing.
 /// Uses {project} = "daily"/"weekly", {cost} = total spend.
-pub fn create_aggregate_session(total_cost: f64, limit: f64, period: &str) -> CodexSession {
-    use crate::session::RawSession;
-    let raw = RawSession {
+pub fn create_aggregate_session(total_cost: f64, limit: f64, period: &str) -> AgentSession {
+    use crate::session::RawAgentSession;
+    let raw = RawAgentSession {
+        provider: crate::provider::AgentProvider::Codex,
         pid: 0,
+        process_start_identity: None,
         session_id: format!("{period}-budget"),
         cwd: String::new(),
         started_at: 0,
     };
-    let mut s = CodexSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.project_name = format!("{period}-budget");
     s.cost_usd = total_cost;
     s.model = format!("limit=${limit:.2}");

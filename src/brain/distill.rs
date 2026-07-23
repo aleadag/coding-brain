@@ -599,6 +599,7 @@ mod tests {
     fn decisions(count: usize) -> Vec<DecisionRecord> {
         (1..=count)
             .map(|index| DecisionRecord {
+                provider: coding_brain_core::provider::AgentProvider::Codex,
                 timestamp: index.to_string(),
                 pid: 1,
                 project: if index % 2 == 0 { "alpha" } else { "beta" }.into(),

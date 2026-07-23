@@ -19,6 +19,7 @@ use coding_brain_core::lifecycle::{
 };
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::project::ProjectIdentity;
+use coding_brain_core::provider::AgentProvider;
 use coding_brain_core::runtime::BrainGateMode;
 
 use super::activity::ActivityStore;
@@ -127,6 +128,7 @@ impl HookActivity {
             label: Some(request.project.clone()),
         };
         let session = SessionTarget {
+            provider: request.lifecycle.provider(),
             session_id: request.lifecycle.session_id().to_string(),
             turn_id: request.lifecycle.turn_id().map(str::to_string),
             tool_use_id: request.tool_use_id.clone(),
@@ -346,6 +348,7 @@ fn parse_request(input: &str) -> Result<PermissionRequest, HookDiagnostic> {
         ));
     }
     let lifecycle = LifecycleIdentity::try_new(
+        AgentProvider::Codex,
         parsed.session_id,
         parsed.turn_id,
         parsed.transcript_path,
@@ -533,6 +536,7 @@ fn run_with_gate_and_stores<R, W, E, F>(
             }
         };
         let audit = HookDecisionAudit {
+            provider: request.lifecycle.provider(),
             project: &request.project,
             tool: &request.tool_name,
             command: activity_context
@@ -657,6 +661,7 @@ fn run_with_gate_and_stores<R, W, E, F>(
     };
 
     let audit = HookDecisionAudit {
+        provider: request.lifecycle.provider(),
         project: &request.project,
         tool: &request.tool_name,
         command: activity_context
@@ -935,7 +940,10 @@ mod tests {
     }
 
     fn projected_status(store: &LifecycleStore) -> Option<ProjectedStatus> {
-        store.read().unwrap().snapshot.unwrap().sessions["session-1"].projected_status
+        let key =
+            coding_brain_core::provider::AgentSessionKey::native(AgentProvider::Codex, "session-1")
+                .storage_key();
+        store.read().unwrap().snapshot.unwrap().sessions[&key].projected_status
     }
 
     #[test]
@@ -985,10 +993,7 @@ mod tests {
         );
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
-        assert_eq!(
-            store.read().unwrap().snapshot.unwrap().sessions["session-1"].projected_status,
-            Some(ProjectedStatus::NeedsInput)
-        );
+        assert_eq!(projected_status(&store), Some(ProjectedStatus::NeedsInput));
     }
 
     #[test]
@@ -1133,6 +1138,7 @@ mod tests {
         assert!(stderr.is_empty());
         let log = std::fs::read_to_string(decisions_dir().join("decisions.jsonl")).unwrap();
         let record: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(record["provider"], "codex");
         assert_eq!(record["project"], expected_project());
         assert_eq!(record["tool"], "Bash");
         assert_eq!(record["command"], "cargo test");

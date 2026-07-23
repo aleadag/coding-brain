@@ -720,6 +720,7 @@ mod tests {
 
     fn review_record() -> brain::decisions::DecisionRecord {
         brain::decisions::DecisionRecord {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             timestamp: "1".into(),
             pid: 1,
             project: "project".into(),

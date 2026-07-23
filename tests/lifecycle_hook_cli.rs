@@ -113,7 +113,12 @@ fn lifecycle_hook_binary_is_silent_and_records_under_temporary_home() {
         .snapshot
         .unwrap();
     assert_eq!(
-        snapshot.sessions["session-1"].projected_status,
+        snapshot.sessions[&coding_brain_core::provider::AgentSessionKey::native(
+            coding_brain_core::provider::AgentProvider::Codex,
+            "session-1",
+        )
+        .storage_key()]
+            .projected_status,
         Some(ProjectedStatus::Processing)
     );
 }
@@ -305,7 +310,12 @@ fn warm_lifecycle_hook_latency_and_roundtrip() {
         view.condition,
         coding_brain_core::lifecycle::StoreCondition::Healthy
     );
-    let state = &view.snapshot.unwrap().sessions["session-1"];
+    let key = coding_brain_core::provider::AgentSessionKey::native(
+        coding_brain_core::provider::AgentProvider::Codex,
+        "session-1",
+    )
+    .storage_key();
+    let state = &view.snapshot.unwrap().sessions[&key];
     assert_eq!(
         state.latest_event,
         Some(coding_brain_core::lifecycle::LifecycleEventName::PermissionRequest)

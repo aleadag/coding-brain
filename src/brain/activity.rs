@@ -1467,13 +1467,15 @@ mod tests {
     fn append_completes_large_valid_unterminated_json_within_row_limit() {
         let (root, store) = fixture_store();
         let mut large = event("large", ActivityState::Denied);
+        large.project.cwd = PathBuf::from(format!("/{}", "p".repeat(20_000)));
         large.session = Some(coding_brain_core::brain_activity::SessionTarget {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             session_id: "session".into(),
             turn_id: None,
             tool_use_id: None,
             project_id: ProjectId::Temporary("project".into()),
-            cwd: PathBuf::from("/work/project"),
-            provider_hints: (0..10).map(|_| "h".repeat(4_000)).collect(),
+            cwd: PathBuf::from(format!("/{}", "s".repeat(20_000))),
+            provider_hints: Vec::new(),
         });
         store.append(large).unwrap();
         let path = root.path().join("activity.jsonl");
@@ -1702,15 +1704,16 @@ mod tests {
     fn oversized_normalized_event_is_rejected() {
         let (_root, store) = fixture_store();
         let mut oversized = event("a1", ActivityState::Denied);
-        oversized.project.cwd = PathBuf::from(format!("/{}", "c".repeat(5_000)));
+        oversized.project.cwd = PathBuf::from(format!("/{}", "c".repeat(40_000)));
         oversized.reasoning = Some("r".repeat(5_000));
         oversized.session = Some(coding_brain_core::brain_activity::SessionTarget {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             session_id: "s".repeat(5_000),
             turn_id: None,
             tool_use_id: None,
             project_id: ProjectId::Temporary("p".repeat(5_000)),
-            cwd: PathBuf::from(format!("/{}", "d".repeat(5_000))),
-            provider_hints: (0..16).map(|_| "h".repeat(5_000)).collect(),
+            cwd: PathBuf::from(format!("/{}", "d".repeat(40_000))),
+            provider_hints: Vec::new(),
         });
         assert!(store.append(oversized).is_err());
         assert!(store.read().unwrap().events().is_empty());

@@ -1,7 +1,7 @@
-use crate::session::CodexSession;
+use crate::session::AgentSession;
 use crate::terminals::{BoundedOutput, PaneCapture, Terminal, checked_capture, run_bounded};
 
-fn pane_target(session: &CodexSession) -> Result<String, String> {
+fn pane_target(session: &AgentSession) -> Result<String, String> {
     let output = run_bounded(std::process::Command::new("tmux").args([
         "list-panes",
         "-a",
@@ -20,7 +20,7 @@ fn pane_target(session: &CodexSession) -> Result<String, String> {
         .ok_or_else(|| format!("TTY {} not found in tmux panes", session.tty))
 }
 
-pub fn capture(session: &CodexSession) -> Result<PaneCapture, String> {
+pub fn capture(session: &AgentSession) -> Result<PaneCapture, String> {
     let target = pane_target(session)?;
     let output = run_bounded(std::process::Command::new("tmux").args([
         "capture-pane",
@@ -63,7 +63,7 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
     }
 }
 
-pub fn switch(session: &CodexSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     // tmux can list panes with their TTY: `tmux list-panes -a -F '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}'`
     let target = pane_target(session)?;
     let _ = std::process::Command::new("tmux")
@@ -75,7 +75,7 @@ pub fn switch(session: &CodexSession) -> Result<(), String> {
     Ok(())
 }
 
-pub fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
+pub fn send_input(session: &AgentSession, text: &str) -> Result<(), String> {
     let target = pane_target(session)?;
     let output = std::process::Command::new("tmux")
         .args(["send-keys", "-t", &target, text, ""])

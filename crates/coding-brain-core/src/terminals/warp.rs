@@ -1,7 +1,7 @@
 use super::run_osascript;
-use crate::session::CodexSession;
+use crate::session::AgentSession;
 
-pub fn switch(session: &CodexSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     let search = build_search_term(session);
 
     let script = format!(
@@ -44,7 +44,7 @@ pub fn switch(session: &CodexSession) -> Result<(), String> {
 
 /// Send input text to the Codex session's Warp pane.
 /// Switches to the pane, ensures terminal focus, types the text, then switches back.
-pub fn send_input(session: &CodexSession, text: &str) -> Result<(), String> {
+pub fn send_input(session: &AgentSession, text: &str) -> Result<(), String> {
     switch(session)?;
     ensure_terminal_focus()?;
 
@@ -88,7 +88,7 @@ fn ensure_terminal_focus() -> Result<(), String> {
     )
 }
 
-pub fn build_search_term(session: &CodexSession) -> String {
+pub fn build_search_term(session: &AgentSession) -> String {
     // Warp's palette treats `-` as negation and `/` as special.
     // Use resume UUID hex prefix when available (unique, no special chars).
     if session.command_args.contains("--resume") {

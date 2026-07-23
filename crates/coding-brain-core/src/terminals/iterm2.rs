@@ -1,7 +1,7 @@
 use super::run_osascript;
-use crate::session::CodexSession;
+use crate::session::AgentSession;
 
-pub fn switch(session: &CodexSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     let script = format!(
         r#"
         tell application "iTerm2"

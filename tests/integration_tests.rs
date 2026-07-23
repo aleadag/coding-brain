@@ -6,18 +6,21 @@ use coding_brain::models;
 use coding_brain::monitor;
 use coding_brain::process;
 use coding_brain::session::{
-    CodexSession, CodexTaskState, RawSession, SessionStatus, TelemetryStatus,
+    AgentSession, CodexTaskState, RawAgentSession, SessionStatus, TelemetryStatus,
 };
+use coding_brain_core::provider::AgentProvider;
 
 /// Helper: create a minimal session for testing status inference.
-fn make_session(cpu: f32, last_message_age_secs: u64) -> CodexSession {
-    let raw = RawSession {
+fn make_session(cpu: f32, last_message_age_secs: u64) -> AgentSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "test-session".into(),
         cwd: "/tmp/test-project".into(),
         started_at: 0,
     };
-    let mut s = CodexSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.cpu_percent = cpu;
     s.telemetry_status = TelemetryStatus::Available;
     s.usage_metrics_available = true;
@@ -155,13 +158,15 @@ fn status_no_signals_idle() {
 
 #[test]
 fn status_no_telemetry_unknown() {
-    let raw = RawSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "test-session".into(),
         cwd: "/tmp/test-project".into(),
         started_at: 0,
     };
-    let mut s = CodexSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     monitor::infer_status(&mut s, "", "", false);
     assert_eq!(s.status, SessionStatus::Unknown);
 }
@@ -364,7 +369,7 @@ fn shorten_model_unknown() {
 // JSONL Parsing Integration Tests (using temp files)
 // ────────────────────────────────────────────────────────────────────────────
 
-fn make_session_with_jsonl(content: &str) -> (CodexSession, tempfile::NamedTempFile) {
+fn make_session_with_jsonl(content: &str) -> (AgentSession, tempfile::NamedTempFile) {
     let mut file = tempfile::NamedTempFile::new().unwrap();
     file.write_all(content.as_bytes()).unwrap();
     if !content.is_empty() && !content.ends_with('\n') {
@@ -372,18 +377,20 @@ fn make_session_with_jsonl(content: &str) -> (CodexSession, tempfile::NamedTempF
     }
     file.flush().unwrap();
 
-    let raw = RawSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "test".into(),
         cwd: "/tmp/test".into(),
         started_at: 0,
     };
-    let mut s = CodexSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.jsonl_path = Some(file.path().to_path_buf());
     (s, file)
 }
 
-fn make_codex_session_with_jsonl(content: &str) -> (CodexSession, tempfile::NamedTempFile) {
+fn make_codex_session_with_jsonl(content: &str) -> (AgentSession, tempfile::NamedTempFile) {
     let mut file = tempfile::Builder::new()
         .prefix("rollout-")
         .suffix(".jsonl")
@@ -395,18 +402,20 @@ fn make_codex_session_with_jsonl(content: &str) -> (CodexSession, tempfile::Name
     }
     file.flush().unwrap();
 
-    let raw = RawSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "test".into(),
         cwd: "/tmp/test".into(),
         started_at: 0,
     };
-    let mut session = CodexSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     session.jsonl_path = Some(file.path().to_path_buf());
     (session, file)
 }
 
-fn codex_session_file(model: &str) -> (CodexSession, tempfile::NamedTempFile) {
+fn codex_session_file(model: &str) -> (AgentSession, tempfile::NamedTempFile) {
     make_codex_session_with_jsonl(&format!(
         "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"{model}\"}}}}\n"
     ))
@@ -464,14 +473,16 @@ fn make_session_with_paths(
     cwd: String,
     session_id: String,
     jsonl_path: std::path::PathBuf,
-) -> CodexSession {
-    let raw = RawSession {
+) -> AgentSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id,
         cwd,
         started_at: 0,
     };
-    let mut s = CodexSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.jsonl_path = Some(jsonl_path);
     s
 }
@@ -652,7 +663,7 @@ fn codex_monitor_records_function_calls() {
     file.write_all(jsonl.as_bytes()).unwrap();
     file.flush().unwrap();
 
-    let mut session = CodexSession::from_codex_transcript(
+    let mut session = AgentSession::from_codex_transcript(
         "019eb6ac-6d30-7301-885d-ff4d354c0116".into(),
         "/home/alexander/hacking/aleadag/codexctl".into(),
         0,
@@ -832,13 +843,15 @@ fn process_backed_codex_monitor_records_usage_metrics() {
     file.write_all(jsonl.as_bytes()).unwrap();
     file.flush().unwrap();
 
-    let raw = RawSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "019eb6ac-6d30-7301-885d-ff4d354c0116".into(),
         cwd: "/home/alexander/hacking/aleadag/codexctl".into(),
         started_at: 0,
     };
-    let mut session = CodexSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     session.jsonl_path = Some(file.path().to_path_buf());
     session.model_profile_source = "codex-transcript".into();
 
@@ -875,13 +888,15 @@ fn process_backed_codex_monitor_preserves_transcript_context_window_on_idle_tick
     file.write_all(jsonl.as_bytes()).unwrap();
     file.flush().unwrap();
 
-    let raw = RawSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "019ebb14-fa82-70b0-afc7-6daab97998ec".into(),
         cwd: "/home/alexander/hacking/aleadag/codexctl".into(),
         started_at: 0,
     };
-    let mut session = CodexSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     session.jsonl_path = Some(file.path().to_path_buf());
     session.model_profile_source = "codex-transcript".into();
 
@@ -902,7 +917,7 @@ fn transcript_backed_sessions_are_not_marked_finished_by_ps() {
     file.write_all(include_str!("fixtures/codex-session-meta.json").as_bytes())
         .unwrap();
     file.flush().unwrap();
-    let session = CodexSession::from_codex_transcript(
+    let session = AgentSession::from_codex_transcript(
         "019eb6ac-6d30-7301-885d-ff4d354c0116".into(),
         "/home/alexander/hacking/aleadag/codexctl".into(),
         0,
@@ -962,13 +977,15 @@ fn jsonl_incremental_reads() {
     writeln!(file, "{line1}").unwrap();
     file.flush().unwrap();
 
-    let raw = RawSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "test".into(),
         cwd: "/tmp/test".into(),
         started_at: 0,
     };
-    let mut s = CodexSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.jsonl_path = Some(file.path().to_path_buf());
 
     // First read
@@ -1034,13 +1051,15 @@ fn jsonl_waiting_for_task_detection() {
 
 #[test]
 fn jsonl_missing_file() {
-    let raw = RawSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "test".into(),
         cwd: "/tmp/test".into(),
         started_at: 0,
     };
-    let mut s = CodexSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.jsonl_path = Some(std::path::PathBuf::from("/nonexistent/path.jsonl"));
 
     // Should not panic
@@ -1050,13 +1069,15 @@ fn jsonl_missing_file() {
 
 #[test]
 fn jsonl_no_path() {
-    let raw = RawSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 1,
+        process_start_identity: None,
         session_id: "test".into(),
         cwd: "/tmp/test".into(),
         started_at: 0,
     };
-    let mut s = CodexSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     // jsonl_path is None
 
     monitor::update_tokens(&mut s);
@@ -1320,7 +1341,7 @@ fn resolve_with_layout(
     cwd: &str,
     session_id: &str,
     slug_on_disk: &str,
-) -> (CodexSession, tempfile::TempDir) {
+) -> (AgentSession, tempfile::TempDir) {
     let _guard = HOME_LOCK.lock().unwrap();
 
     let home = tempfile::tempdir().unwrap();
@@ -1336,13 +1357,15 @@ fn resolve_with_layout(
     )
     .unwrap();
 
-    let raw = RawSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 86131,
+        process_start_identity: None,
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
         started_at: 1776421121745,
     };
-    let mut session = CodexSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     discovery::resolve_jsonl_paths(std::slice::from_mut(&mut session));
 
     // Restore HOME
@@ -1412,13 +1435,15 @@ fn resolve_jsonl_encoding_mismatch_fallback() {
         r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
     ).unwrap();
 
-    let raw = RawSession {
+    let raw = RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 99999,
+        process_start_identity: None,
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
         started_at: 0,
     };
-    let mut session = CodexSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     discovery::resolve_jsonl_paths(std::slice::from_mut(&mut session));
 
     if let Some(h) = original_home {
@@ -1442,8 +1467,10 @@ fn resolve_jsonl_does_not_guess_latest_for_unknown_process_session() {
     std::fs::create_dir_all(&project_dir).unwrap();
     std::fs::write(project_dir.join("unrelated.jsonl"), "{}\n").unwrap();
 
-    let mut session = CodexSession::from_raw(RawSession {
+    let mut session = AgentSession::from_raw(RawAgentSession {
+        provider: AgentProvider::Codex,
         pid: 99998,
+        process_start_identity: None,
         session_id: "codex-99998".into(),
         cwd: cwd.into(),
         started_at: 0,
@@ -1541,6 +1568,7 @@ fn write_terminal_activity(decision_id: &str, session_id: &str, tool_use_id: &st
             label: None,
         },
         session: Some(coding_brain_core::brain_activity::SessionTarget {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             session_id: session_id.into(),
             turn_id: Some("turn-1".into()),
             tool_use_id: Some(tool_use_id.into()),
@@ -1583,6 +1611,7 @@ fn reaper_attributes_outcome_to_recent_decision() {
     write_terminal_activity(&decision_id, "session-1", "call-1");
 
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("cargo test".into()),
         project: "alpha".into(),
@@ -1618,6 +1647,7 @@ fn reaper_leaves_orphaned_outcome_pending_within_window() {
         .unwrap()
         .as_secs();
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("ls".into()),
         project: "p".into(),
@@ -1649,6 +1679,7 @@ fn reaper_orphans_old_unattributed_outcome() {
         - 90_000; // 25h ago
 
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("rm -rf /tmp/stale".into()),
         project: "p".into(),
@@ -1693,6 +1724,7 @@ fn reaper_will_not_double_attribute_one_decision() {
 
     // Two pending outcomes for the same approach.
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("echo hi".into()),
         project: "p".into(),
@@ -1704,6 +1736,7 @@ fn reaper_will_not_double_attribute_one_decision() {
         ts: now,
     });
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("echo hi".into()),
         project: "p".into(),
@@ -1738,6 +1771,7 @@ fn reaper_skips_decisions_lacking_decision_id() {
         now - 5
     ));
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("ls".into()),
         project: "p".into(),
@@ -1781,6 +1815,7 @@ fn reaper_does_not_guess_failed_test_attribution_from_recent_edit() {
     ));
 
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("cargo test --release".into()),
         project: "alpha".into(),
@@ -1815,6 +1850,7 @@ fn reaper_test_failure_skips_passing_run() {
 
     // Successful test run → no fan-out marker.
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("cargo test".into()),
         project: "alpha".into(),
@@ -1849,6 +1885,7 @@ fn reaper_test_failure_only_taps_edit_like_tools() {
     ));
 
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("pytest".into()),
         project: "alpha".into(),
@@ -1883,6 +1920,7 @@ fn reaper_never_creates_heuristic_test_failure_markers() {
 
     // First failing test run.
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("cargo test".into()),
         project: "alpha".into(),
@@ -1899,6 +1937,7 @@ fn reaper_never_creates_heuristic_test_failure_markers() {
     // A second failing run after attribution must not double-tag the same
     // edit — markers are written with create_new.
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("cargo test".into()),
         project: "alpha".into(),
@@ -1934,6 +1973,7 @@ fn reaper_test_failure_respects_fanout_window() {
     ));
 
     write_pending_file(&outcomes::PendingOutcome {
+        provider: AgentProvider::Codex,
         tool: "Bash".into(),
         command: Some("cargo test".into()),
         project: "alpha".into(),

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::session::{self, CodexSession};
+use crate::session::{self, AgentSession};
 use crate::transcript::{self, TranscriptBlock, TranscriptEvent};
 
 /// Compact context for the brain LLM, built from session state + recent transcript.
@@ -28,7 +28,7 @@ pub struct BrainContext {
 }
 
 /// Build a compact context for the brain from a session's state and JSONL transcript.
-pub fn build_context(session: &CodexSession, max_tokens: u32) -> BrainContext {
+pub fn build_context(session: &AgentSession, max_tokens: u32) -> BrainContext {
     let session_summary = format_session_summary(session);
     let recent_transcript = read_recent_transcript(session, max_tokens);
     let decision_prompt = format_decision_prompt(session);
@@ -44,7 +44,7 @@ pub fn build_context(session: &CodexSession, max_tokens: u32) -> BrainContext {
     }
 }
 
-fn format_session_summary(session: &CodexSession) -> String {
+fn format_session_summary(session: &AgentSession) -> String {
     let context_pct = if session.context_max > 0 {
         (session.context_tokens as f64 / session.context_max as f64 * 100.0) as u32
     } else {
@@ -88,7 +88,7 @@ fn format_session_summary(session: &CodexSession) -> String {
     summary
 }
 
-fn format_decision_prompt(session: &CodexSession) -> String {
+fn format_decision_prompt(session: &AgentSession) -> String {
     match session.status {
         crate::session::SessionStatus::NeedsInput => {
             let tool = session.actionable_tool_name().unwrap_or("unknown");
@@ -115,7 +115,7 @@ fn format_decision_prompt(session: &CodexSession) -> String {
 
 /// Read recent transcript entries from the JSONL file, compacted to fit budget.
 /// Keeps the last N full messages and summarizes older ones as one-liners.
-fn read_recent_transcript(session: &CodexSession, max_tokens: u32) -> String {
+fn read_recent_transcript(session: &AgentSession, max_tokens: u32) -> String {
     let Some(ref jsonl_path) = session.jsonl_path else {
         return "(no transcript available)".into();
     };
@@ -417,19 +417,21 @@ pub fn format_brain_prompt(ctx: &BrainContext) -> String {
 mod tests {
     use super::*;
     use crate::session::{
-        ApprovalEvidence, ApprovalObservation, CodexSession, RawSession, SessionStatus,
+        AgentSession, ApprovalEvidence, ApprovalObservation, RawAgentSession, SessionStatus,
         TelemetryStatus,
     };
     use coding_brain_core::terminals::Terminal;
 
-    fn make_session() -> CodexSession {
-        let raw = RawSession {
+    fn make_session() -> AgentSession {
+        let raw = RawAgentSession {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             pid: 100,
+            process_start_identity: None,
             session_id: "test".into(),
             cwd: "/tmp/my-project".into(),
             started_at: 0,
         };
-        let mut s = CodexSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.status = SessionStatus::NeedsInput;
         s.telemetry_status = TelemetryStatus::Available;
         s.model = "gpt-5.5".into();
@@ -441,7 +443,7 @@ mod tests {
         s
     }
 
-    fn confirm_wrapper_command(session: &mut CodexSession, command: &str) {
+    fn confirm_wrapper_command(session: &mut AgentSession, command: &str) {
         session.pending_tool_name = Some("exec".into());
         session.pending_tool_call_id = Some("call-1".into());
         session.pending_tool_input = Some("await tools.exec_command(args);".into());

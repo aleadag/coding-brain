@@ -11,10 +11,27 @@ use std::time::{Duration, Instant};
 
 use coding_brain::brain::activity::ActivityStore;
 use coding_brain_core::brain_activity::{
-    ActivityKind, ActivityOutcome, ActivityState, DeliveryState, SnapshotLimits,
+    ActivityKind, ActivityOutcome, ActivityState, DeliveryState, SessionTarget, SnapshotLimits,
 };
 use coding_brain_core::lifecycle::{LifecycleStore, ProjectedStatus};
+use coding_brain_core::provider::AgentProvider;
 use fs2::FileExt;
+
+#[test]
+fn legacy_activity_target_defaults_to_codex_without_reemitting_provider_hints() {
+    let target: SessionTarget = serde_json::from_value(serde_json::json!({
+        "session_id": "legacy",
+        "project_id": {"kind": "stable", "value": "project"},
+        "cwd": "/tmp/project",
+        "provider_hints": ["agent-deck"]
+    }))
+    .unwrap();
+
+    assert_eq!(target.provider, AgentProvider::Codex);
+    let encoded = serde_json::to_value(target).unwrap();
+    assert_eq!(encoded["provider"], "codex");
+    assert!(encoded.get("provider_hints").is_none());
+}
 
 fn permission_payload(cwd: &Path, command: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
@@ -415,7 +432,13 @@ fn explicit_on_without_toml_uses_defaults_and_audits_without_response() {
     );
     let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
     assert_eq!(
-        lifecycle.read().unwrap().snapshot.unwrap().sessions["session-1"].projected_status,
+        lifecycle.read().unwrap().snapshot.unwrap().sessions
+            [&coding_brain_core::provider::AgentSessionKey::native(
+                AgentProvider::Codex,
+                "session-1",
+            )
+            .storage_key()]
+            .projected_status,
         Some(ProjectedStatus::NeedsInput)
     );
 }

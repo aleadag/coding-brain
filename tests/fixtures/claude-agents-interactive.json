@@ -1,0 +1,14 @@
+{
+  "agents": [
+    {
+      "kind": "interactive",
+      "cwd": "/work/interactive",
+      "startedAt": "2026-07-22T08:00:00Z",
+      "pid": 4101,
+      "status": "working",
+      "sessionId": "interactive-session-uuid",
+      "futureField": { "ignored": true }
+    }
+  ],
+  "schemaVersion": 99
+}

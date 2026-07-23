@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::brain::client::BrainSuggestion;
 use coding_brain_core::brain_activity::ActivityEvent;
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
+use coding_brain_core::provider::AgentProvider;
 use fs2::FileExt;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -61,6 +62,7 @@ impl DecisionType {
 /// A single decision record: what the brain suggested and what the user did.
 #[derive(Debug, Clone)]
 pub struct DecisionRecord {
+    pub provider: AgentProvider,
     pub timestamp: String,
     pub pid: u32,
     pub project: String,
@@ -465,7 +467,7 @@ pub(super) fn local_hour_from_epoch(epoch_secs: i64) -> u8 {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Build a JSON snapshot of session state for embedding in a JSONL record.
-fn snapshot_context(session: &crate::session::CodexSession) -> serde_json::Value {
+fn snapshot_context(session: &crate::session::AgentSession) -> serde_json::Value {
     let context_pct = if session.context_max > 0 {
         ((session.context_tokens as f64 / session.context_max as f64) * 100.0) as u8
     } else {
@@ -503,7 +505,7 @@ pub fn log_decision(
     command: Option<&str>,
     suggestion: &BrainSuggestion,
     user_action: &str,
-    session: Option<&crate::session::CodexSession>,
+    session: Option<&crate::session::AgentSession>,
     decision_type: DecisionType,
     override_reason: Option<&str>,
 ) {
@@ -533,7 +535,7 @@ pub fn log_decision_full(
     command: Option<&str>,
     suggestion: &BrainSuggestion,
     user_action: &str,
-    session: Option<&crate::session::CodexSession>,
+    session: Option<&crate::session::AgentSession>,
     decision_type: DecisionType,
     override_reason: Option<&str>,
     brain_decision_ms: Option<u64>,
@@ -545,6 +547,7 @@ pub fn log_decision_full(
         .as_secs();
     let decision_id = gen_decision_id();
     let mut record = serde_json::json!({
+        "provider": session.map(|session| session.provider).unwrap_or_default(),
         "ts": timestamp_now(),
         "pid": pid,
         "project": project,
@@ -580,10 +583,11 @@ pub fn log_observation(
     tool: Option<&str>,
     command: Option<&str>,
     observed_action: &str, // "user_approve", "user_input", "rule_approve", "rule_deny", etc.
-    session: Option<&crate::session::CodexSession>,
+    session: Option<&crate::session::AgentSession>,
 ) {
     let decision_id = gen_decision_id();
     let mut record = serde_json::json!({
+        "provider": session.map(|session| session.provider).unwrap_or_default(),
         "ts": timestamp_now(),
         "pid": pid,
         "project": project,
@@ -605,6 +609,7 @@ pub fn log_observation(
 }
 
 pub(crate) struct HookDecisionAudit<'a> {
+    pub provider: AgentProvider,
     pub project: &'a str,
     pub tool: &'a str,
     pub command: &'a str,
@@ -636,6 +641,7 @@ fn append_hook_audit(audit: &HookDecisionAudit<'_>, user_action: &str) -> io::Re
         .as_secs();
     let decision_id = gen_decision_id();
     let record = serde_json::json!({
+        "provider": audit.provider,
         "ts": timestamp_now(),
         "pid": 0,
         "project": audit.project,
@@ -799,7 +805,12 @@ pub fn read_all_decisions() -> Vec<DecisionRecord> {
                 .and_then(|v| v.as_str())
                 .map(DecisionType::from_label)
                 .unwrap_or(DecisionType::Session);
+            let provider = match json.get("provider") {
+                None => AgentProvider::Codex,
+                Some(value) => serde_json::from_value(value.clone()).ok()?,
+            };
             Some(DecisionRecord {
+                provider,
                 timestamp: json.get("ts")?.to_string(),
                 pid: json.get("pid")?.as_u64()? as u32,
                 project: json.get("project")?.as_str()?.to_string(),
@@ -1007,8 +1018,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn decision_records_default_legacy_provider_and_retain_explicit_provider() {
+        let root = decisions_dir();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("decisions.jsonl"),
+            concat!(
+                "{\"ts\":\"1\",\"pid\":1,\"project\":\"legacy\",\"user_action\":\"accept\"}\n",
+                "{\"provider\":\"claude\",\"ts\":\"2\",\"pid\":2,\"project\":\"new\",\"user_action\":\"accept\"}\n",
+                "{\"provider\":\"future-provider\",\"ts\":\"3\",\"pid\":3,\"project\":\"invalid\",\"user_action\":\"accept\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let decisions = read_all_decisions();
+
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].provider, AgentProvider::Codex);
+        assert_eq!(decisions[1].provider, AgentProvider::Claude);
+    }
+
     fn make_decision(tool: &str, project: &str, user_action: &str) -> DecisionRecord {
         DecisionRecord {
+            provider: AgentProvider::Codex,
             timestamp: "0".into(),
             pid: 1,
             project: project.into(),
@@ -1342,7 +1375,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_context_fields() {
-        use crate::session::{CodexSession, SessionStatus};
+        use crate::session::{AgentSession, SessionStatus};
         use std::collections::HashMap;
         use std::time::Duration;
 
@@ -1353,8 +1386,10 @@ mod tests {
         let mut files = HashMap::new();
         files.insert("src/main.rs".to_string(), 2u32);
 
-        let session = CodexSession {
+        let session = AgentSession {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             pid: 42,
+            process_start_identity: None,
             process_backed: true,
             session_id: "test-session".into(),
             cwd: "/tmp".into(),

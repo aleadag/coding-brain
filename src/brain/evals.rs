@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::config::BrainConfig;
-use crate::session::{CodexSession, RawSession, SessionStatus, TelemetryStatus};
+use crate::session::{AgentSession, RawAgentSession, SessionStatus, TelemetryStatus};
 
 use super::client;
 use super::context;
@@ -159,14 +159,16 @@ fn run_one(config: &BrainConfig, scenario: &EvalScenario) -> EvalResult {
     }
 }
 
-fn build_session_from_eval(eval: &EvalSession) -> CodexSession {
-    let raw = RawSession {
+fn build_session_from_eval(eval: &EvalSession) -> AgentSession {
+    let raw = RawAgentSession {
+        provider: coding_brain_core::provider::AgentProvider::Codex,
         pid: 99999,
+        process_start_identity: None,
         session_id: "eval".into(),
         cwd: format!("/tmp/{}", eval.project),
         started_at: 0,
     };
-    let mut s = CodexSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.status = match eval.status.to_lowercase().as_str() {
         "needsinput" | "needs input" => SessionStatus::NeedsInput,
         "waitinginput" | "waiting" => SessionStatus::WaitingInput,
