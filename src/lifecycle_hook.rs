@@ -21,6 +21,7 @@ use coding_brain_core::session_links::{
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::brain::UNSUPPORTED_PERMISSION_TOOL_REASON;
 use crate::brain::activity::{ActivityLog, ActivityStore};
 #[cfg(test)]
 use crate::provider_hooks::normalized_outcome;
@@ -446,6 +447,15 @@ fn correlate_outcome(
                 "orphan outcome: exact lifecycle identity is ambiguous or ineligible",
             );
         }
+        let exact_activity_id = &exact_activity_ids[0];
+        if identity.provider() == AgentProvider::Antigravity
+            && first_terminal_with_index(log, exact_activity_id).is_some_and(|(_, event)| {
+                event.state == ActivityState::Abstained
+                    && event.reasoning.as_deref() == Some(UNSUPPORTED_PERMISSION_TOOL_REASON)
+            })
+        {
+            return Correlation::None;
+        }
         return correlate_candidates(
             log,
             lifecycle,
@@ -621,11 +631,18 @@ fn first_allowed_terminal_with_index<'a>(
     log: &'a ActivityLog,
     activity_id: &str,
 ) -> Option<(usize, &'a ActivityEvent)> {
+    first_terminal_with_index(log, activity_id)
+        .filter(|(_, event)| event.state == ActivityState::Allowed && event.decision_id.is_some())
+}
+
+fn first_terminal_with_index<'a>(
+    log: &'a ActivityLog,
+    activity_id: &str,
+) -> Option<(usize, &'a ActivityEvent)> {
     log.events()
         .iter()
         .enumerate()
         .find(|(_, event)| event.activity_id == activity_id && event.state.is_terminal())
-        .filter(|(_, event)| event.state == ActivityState::Allowed && event.decision_id.is_some())
 }
 
 fn outcome_event(
@@ -878,6 +895,100 @@ mod tests {
         )
     }
 
+    fn exact_decision_event(
+        cwd: &Path,
+        provider: AgentProvider,
+        activity_id: &str,
+        recorded_at_ms: u64,
+        state: ActivityState,
+        reason: &str,
+    ) -> ActivityEvent {
+        let tool_use_id = match provider {
+            AgentProvider::Antigravity => "step-5",
+            AgentProvider::Codex => "call-1",
+            AgentProvider::Claude => unreachable!(),
+        };
+        let mut event = decision_event(
+            cwd,
+            activity_id,
+            recorded_at_ms,
+            Some(tool_use_id),
+            "cargo test",
+            state,
+        );
+        let session = event.session.as_mut().unwrap();
+        session.provider = provider;
+        if provider == AgentProvider::Antigravity {
+            session.session_id = "agy-conversation-1".into();
+            session.turn_id = Some("step-5".into());
+        }
+        event.reasoning = Some(reason.into());
+        event
+    }
+
+    fn invoke_exact_post(
+        provider: AgentProvider,
+        cwd: &Path,
+        lifecycle: &LifecycleStore,
+        activity: &ActivityStore,
+    ) {
+        match provider {
+            AgentProvider::Codex => {
+                invoke_activity_hook(
+                    lifecycle,
+                    activity,
+                    hook_payload(
+                        cwd,
+                        "PostToolUse",
+                        "call-1",
+                        "cargo test",
+                        Some(serde_json::json!({"exit_code": 0})),
+                    ),
+                );
+            }
+            AgentProvider::Antigravity => {
+                let mut payload: Value = serde_json::from_slice(include_bytes!(
+                    "../tests/fixtures/hooks/antigravity-post-tool-use.json"
+                ))
+                .unwrap();
+                payload["workspacePaths"] = serde_json::json!([cwd]);
+                persist_provider_hook(
+                    AgentProvider::Antigravity,
+                    Some("PostToolUse"),
+                    &serde_json::to_vec(&payload).unwrap(),
+                    lifecycle,
+                    Some(activity),
+                    None,
+                )
+                .unwrap();
+            }
+            AgentProvider::Claude => unreachable!(),
+        }
+    }
+
+    fn exact_correlation_counts(
+        provider: AgentProvider,
+        rows: &[(&str, ActivityState, &str)],
+    ) -> (usize, usize) {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        for (index, (activity_id, state, reason)) in rows.iter().enumerate() {
+            activity
+                .append(exact_decision_event(
+                    temp.path(),
+                    provider,
+                    activity_id,
+                    index as u64 + 1,
+                    *state,
+                    reason,
+                ))
+                .unwrap();
+        }
+        invoke_exact_post(provider, temp.path(), &lifecycle, &activity);
+        outcome_and_diagnostic_counts(&activity)
+    }
+
     fn assert_diagnostics_are_metadata_only(activity: &ActivityStore, forbidden: &[&str]) {
         let events = activity.read().unwrap().events().to_vec();
         for event in events
@@ -895,6 +1006,90 @@ mod tests {
                 "persisted forbidden value: {value}"
             );
         }
+    }
+
+    #[test]
+    fn unsupported_exception_is_antigravity_only() {
+        assert_eq!(
+            exact_correlation_counts(
+                AgentProvider::Codex,
+                &[(
+                    "activity-1",
+                    ActivityState::Abstained,
+                    UNSUPPORTED_PERMISSION_TOOL_REASON,
+                )],
+            ),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn unsupported_exception_requires_the_exact_reason() {
+        assert_eq!(
+            exact_correlation_counts(
+                AgentProvider::Antigravity,
+                &[(
+                    "activity-1",
+                    ActivityState::Abstained,
+                    "Brain model mode is off",
+                )],
+            ),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn unsupported_exception_requires_one_exact_activity_id() {
+        assert_eq!(
+            exact_correlation_counts(
+                AgentProvider::Antigravity,
+                &[
+                    (
+                        "activity-1",
+                        ActivityState::Abstained,
+                        UNSUPPORTED_PERMISSION_TOOL_REASON,
+                    ),
+                    (
+                        "activity-2",
+                        ActivityState::Abstained,
+                        UNSUPPORTED_PERMISSION_TOOL_REASON,
+                    ),
+                ],
+            ),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn unsupported_exception_respects_first_terminal_state() {
+        assert_eq!(
+            exact_correlation_counts(
+                AgentProvider::Antigravity,
+                &[
+                    ("activity-1", ActivityState::Denied, "model denied"),
+                    (
+                        "activity-1",
+                        ActivityState::Abstained,
+                        UNSUPPORTED_PERMISSION_TOOL_REASON,
+                    ),
+                ],
+            ),
+            (0, 1)
+        );
+        assert_eq!(
+            exact_correlation_counts(
+                AgentProvider::Antigravity,
+                &[
+                    (
+                        "activity-1",
+                        ActivityState::Abstained,
+                        UNSUPPORTED_PERMISSION_TOOL_REASON,
+                    ),
+                    ("activity-1", ActivityState::Denied, "model denied"),
+                ],
+            ),
+            (0, 0)
+        );
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub mod risk;
 pub mod safety;
 pub mod sequences;
 
+pub(crate) const UNSUPPORTED_PERMISSION_TOOL_REASON: &str = "unsupported permission tool";
+
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 

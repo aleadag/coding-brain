@@ -21,6 +21,7 @@ use coding_brain_core::project::ProjectIdentity;
 use coding_brain_core::provider::AgentProvider;
 use coding_brain_core::runtime::BrainGateMode;
 
+use super::UNSUPPORTED_PERMISSION_TOOL_REASON;
 use super::activity::ActivityStore;
 use super::client::BrainSuggestion;
 use super::decisions::{HookDecisionAudit, append_deterministic, append_hook_proposal};
@@ -253,7 +254,7 @@ where
     if !supported {
         return HookEvaluation::Abstain {
             brain: None,
-            reason: "unsupported permission tool".into(),
+            reason: UNSUPPORTED_PERMISSION_TOOL_REASON.into(),
             terminal_state: ActivityState::Abstained,
         };
     }

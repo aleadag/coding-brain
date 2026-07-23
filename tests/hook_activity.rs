@@ -105,6 +105,32 @@ fn run_provider_permission_hook(
     child.wait_with_output().unwrap()
 }
 
+fn run_provider_lifecycle_hook(
+    home: &Path,
+    provider: &str,
+    antigravity_event: Option<&str>,
+    payload: &[u8],
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
+    command.args(["--lifecycle-hook", "--provider", provider]);
+    if let Some(event) = antigravity_event {
+        command.args(["--antigravity-hook-event", event]);
+    }
+    let mut child = command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", isolated_path(home))
+        .current_dir(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    child.wait_with_output().unwrap()
+}
+
 fn claude_permission_payload(cwd: &Path, policy: Option<&str>) -> Vec<u8> {
     let mut payload: serde_json::Value = serde_json::from_slice(include_bytes!(
         "fixtures/hooks/claude-permission-request.json"
@@ -135,6 +161,27 @@ fn antigravity_permission_payload(cwd: &Path, policy: Option<&str>) -> Vec<u8> {
         payload["decision"] = serde_json::json!(policy);
         payload["permissionOverrides"] = serde_json::json!(["command(cargo test)"]);
     }
+    serde_json::to_vec(&payload).unwrap()
+}
+
+fn unsupported_antigravity_permission_payload(cwd: &Path, step: u64, tool: &str) -> Vec<u8> {
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&antigravity_permission_payload(cwd, None)).unwrap();
+    payload["stepIdx"] = serde_json::json!(step);
+    payload["toolCall"] = serde_json::json!({
+        "name": tool,
+        "args": {"AbsolutePath": "/tmp/example"}
+    });
+    serde_json::to_vec(&payload).unwrap()
+}
+
+fn antigravity_post_payload(cwd: &Path, step: u64) -> Vec<u8> {
+    let mut payload: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "fixtures/hooks/antigravity-post-tool-use.json"
+    ))
+    .unwrap();
+    payload["stepIdx"] = serde_json::json!(step);
+    payload["workspacePaths"] = serde_json::json!([cwd]);
     serde_json::to_vec(&payload).unwrap()
 }
 
@@ -1135,6 +1182,70 @@ fn antigravity_reason_is_redacted_and_bounded() {
     assert!(reason.contains("[REDACTED]"));
     assert!(!reason.contains("sk-secret-value"));
     assert!(reason.len() <= coding_brain_core::brain_activity::MAX_ACTIVITY_FIELD_BYTES);
+}
+
+#[test]
+fn unsupported_antigravity_post_tool_use_is_observation_only() {
+    for (step, tool) in [(5, "view_file"), (6, "grep_search")] {
+        let home = tempfile::tempdir().unwrap();
+        let permission = run_provider_permission_hook(
+            home.path(),
+            "antigravity",
+            Some("PreToolUse"),
+            &unsupported_antigravity_permission_payload(home.path(), step, tool),
+        );
+        assert!(permission.status.success(), "{tool}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&permission.stdout).unwrap()["decision"],
+            "ask"
+        );
+        assert!(
+            permission.stderr.is_empty(),
+            "{tool}: {}",
+            String::from_utf8_lossy(&permission.stderr)
+        );
+
+        let post = run_provider_lifecycle_hook(
+            home.path(),
+            "antigravity",
+            Some("PostToolUse"),
+            &antigravity_post_payload(home.path(), step),
+        );
+        assert!(post.status.success(), "{tool}");
+        assert!(post.stdout.is_empty(), "{tool}");
+        assert!(
+            post.stderr.is_empty(),
+            "{tool}: {}",
+            String::from_utf8_lossy(&post.stderr)
+        );
+
+        let events = activity(home.path()).read().unwrap().events().to_vec();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == ActivityKind::Lifecycle
+                    && event.tool.as_deref() == Some("PostToolUse"))
+                .count(),
+            1,
+            "{tool}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.state == ActivityState::Outcome)
+                .count(),
+            0,
+            "{tool}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == ActivityKind::Diagnostic)
+                .count(),
+            0,
+            "{tool}"
+        );
+    }
 }
 
 #[test]
