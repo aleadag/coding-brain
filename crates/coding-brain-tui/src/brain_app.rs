@@ -84,6 +84,7 @@ impl BrainApp {
 
     pub fn refresh(&mut self) {
         let mut errors = Vec::new();
+        let recovery = self.runtime.actions.poll_recovery();
         match self.runtime.source.snapshot(SnapshotLimits::default()) {
             Ok(snapshot) => self.snapshot = snapshot,
             Err(error) => errors.push(format!("Live: {error}")),
@@ -102,6 +103,8 @@ impl BrainApp {
         self.clamp_selection();
         if !errors.is_empty() {
             self.status = Some(errors.join(" · "));
+        } else if !recovery.is_empty() {
+            self.status = Some(recovery.join(" · "));
         }
     }
 
@@ -449,7 +452,7 @@ mod tests {
         let effect = app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(effect, Some(BrainEffect::SwitchToSession(_))));
-        assert!(mock.actions().is_empty());
+        assert!(non_poll_actions(&mock).is_empty());
     }
 
     #[test]
@@ -459,7 +462,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('g')));
 
         assert_eq!(app.gate_mode(), BrainGateMode::On);
-        assert!(mock.actions().is_empty());
+        assert!(non_poll_actions(&mock).is_empty());
     }
 
     #[test]
@@ -508,7 +511,7 @@ mod tests {
         }
 
         assert_eq!(
-            mock.actions(),
+            non_poll_actions(&mock),
             [
                 CorrectionDisposition::BrainRight,
                 CorrectionDisposition::BrainWrong,
@@ -555,7 +558,7 @@ mod tests {
             app.status(),
             Some("Corrections are only available for Decision activity")
         );
-        assert!(mock.actions().is_empty());
+        assert!(non_poll_actions(&mock).is_empty());
     }
 
     #[test]
@@ -576,7 +579,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('m')));
 
         assert_eq!(
-            mock.actions(),
+            non_poll_actions(&mock),
             vec![MockBrainAction::MarkCanonical {
                 decision_id: "decision-1".into(),
                 note: None,
@@ -602,6 +605,13 @@ mod tests {
         let runtime = BrainRuntime::new(mock.clone(), mock.clone());
         let app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
         (app, mock)
+    }
+
+    fn non_poll_actions(mock: &MockBrainRuntime) -> Vec<MockBrainAction> {
+        mock.actions()
+            .into_iter()
+            .filter(|action| *action != MockBrainAction::PollRecovery)
+            .collect()
     }
 
     fn activity() -> ActivityItem {

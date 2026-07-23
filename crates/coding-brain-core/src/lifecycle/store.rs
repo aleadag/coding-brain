@@ -27,6 +27,12 @@ pub struct LifecycleStore {
     root: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordedLifecycleEvent {
+    pub outcome: ApplyOutcome,
+    pub sequence: u64,
+}
+
 impl LifecycleStore {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -71,11 +77,27 @@ impl LifecycleStore {
         self.record_at(event, epoch_ms())
     }
 
+    pub fn record_with_sequence(
+        &self,
+        event: LifecycleEvent,
+    ) -> Result<RecordedLifecycleEvent, StoreError> {
+        self.record_with_sequence_at(event, epoch_ms())
+    }
+
     fn record_at(
         &self,
         event: LifecycleEvent,
         received_at_ms: u64,
     ) -> Result<ApplyOutcome, StoreError> {
+        self.record_with_sequence_at(event, received_at_ms)
+            .map(|recorded| recorded.outcome)
+    }
+
+    fn record_with_sequence_at(
+        &self,
+        event: LifecycleEvent,
+        received_at_ms: u64,
+    ) -> Result<RecordedLifecycleEvent, StoreError> {
         let lock = self.open_lock()?;
         let _guard = lock_with_timeout(&lock, LockKind::Exclusive)?;
         self.cleanup_abandoned_temps()?;
@@ -104,10 +126,15 @@ impl LifecycleStore {
         }
 
         let outcome = snapshot.apply(event, received_at_ms);
+        let sequence = snapshot
+            .sessions
+            .get(&session_key)
+            .map(|state| state.latest_sequence)
+            .ok_or(StoreError::Serialization)?;
         let bytes = serde_json::to_vec(&snapshot).map_err(|_| StoreError::Serialization)?;
         ensure_serialized_size(&bytes)?;
         self.persist(&bytes)?;
-        Ok(outcome)
+        Ok(RecordedLifecycleEvent { outcome, sequence })
     }
 
     fn open_lock(&self) -> Result<File, StoreError> {
@@ -487,6 +514,24 @@ mod tests {
                 .projected_status,
             Some(ProjectedStatus::Processing)
         );
+    }
+
+    #[test]
+    fn recorded_event_returns_its_exact_sequence_under_the_store_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LifecycleStore::at(temp.path());
+
+        let first = store
+            .record_with_sequence_at(prompt("session-1", "turn-1"), 1_000)
+            .unwrap();
+        let second = store
+            .record_with_sequence_at(prompt("session-2", "turn-1"), 1_001)
+            .unwrap();
+
+        assert_eq!(first.outcome, ApplyOutcome::Applied);
+        assert_eq!(first.sequence, 1);
+        assert_eq!(second.outcome, ApplyOutcome::Applied);
+        assert_eq!(second.sequence, 2);
     }
 
     #[test]

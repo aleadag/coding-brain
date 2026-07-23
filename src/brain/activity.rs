@@ -109,6 +109,13 @@ pub enum ActivityStoreError {
     EventTooLarge,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicReservationOutcome {
+    Reserved,
+    Duplicate,
+    Cooldown,
+}
+
 impl fmt::Display for ActivityStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -255,6 +262,132 @@ impl ActivityStore {
         file.flush()?;
         file.sync_data()?;
         Ok(())
+    }
+
+    pub(crate) fn reserve_recovery_event(
+        &self,
+        event: ActivityEvent,
+        cooldown_ms: u64,
+    ) -> Result<AtomicReservationOutcome, ActivityStoreError> {
+        if event.schema_version != ACTIVITY_SCHEMA_VERSION {
+            return Err(ActivityStoreError::UnsupportedSchema(event.schema_version));
+        }
+        let event = event.normalized();
+        if event.rule_id.as_deref() != Some("recovery_reservation")
+            || !event.has_consistent_payload()
+        {
+            return Err(ActivityStoreError::InvalidEvent);
+        }
+        let mut serialized = serde_json::to_vec(&event)?;
+        if serialized.len() > MAX_ACTIVITY_EVENT_BYTES {
+            return Err(ActivityStoreError::EventTooLarge);
+        }
+        serialized.push(b'\n');
+
+        let lock = self.open_lock()?;
+        let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Exclusive)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)?;
+        set_file_mode(&file)?;
+        if let Some(discarded_bytes) = repair_tail(&mut file)? {
+            let row = DiagnosticRow {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                diagnostic: StoreDiagnostic::TruncatedTail { discarded_bytes },
+            };
+            let mut diagnostic = serde_json::to_vec(&row)?;
+            diagnostic.push(b'\n');
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(&diagnostic)?;
+        }
+
+        let log = self.read_unlocked()?;
+        let same_session = |candidate: &ActivityEvent| {
+            candidate.rule_id.as_deref() == Some("recovery_reservation")
+                && candidate
+                    .session
+                    .as_ref()
+                    .zip(event.session.as_ref())
+                    .is_some_and(|(candidate, current)| {
+                        candidate.provider == current.provider
+                            && candidate.session_id == current.session_id
+                    })
+        };
+        if log
+            .events()
+            .iter()
+            .any(|candidate| same_session(candidate) && candidate.activity_id == event.activity_id)
+        {
+            return Ok(AtomicReservationOutcome::Duplicate);
+        }
+        if log.events().iter().rev().any(|candidate| {
+            same_session(candidate)
+                && event
+                    .recorded_at_ms
+                    .saturating_sub(candidate.recorded_at_ms)
+                    < cooldown_ms
+        }) {
+            return Ok(AtomicReservationOutcome::Cooldown);
+        }
+
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&serialized)?;
+        file.flush()?;
+        file.sync_data()?;
+        Ok(AtomicReservationOutcome::Reserved)
+    }
+
+    pub(crate) fn append_if_absent(
+        &self,
+        event: ActivityEvent,
+    ) -> Result<bool, ActivityStoreError> {
+        if event.schema_version != ACTIVITY_SCHEMA_VERSION {
+            return Err(ActivityStoreError::UnsupportedSchema(event.schema_version));
+        }
+        let event = event.normalized();
+        if !event.has_consistent_payload() {
+            return Err(ActivityStoreError::InvalidEvent);
+        }
+        let mut serialized = serde_json::to_vec(&event)?;
+        if serialized.len() > MAX_ACTIVITY_EVENT_BYTES {
+            return Err(ActivityStoreError::EventTooLarge);
+        }
+        serialized.push(b'\n');
+        let lock = self.open_lock()?;
+        let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Exclusive)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)?;
+        set_file_mode(&file)?;
+        if let Some(discarded_bytes) = repair_tail(&mut file)? {
+            let row = DiagnosticRow {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                diagnostic: StoreDiagnostic::TruncatedTail { discarded_bytes },
+            };
+            let mut diagnostic = serde_json::to_vec(&row)?;
+            diagnostic.push(b'\n');
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(&diagnostic)?;
+        }
+        if self
+            .read_unlocked()?
+            .events()
+            .iter()
+            .any(|candidate| candidate.activity_id == event.activity_id)
+        {
+            return Ok(false);
+        }
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&serialized)?;
+        file.flush()?;
+        file.sync_data()?;
+        Ok(true)
     }
 
     pub fn read(&self) -> Result<ActivityLog, ActivityStoreError> {

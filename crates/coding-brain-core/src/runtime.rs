@@ -223,6 +223,9 @@ pub trait BrainSource: Send + Sync {
 pub trait BrainActions: Send + Sync {
     fn record_correction(&self, correction: CorrectionInput) -> Result<(), String>;
     fn mark_canonical(&self, decision_id: &str, note: Option<String>) -> Result<(), String>;
+    fn poll_recovery(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone)]
@@ -355,6 +358,7 @@ pub struct MockBrainRuntime {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockBrainAction {
+    PollRecovery,
     RecordCorrection(CorrectionInput),
     MarkCanonical {
         decision_id: String,
@@ -402,6 +406,14 @@ impl BrainSource for MockBrainRuntime {
 }
 
 impl BrainActions for MockBrainRuntime {
+    fn poll_recovery(&self) -> Vec<String> {
+        self.actions_log
+            .lock()
+            .expect("brain actions_log poisoned")
+            .push(MockBrainAction::PollRecovery);
+        Vec::new()
+    }
+
     fn record_correction(&self, correction: CorrectionInput) -> Result<(), String> {
         self.actions_log
             .lock()

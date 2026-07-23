@@ -16,6 +16,7 @@ mod config;
 mod doctor;
 mod init;
 mod lifecycle_hook;
+mod provider_hooks;
 mod runtime;
 
 use std::io;
@@ -195,13 +196,25 @@ pub(crate) struct Cli {
     #[arg(long, help_heading = "Brain (Local LLM)")]
     pub(crate) brain_query: bool,
 
-    /// Internal Codex PermissionRequest hook adapter.
+    /// Internal provider permission hook adapter.
     #[arg(long, hide = true)]
     pub(crate) permission_hook: bool,
 
     /// Internal Codex lifecycle hook adapter.
     #[arg(long, hide = true)]
     pub(crate) lifecycle_hook: bool,
+
+    /// Internal guarded Stop recovery adapter.
+    #[arg(long, hide = true)]
+    pub(crate) recovery_hook: bool,
+
+    /// Internal hook provider dispatch.
+    #[arg(long, hide = true, value_enum)]
+    pub(crate) provider: Option<provider_hooks::HookProvider>,
+
+    /// Trusted Antigravity hook event selected by the hook registration.
+    #[arg(long, hide = true)]
+    pub(crate) antigravity_hook_event: Option<String>,
 
     /// Internal one-shot preference distiller.
     #[arg(long, hide = true)]
@@ -329,7 +342,8 @@ fn select_mode(cli: &Cli) -> RunMode {
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
-    let is_internal_hook = cli.permission_hook || cli.lifecycle_hook || cli.distill_once;
+    let is_internal_hook =
+        cli.permission_hook || cli.lifecycle_hook || cli.recovery_hook || cli.distill_once;
     let result = run_main(cli);
     if result.is_ok() && !is_internal_hook {
         maybe_print_star_prompt();
@@ -428,7 +442,10 @@ fn run_main(cli: Cli) -> io::Result<()> {
         return Ok(());
     }
     if cli.lifecycle_hook {
-        lifecycle_hook::run();
+        lifecycle_hook::run(
+            cli.provider.map(Into::into).unwrap_or_default(),
+            cli.antigravity_hook_event.as_deref(),
+        );
         return Ok(());
     }
 
@@ -451,6 +468,14 @@ fn run_main(cli: Cli) -> io::Result<()> {
     }
 
     apply_brain_cli_overrides(&mut cfg, &cli);
+    if cli.recovery_hook {
+        brain::recovery::run_hook(
+            cfg.brain.as_ref(),
+            cli.provider.map(Into::into).unwrap_or_default(),
+            cli.antigravity_hook_event.as_deref(),
+        );
+        return Ok(());
+    }
     if let Some(action) = early_config_action(&cli) {
         return match action {
             ConfigAction::Show => {
@@ -468,7 +493,11 @@ fn run_main(cli: Cli) -> io::Result<()> {
         };
     }
     if cli.permission_hook {
-        brain::permission_hook::run(cfg.brain.as_ref());
+        brain::permission_hook::run(
+            cfg.brain.as_ref(),
+            cli.provider.map(Into::into).unwrap_or_default(),
+            cli.antigravity_hook_event.as_deref(),
+        );
         return Ok(());
     }
     let model_active = matches!(
@@ -1079,10 +1108,50 @@ mod permission_hook_cli_tests {
 
     #[test]
     fn lifecycle_hook_flag_is_hidden() {
-        let cli = Cli::try_parse_from(["coding-brain", "--lifecycle-hook"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "coding-brain",
+            "--lifecycle-hook",
+            "--provider",
+            "antigravity",
+            "--antigravity-hook-event",
+            "Stop",
+        ])
+        .unwrap();
         assert!(cli.lifecycle_hook);
+        assert_eq!(
+            cli.provider,
+            Some(provider_hooks::HookProvider::Antigravity)
+        );
+        assert_eq!(cli.antigravity_hook_event.as_deref(), Some("Stop"));
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--lifecycle-hook"));
+        assert!(!help.contains("--provider"));
+        assert!(!help.contains("--antigravity-hook-event"));
+    }
+
+    #[test]
+    fn recovery_hook_flag_is_hidden_and_provider_scoped() {
+        let cli = Cli::try_parse_from([
+            "coding-brain",
+            "--recovery-hook",
+            "--provider",
+            "antigravity",
+            "--antigravity-hook-event",
+            "Stop",
+        ])
+        .unwrap();
+        assert!(cli.recovery_hook);
+        assert_eq!(
+            cli.provider,
+            Some(provider_hooks::HookProvider::Antigravity)
+        );
+        assert_eq!(cli.antigravity_hook_event.as_deref(), Some("Stop"));
+        assert!(
+            !Cli::command()
+                .render_long_help()
+                .to_string()
+                .contains("--recovery-hook")
+        );
     }
 
     #[test]

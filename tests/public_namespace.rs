@@ -79,7 +79,7 @@ fn stale_hooks_are_diagnostic_until_init() {
         ("PostToolUse", Some("*"), "--lifecycle-hook", 2),
         ("SubagentStart", Some("*"), "--lifecycle-hook", 2),
         ("SubagentStop", Some("*"), "--lifecycle-hook", 2),
-        ("Stop", None, "--lifecycle-hook", 2),
+        ("Stop", None, "--recovery-hook", 30),
     ] {
         let mut handler = serde_json::json!({
             "type": "command",

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use coding_brain_core::runtime::{
-    BrainEffect, BrainRuntime, DecisionSummary, EndpointHealth, MockBrainRuntime, ReviewItemSummary,
+    BrainEffect, BrainRuntime, DecisionSummary, EndpointHealth, MockBrainAction, MockBrainRuntime,
+    ReviewItemSummary,
 };
 use coding_brain_core::theme::{Theme, ThemeMode};
 use coding_brain_tui::brain_app::{BrainApp, BrainTab};
@@ -24,7 +25,7 @@ fn offline_brain_opens_live_keeps_review_and_exits_cleanly() {
         }],
         ..MockBrainRuntime::default()
     });
-    let runtime = BrainRuntime::new(mock.clone(), mock);
+    let runtime = BrainRuntime::new(mock.clone(), mock.clone());
     let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
     let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
 
@@ -35,6 +36,7 @@ fn offline_brain_opens_live_keeps_review_and_exits_cleanly() {
     assert_eq!(app.tab(), BrainTab::Live);
     assert_eq!(app.review_queue().len(), 1);
     assert!(!app.endpoint_health().reachable);
+    assert!(mock.actions().contains(&MockBrainAction::PollRecovery));
     let buffer = terminal.backend().buffer();
     let rendered = (0..buffer.area.height)
         .map(|y| {

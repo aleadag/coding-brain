@@ -6,16 +6,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
 
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, ProjectEvidence,
     SessionTarget, bounded_redacted_activity_text, lossless_redacted_activity_text,
 };
 use coding_brain_core::lifecycle::{
-    LifecycleEvent, LifecycleIdentity, LifecycleStore, PermissionDisposition,
-    coding_brain_state_root,
+    ApplyOutcome, IgnoreReason, LifecycleEvent, LifecycleIdentity, LifecycleStore,
+    PermissionDisposition, coding_brain_state_root,
 };
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::project::ProjectIdentity;
@@ -29,30 +28,10 @@ use super::query::{self, BrainDecision, BrainDecisionRequest};
 use super::safety::SafetyDeny;
 use crate::config::BrainConfig;
 use crate::lifecycle_hook::read_bounded_hook_input;
+use crate::provider_hooks::{PermissionHookRequest, ProviderPermissionPolicy, parse_permission};
 
 const HOOK_INFERENCE_TIMEOUT_MS: u64 = 25_000;
 static ACTIVITY_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-#[derive(Debug, Deserialize)]
-struct PermissionRequestInput {
-    session_id: String,
-    turn_id: Option<String>,
-    tool_use_id: Option<String>,
-    transcript_path: Option<PathBuf>,
-    cwd: String,
-    hook_event_name: String,
-    tool_name: String,
-    tool_input: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PermissionRequest {
-    lifecycle: LifecycleIdentity,
-    project: String,
-    tool_name: String,
-    command: Option<String>,
-    tool_use_id: Option<String>,
-}
 
 #[derive(Debug)]
 struct HookDiagnostic(String);
@@ -69,11 +48,45 @@ impl fmt::Display for HookDiagnostic {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug)]
+enum PermissionRecordError {
+    Ignored(IgnoreReason),
+    Failed(HookDiagnostic),
+}
+
+impl fmt::Display for PermissionRecordError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ignored(reason) => write!(formatter, "lifecycle event was ignored: {reason:?}"),
+            Self::Failed(diagnostic) => diagnostic.fmt(formatter),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum PermissionBehavior {
     Allow,
     Deny,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AntigravityDecision {
+    Allow,
+    Deny,
+    Ask,
+}
+
+enum ProviderPermissionResponse {
+    CodexOrClaude {
+        behavior: PermissionBehavior,
+        message: Option<String>,
+    },
+    Antigravity {
+        decision: AntigravityDecision,
+        reason: Option<String>,
+    },
 }
 
 impl PermissionBehavior {
@@ -116,7 +129,7 @@ struct HookActivity {
 
 impl HookActivity {
     fn from_request(
-        request: &PermissionRequest,
+        request: &PermissionHookRequest,
         paths: &CodingBrainPaths,
     ) -> Result<Self, HookDiagnostic> {
         let identity = ProjectIdentity::load(request.lifecycle.cwd(), paths).map_err(|error| {
@@ -297,96 +310,80 @@ where
 }
 
 #[derive(Serialize)]
-struct HookResponse<'a> {
+struct HookResponse {
     #[serde(rename = "hookSpecificOutput")]
-    hook_specific_output: HookSpecificOutput<'a>,
+    hook_specific_output: HookSpecificOutput,
 }
 
 #[derive(Serialize)]
-struct HookSpecificOutput<'a> {
+struct HookSpecificOutput {
     #[serde(rename = "hookEventName")]
     hook_event_name: &'static str,
-    decision: HookResponseDecision<'a>,
+    decision: HookResponseDecision,
 }
 
 #[derive(Serialize)]
-struct HookResponseDecision<'a> {
+struct HookResponseDecision {
     behavior: PermissionBehavior,
     #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<&'a str>,
+    message: Option<String>,
 }
 
-fn parse_request(input: &str) -> Result<PermissionRequest, HookDiagnostic> {
-    let parsed: PermissionRequestInput = serde_json::from_str(input)
-        .map_err(|_| HookDiagnostic::new("invalid PermissionRequest payload"))?;
-    if parsed.hook_event_name != "PermissionRequest" {
-        return Err(HookDiagnostic::new("unsupported hook event"));
-    }
-    for (field, value) in [
-        ("session_id", Some(parsed.session_id.as_str())),
-        ("turn_id", parsed.turn_id.as_deref()),
-        ("cwd", Some(parsed.cwd.as_str())),
-    ] {
-        if value.is_some_and(|value| value.trim().is_empty()) {
-            return Err(HookDiagnostic::new(format!(
-                "PermissionRequest field {field} must not be empty"
-            )));
+fn parse_request(input: &str) -> Result<PermissionHookRequest, HookDiagnostic> {
+    parse_permission(AgentProvider::Codex, None, input.as_bytes())
+        .map_err(|error| HookDiagnostic::new(format!("invalid PermissionRequest payload: {error}")))
+}
+
+fn serialize_response(response: ProviderPermissionResponse) -> Result<Vec<u8>, serde_json::Error> {
+    match response {
+        ProviderPermissionResponse::CodexOrClaude { behavior, message } => {
+            serde_json::to_vec(&HookResponse {
+                hook_specific_output: HookSpecificOutput {
+                    hook_event_name: "PermissionRequest",
+                    decision: HookResponseDecision { behavior, message },
+                },
+            })
+        }
+        ProviderPermissionResponse::Antigravity { decision, reason } => {
+            #[derive(Serialize)]
+            struct Response {
+                decision: AntigravityDecision,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                reason: Option<String>,
+            }
+            serde_json::to_vec(&Response { decision, reason })
         }
     }
-    if parsed.tool_name.trim().is_empty() {
-        return Err(HookDiagnostic::new(
-            "PermissionRequest field tool_name must not be empty",
-        ));
+}
+
+fn response_for_behavior(
+    provider: AgentProvider,
+    behavior: PermissionBehavior,
+    message: Option<&str>,
+) -> ProviderPermissionResponse {
+    let deny_message = (behavior == PermissionBehavior::Deny)
+        .then(|| message.map(bounded_redacted_activity_text))
+        .flatten();
+    match provider {
+        AgentProvider::Codex | AgentProvider::Claude => ProviderPermissionResponse::CodexOrClaude {
+            behavior,
+            message: deny_message,
+        },
+        AgentProvider::Antigravity => ProviderPermissionResponse::Antigravity {
+            decision: match behavior {
+                PermissionBehavior::Allow => AntigravityDecision::Allow,
+                PermissionBehavior::Deny => AntigravityDecision::Deny,
+            },
+            reason: deny_message,
+        },
     }
-    if parsed
-        .tool_use_id
-        .as_deref()
-        .is_some_and(|tool_use_id| tool_use_id.trim().is_empty())
-    {
-        return Err(HookDiagnostic::new(
-            "PermissionRequest field tool_use_id must not be empty",
-        ));
+}
+
+fn antigravity_ask() -> ProviderPermissionResponse {
+    ProviderPermissionResponse::Antigravity {
+        decision: AntigravityDecision::Ask,
+        reason: Some("Coding Brain abstained".into()),
     }
-    let lifecycle = LifecycleIdentity::try_new(
-        AgentProvider::Codex,
-        parsed.session_id,
-        parsed.turn_id,
-        parsed.transcript_path,
-        PathBuf::from(parsed.cwd),
-    )
-    .map_err(|error| HookDiagnostic::new(format!("invalid PermissionRequest identity: {error}")))?;
-    if lifecycle.turn_id().is_none() {
-        return Err(HookDiagnostic::new(
-            "PermissionRequest field turn_id must not be empty",
-        ));
-    }
-    let command = if parsed.tool_name == "Bash" {
-        let command = parsed
-            .tool_input
-            .get("command")
-            .and_then(Value::as_str)
-            .filter(|command| !command.trim().is_empty())
-            .ok_or_else(|| {
-                HookDiagnostic::new("PermissionRequest field tool_input.command must not be empty")
-            })?;
-        Some(command.to_string())
-    } else {
-        None
-    };
-    let project = lifecycle
-        .cwd()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| lifecycle.cwd().to_string_lossy().into_owned());
-    Ok(PermissionRequest {
-        lifecycle,
-        project,
-        tool_name: parsed.tool_name,
-        command,
-        tool_use_id: parsed.tool_use_id,
-    })
 }
 
 fn write_diagnostic(stderr: &mut impl Write, diagnostic: impl fmt::Display) {
@@ -398,13 +395,19 @@ fn record_permission(
     store: &LifecycleStore,
     identity: &LifecycleIdentity,
     disposition: PermissionDisposition,
-) -> Result<(), HookDiagnostic> {
-    let event = LifecycleEvent::permission(identity.clone(), disposition)
-        .map_err(|error| HookDiagnostic::new(format!("invalid lifecycle event: {error}")))?;
-    store
-        .record(event)
-        .map(|_| ())
-        .map_err(|error| HookDiagnostic::new(format!("could not persist lifecycle state: {error}")))
+) -> Result<(), PermissionRecordError> {
+    let event = LifecycleEvent::permission(identity.clone(), disposition).map_err(|error| {
+        PermissionRecordError::Failed(HookDiagnostic::new(format!(
+            "invalid lifecycle event: {error}"
+        )))
+    })?;
+    match store.record(event) {
+        Ok(ApplyOutcome::Applied) => Ok(()),
+        Ok(ApplyOutcome::Ignored(reason)) => Err(PermissionRecordError::Ignored(reason)),
+        Err(error) => Err(PermissionRecordError::Failed(HookDiagnostic::new(format!(
+            "could not persist lifecycle state: {error}"
+        )))),
+    }
 }
 
 fn run_with_gate_and_store<R, W, E, F>(
@@ -437,8 +440,8 @@ fn run_with_gate_and_store<R, W, E, F>(
 #[allow(clippy::too_many_arguments)]
 fn run_with_gate_and_stores<R, W, E, F>(
     stdin: R,
-    mut stdout: W,
-    mut stderr: E,
+    stdout: W,
+    stderr: E,
     config: Option<&BrainConfig>,
     gate_mode: BrainGateMode,
     lifecycle_store: &LifecycleStore,
@@ -450,24 +453,58 @@ fn run_with_gate_and_stores<R, W, E, F>(
     E: Write,
     F: FnOnce(&BrainConfig, &str) -> Result<BrainSuggestion, String>,
 {
+    run_provider_with_gate_and_stores(
+        stdin,
+        stdout,
+        stderr,
+        config,
+        gate_mode,
+        lifecycle_store,
+        activity_store,
+        AgentProvider::Codex,
+        None,
+        infer,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_provider_with_gate_and_stores<R, W, E, F>(
+    stdin: R,
+    mut stdout: W,
+    mut stderr: E,
+    config: Option<&BrainConfig>,
+    gate_mode: BrainGateMode,
+    lifecycle_store: &LifecycleStore,
+    activity_store: Option<&ActivityStore>,
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+    infer: F,
+) where
+    R: Read,
+    W: Write,
+    E: Write,
+    F: FnOnce(&BrainConfig, &str) -> Result<BrainSuggestion, String>,
+{
     let input = match read_bounded_hook_input(stdin) {
         Ok(input) => input,
         Err(error) => {
             write_diagnostic(&mut stderr, error);
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
             return;
         }
     };
-    let input = match std::str::from_utf8(&input) {
-        Ok(input) => input,
-        Err(_) => {
-            write_diagnostic(&mut stderr, "invalid PermissionRequest payload");
-            return;
-        }
-    };
-    let request = match parse_request(input) {
+    let request = match parse_permission(provider, antigravity_event, &input) {
         Ok(request) => request,
-        Err(diagnostic) => {
-            write_diagnostic(&mut stderr, diagnostic);
+        Err(error) => {
+            write_diagnostic(
+                &mut stderr,
+                HookDiagnostic::new(format!("invalid permission payload: {error}")),
+            );
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
             return;
         }
     };
@@ -501,37 +538,65 @@ fn run_with_gate_and_stores<R, W, E, F>(
         tool_input: request.command.clone().unwrap_or_default(),
         diff_digest: None,
     };
-    let evaluation = evaluate_request(
-        &brain_request,
-        config,
-        gate_mode,
-        persistence_error.is_none(),
-        request.command.is_some(),
-        infer,
-    );
+    let evaluation = if let Some(safety) = super::safety::evaluate(&brain_request) {
+        HookEvaluation::Deny {
+            brain: None,
+            deterministic: true,
+            safety: Some(safety),
+            terminal_state: ActivityState::Denied,
+        }
+    } else if request.provider_policy == ProviderPermissionPolicy::Denies {
+        HookEvaluation::Deny {
+            brain: None,
+            deterministic: true,
+            safety: None,
+            terminal_state: ActivityState::Denied,
+        }
+    } else {
+        let model_evaluation = evaluate_request(
+            &brain_request,
+            config,
+            gate_mode,
+            persistence_error.is_none(),
+            request.command.is_some(),
+            infer,
+        );
+        match (request.provider_policy, model_evaluation) {
+            (ProviderPermissionPolicy::RequiresAsk, HookEvaluation::Allow { brain, .. }) => {
+                HookEvaluation::Abstain {
+                    brain: Some(brain),
+                    reason: "provider permission policy requires confirmation".into(),
+                    terminal_state: ActivityState::Abstained,
+                }
+            }
+            (_, evaluation) => evaluation,
+        }
+    };
     if let HookEvaluation::Deny {
         deterministic: true,
-        safety: Some(deny),
+        safety,
         terminal_state,
         ..
     } = &evaluation
     {
-        let response = HookResponse {
-            hook_specific_output: HookSpecificOutput {
-                hook_event_name: "PermissionRequest",
-                decision: HookResponseDecision {
-                    behavior: PermissionBehavior::Deny,
-                    message: Some(&deny.reason),
-                },
-            },
-        };
-        let serialized = match serde_json::to_vec(&response) {
+        let reason = safety
+            .as_ref()
+            .map(|deny| deny.reason.as_str())
+            .unwrap_or("provider permission policy denied request");
+        let serialized = match serialize_response(response_for_behavior(
+            provider,
+            PermissionBehavior::Deny,
+            safety.as_ref().map(|deny| deny.reason.as_str()),
+        )) {
             Ok(serialized) => serialized,
             Err(error) => {
                 write_diagnostic(
                     &mut stderr,
                     format!("could not serialize response: {error}"),
                 );
+                if provider == AgentProvider::Antigravity {
+                    write_failsafe_ask(&mut stdout, &mut stderr);
+                }
                 return;
             }
         };
@@ -546,8 +611,12 @@ fn run_with_gate_and_stores<R, W, E, F>(
                 .unwrap_or_default(),
             brain_action: "deny",
             brain_confidence: 1.0,
-            brain_reasoning: &deny.reason,
-            brain_source: "deterministic",
+            brain_reasoning: reason,
+            brain_source: if safety.is_some() {
+                "deterministic"
+            } else {
+                "provider_policy"
+            },
             brain_threshold: None,
             session_id: request.lifecycle.session_id(),
             turn_id: request.lifecycle.turn_id().unwrap_or_default(),
@@ -561,8 +630,8 @@ fn run_with_gate_and_stores<R, W, E, F>(
         };
         if let (Ok(context), Some(activity_store)) = (&activity_context, activity_store) {
             let mut terminal = context.event(*terminal_state);
-            terminal.rule_id = Some(deny.rule_id.into());
-            terminal.reasoning = Some(deny.reason.clone());
+            terminal.rule_id = safety.as_ref().map(|deny| deny.rule_id.into());
+            terminal.reasoning = Some(reason.into());
             terminal.decision_id.clone_from(&decision_id);
             if let Err(error) = activity_store.append(terminal) {
                 persistence_error.get_or_insert_with(|| error.to_string());
@@ -629,6 +698,9 @@ fn run_with_gate_and_stores<R, W, E, F>(
                 let _ = activity_store.compact_if_needed();
             }
             needs_input(&mut stderr);
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
             return;
         }
         _ => unreachable!("deterministic deny was handled before model persistence"),
@@ -637,16 +709,11 @@ fn run_with_gate_and_stores<R, W, E, F>(
     // Serialize first so a serialization error can never leave a prepared
     // audit record without a response ready to write.
     let serialized = if let Some(behavior) = behavior {
-        let response = HookResponse {
-            hook_specific_output: HookSpecificOutput {
-                hook_event_name: "PermissionRequest",
-                decision: HookResponseDecision {
-                    behavior,
-                    message: brain.message.as_deref(),
-                },
-            },
-        };
-        match serde_json::to_vec(&response) {
+        match serialize_response(response_for_behavior(
+            provider,
+            behavior,
+            brain.message.as_deref(),
+        )) {
             Ok(serialized) => Some(serialized),
             Err(error) => {
                 write_diagnostic(
@@ -685,6 +752,9 @@ fn run_with_gate_and_stores<R, W, E, F>(
                 format!("could not persist decision proposal: {error}"),
             );
             needs_input(&mut stderr);
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
             return;
         }
     };
@@ -699,6 +769,9 @@ fn run_with_gate_and_stores<R, W, E, F>(
             format!("could not persist terminal activity: {error}"),
         );
         needs_input(&mut stderr);
+        if provider == AgentProvider::Antigravity {
+            write_failsafe_ask(&mut stdout, &mut stderr);
+        }
         return;
     }
     let Some(serialized) = serialized else {
@@ -707,6 +780,9 @@ fn run_with_gate_and_stores<R, W, E, F>(
             write_diagnostic(&mut stderr, &brain.reasoning);
         }
         needs_input(&mut stderr);
+        if provider == AgentProvider::Antigravity {
+            write_failsafe_ask(&mut stdout, &mut stderr);
+        }
         return;
     };
     if let Err(error) = record_permission(
@@ -714,7 +790,26 @@ fn run_with_gate_and_stores<R, W, E, F>(
         &request.lifecycle,
         PermissionDisposition::Decided,
     ) {
-        write_diagnostic(&mut stderr, error);
+        let message = format!("could not persist executable permission state: {error}");
+        write_diagnostic(&mut stderr, &message);
+        if behavior == Some(PermissionBehavior::Allow) {
+            if let (Ok(context), Some(activity_store)) = (&activity_context, activity_store) {
+                let mut event = context.event(ActivityState::Error);
+                event.decision_id = Some(decision_id);
+                event.reasoning = Some(bounded_redacted_activity_text(&message));
+                if let Err(error) = activity_store.append(event) {
+                    write_diagnostic(
+                        &mut stderr,
+                        format!("could not persist permission failure activity: {error}"),
+                    );
+                }
+                let _ = activity_store.compact_if_needed();
+            }
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
     }
     let (delivery, failure) = match write_response(&mut stdout, &serialized) {
         Ok(()) => (ActivityState::Delivered, None),
@@ -739,6 +834,17 @@ fn run_with_gate_and_stores<R, W, E, F>(
 fn write_response(stdout: &mut impl Write, serialized: &[u8]) -> std::io::Result<()> {
     stdout.write_all(serialized)?;
     stdout.flush()
+}
+
+fn write_failsafe_ask(stdout: &mut impl Write, stderr: &mut impl Write) {
+    match serialize_response(antigravity_ask()) {
+        Ok(serialized) => {
+            if let Err(error) = write_response(stdout, &serialized) {
+                write_diagnostic(stderr, format!("could not write response: {error}"));
+            }
+        }
+        Err(error) => write_diagnostic(stderr, format!("could not serialize response: {error}")),
+    }
 }
 
 fn run_with_gate<R, W, E, F>(
@@ -784,24 +890,69 @@ where
     run_with_gate(stdin, stdout, stderr, config, resolved.mode, infer);
 }
 
-pub(crate) fn run(config: Option<&BrainConfig>) {
+fn run_provider_with<R, W, E, F>(
+    stdin: R,
+    stdout: W,
+    mut stderr: E,
+    config: Option<&BrainConfig>,
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+    infer: F,
+) where
+    R: Read,
+    W: Write,
+    E: Write,
+    F: FnOnce(&BrainConfig, &str) -> Result<BrainSuggestion, String>,
+{
+    let resolved = super::resolve_gate_mode(config);
+    if let Some(warning) = resolved.warning {
+        write_diagnostic(&mut stderr, warning);
+    }
+    let lifecycle_store = LifecycleStore::at(coding_brain_state_root());
+    let activity_store = current_paths()
+        .ok()
+        .map(|paths| ActivityStore::at(paths.state_root().join("activity.jsonl")));
+    run_provider_with_gate_and_stores(
+        stdin,
+        stdout,
+        stderr,
+        config,
+        resolved.mode,
+        &lifecycle_store,
+        activity_store.as_ref(),
+        provider,
+        antigravity_event,
+        infer,
+    );
+}
+
+pub(crate) fn run(
+    config: Option<&BrainConfig>,
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+) {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
-    run_with(
+    run_provider_with(
         stdin.lock(),
         stdout.lock(),
         stderr.lock(),
         config,
+        provider,
+        antigravity_event,
         super::client::infer,
     );
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::ffi::OsString;
     use std::io::Cursor;
+    use std::panic::AssertUnwindSafe;
     use std::path::Path;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -842,6 +993,20 @@ mod tests {
                 std::io::ErrorKind::BrokenPipe,
                 "fixture flush failed",
             ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct VisibleThenPanicWriter(Rc<RefCell<Vec<u8>>>);
+
+    impl Write for VisibleThenPanicWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("simulated abrupt termination after response bytes became visible")
         }
     }
 
@@ -1018,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_failure_does_not_change_valid_decision_bytes() {
+    fn lifecycle_failure_suppresses_allow_after_recording_error_activity() {
         let temp = tempfile::tempdir().unwrap();
         let healthy = LifecycleStore::at(temp.path().join("healthy"));
         let healthy_activity = ActivityStore::at(temp.path().join("healthy-activity.jsonl"));
@@ -1034,7 +1199,7 @@ mod tests {
             &mut healthy_stdout,
             &mut healthy_stderr,
             Some(&enabled_config()),
-            BrainGateMode::On,
+            BrainGateMode::Auto,
             &healthy,
             Some(&healthy_activity),
             |_, _| Ok(suggestion(RuleAction::Approve, 0.9)),
@@ -1046,18 +1211,34 @@ mod tests {
             &mut failed_stdout,
             &mut failed_stderr,
             Some(&enabled_config()),
-            BrainGateMode::On,
+            BrainGateMode::Auto,
             &blocked,
             Some(&blocked_activity),
             |_, _| Ok(suggestion(RuleAction::Approve, 0.9)),
         );
 
-        assert_eq!(failed_stdout, healthy_stdout);
+        assert!(!healthy_stdout.is_empty());
+        assert!(failed_stdout.is_empty());
         assert!(healthy_stderr.is_empty());
         assert!(
             String::from_utf8(failed_stderr)
                 .unwrap()
                 .contains("lifecycle")
+        );
+        assert_eq!(
+            blocked_activity
+                .read()
+                .unwrap()
+                .events()
+                .iter()
+                .map(|event| event.state)
+                .collect::<Vec<_>>(),
+            [
+                ActivityState::Observed,
+                ActivityState::Evaluating,
+                ActivityState::Allowed,
+                ActivityState::Error,
+            ]
         );
     }
 
@@ -1631,6 +1812,56 @@ mod tests {
         assert!(
             !activity.snapshot(Default::default()).unwrap().attention[0].tool_execution_confirmed
         );
+    }
+
+    #[test]
+    fn abrupt_termination_after_visible_bytes_leaves_delivery_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let visible = Rc::new(RefCell::new(Vec::new()));
+        let writer = VisibleThenPanicWriter(Rc::clone(&visible));
+        let mut stderr = Vec::new();
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            run_with_gate_and_stores(
+                Cursor::new(payload()),
+                writer,
+                &mut stderr,
+                Some(&enabled_config()),
+                BrainGateMode::Auto,
+                &lifecycle,
+                Some(&activity),
+                |_, _| Ok(suggestion(RuleAction::Approve, 0.9)),
+            );
+        }));
+
+        assert!(result.is_err());
+        let response: serde_json::Value = serde_json::from_slice(&visible.borrow()).unwrap();
+        assert_eq!(
+            response["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        assert_eq!(
+            activity
+                .read()
+                .unwrap()
+                .events()
+                .iter()
+                .map(|event| event.state)
+                .collect::<Vec<_>>(),
+            [
+                ActivityState::Observed,
+                ActivityState::Evaluating,
+                ActivityState::Allowed,
+            ]
+        );
+        let snapshot = activity.snapshot(Default::default()).unwrap();
+        assert_eq!(
+            snapshot.attention[0].delivery,
+            coding_brain_core::brain_activity::DeliveryState::Unknown
+        );
+        assert!(!snapshot.attention[0].tool_execution_confirmed);
     }
 
     #[test]

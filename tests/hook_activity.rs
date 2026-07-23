@@ -2,20 +2,21 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
 
 use coding_brain::brain::activity::ActivityStore;
 use coding_brain_core::brain_activity::{
-    ActivityKind, ActivityOutcome, ActivityState, DeliveryState, SessionTarget, SnapshotLimits,
+    ActivityKind, ActivityOutcome, ActivityState, DeliveryState, MAX_ACTIVITY_FIELD_BYTES,
+    SessionTarget, SnapshotLimits,
 };
-use coding_brain_core::lifecycle::{LifecycleStore, ProjectedStatus};
+use coding_brain_core::lifecycle::{
+    ApplyOutcome, IgnoreReason, LifecycleEvent, LifecycleEventKind, LifecycleIdentity,
+    LifecycleStore, PermissionDisposition, ProjectedStatus,
+};
 use coding_brain_core::provider::AgentProvider;
-use fs2::FileExt;
 
 #[test]
 fn legacy_activity_target_defaults_to_codex_without_reemitting_provider_hints() {
@@ -78,6 +79,65 @@ fn run_permission_hook(home: &Path, payload: &[u8]) -> Output {
     child.wait_with_output().unwrap()
 }
 
+fn run_provider_permission_hook(
+    home: &Path,
+    provider: &str,
+    antigravity_event: Option<&str>,
+    payload: &[u8],
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
+    command.args(["--permission-hook", "--provider", provider]);
+    if let Some(event) = antigravity_event {
+        command.args(["--antigravity-hook-event", event]);
+    }
+    let mut child = command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", isolated_path(home))
+        .current_dir(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn claude_permission_payload(cwd: &Path, policy: Option<&str>) -> Vec<u8> {
+    let mut payload: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "fixtures/hooks/claude-permission-request.json"
+    ))
+    .unwrap();
+    payload["cwd"] = serde_json::json!(cwd);
+    payload["provider"] = serde_json::json!("codex");
+    if let Some(policy) = policy {
+        payload["permission_suggestions"] = serde_json::json!([{
+            "type": "addRules",
+            "rules": [{"toolName": "Bash", "ruleContent": "cargo test"}],
+            "behavior": policy,
+            "destination": "session"
+        }]);
+    }
+    serde_json::to_vec(&payload).unwrap()
+}
+
+fn antigravity_permission_payload(cwd: &Path, policy: Option<&str>) -> Vec<u8> {
+    let mut payload: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "fixtures/hooks/antigravity-pre-tool-use.json"
+    ))
+    .unwrap();
+    payload["workspacePaths"] = serde_json::json!([cwd]);
+    payload["provider"] = serde_json::json!("claude");
+    payload["hookEventName"] = serde_json::json!("PermissionRequest");
+    if let Some(policy) = policy {
+        payload["decision"] = serde_json::json!(policy);
+        payload["permissionOverrides"] = serde_json::json!(["command(cargo test)"]);
+    }
+    serde_json::to_vec(&payload).unwrap()
+}
+
 fn spawn_permission_hook(home: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_coding-brain"))
         .arg("--permission-hook")
@@ -117,8 +177,102 @@ fn run_lifecycle_hook(home: &Path, payload: &[u8]) -> Output {
     child.wait_with_output().unwrap()
 }
 
+fn run_provider_recovery_hook(
+    home: &Path,
+    provider: &str,
+    antigravity_event: Option<&str>,
+    payload: &[u8],
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
+    command.args(["--recovery-hook", "--provider", provider]);
+    if let Some(event) = antigravity_event {
+        command.args(["--antigravity-hook-event", event]);
+    }
+    let mut child = command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", isolated_path(home))
+        .current_dir(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn recovery_hook_without_trusted_live_link_publishes_no_stop() {
+    let home = tempfile::tempdir().unwrap();
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/hooks/antigravity-stop.json")).unwrap();
+    payload["workspacePaths"] = serde_json::json!([home.path()]);
+
+    let output = run_provider_recovery_hook(
+        home.path(),
+        "antigravity",
+        Some("Stop"),
+        &serde_json::to_vec(&payload).unwrap(),
+    );
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "coding-brain recovery hook: Stop persistence failed\n"
+    );
+    let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
+    let view = lifecycle.read().unwrap();
+    assert!(view.snapshot.is_none());
+    assert!(activity(home.path()).read().unwrap().events().is_empty());
+}
+
 fn activity(home: &Path) -> ActivityStore {
     ActivityStore::at(home.join(".local/state/coding-brain/activity.jsonl"))
+}
+
+fn seed_ignored_permission(home: &Path, provider: AgentProvider, ignored_reason: IgnoreReason) {
+    let (session_id, turn_id) = match provider {
+        AgentProvider::Claude => ("claude-session-1", "claude-session-1"),
+        AgentProvider::Antigravity => ("agy-conversation-1", "step-5"),
+        AgentProvider::Codex => unreachable!(),
+    };
+    let identity = |turn_id: &str| {
+        LifecycleIdentity::try_new(
+            provider,
+            session_id.into(),
+            Some(turn_id.into()),
+            None,
+            home.to_path_buf(),
+        )
+        .unwrap()
+    };
+    let lifecycle = LifecycleStore::at(home.join(".local/state/coding-brain"));
+    let record = |event| assert_eq!(lifecycle.record(event).unwrap(), ApplyOutcome::Applied);
+    match ignored_reason {
+        IgnoreReason::Duplicate => record(
+            LifecycleEvent::permission(identity(turn_id), PermissionDisposition::Decided).unwrap(),
+        ),
+        IgnoreReason::RecentTurn => {
+            record(
+                LifecycleEvent::from_parts(identity(turn_id), LifecycleEventKind::UserPromptSubmit)
+                    .unwrap(),
+            );
+            record(
+                LifecycleEvent::from_parts(identity(turn_id), LifecycleEventKind::Stop).unwrap(),
+            );
+        }
+        IgnoreReason::AmbiguousTurn => record(
+            LifecycleEvent::from_parts(
+                identity("different-open-turn"),
+                LifecycleEventKind::UserPromptSubmit,
+            )
+            .unwrap(),
+        ),
+        IgnoreReason::ActiveSubagentCapacity => unreachable!(),
+    }
 }
 
 fn install_model_fixture(home: &Path, action: &str) {
@@ -189,42 +343,6 @@ fn assert_default_model_request(home: &Path) {
         stdin.contains("\"model\":\"gemma4:e4b\""),
         "missing default model in curl request: {stdin}"
     );
-}
-
-fn read_json_envelope(reader: &mut impl Read) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    let mut depth = 0_u32;
-    let mut in_string = false;
-    let mut escaped = false;
-    loop {
-        let read = reader.read(&mut buffer).unwrap();
-        assert!(read > 0, "hook stdout closed before a complete envelope");
-        for byte in &buffer[..read] {
-            result.push(*byte);
-            if in_string {
-                if escaped {
-                    escaped = false;
-                } else if *byte == b'\\' {
-                    escaped = true;
-                } else if *byte == b'"' {
-                    in_string = false;
-                }
-                continue;
-            }
-            match *byte {
-                b'"' => in_string = true,
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return result;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
 }
 
 fn overwrite_curl(home: &Path, script: &str) {
@@ -320,6 +438,703 @@ fn model_action_requires_proposal_and_terminal_before_delivery() {
     let snapshot = store.snapshot(SnapshotLimits::default()).unwrap();
     assert_eq!(snapshot.recent[0].delivery, DeliveryState::Delivered);
     assert!(!snapshot.recent[0].tool_execution_confirmed);
+}
+
+#[test]
+fn claude_permission_uses_exact_schema_and_cli_provider_authority() {
+    for (action, behavior) in [("approve", "allow"), ("deny", "deny")] {
+        let home = tempfile::tempdir().unwrap();
+        install_model_fixture(home.path(), action);
+
+        let output = run_provider_permission_hook(
+            home.path(),
+            "claude",
+            None,
+            &claude_permission_payload(home.path(), None),
+        );
+
+        assert!(output.status.success());
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": behavior}
+                }
+            })
+        );
+        let events = activity(home.path()).read().unwrap().events().to_vec();
+        assert!(events.iter().all(|event| {
+            event
+                .session
+                .as_ref()
+                .is_none_or(|session| session.provider == AgentProvider::Claude)
+        }));
+    }
+}
+
+#[test]
+fn provider_ask_or_deny_policy_never_becomes_claude_allow() {
+    for policy in ["ask", "deny"] {
+        let home = tempfile::tempdir().unwrap();
+        install_model_fixture(home.path(), "approve");
+
+        let output = run_provider_permission_hook(
+            home.path(),
+            "claude",
+            None,
+            &claude_permission_payload(home.path(), Some(policy)),
+        );
+
+        assert!(output.status.success());
+        if policy == "deny" {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PermissionRequest",
+                        "decision": {"behavior": "deny"}
+                    }
+                })
+            );
+        } else {
+            assert!(output.stdout.is_empty());
+        }
+    }
+}
+
+#[test]
+fn provider_ask_policy_preserves_claude_model_deny() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "deny");
+
+    let output = run_provider_permission_hook(
+        home.path(),
+        "claude",
+        None,
+        &claude_permission_payload(home.path(), Some("ask")),
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "deny"}
+            }
+        })
+    );
+}
+
+#[test]
+fn antigravity_permission_uses_exact_decisions_without_forbidden_overrides() {
+    for (action, decision) in [("approve", "allow"), ("deny", "deny")] {
+        let home = tempfile::tempdir().unwrap();
+        install_model_fixture(home.path(), action);
+
+        let output = run_provider_permission_hook(
+            home.path(),
+            "antigravity",
+            Some("PreToolUse"),
+            &antigravity_permission_payload(home.path(), None),
+        );
+
+        assert!(output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::json!({"decision": decision})
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("force_ask"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("permissionOverrides"));
+        let events = activity(home.path()).read().unwrap().events().to_vec();
+        assert!(events.iter().all(|event| {
+            event
+                .session
+                .as_ref()
+                .is_none_or(|session| session.provider == AgentProvider::Antigravity)
+        }));
+    }
+}
+
+#[test]
+fn antigravity_abstention_and_provider_force_ask_preserve_native_prompt() {
+    for policy in [None, Some("force_ask")] {
+        let home = tempfile::tempdir().unwrap();
+        if policy.is_none() {
+            install_gate_mode_fixture(home.path(), "off");
+        } else {
+            install_model_fixture(home.path(), "approve");
+        }
+
+        let output = run_provider_permission_hook(
+            home.path(),
+            "antigravity",
+            Some("PreToolUse"),
+            &antigravity_permission_payload(home.path(), policy),
+        );
+
+        assert!(output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::json!({
+                "decision": "ask",
+                "reason": "Coding Brain abstained"
+            })
+        );
+        let encoded = String::from_utf8_lossy(&output.stdout);
+        assert!(!encoded.contains("force_ask"));
+        assert!(!encoded.contains("permissionOverrides"));
+    }
+}
+
+#[test]
+fn provider_ask_policy_preserves_antigravity_model_deny() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "deny");
+
+    let output = run_provider_permission_hook(
+        home.path(),
+        "antigravity",
+        Some("PreToolUse"),
+        &antigravity_permission_payload(home.path(), Some("force_ask")),
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({"decision": "deny"})
+    );
+}
+
+#[test]
+fn provider_ask_and_model_deny_survive_ignored_lifecycle_decision() {
+    let mut failures = Vec::new();
+    for provider in [AgentProvider::Claude, AgentProvider::Antigravity] {
+        for ignored_reason in [
+            IgnoreReason::Duplicate,
+            IgnoreReason::RecentTurn,
+            IgnoreReason::AmbiguousTurn,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            install_model_fixture(home.path(), "deny");
+            seed_ignored_permission(home.path(), provider, ignored_reason);
+            let (provider_name, event, payload) = match provider {
+                AgentProvider::Claude => (
+                    "claude",
+                    None,
+                    claude_permission_payload(home.path(), Some("ask")),
+                ),
+                AgentProvider::Antigravity => (
+                    "antigravity",
+                    Some("PreToolUse"),
+                    antigravity_permission_payload(home.path(), Some("force_ask")),
+                ),
+                AgentProvider::Codex => unreachable!(),
+            };
+
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+            assert!(output.status.success());
+            let expected = if provider == AgentProvider::Claude {
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PermissionRequest",
+                        "decision": {"behavior": "deny"}
+                    }
+                })
+            } else {
+                serde_json::json!({"decision": "deny"})
+            };
+            let ignored_reason = format!("{ignored_reason:?}");
+            match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                Ok(response) if response == expected => {}
+                Ok(response) => failures.push(format!(
+                    "{provider_name} {ignored_reason}: expected {expected}, got {response}"
+                )),
+                Err(error) => failures.push(format!(
+                    "{provider_name} {ignored_reason}: invalid response ({error})"
+                )),
+            }
+            if !String::from_utf8_lossy(&output.stderr).contains(&ignored_reason) {
+                failures.push(format!(
+                    "{provider_name} {ignored_reason}: missing diagnostic: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn model_allow_requires_applied_lifecycle_decision() {
+    for provider in [AgentProvider::Claude, AgentProvider::Antigravity] {
+        for ignored_reason in [
+            IgnoreReason::Duplicate,
+            IgnoreReason::RecentTurn,
+            IgnoreReason::AmbiguousTurn,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            install_model_fixture(home.path(), "approve");
+            seed_ignored_permission(home.path(), provider, ignored_reason);
+            let (provider_name, event, payload) = match provider {
+                AgentProvider::Claude => {
+                    ("claude", None, claude_permission_payload(home.path(), None))
+                }
+                AgentProvider::Antigravity => (
+                    "antigravity",
+                    Some("PreToolUse"),
+                    antigravity_permission_payload(home.path(), None),
+                ),
+                AgentProvider::Codex => unreachable!(),
+            };
+
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+            assert!(output.status.success());
+            if provider == AgentProvider::Claude {
+                assert!(output.stdout.is_empty(), "{ignored_reason:?}");
+            } else {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+                    serde_json::json!({
+                        "decision": "ask",
+                        "reason": "Coding Brain abstained"
+                    }),
+                    "{ignored_reason:?}"
+                );
+            }
+            let events = activity(home.path()).read().unwrap().events().to_vec();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.state != ActivityState::Delivered),
+                "{provider_name} {ignored_reason:?}"
+            );
+            assert_eq!(
+                events.last().unwrap().state,
+                ActivityState::Error,
+                "{provider_name} {ignored_reason:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn provider_allow_responses_omit_model_message() {
+    for provider in ["codex", "claude", "antigravity"] {
+        let home = tempfile::tempdir().unwrap();
+        install_model_fixture_full(
+            home.path(),
+            "approve",
+            0.9,
+            Some("approval detail must not escape"),
+        );
+
+        let (event, payload) = match provider {
+            "codex" => (None, permission_payload(home.path(), "cargo test")),
+            "claude" => (None, claude_permission_payload(home.path(), None)),
+            _ => (
+                Some("PreToolUse"),
+                antigravity_permission_payload(home.path(), None),
+            ),
+        };
+        let output = run_provider_permission_hook(home.path(), provider, event, &payload);
+
+        assert!(output.status.success());
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if provider != "antigravity" {
+            assert_eq!(
+                response,
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PermissionRequest",
+                        "decision": {"behavior": "allow"}
+                    }
+                })
+            );
+        } else {
+            assert_eq!(response, serde_json::json!({"decision": "allow"}));
+        }
+    }
+}
+
+#[test]
+fn claude_allow_is_suppressed_for_open_turn_mismatch() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Claude,
+        "claude-session-1".into(),
+        Some("different-open-turn".into()),
+        None,
+        home.path().to_path_buf(),
+    )
+    .unwrap();
+    lifecycle
+        .record(LifecycleEvent::from_parts(identity, LifecycleEventKind::UserPromptSubmit).unwrap())
+        .unwrap();
+
+    let output = run_provider_permission_hook(
+        home.path(),
+        "claude",
+        None,
+        &claude_permission_payload(home.path(), None),
+    );
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ignored"));
+    assert_eq!(
+        activity(home.path())
+            .read()
+            .unwrap()
+            .events()
+            .last()
+            .unwrap()
+            .state,
+        ActivityState::Error
+    );
+}
+
+#[test]
+fn repeated_claude_synthesized_turn_id_suppresses_second_allow() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    let payload = claude_permission_payload(home.path(), None);
+
+    let first = run_provider_permission_hook(home.path(), "claude", None, &payload);
+    let second = run_provider_permission_hook(home.path(), "claude", None, &payload);
+
+    assert!(first.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&first.stdout).unwrap()["hookSpecificOutput"]["decision"]
+            ["behavior"],
+        "allow"
+    );
+    assert!(second.status.success());
+    assert!(second.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("ignored"));
+}
+
+#[test]
+fn repeated_antigravity_synthesized_turn_id_asks_after_model_allow() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    let payload = antigravity_permission_payload(home.path(), None);
+
+    let first =
+        run_provider_permission_hook(home.path(), "antigravity", Some("PreToolUse"), &payload);
+    let second =
+        run_provider_permission_hook(home.path(), "antigravity", Some("PreToolUse"), &payload);
+
+    assert!(first.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&first.stdout).unwrap(),
+        serde_json::json!({"decision": "allow"})
+    );
+    assert!(second.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&second.stdout).unwrap(),
+        serde_json::json!({
+            "decision": "ask",
+            "reason": "Coding Brain abstained"
+        })
+    );
+    assert!(String::from_utf8_lossy(&second.stderr).contains("ignored"));
+    assert_eq!(
+        activity(home.path())
+            .read()
+            .unwrap()
+            .events()
+            .last()
+            .unwrap()
+            .state,
+        ActivityState::Error
+    );
+}
+
+#[test]
+fn antigravity_permission_requires_trusted_pre_tool_use_dispatch() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    let payload = antigravity_permission_payload(home.path(), None);
+
+    for event in [None, Some("Stop")] {
+        let output = run_provider_permission_hook(home.path(), "antigravity", event, &payload);
+        assert!(output.status.success());
+        assert_ne!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["decision"],
+            "allow"
+        );
+    }
+}
+
+#[test]
+fn antigravity_invalid_present_policy_evidence_never_allows() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    let base: serde_json::Value =
+        serde_json::from_slice(&antigravity_permission_payload(home.path(), None)).unwrap();
+    let mut cases = Vec::new();
+    for value in [
+        serde_json::Value::Null,
+        serde_json::json!({}),
+        serde_json::json!("unexpected"),
+    ] {
+        let mut payload = base.clone();
+        payload["decision"] = value;
+        cases.push(serde_json::to_vec(&payload).unwrap());
+    }
+    for value in [serde_json::Value::Null, serde_json::json!({})] {
+        let mut payload = base.clone();
+        payload["permissionOverrides"] = value;
+        cases.push(serde_json::to_vec(&payload).unwrap());
+    }
+    let mut oversized = serde_json::to_vec(&base).unwrap();
+    oversized.extend(vec![b' '; 65_537]);
+    cases.push(oversized);
+
+    for payload in cases {
+        let output =
+            run_provider_permission_hook(home.path(), "antigravity", Some("PreToolUse"), &payload);
+        assert!(output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["decision"],
+            "ask"
+        );
+        let encoded = String::from_utf8_lossy(&output.stdout);
+        assert!(!encoded.contains("force_ask"));
+        assert!(!encoded.contains("permissionOverrides"));
+    }
+}
+
+#[test]
+fn omitted_provider_is_byte_equivalent_to_explicit_codex_for_8k_command() {
+    let implicit_home = tempfile::tempdir().unwrap();
+    let explicit_home = tempfile::tempdir().unwrap();
+    install_model_fixture(implicit_home.path(), "approve");
+    install_model_fixture(explicit_home.path(), "approve");
+    let command = "x".repeat(8 * 1024);
+
+    let implicit = run_permission_hook(
+        implicit_home.path(),
+        &permission_payload(implicit_home.path(), &command),
+    );
+    let explicit = run_provider_permission_hook(
+        explicit_home.path(),
+        "codex",
+        None,
+        &permission_payload(explicit_home.path(), &command),
+    );
+
+    assert_eq!(implicit.stdout, explicit.stdout);
+    assert_eq!(implicit.stderr, explicit.stderr);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&implicit.stdout).unwrap()["hookSpecificOutput"]
+            ["decision"]["behavior"],
+        "allow"
+    );
+}
+
+#[test]
+fn provider_permissions_accept_8k_commands_with_bounded_activity() {
+    for provider in ["claude", "antigravity"] {
+        let home = tempfile::tempdir().unwrap();
+        install_model_fixture(home.path(), "approve");
+        let command = "x".repeat(8 * 1024);
+        let (event, payload) = if provider == "claude" {
+            let mut payload: serde_json::Value =
+                serde_json::from_slice(&claude_permission_payload(home.path(), None)).unwrap();
+            payload["tool_input"]["command"] = serde_json::json!(command);
+            (None, serde_json::to_vec(&payload).unwrap())
+        } else {
+            let mut payload: serde_json::Value =
+                serde_json::from_slice(&antigravity_permission_payload(home.path(), None)).unwrap();
+            payload["toolCall"]["args"]["CommandLine"] = serde_json::json!(command);
+            (Some("PreToolUse"), serde_json::to_vec(&payload).unwrap())
+        };
+
+        let output = run_provider_permission_hook(home.path(), provider, event, &payload);
+
+        assert!(output.status.success());
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if provider == "claude" {
+            assert_eq!(
+                response["hookSpecificOutput"]["decision"]["behavior"],
+                "allow"
+            );
+        } else {
+            assert_eq!(response["decision"], "allow");
+        }
+        assert!(output.stdout.len() < 256);
+        assert!(
+            activity(home.path())
+                .read()
+                .unwrap()
+                .events()
+                .iter()
+                .all(|event| {
+                    event
+                        .normalized_command
+                        .as_ref()
+                        .is_none_or(|command| command.len() <= MAX_ACTIVITY_FIELD_BYTES)
+                })
+        );
+    }
+}
+
+#[test]
+fn malformed_provider_fields_preserve_each_native_prompt() {
+    let claude_home = tempfile::tempdir().unwrap();
+    install_model_fixture(claude_home.path(), "approve");
+    let claude_base: serde_json::Value =
+        serde_json::from_slice(&claude_permission_payload(claude_home.path(), None)).unwrap();
+    for (field, value) in [
+        ("session_id", serde_json::json!("")),
+        ("tool_name", serde_json::json!("x".repeat(513))),
+        (
+            "tool_input",
+            serde_json::json!({"command": "x".repeat(65_537)}),
+        ),
+    ] {
+        let mut payload = claude_base.clone();
+        payload[field] = value;
+        let output = run_provider_permission_hook(
+            claude_home.path(),
+            "claude",
+            None,
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        assert!(output.stdout.is_empty());
+    }
+    let mut unsupported_claude = claude_base.clone();
+    unsupported_claude["tool_name"] = serde_json::json!("Read");
+    unsupported_claude["tool_input"] = serde_json::json!({"file_path": "/tmp/example"});
+    let output = run_provider_permission_hook(
+        claude_home.path(),
+        "claude",
+        None,
+        &serde_json::to_vec(&unsupported_claude).unwrap(),
+    );
+    assert!(output.stdout.is_empty());
+
+    let antigravity_home = tempfile::tempdir().unwrap();
+    install_model_fixture(antigravity_home.path(), "approve");
+    let antigravity_base: serde_json::Value = serde_json::from_slice(
+        &antigravity_permission_payload(antigravity_home.path(), None),
+    )
+    .unwrap();
+    for mutate in [
+        ("conversationId", serde_json::json!("")),
+        ("conversationId", serde_json::json!("x".repeat(513))),
+        (
+            "toolCall",
+            serde_json::json!({"name": "run_command", "args": {}}),
+        ),
+        (
+            "toolCall",
+            serde_json::json!({"name": "x".repeat(513), "args": {}}),
+        ),
+        (
+            "toolCall",
+            serde_json::json!({
+                "name": "run_command",
+                "args": {"CommandLine": "x".repeat(65_537)}
+            }),
+        ),
+    ] {
+        let mut payload = antigravity_base.clone();
+        payload[mutate.0] = mutate.1;
+        let output = run_provider_permission_hook(
+            antigravity_home.path(),
+            "antigravity",
+            Some("PreToolUse"),
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["decision"],
+            "ask"
+        );
+    }
+    let mut unsupported_antigravity = antigravity_base;
+    unsupported_antigravity["toolCall"] = serde_json::json!({
+        "name": "view_file",
+        "args": {"AbsolutePath": "/tmp/example"}
+    });
+    let output = run_provider_permission_hook(
+        antigravity_home.path(),
+        "antigravity",
+        Some("PreToolUse"),
+        &serde_json::to_vec(&unsupported_antigravity).unwrap(),
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["decision"],
+        "ask"
+    );
+}
+
+#[test]
+fn antigravity_inference_and_persistence_failures_ask() {
+    let inference_home = tempfile::tempdir().unwrap();
+    install_model_fixture(inference_home.path(), "approve");
+    overwrite_curl(inference_home.path(), "exit 7");
+    let inference = run_provider_permission_hook(
+        inference_home.path(),
+        "antigravity",
+        Some("PreToolUse"),
+        &antigravity_permission_payload(inference_home.path(), None),
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&inference.stdout).unwrap()["decision"],
+        "ask"
+    );
+
+    let persistence_home = tempfile::tempdir().unwrap();
+    install_model_fixture(persistence_home.path(), "approve");
+    fs::create_dir_all(
+        persistence_home
+            .path()
+            .join(".local/state/coding-brain/brain/decisions.jsonl"),
+    )
+    .unwrap();
+    let persistence = run_provider_permission_hook(
+        persistence_home.path(),
+        "antigravity",
+        Some("PreToolUse"),
+        &antigravity_permission_payload(persistence_home.path(), None),
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&persistence.stdout).unwrap()["decision"],
+        "ask"
+    );
+}
+
+#[test]
+fn antigravity_reason_is_redacted_and_bounded() {
+    let home = tempfile::tempdir().unwrap();
+    let message = format!("token sk-secret-value {}", "x".repeat(16_000));
+    install_model_fixture_full(home.path(), "deny", 0.9, Some(&message));
+
+    let output = run_provider_permission_hook(
+        home.path(),
+        "antigravity",
+        Some("PreToolUse"),
+        &antigravity_permission_payload(home.path(), None),
+    );
+
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let reason = response["reason"].as_str().unwrap();
+    assert!(reason.contains("[REDACTED]"));
+    assert!(!reason.contains("sk-secret-value"));
+    assert!(reason.len() <= coding_brain_core::brain_activity::MAX_ACTIVITY_FIELD_BYTES);
 }
 
 #[test]
@@ -600,59 +1415,28 @@ fn closed_stdout_pipe_records_delivery_failed() {
 }
 
 #[test]
-fn killed_after_stdout_is_unknown_until_later_outcome() {
+fn bounded_permission_response_records_delivery_before_later_outcome() {
     let home = tempfile::tempdir().unwrap();
     let large_message = "x".repeat(512 * 1024);
     install_model_fixture_full(home.path(), "approve", 0.9, Some(&large_message));
     let pre = run_lifecycle_hook(home.path(), &pre_tool_payload(home.path(), "cargo test"));
     assert!(pre.status.success());
     assert!(pre.stderr.is_empty());
-    let mut child = spawn_permission_hook(home.path());
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&permission_payload(home.path(), "cargo test"))
-        .unwrap();
+    let output = run_permission_hook(home.path(), &permission_payload(home.path(), "cargo test"));
 
     let store = activity(home.path());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if store.read().is_ok_and(|log| {
-            log.events()
-                .iter()
-                .any(|event| event.state == ActivityState::Allowed)
-        }) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "terminal activity was not written"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(home.path().join(".local/state/coding-brain/activity.lock"))
-        .unwrap();
-    FileExt::lock_exclusive(&lock).unwrap();
-    let envelope = read_json_envelope(child.stdout.as_mut().unwrap());
-    let response: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         response["hookSpecificOutput"]["decision"]["behavior"],
         "allow"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
-    FileExt::unlock(&lock).unwrap();
+    assert!(
+        output.stdout.len() <= coding_brain_core::brain_activity::MAX_ACTIVITY_FIELD_BYTES + 256
+    );
 
     let before = store.snapshot(SnapshotLimits::default()).unwrap();
-    assert_eq!(before.attention[0].delivery, DeliveryState::Unknown);
-    assert!(!before.attention[0].tool_execution_confirmed);
+    assert_eq!(before.recent[0].delivery, DeliveryState::Delivered);
+    assert!(!before.recent[0].tool_execution_confirmed);
 
     let outcome = post_tool_payload(home.path(), "cargo test");
     let lifecycle = run_lifecycle_hook(home.path(), &outcome);
@@ -666,8 +1450,8 @@ fn killed_after_stdout_is_unknown_until_later_outcome() {
         .recent
         .iter()
         .chain(after.attention.iter().map(|item| &item.activity))
-        .find(|item| item.activity_id == before.attention[0].activity_id)
+        .find(|item| item.activity_id == before.recent[0].activity_id)
         .unwrap();
-    assert_eq!(confirmed.delivery, DeliveryState::Unknown);
+    assert_eq!(confirmed.delivery, DeliveryState::Delivered);
     assert!(confirmed.tool_execution_confirmed);
 }

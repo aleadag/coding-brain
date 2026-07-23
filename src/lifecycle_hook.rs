@@ -9,16 +9,34 @@ use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivityState,
     ProjectEvidence, SessionTarget, bounded_activity_identifier, lossless_redacted_activity_text,
 };
-use coding_brain_core::lifecycle::{LifecycleEvent, LifecycleStore, coding_brain_state_root};
+use coding_brain_core::lifecycle::{
+    ApplyOutcome, LifecycleEvent, LifecycleStore, coding_brain_state_root,
+};
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::project::ProjectIdentity;
+use coding_brain_core::provider::AgentProvider;
+use coding_brain_core::session_links::{
+    SESSION_IDENTITY_LINK_SCHEMA_VERSION, SessionIdentityLink, SessionLinkStore,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::brain::activity::{ActivityLog, ActivityStore};
+#[cfg(test)]
+use crate::provider_hooks::normalized_outcome;
+use crate::provider_hooks::{ParsedLifecycleHook, parse_lifecycle};
 
 pub(crate) const MAX_HOOK_INPUT_BYTES: usize = 64 * 1024;
 static LIFECYCLE_ACTIVITY_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Debug, Clone)]
+pub(crate) struct RecordedProviderHook {
+    pub parsed: ParsedLifecycleHook,
+    pub event: LifecycleEvent,
+    pub outcome: ApplyOutcome,
+    pub sequence: u64,
+    pub recovery_link_persisted: bool,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HookInputError {
@@ -50,37 +68,64 @@ pub(crate) fn read_bounded_hook_input(mut reader: impl Read) -> Result<Vec<u8>, 
 }
 
 fn write_diagnostic(stderr: &mut impl Write, diagnostic: impl fmt::Display) {
+    let mut diagnostic =
+        coding_brain_core::brain_activity::redact_activity_text(&diagnostic.to_string());
+    if diagnostic.len() > 200 {
+        let mut boundary = 200;
+        while !diagnostic.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        diagnostic.truncate(boundary);
+        diagnostic.push('…');
+    }
     let _ = writeln!(stderr, "coding-brain lifecycle hook: {diagnostic}");
 }
 
 pub(crate) fn run_with<R: Read, W: Write, E: Write>(
     stdin: R,
-    stdout: W,
+    _stdout: W,
     stderr: E,
     store: &LifecycleStore,
 ) {
-    run_with_activity(stdin, stdout, stderr, store, None);
+    run_provider_with_activity(AgentProvider::Codex, stdin, stderr, store, None, None, None);
 }
 
 #[derive(Debug, Deserialize)]
-struct LifecycleActivityInput {
-    #[serde(default)]
-    tool_name: Option<String>,
-    #[serde(default)]
-    tool_use_id: Option<String>,
+struct RawLifecycleActivityInput {
     #[serde(default)]
     tool_input: Value,
-    #[serde(default)]
-    tool_response: Option<Value>,
+}
+
+struct LifecycleActivityInput {
+    tool_name: Option<String>,
+    tool_use_id: Option<String>,
+    normalized_command: Option<String>,
+    outcome: Option<ActivityOutcome>,
 }
 
 impl LifecycleActivityInput {
+    fn from_parsed(parsed: &ParsedLifecycleHook, raw: &[u8]) -> Self {
+        let normalized_command = (parsed.tool_name.as_deref() == Some("Bash"))
+            .then(|| {
+                serde_json::from_slice::<RawLifecycleActivityInput>(raw)
+                    .ok()?
+                    .tool_input
+                    .get("command")?
+                    .as_str()
+                    .filter(|command| !command.trim().is_empty())
+                    .and_then(lossless_redacted_activity_text)
+            })
+            .flatten();
+        Self {
+            tool_name: parsed.tool_name.clone(),
+            tool_use_id: parsed.tool_use_id.clone(),
+            normalized_command,
+            outcome: parsed.outcome,
+        }
+    }
+
     fn normalized_bash_command(&self) -> Option<String> {
-        (self.tool_name.as_deref() == Some("Bash"))
-            .then(|| self.tool_input.get("command")?.as_str())
-            .flatten()
-            .filter(|command| !command.trim().is_empty())
-            .and_then(lossless_redacted_activity_text)
+        self.normalized_command.clone()
     }
 
     fn normalized_tool_use_id(&self) -> Option<String> {
@@ -100,9 +145,29 @@ enum Correlation {
 pub(crate) fn run_with_activity<R: Read, W: Write, E: Write>(
     stdin: R,
     _stdout: W,
+    stderr: E,
+    store: &LifecycleStore,
+    activity: Option<&ActivityStore>,
+) {
+    run_provider_with_activity(
+        AgentProvider::Codex,
+        stdin,
+        stderr,
+        store,
+        activity,
+        None,
+        None,
+    );
+}
+
+fn run_provider_with_activity<R: Read, E: Write>(
+    provider: AgentProvider,
+    stdin: R,
     mut stderr: E,
     store: &LifecycleStore,
     activity: Option<&ActivityStore>,
+    session_links: Option<&SessionLinkStore>,
+    antigravity_event: Option<&str>,
 ) {
     let input = match read_bounded_hook_input(stdin) {
         Ok(input) => input,
@@ -111,18 +176,38 @@ pub(crate) fn run_with_activity<R: Read, W: Write, E: Write>(
             return;
         }
     };
-    let event = match LifecycleEvent::parse(&input) {
+    let mut parsed = match parse_lifecycle(provider, antigravity_event, &input) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            return;
+        }
+    };
+    parsed.live_process = crate::provider_hooks::live_parent_process(provider);
+    let activity_input = LifecycleActivityInput::from_parsed(&parsed, &input);
+    let event = match LifecycleEvent::from_parts(parsed.identity.clone(), parsed.event.clone()) {
         Ok(event) => event,
         Err(error) => {
             write_diagnostic(&mut stderr, error);
             return;
         }
     };
-    let activity_input = serde_json::from_slice::<LifecycleActivityInput>(&input).ok();
     if let Err(error) = store.record(event.clone()) {
         write_diagnostic(&mut stderr, error);
     }
-    if let (Some(activity), Some(activity_input)) = (activity, activity_input) {
+    if let (Some(session_links), Some(live_process)) = (session_links, parsed.live_process.clone())
+        && crate::provider_hooks::revalidate_live_process(&live_process)
+        && let Err(error) = session_links.append(SessionIdentityLink {
+            schema_version: SESSION_IDENTITY_LINK_SCHEMA_VERSION,
+            recorded_at_ms: epoch_ms(),
+            provider,
+            native_session_id: parsed.identity.session_id().to_string(),
+            live_process,
+        })
+    {
+        write_diagnostic(&mut stderr, error);
+    }
+    if let Some(activity) = activity {
         let result = if event.name().as_str() == "PostToolUse" {
             let observation = match observation_event(&event, &activity_input) {
                 Ok(observation) => observation,
@@ -160,6 +245,111 @@ pub(crate) fn run_with_activity<R: Read, W: Write, E: Write>(
         }
         let _ = activity.compact_if_needed();
     }
+}
+
+pub(crate) fn persist_provider_hook(
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+    input: &[u8],
+    store: &LifecycleStore,
+    activity: Option<&ActivityStore>,
+    session_links: Option<&SessionLinkStore>,
+) -> Result<RecordedProviderHook, String> {
+    let mut parsed = match parse_lifecycle(provider, antigravity_event, input) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Err(error.to_string());
+        }
+    };
+    parsed.live_process = crate::provider_hooks::live_parent_process(provider);
+    let activity_input = LifecycleActivityInput::from_parsed(&parsed, input);
+    let event = match LifecycleEvent::from_parts(parsed.identity.clone(), parsed.event.clone()) {
+        Ok(event) => event,
+        Err(error) => {
+            return Err(error.to_string());
+        }
+    };
+    let is_stop = event.name() == coding_brain_core::lifecycle::LifecycleEventName::Stop;
+    let (recorded, recovery_link_persisted) = persist_recovery_event_in_order(
+        is_stop,
+        || {
+            let (Some(session_links), Some(live_process)) =
+                (session_links, parsed.live_process.clone())
+            else {
+                return Ok(false);
+            };
+            if !crate::provider_hooks::revalidate_live_process(&live_process) {
+                return Ok(false);
+            }
+            let native_session_id = parsed.identity.session_id().to_string();
+            session_links
+                .append(SessionIdentityLink {
+                    schema_version: SESSION_IDENTITY_LINK_SCHEMA_VERSION,
+                    recorded_at_ms: epoch_ms(),
+                    provider,
+                    native_session_id: native_session_id.clone(),
+                    live_process: live_process.clone(),
+                })
+                .map_err(|error| error.to_string())?;
+            let projection = session_links
+                .read_projection()
+                .map_err(|error| error.to_string())?;
+            let native =
+                coding_brain_core::provider::AgentSessionKey::native(provider, &native_session_id);
+            Ok(
+                projection.native_for(&live_process) == Some(native_session_id.as_str())
+                    && projection.live_for(&native) == Some(&live_process),
+            )
+        },
+        || {
+            store
+                .record_with_sequence(event.clone())
+                .map_err(|error| error.to_string())
+        },
+    )?;
+    if let Some(activity) = activity {
+        let result = if event.name().as_str() == "PostToolUse" {
+            let observation = observation_event(&event, &activity_input)?;
+            activity
+                .append_from_snapshot(|log| {
+                    let mut events = vec![observation];
+                    match correlate_outcome(log, &event, &activity_input) {
+                        Correlation::Outcome(outcome) => events.push(outcome),
+                        Correlation::Diagnostic { event, .. } => events.push(event),
+                        Correlation::None => {}
+                    }
+                    events
+                })
+                .map_err(|error| error.to_string())
+        } else {
+            append_observation(activity, &event, &activity_input)
+        };
+        result?;
+        let _ = activity.compact_if_needed();
+    }
+    Ok(RecordedProviderHook {
+        parsed,
+        event,
+        outcome: recorded.outcome,
+        sequence: recorded.sequence,
+        recovery_link_persisted,
+    })
+}
+
+fn persist_recovery_event_in_order<T>(
+    requires_link: bool,
+    persist_and_verify_link: impl FnOnce() -> Result<bool, String>,
+    publish_lifecycle: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, bool), String> {
+    let link_persisted = if requires_link {
+        persist_and_verify_link()?
+    } else {
+        false
+    };
+    if requires_link && !link_persisted {
+        return Err("exact recovery identity link unavailable".into());
+    }
+    publish_lifecycle().map(|recorded| (recorded, link_persisted))
 }
 
 fn append_observation(
@@ -268,6 +458,22 @@ fn correlate_outcome(
         return Correlation::None;
     }
 
+    let has_any_decision = log
+        .events()
+        .iter()
+        .any(|event| event.kind == ActivityKind::Decision);
+    let has_provider_decision = log.events().iter().any(|event| {
+        event.kind == ActivityKind::Decision
+            && event.session.as_ref().is_some_and(|session| {
+                session.provider == identity.provider()
+                    && session.session_id == identity.session_id()
+                    && session.turn_id.as_deref() == identity.turn_id()
+            })
+    });
+    if has_any_decision && !has_provider_decision {
+        return Correlation::None;
+    }
+
     let anchors = log
         .events()
         .iter()
@@ -276,7 +482,8 @@ fn correlate_outcome(
             event.kind == ActivityKind::Lifecycle
                 && event.tool.as_deref() == Some("PreToolUse")
                 && event.session.as_ref().is_some_and(|session| {
-                    session.session_id == identity.session_id()
+                    session.provider == identity.provider()
+                        && session.session_id == identity.session_id()
                         && session.turn_id.as_deref() == identity.turn_id()
                         && session.tool_use_id.as_deref() == Some(tool_use_id.as_str())
                 })
@@ -297,7 +504,8 @@ fn correlate_outcome(
             event.kind == ActivityKind::Lifecycle
                 && event.tool.as_deref() == Some("PreToolUse")
                 && event.session.as_ref().is_some_and(|session| {
-                    session.session_id == identity.session_id()
+                    session.provider == identity.provider()
+                        && session.session_id == identity.session_id()
                         && session.turn_id.as_deref() == identity.turn_id()
                 })
         })
@@ -333,7 +541,8 @@ fn correlate_outcome(
                 && event.tool.as_deref() == Some("Bash")
                 && event.normalized_command.as_deref() == Some(command.as_str())
                 && event.session.as_ref().is_some_and(|session| {
-                    session.session_id == identity.session_id()
+                    session.provider == identity.provider()
+                        && session.session_id == identity.session_id()
                         && session.turn_id.as_deref() == identity.turn_id()
                 })
                 && first_allowed_terminal_with_index(log, &event.activity_id)
@@ -382,13 +591,14 @@ fn correlate_candidates(
     }
     let matched = candidates[0];
     let post_id = input.normalized_tool_use_id();
-    let outcome = normalized_outcome(input.tool_response.as_ref());
+    let outcome = input.outcome.unwrap_or(ActivityOutcome::Completed);
     let post_already_recorded = log.events().iter().any(|event| {
         event.state == ActivityState::Outcome
             && event.activity_id == matched.activity_id
             && event.outcome == Some(outcome)
             && event.session.as_ref().is_some_and(|session| {
-                session.session_id == lifecycle.identity().session_id()
+                session.provider == lifecycle.identity().provider()
+                    && session.session_id == lifecycle.identity().session_id()
                     && session.turn_id.as_deref() == lifecycle.identity().turn_id()
                     && session.tool_use_id.as_deref() == post_id.as_deref()
             })
@@ -508,35 +718,6 @@ fn diagnostic_event(
     })
 }
 
-fn normalized_outcome(response: Option<&Value>) -> ActivityOutcome {
-    let Some(Value::Object(response)) = response else {
-        return ActivityOutcome::Completed;
-    };
-    let status = response.get("status").and_then(Value::as_str);
-    if response.get("cancelled").and_then(Value::as_bool) == Some(true)
-        || matches!(status, Some("cancelled" | "canceled"))
-    {
-        ActivityOutcome::Cancelled
-    } else if response.get("is_error").and_then(Value::as_bool) == Some(true)
-        || response
-            .get("exit_code")
-            .and_then(Value::as_i64)
-            .is_some_and(|code| code != 0)
-        || response.get("success").and_then(Value::as_bool) == Some(false)
-        || matches!(status, Some("failed" | "error"))
-    {
-        ActivityOutcome::Failed
-    } else if response.get("exit_code").and_then(Value::as_i64) == Some(0)
-        || response.get("success").and_then(Value::as_bool) == Some(true)
-        || response.get("is_error").and_then(Value::as_bool) == Some(false)
-        || matches!(status, Some("succeeded" | "success"))
-    {
-        ActivityOutcome::Succeeded
-    } else {
-        ActivityOutcome::Completed
-    }
-}
-
 fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -559,18 +740,21 @@ fn current_paths() -> Option<CodingBrainPaths> {
     CodingBrainPaths::resolve(&environment).ok()
 }
 
-pub(crate) fn run() {
-    let store = LifecycleStore::at(coding_brain_state_root());
+pub(crate) fn run(provider: AgentProvider, antigravity_event: Option<&str>) {
+    let state_root = coding_brain_state_root();
+    let store = LifecycleStore::at(&state_root);
+    let session_links = SessionLinkStore::at(state_root.join("session-links.jsonl"));
     let activity = activity_store();
     let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
     let stderr = std::io::stderr();
-    run_with_activity(
+    run_provider_with_activity(
+        provider,
         stdin.lock(),
-        stdout.lock(),
         stderr.lock(),
         &store,
         activity.as_ref(),
+        Some(&session_links),
+        antigravity_event,
     );
 }
 
@@ -615,6 +799,7 @@ mod tests {
                 label: Some("project".into()),
             },
             session: Some(SessionTarget {
+                provider: AgentProvider::Codex,
                 session_id: "session-1".into(),
                 turn_id: Some("turn-1".into()),
                 tool_use_id: tool_use_id.map(str::to_owned),
@@ -774,6 +959,66 @@ mod tests {
     }
 
     #[test]
+    fn strict_stop_persistence_does_not_publish_without_exact_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let mut payload: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/hooks/antigravity-stop.json"
+        ))
+        .unwrap();
+        payload["workspacePaths"] = serde_json::json!([temp.path()]);
+
+        let result = persist_provider_hook(
+            AgentProvider::Antigravity,
+            Some("Stop"),
+            &serde_json::to_vec(&payload).unwrap(),
+            &lifecycle,
+            Some(&activity),
+            None,
+        );
+
+        assert!(result.is_err());
+        assert!(lifecycle.read().unwrap().snapshot.is_none());
+        assert!(activity.read().unwrap().events().is_empty());
+    }
+
+    #[test]
+    fn strict_stop_persistence_verifies_link_before_publishing_lifecycle() {
+        let order = std::cell::RefCell::new(Vec::new());
+        let result = persist_recovery_event_in_order(
+            true,
+            || {
+                order.borrow_mut().push("link");
+                Ok(true)
+            },
+            || {
+                order.borrow_mut().push("stop");
+                Ok(7_u64)
+            },
+        )
+        .unwrap();
+        order.borrow_mut().push("evaluation");
+
+        assert_eq!(result, (7, true));
+        assert_eq!(order.into_inner(), vec!["link", "stop", "evaluation"]);
+
+        let published = std::cell::Cell::new(false);
+        assert!(
+            persist_recovery_event_in_order(
+                true,
+                || Ok(false),
+                || {
+                    published.set(true);
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert!(!published.get());
+    }
+
+    #[test]
     fn generic_lifecycle_hook_records_only_normalized_activity_identity() {
         let temp = tempfile::tempdir().unwrap();
         let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
@@ -823,6 +1068,19 @@ mod tests {
             assert!(!diagnostic.contains("secret"));
             assert!(!store.snapshot_path().exists());
         }
+    }
+
+    #[test]
+    fn lifecycle_diagnostics_are_redacted_and_bounded() {
+        let mut stderr = Vec::new();
+        write_diagnostic(
+            &mut stderr,
+            format!("api_key=sk-secret-value {}", "x".repeat(1_024)),
+        );
+        let diagnostic = String::from_utf8(stderr).unwrap();
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!diagnostic.contains("sk-secret-value"));
+        assert!(diagnostic.len() < 256);
     }
 
     #[test]
@@ -1080,8 +1338,13 @@ mod tests {
         );
 
         let events = activity.read().unwrap().events().to_vec();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].activity_id, "claude-activity");
+        assert_eq!(events[1].kind, ActivityKind::Lifecycle);
+        assert_eq!(
+            events[1].session.as_ref().unwrap().provider,
+            AgentProvider::Codex
+        );
     }
 
     #[test]

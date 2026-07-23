@@ -351,9 +351,16 @@ fn endpoint_reachable(endpoint: &str) -> bool {
         .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() != "000")
 }
 
-pub struct LiveBrainActions;
+#[derive(Default)]
+pub struct LiveBrainActions {
+    recovery: brain::recovery::RecoveryCoordinator,
+}
 
 impl BrainActions for LiveBrainActions {
+    fn poll_recovery(&self) -> Vec<String> {
+        self.recovery.poll()
+    }
+
     fn record_correction(&self, correction: CorrectionInput) -> Result<(), String> {
         let paths = brain::distill::current_paths().map_err(|error| error.to_string())?;
         record_correction_at_path(&paths.state_root().join("activity.jsonl"), correction)

@@ -162,6 +162,21 @@ pub struct LifecycleEvent {
 }
 
 impl LifecycleEvent {
+    pub fn from_parts(
+        identity: LifecycleIdentity,
+        kind: LifecycleEventKind,
+    ) -> Result<Self, LifecycleInputError> {
+        if !matches!(kind, LifecycleEventKind::SessionStart { .. }) {
+            require_turn(&identity)?;
+        }
+        if let LifecycleEventKind::SubagentStart { agent_id }
+        | LifecycleEventKind::SubagentStop { agent_id } = &kind
+        {
+            validate_id("agent_id", agent_id)?;
+        }
+        Ok(Self { identity, kind })
+    }
+
     pub fn parse(raw: &[u8]) -> Result<Self, LifecycleInputError> {
         let raw: RawLifecycleEvent =
             serde_json::from_slice(raw).map_err(|_| LifecycleInputError::InvalidJson)?;

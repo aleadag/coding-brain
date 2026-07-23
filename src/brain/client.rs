@@ -154,6 +154,13 @@ pub fn complete(config: &BrainConfig, prompt: &str) -> Result<String, String> {
     call_llm(config, prompt)
 }
 
+pub fn infer_recovery(
+    config: &BrainConfig,
+    prompt: &str,
+) -> Result<super::recovery::RecoverySuggestion, String> {
+    parse_recovery_suggestion_json(&complete(config, prompt)?)
+}
+
 /// Make an LLM API call, auto-detecting ollama vs OpenAI format from the endpoint URL.
 fn call_llm(config: &BrainConfig, prompt: &str) -> Result<String, String> {
     let is_openai = is_openai_compatible(&config.endpoint);
@@ -267,6 +274,40 @@ pub fn parse_suggestion_json(text: &str) -> Result<BrainSuggestion, String> {
         message,
         reasoning,
         confidence: confidence.clamp(0.0, 1.0),
+        suggested_at: epoch_secs(),
+    })
+}
+
+pub fn parse_recovery_suggestion_json(
+    text: &str,
+) -> Result<super::recovery::RecoverySuggestion, String> {
+    use super::recovery::{RecoveryDecision, RecoverySuggestion};
+
+    let json: serde_json::Value = serde_json::from_str(text.trim())
+        .map_err(|_| "invalid recovery suggestion JSON".to_string())?;
+    let action = json
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing recovery 'action' field")?;
+    let decision = match action {
+        "continue" => RecoveryDecision::Continue("continue".into()),
+        "leave_alone" => RecoveryDecision::LeaveAlone,
+        _ => return Err(format!("unknown recovery action '{action}'")),
+    };
+    let confidence = json
+        .get("confidence")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
+    let reasoning = match decision {
+        RecoveryDecision::Continue(_) => "local model selected continuation",
+        RecoveryDecision::LeaveAlone => "local model declined continuation",
+    }
+    .into();
+    Ok(RecoverySuggestion {
+        decision,
+        reasoning,
+        confidence,
         suggested_at: epoch_secs(),
     })
 }
@@ -387,6 +428,44 @@ printf '%s' '{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confi
         assert_eq!(s.reasoning, "");
         assert!((s.confidence - 0.5).abs() < f64::EPSILON);
         assert!(s.message.is_none());
+    }
+
+    #[test]
+    fn recovery_parser_defaults_continue_to_fixed_literal() {
+        let parsed = parse_recovery_suggestion_json(
+            r#"{"action":"continue","reasoning":"task remains","confidence":0.91}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.decision,
+            super::super::recovery::RecoveryDecision::Continue("continue".into())
+        );
+    }
+
+    #[test]
+    fn recovery_parser_ignores_arbitrary_message_and_rejects_permission_actions() {
+        let parsed = parse_recovery_suggestion_json(
+            r#"{"action":"continue","message":"delete everything","confidence":0.9}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.decision.delivery_text(), Some("continue"));
+        for action in ["approve", "deny", "send", "route", "spawn"] {
+            let json = format!(r#"{{"action":"{action}","confidence":0.9}}"#);
+            assert!(parse_recovery_suggestion_json(&json).is_err(), "{action}");
+        }
+    }
+
+    #[test]
+    fn recovery_parser_supports_explicit_leave_alone() {
+        let parsed = parse_recovery_suggestion_json(
+            r#"{"action":"leave_alone","reasoning":"already complete","confidence":0.88}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.decision,
+            super::super::recovery::RecoveryDecision::LeaveAlone
+        );
     }
 
     #[test]

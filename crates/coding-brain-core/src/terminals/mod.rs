@@ -83,6 +83,20 @@ pub struct TerminalActionOutcome {
     pub prompt_cleared: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardedActionFailure {
+    NotSent(String),
+    DeliveryUnknown(String),
+}
+
+impl GuardedActionFailure {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotSent(message) | Self::DeliveryUnknown(message) => message,
+        }
+    }
+}
+
 trait GuardedTerminalBackend {
     fn resolve_exact_target(&self, session: &AgentSession) -> Result<String, String>;
     fn capture(&self, target: &str) -> Result<PaneCapture, String>;
@@ -1621,6 +1635,8 @@ fn match_approval_prompt(
     })
 }
 
+const CODEX_RECOVERY_PATTERN_VERSION: u16 = 1;
+const CODEX_RECOVERY_PLACEHOLDER: &str = "› Ask Codex to do anything";
 const CLAUDE_RECOVERY_PATTERN_VERSION: u16 = 1;
 const ANTIGRAVITY_PERMISSION_PATTERN_VERSION: u16 = 1;
 const ANTIGRAVITY_RECOVERY_PATTERN_VERSION: u16 = 1;
@@ -1749,6 +1765,56 @@ fn latest_claude_prompt(text: &str, action: &TerminalSessionAction) -> LatestPro
     exact_fixed_prompt(&lines, start, CLAUDE_RECOVERY_PATTERN_VERSION, &expected)
 }
 
+fn codex_context_footer(line: &PromptLine) -> bool {
+    let tokens = line.lower.split_whitespace().collect::<Vec<_>>();
+    let context_percent = tokens
+        .get(3)
+        .and_then(|token| token.strip_suffix('%'))
+        .and_then(|percent| percent.parse::<u8>().ok());
+    tokens.get(0..3) == Some(&["?", "for", "shortcuts"])
+        && context_percent.is_some_and(|percent| percent <= 100)
+        && tokens.get(4..) == Some(&["context", "left"])
+}
+
+fn exact_codex_active_recovery_prompt(lines: &[PromptLine]) -> bool {
+    let [.., status, composer, footer] = lines else {
+        return false;
+    };
+    status.exact.starts_with("• ")
+        && status.exact.contains(" (")
+        && status.exact.ends_with(" • esc to interrupt)")
+        && composer.exact == CODEX_RECOVERY_PLACEHOLDER
+        && codex_context_footer(footer)
+}
+
+fn latest_codex_recovery_prompt(text: &str) -> LatestProviderPrompt {
+    let lines = prompt_lines(text);
+    let has_remnant = lines.iter().any(|line| {
+        line.exact == CODEX_RECOVERY_PLACEHOLDER
+            || line.lower.starts_with("? for shortcuts")
+            || line.lower.contains("context left")
+    });
+    let [.., composer, footer] = lines.as_slice() else {
+        return if has_remnant {
+            LatestProviderPrompt::Incomplete
+        } else {
+            LatestProviderPrompt::Absent
+        };
+    };
+    if exact_codex_active_recovery_prompt(&lines)
+        || composer.exact != CODEX_RECOVERY_PLACEHOLDER
+        || !codex_context_footer(footer)
+    {
+        return LatestProviderPrompt::Incomplete;
+    }
+    LatestProviderPrompt::Complete(ParsedProviderPrompt {
+        pattern_version: CODEX_RECOVERY_PATTERN_VERSION,
+        block: format!("{} {}", composer.exact, footer.lower),
+        tool_use_id: None,
+        has_trailing_text: false,
+    })
+}
+
 fn latest_antigravity_prompt(text: &str, action: &TerminalSessionAction) -> LatestProviderPrompt {
     let lines = prompt_lines(text);
     match action {
@@ -1838,18 +1904,22 @@ fn match_semantic_prompt(
 ) -> Option<PromptEvidence> {
     let (pattern_version, block, tool_use_id) = match session.provider {
         AgentProvider::Codex => {
-            let evidence = match_approval_prompt(capture, session)?;
-            if !matches!(
-                action,
-                TerminalSessionAction::Allow | TerminalSessionAction::Deny
-            ) {
-                return None;
+            if matches!(action, TerminalSessionAction::Continue) {
+                recognized_provider_prompt(latest_codex_recovery_prompt(&capture.text))?
+            } else {
+                let evidence = match_approval_prompt(capture, session)?;
+                if !matches!(
+                    action,
+                    TerminalSessionAction::Allow | TerminalSessionAction::Deny
+                ) {
+                    return None;
+                }
+                (
+                    evidence.prompt_pattern_version,
+                    evidence.prompt_fingerprint.to_string(),
+                    Some(evidence.call_id),
+                )
             }
-            (
-                evidence.prompt_pattern_version,
-                evidence.prompt_fingerprint.to_string(),
-                Some(evidence.call_id),
-            )
         }
         AgentProvider::Claude => {
             recognized_provider_prompt(latest_claude_prompt(&capture.text, action))?
@@ -1879,7 +1949,9 @@ fn match_semantic_prompt(
         backend: capture.backend.clone(),
         target: capture.target.clone(),
         pattern_version,
-        fingerprint: if session.provider == AgentProvider::Codex {
+        fingerprint: if session.provider == AgentProvider::Codex
+            && !matches!(action, TerminalSessionAction::Continue)
+        {
             block.parse().ok()?
         } else {
             fingerprint(&block)
@@ -1896,11 +1968,23 @@ fn post_prompt_advanced(
 ) -> bool {
     let candidate = match session.provider {
         AgentProvider::Codex => {
-            let question_present = prompt_lines(&capture.text).iter().any(|line| {
-                line.lower
-                    .contains("would you like to run the following command?")
-            });
-            return !question_present;
+            if matches!(action, TerminalSessionAction::Continue) {
+                return match latest_codex_recovery_prompt(&capture.text) {
+                    LatestProviderPrompt::Complete(prompt) => {
+                        fingerprint(&prompt.block) != expected.fingerprint
+                    }
+                    LatestProviderPrompt::Absent => true,
+                    LatestProviderPrompt::Incomplete => {
+                        exact_codex_active_recovery_prompt(&prompt_lines(&capture.text))
+                    }
+                };
+            } else {
+                let question_present = prompt_lines(&capture.text).iter().any(|line| {
+                    line.lower
+                        .contains("would you like to run the following command?")
+                });
+                return !question_present;
+            }
         }
         AgentProvider::Claude => latest_claude_prompt(&capture.text, action),
         AgentProvider::Antigravity => latest_antigravity_prompt(&capture.text, action),
@@ -1966,38 +2050,46 @@ fn checked_target_capture(
     Ok(capture)
 }
 
-fn execute_guarded_action_with(
+fn execute_guarded_action_classified_with(
     session: &AgentSession,
     action: TerminalSessionAction,
     backend: &dyn GuardedTerminalBackend,
-) -> Result<TerminalActionOutcome, String> {
+) -> Result<TerminalActionOutcome, GuardedActionFailure> {
+    let not_sent = GuardedActionFailure::NotSent;
+    let delivery_unknown = GuardedActionFailure::DeliveryUnknown;
     if let TerminalSessionAction::Text(text) = &action {
-        validate_manual_text(text)?;
+        validate_manual_text(text).map_err(not_sent)?;
     }
     session.live_process_identity().ok_or_else(|| {
-        "guarded terminal action requires an exact live process identity".to_string()
+        not_sent("guarded terminal action requires an exact live process identity".to_string())
     })?;
 
-    let target = backend.resolve_exact_target(session)?;
-    let initial = checked_target_capture(backend, &target)?;
+    let target = backend.resolve_exact_target(session).map_err(not_sent)?;
+    let initial = checked_target_capture(backend, &target).map_err(not_sent)?;
 
     if let TerminalSessionAction::Text(text) = &action {
         let baseline_fingerprint = fingerprint(&normalize_whitespace(&initial.text));
-        if backend.resolve_exact_target(session)? != target {
-            return Err("guarded terminal target changed; action cancelled".into());
+        if backend.resolve_exact_target(session).map_err(not_sent)? != target {
+            return Err(not_sent(
+                "guarded terminal target changed; action cancelled".into(),
+            ));
         }
         backend
             .send_literal(&target, text)
-            .map_err(|_| "guarded terminal literal send failed".to_string())?;
+            .map_err(|_| not_sent("guarded terminal literal send failed".to_string()))?;
         backend
             .send_keys(&target, &["Enter"])
-            .map_err(|_| "guarded terminal key send failed".to_string())?;
-        let post = checked_target_capture(backend, &target)?;
+            .map_err(|_| delivery_unknown("guarded terminal key send failed".to_string()))?;
+        let post = checked_target_capture(backend, &target).map_err(delivery_unknown)?;
         if post.backend != initial.backend {
-            return Err("guarded terminal capture backend changed".into());
+            return Err(delivery_unknown(
+                "guarded terminal capture backend changed".into(),
+            ));
         }
         if fingerprint(&normalize_whitespace(&post.text)) == baseline_fingerprint {
-            return Err("terminal prompt did not advance after action".into());
+            return Err(delivery_unknown(
+                "terminal prompt did not advance after action".into(),
+            ));
         }
         return Ok(TerminalActionOutcome {
             action: TerminalSessionAction::Text(String::new()),
@@ -2008,27 +2100,44 @@ fn execute_guarded_action_with(
     }
 
     let expected = match_semantic_prompt(&initial, session, &action)
-        .ok_or_else(|| "no recognized complete provider prompt for action".to_string())?;
-    if backend.resolve_exact_target(session)? != target {
-        return Err("guarded terminal target changed; action cancelled".into());
+        .ok_or_else(|| not_sent("no recognized complete provider prompt for action".to_string()))?;
+    if backend.resolve_exact_target(session).map_err(not_sent)? != target {
+        return Err(not_sent(
+            "guarded terminal target changed; action cancelled".into(),
+        ));
     }
-    let recapture = checked_target_capture(backend, &target)?;
+    let recapture = checked_target_capture(backend, &target).map_err(not_sent)?;
     let current = match_semantic_prompt(&recapture, session, &action)
-        .ok_or_else(|| "provider prompt changed or disappeared".to_string())?;
+        .ok_or_else(|| not_sent("provider prompt changed or disappeared".to_string()))?;
     if current != expected {
-        return Err("provider prompt changed; action cancelled".into());
+        return Err(not_sent("provider prompt changed; action cancelled".into()));
     }
-    let keys = semantic_keys(session.provider, &action)
-        .ok_or_else(|| "provider does not support this terminal action".to_string())?;
-    backend
-        .send_keys(&target, keys)
-        .map_err(|_| "guarded terminal key send failed".to_string())?;
-    let post = checked_target_capture(backend, &target)?;
+    if session.provider == AgentProvider::Codex && matches!(action, TerminalSessionAction::Continue)
+    {
+        backend
+            .send_literal(&target, "continue")
+            .map_err(|_| not_sent("guarded terminal literal send failed".to_string()))?;
+        backend
+            .send_keys(&target, &["Enter"])
+            .map_err(|_| not_sent("guarded terminal key send failed".to_string()))?;
+    } else {
+        let keys = semantic_keys(session.provider, &action).ok_or_else(|| {
+            not_sent("provider does not support this terminal action".to_string())
+        })?;
+        backend
+            .send_keys(&target, keys)
+            .map_err(|_| not_sent("guarded terminal key send failed".to_string()))?;
+    }
+    let post = checked_target_capture(backend, &target).map_err(delivery_unknown)?;
     if post.backend != initial.backend {
-        return Err("guarded terminal capture backend changed".into());
+        return Err(delivery_unknown(
+            "guarded terminal capture backend changed".into(),
+        ));
     }
     if !post_prompt_advanced(&post, session, &action, &expected) {
-        return Err("terminal prompt did not advance after action".into());
+        return Err(delivery_unknown(
+            "terminal prompt did not advance after action".into(),
+        ));
     }
 
     Ok(TerminalActionOutcome {
@@ -2039,11 +2148,67 @@ fn execute_guarded_action_with(
     })
 }
 
+fn execute_guarded_action_with(
+    session: &AgentSession,
+    action: TerminalSessionAction,
+    backend: &dyn GuardedTerminalBackend,
+) -> Result<TerminalActionOutcome, String> {
+    execute_guarded_action_classified_with(session, action, backend)
+        .map_err(|error| error.message().to_string())
+}
+
+fn probe_recovery_prompt_with(
+    session: &AgentSession,
+    backend: &dyn GuardedTerminalBackend,
+) -> Result<PromptEvidence, String> {
+    session.live_process_identity().ok_or_else(|| {
+        "recovery prompt probe requires an exact live process identity".to_string()
+    })?;
+    let target = backend.resolve_exact_target(session)?;
+    let capture = checked_target_capture(backend, &target)?;
+    match_semantic_prompt(&capture, session, &TerminalSessionAction::Continue)
+        .ok_or_else(|| "no recognized complete provider recovery prompt".to_string())
+}
+
+pub fn probe_recovery_prompt(session: &AgentSession) -> Result<PromptEvidence, String> {
+    probe_recovery_prompt_with(session, &TmuxGuardedBackend)
+}
+
+fn probe_actionable_prompt_with(
+    session: &AgentSession,
+    backend: &dyn GuardedTerminalBackend,
+) -> Result<PromptEvidence, String> {
+    session.live_process_identity().ok_or_else(|| {
+        "actionable prompt probe requires an exact live process identity".to_string()
+    })?;
+    let target = backend.resolve_exact_target(session)?;
+    let capture = checked_target_capture(backend, &target)?;
+    [
+        TerminalSessionAction::Continue,
+        TerminalSessionAction::Allow,
+        TerminalSessionAction::Deny,
+    ]
+    .into_iter()
+    .find_map(|action| match_semantic_prompt(&capture, session, &action))
+    .ok_or_else(|| "no recognized complete provider actionable prompt".to_string())
+}
+
+pub fn probe_actionable_prompt(session: &AgentSession) -> Result<PromptEvidence, String> {
+    probe_actionable_prompt_with(session, &TmuxGuardedBackend)
+}
+
 pub fn execute_guarded_action(
     session: &AgentSession,
     action: TerminalSessionAction,
 ) -> Result<TerminalActionOutcome, String> {
     execute_guarded_action_with(session, action, &TmuxGuardedBackend)
+}
+
+pub fn execute_guarded_action_classified(
+    session: &AgentSession,
+    action: TerminalSessionAction,
+) -> Result<TerminalActionOutcome, GuardedActionFailure> {
+    execute_guarded_action_classified_with(session, action, &TmuxGuardedBackend)
 }
 
 fn refresh_approval_observation_with(
@@ -2283,6 +2448,133 @@ mod tests {
     }
 
     #[test]
+    fn guarded_codex_continue_requires_exact_idle_composer_and_sends_fixed_literal() {
+        let fixture = include_str!("../../../../tests/fixtures/codex-recovery-composer-pane.txt");
+        let backend = FakeGuardedBackend::with_captures([
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(include_str!(
+                "../../../../tests/fixtures/codex-active-composer-pane.txt"
+            ))),
+        ]);
+
+        let outcome = execute_guarded_action_classified_with(
+            &guarded_session(crate::provider::AgentProvider::Codex),
+            TerminalSessionAction::Continue,
+            &backend,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.action, TerminalSessionAction::Continue);
+        assert_eq!(backend.literals.lock().unwrap().as_slice(), ["continue"]);
+        assert_eq!(backend.keys.lock().unwrap().as_slice(), [vec!["Enter"]]);
+    }
+
+    #[test]
+    fn guarded_codex_continue_rejects_active_or_unchanged_composer() {
+        let fixture = include_str!("../../../../tests/fixtures/codex-recovery-composer-pane.txt");
+        let active = include_str!("../../../../tests/fixtures/codex-active-composer-pane.txt");
+        let active_backend = FakeGuardedBackend::with_captures([Ok(guarded_capture(active))]);
+        assert!(matches!(
+            execute_guarded_action_classified_with(
+                &guarded_session(crate::provider::AgentProvider::Codex),
+                TerminalSessionAction::Continue,
+                &active_backend,
+            ),
+            Err(GuardedActionFailure::NotSent(_))
+        ));
+        assert!(active_backend.literals.lock().unwrap().is_empty());
+
+        let unchanged_backend = FakeGuardedBackend::with_captures([
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(fixture)),
+        ]);
+        assert!(matches!(
+            execute_guarded_action_classified_with(
+                &guarded_session(crate::provider::AgentProvider::Codex),
+                TerminalSessionAction::Continue,
+                &unchanged_backend,
+            ),
+            Err(GuardedActionFailure::DeliveryUnknown(_))
+        ));
+    }
+
+    #[test]
+    fn guarded_codex_continue_treats_incomplete_post_capture_as_unknown() {
+        let fixture = include_str!("../../../../tests/fixtures/codex-recovery-composer-pane.txt");
+        for incomplete in [
+            "• Prior response\n› Ask Codex to do anything\n? for shortcuts",
+            "• Prior response\n› continue\n? for shortcuts 100% context left",
+            "• Prior response\n› Ask Codex to do anything\n? for shortcuts 101% context left",
+        ] {
+            let backend = FakeGuardedBackend::with_captures([
+                Ok(guarded_capture(fixture)),
+                Ok(guarded_capture(fixture)),
+                Ok(guarded_capture(incomplete)),
+            ]);
+
+            assert!(matches!(
+                execute_guarded_action_classified_with(
+                    &guarded_session(crate::provider::AgentProvider::Codex),
+                    TerminalSessionAction::Continue,
+                    &backend,
+                ),
+                Err(GuardedActionFailure::DeliveryUnknown(_))
+            ));
+            assert_eq!(backend.literals.lock().unwrap().as_slice(), ["continue"]);
+            assert_eq!(backend.keys.lock().unwrap().as_slice(), [vec!["Enter"]]);
+        }
+    }
+
+    #[test]
+    fn recovery_probe_returns_only_recognized_provider_fingerprint_without_sending() {
+        let fixture = include_str!("../../../../tests/fixtures/claude-recovery-pane.txt");
+        let backend = FakeGuardedBackend::with_captures([Ok(guarded_capture(fixture))]);
+
+        let evidence = probe_recovery_prompt_with(
+            &guarded_session(crate::provider::AgentProvider::Claude),
+            &backend,
+        )
+        .unwrap();
+
+        assert_eq!(evidence.provider, crate::provider::AgentProvider::Claude);
+        assert_eq!(evidence.action, TerminalSessionAction::Continue);
+        assert_ne!(evidence.fingerprint, 0);
+        assert!(backend.keys.lock().unwrap().is_empty());
+        assert!(backend.literals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_probe_rejects_idle_or_unrecognized_terminal_text() {
+        let backend = FakeGuardedBackend::with_captures([Ok(guarded_capture("Claude is idle"))]);
+        let error = probe_recovery_prompt_with(
+            &guarded_session(crate::provider::AgentProvider::Claude),
+            &backend,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("recognized"));
+        assert!(backend.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn actionable_probe_recognizes_permission_without_sending() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
+        let backend = FakeGuardedBackend::with_captures([Ok(guarded_capture(fixture))]);
+
+        let evidence = probe_actionable_prompt_with(
+            &guarded_session(crate::provider::AgentProvider::Antigravity),
+            &backend,
+        )
+        .unwrap();
+
+        assert_eq!(evidence.action, TerminalSessionAction::Allow);
+        assert!(backend.keys.lock().unwrap().is_empty());
+        assert!(backend.literals.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn guarded_antigravity_allow_requires_matching_tool_identity() {
         let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
         let changed = fixture.replace("tool-42", "tool-99");
@@ -2498,6 +2790,51 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("did not advance"));
+    }
+
+    #[test]
+    fn guarded_delivery_classifies_send_failure_and_post_send_uncertainty() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-recovery-pane.txt");
+        let send_failure = FakeGuardedBackend {
+            targets: std::sync::Mutex::new(
+                [Ok("test-pane".into()), Ok("test-pane".into())]
+                    .into_iter()
+                    .collect(),
+            ),
+            captures: std::sync::Mutex::new(
+                [Ok(guarded_capture(fixture)), Ok(guarded_capture(fixture))]
+                    .into_iter()
+                    .collect(),
+            ),
+            keys_error: Some("send failed".into()),
+            ..FakeGuardedBackend::default()
+        };
+        assert!(matches!(
+            execute_guarded_action_classified_with(
+                &guarded_session(crate::provider::AgentProvider::Antigravity),
+                TerminalSessionAction::Continue,
+                &send_failure,
+            ),
+            Err(GuardedActionFailure::NotSent(_))
+        ));
+
+        let uncertain = FakeGuardedBackend::with_captures([
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(fixture)),
+            Err("capture failed after send".into()),
+        ]);
+        assert!(matches!(
+            execute_guarded_action_classified_with(
+                &guarded_session(crate::provider::AgentProvider::Antigravity),
+                TerminalSessionAction::Continue,
+                &uncertain,
+            ),
+            Err(GuardedActionFailure::DeliveryUnknown(_))
+        ));
+        assert_eq!(
+            uncertain.keys.lock().unwrap().as_slice(),
+            [vec!["1", "Enter"]]
+        );
     }
 
     #[test]

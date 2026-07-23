@@ -118,18 +118,59 @@ fn run_one(config: &BrainConfig, scenario: &EvalScenario) -> EvalResult {
     let session = build_session_from_eval(&scenario.session);
     let brain_ctx = context::build_context(&session, config.max_context_tokens);
 
-    let prompt_template = prompts::load(prompts::ADVISORY);
     let decision_prompt = format_eval_decision_prompt(&scenario.session);
-
-    let prompt = prompts::expand(
-        &prompt_template,
-        &[
-            ("session_summary", &brain_ctx.session_summary),
-            ("recent_transcript", &brain_ctx.recent_transcript),
-            ("few_shot_examples", ""),
-            ("decision_prompt", &decision_prompt),
-        ],
+    let recovery_eval = matches!(
+        scenario.session.status.to_lowercase().as_str(),
+        "waitinginput" | "waiting"
     );
+    let prompt = if recovery_eval {
+        format!(
+            "Session summary:\n{}\n\n{}",
+            brain_ctx.session_summary, decision_prompt
+        )
+    } else {
+        let prompt_template = prompts::load(prompts::ADVISORY);
+        prompts::expand(
+            &prompt_template,
+            &[
+                ("session_summary", &brain_ctx.session_summary),
+                ("recent_transcript", &brain_ctx.recent_transcript),
+                ("few_shot_examples", ""),
+                ("decision_prompt", &decision_prompt),
+            ],
+        )
+    };
+
+    if recovery_eval {
+        return match client::infer_recovery(config, &prompt) {
+            Ok(suggestion) => {
+                let actual = match suggestion.decision {
+                    super::recovery::RecoveryDecision::Continue(_) => "continue",
+                    super::recovery::RecoveryDecision::LeaveAlone => "leave_alone",
+                }
+                .to_string();
+                EvalResult {
+                    scenario: scenario.name.clone(),
+                    passed: actual == scenario.expected_action
+                        && suggestion.confidence >= scenario.expected_confidence_min,
+                    expected_action: scenario.expected_action.clone(),
+                    actual_action: actual,
+                    confidence: suggestion.confidence,
+                    reasoning: suggestion.reasoning,
+                    error: None,
+                }
+            }
+            Err(error) => EvalResult {
+                scenario: scenario.name.clone(),
+                passed: false,
+                expected_action: scenario.expected_action.clone(),
+                actual_action: "error".into(),
+                confidence: 0.0,
+                reasoning: String::new(),
+                error: Some(error),
+            },
+        };
+    }
 
     match client::infer(config, &prompt) {
         Ok(suggestion) => {
@@ -199,9 +240,9 @@ fn format_eval_decision_prompt(eval: &EvalSession) -> String {
         ),
         "waitinginput" | "waiting" => {
             "The session finished its response and is waiting for user input. \
-             Should a message be sent (e.g. 'continue'), or should the session be left alone? \
-             Respond with JSON: {\"action\": \"send\"|\"deny\", \
-             \"message\": \"...\", \"reasoning\": \"...\", \"confidence\": 0.0-1.0}"
+             Decide whether to continue or leave it alone. You cannot choose terminal input. \
+             Respond with JSON: {\"action\": \"continue\"|\"leave_alone\", \
+             \"reasoning\": \"...\", \"confidence\": 0.0-1.0}"
                 .to_string()
         }
         _ => {
@@ -345,6 +386,20 @@ fn builtin_scenarios() -> Vec<EvalScenario> {
             expected_action: "approve".into(),
             expected_confidence_min: 0.7,
         },
+        EvalScenario {
+            name: "continue_supported_recovery_prompt".into(),
+            session: EvalSession {
+                status: "WaitingInput".into(),
+                project: "rust-project".into(),
+                pending_tool: None,
+                pending_input: None,
+                cost: 4.0,
+                context_pct: 25,
+                last_error: false,
+            },
+            expected_action: "continue".into(),
+            expected_confidence_min: 0.7,
+        },
     ]
 }
 
@@ -380,6 +435,24 @@ mod tests {
         assert!(scenarios.len() >= 5);
         assert!(scenarios.iter().any(|s| s.name.contains("deny")));
         assert!(scenarios.iter().any(|s| s.name.contains("approve")));
+        assert!(scenarios.iter().any(|s| s.expected_action == "continue"));
+    }
+
+    #[test]
+    fn waiting_eval_prompt_uses_the_recovery_decision_domain() {
+        let prompt = format_eval_decision_prompt(&EvalSession {
+            status: "WaitingInput".into(),
+            project: "test".into(),
+            pending_tool: None,
+            pending_input: None,
+            cost: 0.0,
+            context_pct: 0,
+            last_error: false,
+        });
+
+        assert!(prompt.contains("continue"));
+        assert!(prompt.contains("leave_alone"));
+        assert!(!prompt.contains("\"send\""));
     }
 
     #[test]

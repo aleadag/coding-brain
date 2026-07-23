@@ -64,8 +64,8 @@ const HOOKS: &[HookSpec] = &[
     HookSpec {
         event: "Stop",
         matcher: None,
-        argument: "--lifecycle-hook",
-        timeout: 2,
+        argument: "--recovery-hook",
+        timeout: 30,
         status_message: None,
     },
 ];
@@ -393,14 +393,7 @@ fn inspect_lifecycle_handlers(value: &serde_json::Value, scope: &mut LifecycleHo
                 state.unavailable |= command_uses_missing_absolute_binary(command);
                 let current = matcher == spec.matcher
                     && handler.get("type").and_then(serde_json::Value::as_str) == Some("command")
-                    && is_exact_current_command(
-                        command,
-                        if event == ManagedHookEvent::PermissionRequest {
-                            &["--permission-hook"]
-                        } else {
-                            &["--lifecycle-hook"]
-                        },
-                    )
+                    && is_exact_current_command(command, &[spec.argument])
                     && handler.get("timeout").and_then(serde_json::Value::as_u64)
                         == Some(u64::from(spec.timeout))
                     && spec.status_message.is_none_or(|expected| {
@@ -417,10 +410,10 @@ fn inspect_lifecycle_handlers(value: &serde_json::Value, scope: &mut LifecycleHo
 }
 
 fn is_discoverable_managed_command(event: ManagedHookEvent, command: &str) -> bool {
-    let expected = if event == ManagedHookEvent::PermissionRequest {
-        "--permission-hook"
-    } else {
-        "--lifecycle-hook"
+    let expected = match event {
+        ManagedHookEvent::PermissionRequest => "--permission-hook",
+        ManagedHookEvent::Stop => "--recovery-hook",
+        _ => "--lifecycle-hook",
     };
     let mut words = command.split_whitespace();
     let Some(program) = words.next() else {
@@ -430,6 +423,10 @@ fn is_discoverable_managed_command(event: ManagedHookEvent, command: &str) -> bo
         return false;
     }
     words.any(|argument| argument == expected)
+        || (event == ManagedHookEvent::Stop
+            && command
+                .split_whitespace()
+                .any(|argument| argument == "--lifecycle-hook"))
         || (matches!(
             event,
             ManagedHookEvent::PostToolUse | ManagedHookEvent::Stop
@@ -614,10 +611,15 @@ fn is_managed_permission_command(command: &str) -> bool {
 fn is_managed_command(event: &str, command: &str) -> bool {
     match event {
         "PermissionRequest" => is_managed_permission_command(command),
+        "Stop" => {
+            is_exact_managed_command(command, &["--recovery-hook"])
+                || is_exact_managed_command(command, &["--lifecycle-hook"])
+                || is_managed_snapshot_command(command)
+        }
         "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart"
-        | "SubagentStop" | "Stop" => {
+        | "SubagentStop" => {
             is_exact_managed_command(command, &["--lifecycle-hook"])
-                || (matches!(event, "PostToolUse" | "Stop") && is_managed_snapshot_command(command))
+                || (event == "PostToolUse" && is_managed_snapshot_command(command))
         }
         _ => false,
     }
@@ -885,7 +887,7 @@ mod tests {
             ("PostToolUse", Some("*"), "--lifecycle-hook", 2),
             ("SubagentStart", Some("*"), "--lifecycle-hook", 2),
             ("SubagentStop", Some("*"), "--lifecycle-hook", 2),
-            ("Stop", None, "--lifecycle-hook", 2),
+            ("Stop", None, "--recovery-hook", 30),
         ];
 
         assert_eq!(obj.len(), expected.len());
@@ -1276,7 +1278,7 @@ mod tests {
         );
         assert_eq!(
             settings["hooks"]["Stop"][1]["hooks"][0]["command"],
-            "coding-brain --lifecycle-hook"
+            "coding-brain --recovery-hook"
         );
         assert_eq!(
             settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],

@@ -18,6 +18,7 @@ pub mod pref_store;
 pub mod preferences;
 pub mod prompts;
 pub mod query;
+pub mod recovery;
 pub mod retrieval;
 pub mod review;
 pub mod risk;

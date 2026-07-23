@@ -1,0 +1,1 @@
+{"session_id":"claude-session-1","transcript_path":"/tmp/claude-session-1.jsonl","cwd":"/work/claude","permission_mode":"default","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"cargo test"},"permission_suggestions":[]}

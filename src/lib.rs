@@ -19,4 +19,5 @@ pub mod brain;
 pub mod doctor;
 pub mod init;
 mod lifecycle_hook;
+mod provider_hooks;
 pub mod runtime;

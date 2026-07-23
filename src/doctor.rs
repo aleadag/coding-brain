@@ -767,6 +767,7 @@ mod tests {
                 label: Some("doctor-project".into()),
             },
             session: Some(SessionTarget {
+                provider: coding_brain_core::provider::AgentProvider::Codex,
                 session_id: "doctor-session".into(),
                 turn_id: Some("doctor-turn".into()),
                 tool_use_id: tool_use_id.map(str::to_owned),
@@ -1314,7 +1315,7 @@ mod tests {
                 "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
                 "SubagentStart": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
                 "SubagentStop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
-                "Stop": [{ "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }]
+                "Stop": [{ "hooks": [{ "type": "command", "command": "coding-brain --recovery-hook", "timeout": 30 }] }]
             }
         })
     }
