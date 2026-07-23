@@ -35,6 +35,23 @@ pub struct SessionTarget {
     pub cwd: PathBuf,
     #[serde(default, skip_serializing)]
     pub provider_hints: Vec<String>,
+    #[serde(default, skip_serializing_if = "SessionTargetProvenance::is_unknown")]
+    pub provenance: SessionTargetProvenance,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTargetProvenance {
+    #[default]
+    Unknown,
+    Structured,
+    RecognizedProcessAttention,
+}
+
+impl SessionTargetProvenance {
+    fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,6 +615,7 @@ mod tests {
             project_id: ProjectId::Temporary("q".repeat(5_000)),
             cwd: PathBuf::from(format!("/{}", "d".repeat(5_000))),
             provider_hints: (0..100).map(|index| format!("hint-{index}")).collect(),
+            provenance: SessionTargetProvenance::Structured,
         });
 
         let normalized = activity.normalized();
@@ -610,6 +628,37 @@ mod tests {
         let session = normalized.session.unwrap();
         assert!(session.session_id.len() <= MAX_ACTIVITY_FIELD_BYTES);
         assert_eq!(session.provider_hints.len(), MAX_PROVIDER_HINTS);
+    }
+
+    #[test]
+    fn process_only_target_provenance_is_explicit_and_legacy_safe() {
+        let mut activity = event("command", "reason", "note");
+        activity.session = Some(SessionTarget {
+            provider: AgentProvider::Antigravity,
+            session_id: "process:7:9:4:pts0".into(),
+            turn_id: None,
+            tool_use_id: None,
+            project_id: ProjectId::Temporary("project".into()),
+            cwd: PathBuf::from("/work/project"),
+            provider_hints: Vec::new(),
+            provenance: SessionTargetProvenance::RecognizedProcessAttention,
+        });
+        let encoded = serde_json::to_value(&activity).unwrap();
+        assert_eq!(
+            encoded["session"]["provenance"],
+            "recognized_process_attention"
+        );
+
+        let mut legacy = encoded;
+        legacy["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("provenance");
+        let decoded: ActivityEvent = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            decoded.session.unwrap().provenance,
+            SessionTargetProvenance::Unknown
+        );
     }
 
     #[test]
@@ -654,6 +703,7 @@ mod tests {
             project_id: ProjectId::Temporary("project".into()),
             cwd: opaque.clone(),
             provider_hints: Vec::new(),
+            provenance: SessionTargetProvenance::Structured,
         });
         let normalized = activity.normalized();
         assert_eq!(normalized.project.cwd, opaque);

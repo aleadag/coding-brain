@@ -18,8 +18,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
             .iter()
             .map(|item| {
                 ListItem::new(format!(
-                    "{:.0}  {}  {}",
-                    item.score, item.reason, item.decision.id
+                    "{:.0}  {}  {}  {}",
+                    item.score,
+                    item.decision.provider.label(),
+                    item.reason,
+                    item.decision.id
                 ))
             })
             .collect()
@@ -48,6 +51,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
         .map(|item| {
             vec![
                 Line::raw(format!("Decision: {}", item.decision.id)),
+                Line::raw(format!("Provider: {}", item.decision.provider.label())),
                 Line::raw(format!("Why review: {}", item.reason)),
                 Line::raw(format!("Brain: {}", item.decision.action)),
                 Line::raw(format!(

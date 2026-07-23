@@ -51,6 +51,23 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
             tier.tier, accuracy, tier.samples, tier.false_approvals
         )));
     }
+    if !scorecard.providers.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::raw("Per-provider accuracy"));
+        for provider in &scorecard.providers {
+            let accuracy = if provider.decisions == 0 {
+                0.0
+            } else {
+                provider.correct as f64 / provider.decisions as f64 * 100.0
+            };
+            lines.push(Line::raw(format!(
+                "  {:<12} {:>5.1}%  n={}",
+                provider.provider.label(),
+                accuracy,
+                provider.decisions
+            )));
+        }
+    }
     if scorecard.total_decisions == 0 {
         lines.push(Line::raw(
             "No decisions yet. Coding Brain will learn as you work.",

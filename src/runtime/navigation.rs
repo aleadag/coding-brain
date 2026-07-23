@@ -1070,6 +1070,7 @@ mod tests {
             project_id: ProjectId::Stable("project".into()),
             cwd: cwd.into(),
             provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
         }
     }
 

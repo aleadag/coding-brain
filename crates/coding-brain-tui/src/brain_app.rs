@@ -1,14 +1,16 @@
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
 
 use coding_brain_core::brain_activity::{
-    ActivityItem, ActivitySnapshot, AttentionItem, CorrectionDisposition, SnapshotLimits,
-    redact_activity_text,
+    ActivityItem, ActivitySnapshot, AttentionItem, CorrectionDisposition, SessionTargetProvenance,
+    SnapshotLimits, redact_activity_text,
 };
 use coding_brain_core::runtime::{
     BrainEffect, BrainGateMode, BrainRuntime, CorrectionInput, EndpointHealth, ReviewItemSummary,
-    ScorecardSummary, SessionNavigation,
+    ScorecardSummary, SessionActionRequest, SessionNavigation,
 };
+use coding_brain_core::terminals::TerminalSessionAction;
 use coding_brain_core::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -16,6 +18,7 @@ use crate::terminal_suspend::NavigationOutcome;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_NOTE_CHARS: usize = 512;
+const MAX_MANUAL_TEXT_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrainTab {
@@ -45,6 +48,53 @@ enum BrainInput {
         decision_id: String,
         note: String,
     },
+    SessionAction {
+        target: coding_brain_core::brain_activity::SessionTarget,
+        text: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SessionActionKind {
+    label: &'static str,
+    manual_bytes: Option<usize>,
+}
+
+#[derive(Debug)]
+struct SessionActionDelivery {
+    kind: SessionActionKind,
+    result: Result<(), String>,
+}
+
+struct SessionActionWorker {
+    receiver: Option<Receiver<SessionActionDelivery>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SessionActionWorker {
+    fn new() -> Self {
+        Self {
+            receiver: None,
+            handle: None,
+        }
+    }
+
+    fn is_in_flight(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    fn finish(&mut self) {
+        self.receiver = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for SessionActionWorker {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 pub struct BrainApp {
@@ -58,6 +108,8 @@ pub struct BrainApp {
     endpoint_health: EndpointHealth,
     selection: usize,
     input: Option<BrainInput>,
+    session_action_worker: SessionActionWorker,
+    pending_action_status: Option<String>,
     status: Option<String>,
     refreshed_at: Instant,
 }
@@ -75,6 +127,8 @@ impl BrainApp {
             endpoint_health: EndpointHealth::default(),
             selection: 0,
             input: None,
+            session_action_worker: SessionActionWorker::new(),
+            pending_action_status: None,
             status: None,
             refreshed_at: Instant::now() - REFRESH_INTERVAL,
         };
@@ -83,8 +137,15 @@ impl BrainApp {
     }
 
     pub fn refresh(&mut self) {
+        self.refresh_state();
+    }
+
+    fn refresh_state(&mut self) -> bool {
         let mut errors = Vec::new();
         let recovery = self.runtime.actions.poll_recovery();
+        if let Some(status) = self.poll_session_action_delivery() {
+            self.pending_action_status = Some(status);
+        }
         match self.runtime.source.snapshot(SnapshotLimits::default()) {
             Ok(snapshot) => self.snapshot = snapshot,
             Err(error) => errors.push(format!("Live: {error}")),
@@ -101,10 +162,17 @@ impl BrainApp {
         self.endpoint_health = self.runtime.source.endpoint_health();
         self.refreshed_at = Instant::now();
         self.clamp_selection();
-        if !errors.is_empty() {
+        if let Some(status) = self.pending_action_status.take() {
+            self.status = Some(status);
+            true
+        } else if !errors.is_empty() {
             self.status = Some(errors.join(" · "));
+            false
         } else if !recovery.is_empty() {
             self.status = Some(recovery.join(" · "));
+            false
+        } else {
+            false
         }
     }
 
@@ -119,13 +187,7 @@ impl BrainApp {
     }
 
     pub fn complete_navigation(&mut self, result: Result<NavigationOutcome, String>) {
-        let tab = self.tab;
-        let selection = self.selection;
-        self.refresh();
-        self.tab = tab;
-        self.selection = selection;
-        self.clamp_selection();
-        self.status = Some(match result {
+        let navigation_status = match result {
             Ok(NavigationOutcome::Attached) => "Returned from session".into(),
             Ok(NavigationOutcome::Cancelled {
                 restore_error: None,
@@ -138,10 +200,25 @@ impl BrainApp {
             ),
             Ok(NavigationOutcome::FocusedFallback) => "Focused session terminal".into(),
             Err(error) => format!("Could not switch session: {}", bounded_status(&error)),
-        });
+        };
+        let tab = self.tab;
+        let selection = self.selection;
+        let surfaced_action = self.refresh_state();
+        self.tab = tab;
+        self.selection = selection;
+        self.clamp_selection();
+        if !surfaced_action {
+            self.status = Some(navigation_status);
+        }
     }
 
     pub fn handle_key(&mut self, event: KeyEvent) -> Option<BrainEffect> {
+        if self.session_action_worker.is_in_flight()
+            && matches!(event.code, KeyCode::Char('q') | KeyCode::Enter)
+        {
+            self.status = Some("Session action is still in progress".into());
+            return None;
+        }
         if self.input.is_some() {
             return self.handle_input(event.code);
         }
@@ -168,6 +245,10 @@ impl BrainApp {
                 None
             }
             KeyCode::Enter => self.navigation_effect(),
+            KeyCode::Char('x') if self.tab == BrainTab::Live => {
+                self.begin_session_action();
+                None
+            }
             KeyCode::Char('c') if self.tab == BrainTab::Live => {
                 self.begin_correction();
                 None
@@ -235,6 +316,116 @@ impl BrainApp {
         }
     }
 
+    fn begin_session_action(&mut self) {
+        if self.session_action_worker.is_in_flight() {
+            self.status = Some("A session action is already in progress".into());
+            return;
+        }
+        let Some(item) = self.selected_live_activity() else {
+            self.status = Some("No actionable session for this activity".into());
+            return;
+        };
+        let Some(target) = item.session.clone() else {
+            self.status = Some("No actionable session for this activity".into());
+            return;
+        };
+        match target.provenance {
+            SessionTargetProvenance::Unknown => {
+                self.status = Some("Session action authority is unavailable".into());
+                return;
+            }
+            SessionTargetProvenance::RecognizedProcessAttention
+                if self.selected_attention().is_none_or(|attention| {
+                    attention.rule_id.as_deref() != Some("actionable_prompt_attention")
+                }) =>
+            {
+                self.status =
+                    Some("Process-only action requires recognized prompt evidence".into());
+                return;
+            }
+            SessionTargetProvenance::Structured
+            | SessionTargetProvenance::RecognizedProcessAttention => {}
+        }
+        self.input = Some(BrainInput::SessionAction { target, text: None });
+    }
+
+    fn dispatch_session_action(
+        &mut self,
+        target: coding_brain_core::brain_activity::SessionTarget,
+        action: TerminalSessionAction,
+    ) {
+        let kind = match &action {
+            TerminalSessionAction::Allow => SessionActionKind {
+                label: "allow",
+                manual_bytes: None,
+            },
+            TerminalSessionAction::Deny => SessionActionKind {
+                label: "deny",
+                manual_bytes: None,
+            },
+            TerminalSessionAction::Continue => SessionActionKind {
+                label: "continue",
+                manual_bytes: None,
+            },
+            TerminalSessionAction::Text(text) => SessionActionKind {
+                label: "manual text",
+                manual_bytes: Some(text.len()),
+            },
+        };
+        self.input = None;
+        if self.session_action_worker.is_in_flight() {
+            self.status = Some("A session action is already in progress".into());
+            return;
+        }
+        self.status = Some(format!("Sending {}…", kind.label));
+        let actions = Arc::clone(&self.runtime.actions);
+        let (sender, receiver) = sync_channel(1);
+        self.session_action_worker.receiver = Some(receiver);
+        let spawn_result = std::thread::Builder::new()
+            .name("coding-brain-session-action".into())
+            .spawn(move || {
+                let result = actions.send_session_action(SessionActionRequest { target, action });
+                let result = match (kind.manual_bytes, result) {
+                    (_, Ok(())) => Ok(()),
+                    (Some(_), Err(_)) => Err(String::new()),
+                    (None, Err(error)) => Err(bounded_status(&error)),
+                };
+                let _ = sender.send(SessionActionDelivery { kind, result });
+            });
+        match spawn_result {
+            Ok(handle) => self.session_action_worker.handle = Some(handle),
+            Err(_) => {
+                self.session_action_worker.receiver = None;
+                self.status = Some(format!("Could not start {} delivery", kind.label));
+            }
+        }
+    }
+
+    fn poll_session_action_delivery(&mut self) -> Option<String> {
+        let result = self.session_action_worker.receiver.as_ref()?.try_recv();
+        match result {
+            Ok(delivery) => {
+                let status = match (delivery.kind.manual_bytes, delivery.result) {
+                    (Some(bytes), Ok(())) => format!("Sent manual text ({bytes} bytes)"),
+                    (Some(bytes), Err(_)) => {
+                        format!("Could not send manual text ({bytes} bytes)")
+                    }
+                    (None, Ok(())) => format!("Sent {}", delivery.kind.label),
+                    (None, Err(error)) => {
+                        format!("Could not send {}: {error}", delivery.kind.label)
+                    }
+                };
+                self.session_action_worker.finish();
+                Some(status)
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.session_action_worker.finish();
+                Some("Session action worker stopped unexpectedly".into())
+            }
+        }
+    }
+
     fn handle_input(&mut self, code: KeyCode) -> Option<BrainEffect> {
         match code {
             KeyCode::Esc => self.input = None,
@@ -243,7 +434,13 @@ impl BrainApp {
                 | Some(BrainInput::Canonical { note, .. }) => {
                     note.pop();
                 }
+                Some(BrainInput::SessionAction {
+                    text: Some(text), ..
+                }) => {
+                    text.pop();
+                }
                 None => {}
+                Some(BrainInput::SessionAction { text: None, .. }) => {}
             },
             KeyCode::Enter => match self.input.clone() {
                 Some(BrainInput::Correction {
@@ -257,22 +454,54 @@ impl BrainApp {
                 Some(BrainInput::Canonical { decision_id, note }) => {
                     self.mark_canonical(&decision_id, (!note.is_empty()).then_some(note));
                 }
+                Some(BrainInput::SessionAction {
+                    target,
+                    text: Some(text),
+                }) if !text.is_empty() => {
+                    self.dispatch_session_action(target, TerminalSessionAction::Text(text));
+                }
+                Some(BrainInput::SessionAction { text: Some(_), .. }) => {
+                    self.status = Some("Manual text cannot be empty".into());
+                }
+                Some(BrainInput::SessionAction { text: None, .. }) => {}
                 None => {}
             },
-            KeyCode::Char(character) => match self.input.as_mut() {
-                Some(BrainInput::Correction {
-                    disposition, note, ..
-                }) if disposition.is_none() => {
-                    *disposition = match character {
-                        'r' => Some(CorrectionDisposition::BrainRight),
-                        'w' => Some(CorrectionDisposition::BrainWrong),
-                        'e' => Some(CorrectionDisposition::Exception),
-                        _ => None,
-                    };
+            KeyCode::Char(character) => match self.input.clone() {
+                Some(BrainInput::SessionAction { target, text: None }) => match character {
+                    'a' => self.dispatch_session_action(target, TerminalSessionAction::Allow),
+                    'd' => self.dispatch_session_action(target, TerminalSessionAction::Deny),
+                    'c' => self.dispatch_session_action(target, TerminalSessionAction::Continue),
+                    't' => {
+                        self.input = Some(BrainInput::SessionAction {
+                            target,
+                            text: Some(String::new()),
+                        });
+                    }
+                    _ => {}
+                },
+                Some(BrainInput::SessionAction { text: Some(_), .. }) => {
+                    if let Some(BrainInput::SessionAction {
+                        text: Some(text), ..
+                    }) = self.input.as_mut()
+                    {
+                        push_bounded_bytes(text, character, MAX_MANUAL_TEXT_BYTES);
+                    }
                 }
-                Some(BrainInput::Correction { note, .. })
-                | Some(BrainInput::Canonical { note, .. }) => push_bounded(note, character),
-                None => {}
+                _ => match self.input.as_mut() {
+                    Some(BrainInput::Correction {
+                        disposition, note, ..
+                    }) if disposition.is_none() => {
+                        *disposition = match character {
+                            'r' => Some(CorrectionDisposition::BrainRight),
+                            'w' => Some(CorrectionDisposition::BrainWrong),
+                            'e' => Some(CorrectionDisposition::Exception),
+                            _ => None,
+                        };
+                    }
+                    Some(BrainInput::Correction { note, .. })
+                    | Some(BrainInput::Canonical { note, .. }) => push_bounded(note, character),
+                    None | Some(BrainInput::SessionAction { .. }) => {}
+                },
             },
             _ => {}
         }
@@ -383,6 +612,15 @@ impl BrainApp {
                 Some(disposition) => format!("Correction {disposition:?} note: {note}"),
             }),
             Some(BrainInput::Canonical { note, .. }) => Some(format!("Canonical note: {note}")),
+            Some(BrainInput::SessionAction { text: None, .. }) => {
+                Some("Action: [a] allow  [d] deny  [c] continue  [t] manual text".into())
+            }
+            Some(BrainInput::SessionAction {
+                text: Some(text), ..
+            }) => Some(format!(
+                "Manual text: {} bytes / {MAX_MANUAL_TEXT_BYTES} [hidden]",
+                text.len()
+            )),
             None => None,
         }
     }
@@ -394,6 +632,12 @@ impl BrainApp {
 
 fn push_bounded(value: &mut String, character: char) {
     if value.chars().count() < MAX_NOTE_CHARS {
+        value.push(character);
+    }
+}
+
+fn push_bounded_bytes(value: &mut String, character: char, max_bytes: usize) {
+    if value.len() + character.len_utf8() <= max_bytes {
         value.push(character);
     }
 }
@@ -417,16 +661,21 @@ fn bounded_status(status: &str) -> String {
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     use coding_brain_core::brain_activity::{
         ActivityItem, ActivityKind, ActivitySnapshot, ActivityState, AttentionItem,
         CorrectionDisposition, DeliveryState, ProjectEvidence, SessionTarget,
+        SessionTargetProvenance,
     };
     use coding_brain_core::project::ProjectId;
     use coding_brain_core::runtime::{
-        BrainEffect, BrainRuntime, CorrectionInput, DecisionSummary, MockBrainAction,
-        MockBrainRuntime, ReviewItemSummary,
+        BrainActions, BrainEffect, BrainRuntime, BrainSource, CorrectionInput, DecisionSummary,
+        EndpointHealth, MockBrainAction, MockBrainRuntime, ReviewItemSummary, ScorecardSummary,
+        SessionActionRequest,
     };
+    use coding_brain_core::terminals::TerminalSessionAction;
     use coding_brain_core::theme::{Theme, ThemeMode};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -452,6 +701,347 @@ mod tests {
         let effect = app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(effect, Some(BrainEffect::SwitchToSession(_))));
+        assert!(non_poll_actions(&mock).is_empty());
+    }
+
+    #[test]
+    fn live_action_mode_dispatches_semantic_action_to_exact_target() {
+        for (key_code, action) in [
+            ('a', TerminalSessionAction::Allow),
+            ('d', TerminalSessionAction::Deny),
+            ('c', TerminalSessionAction::Continue),
+        ] {
+            let (mut app, mock) = fixture_app(true);
+
+            app.handle_key(key(KeyCode::Char('x')));
+            app.handle_key(key(KeyCode::Char(key_code)));
+            wait_for_actions(&mut app, &mock, 1);
+
+            assert_eq!(
+                non_poll_actions(&mock),
+                vec![MockBrainAction::SessionAction(
+                    coding_brain_core::runtime::SessionActionRequest {
+                        target: activity().session.unwrap(),
+                        action,
+                    }
+                )]
+            );
+            assert_eq!(app.input_prompt(), None);
+        }
+    }
+
+    #[test]
+    fn live_action_mode_requires_exact_target_and_escape_cancels() {
+        let (mut app, mock) = fixture_app(true);
+        app.snapshot.attention[0].activity.session = None;
+
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert_eq!(app.input_prompt(), None);
+        assert_eq!(
+            app.status(),
+            Some("No actionable session for this activity")
+        );
+        assert!(non_poll_actions(&mock).is_empty());
+
+        app.snapshot.attention[0].activity.session = activity().session;
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.input_prompt(), None);
+        assert!(non_poll_actions(&mock).is_empty());
+    }
+
+    #[test]
+    fn manual_text_is_bounded_hidden_and_dropped_after_failure() {
+        let mock = Arc::new(MockBrainRuntime {
+            activity_snapshot: ActivitySnapshot {
+                attention: vec![AttentionItem {
+                    activity: activity(),
+                    occurrences: 1,
+                    unresolved_occurrences: 1,
+                }],
+                unresolved_count: 1,
+                ..ActivitySnapshot::default()
+            },
+            session_action_error: std::sync::Mutex::new(Some(
+                "delivery failed for top-secret-literal".into(),
+            )),
+            ..MockBrainRuntime::default()
+        });
+        let runtime = BrainRuntime::new(mock.clone(), mock.clone());
+        let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Char('t')));
+        for character in "top-secret-literal".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        let prompt = app.input_prompt().unwrap();
+        assert!(prompt.contains("18 bytes"));
+        assert!(!prompt.contains("top-secret-literal"));
+        for _ in 0..5000 {
+            app.handle_key(key(KeyCode::Char('x')));
+        }
+        assert!(app.input_prompt().unwrap().contains("4096 bytes"));
+
+        app.handle_key(key(KeyCode::Enter));
+        wait_for_actions(&mut app, &mock, 1);
+
+        assert_eq!(app.input_prompt(), None);
+        assert!(!app.status().unwrap().contains("top-secret-literal"));
+        let actions = non_poll_actions(&mock);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            MockBrainAction::SessionAction(request)
+                if matches!(&request.action, TerminalSessionAction::Text(text) if text.len() == 4096)
+        ));
+    }
+
+    #[test]
+    fn escape_drops_manual_text_without_dispatch() {
+        let (mut app, mock) = fixture_app(true);
+
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Char('t')));
+        for character in "top-secret-literal".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(app.input_prompt(), None);
+        assert!(non_poll_actions(&mock).is_empty());
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn semantic_delivery_failure_is_bounded_status() {
+        let mock = Arc::new(MockBrainRuntime {
+            activity_snapshot: ActivitySnapshot {
+                attention: vec![AttentionItem {
+                    activity: activity(),
+                    occurrences: 1,
+                    unresolved_occurrences: 1,
+                }],
+                unresolved_count: 1,
+                ..ActivitySnapshot::default()
+            },
+            session_action_error: std::sync::Mutex::new(Some("x".repeat(700))),
+            ..MockBrainRuntime::default()
+        });
+        let runtime = BrainRuntime::new(mock.clone(), mock);
+        let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Char('a')));
+        wait_for_status(&mut app, "Could not send allow");
+
+        assert!(app.status().unwrap().chars().count() <= MAX_NOTE_CHARS + 22);
+        assert_eq!(app.input_prompt(), None);
+    }
+
+    #[test]
+    fn slow_action_delivery_is_nonblocking_single_flight_and_reports_completion() {
+        for (error, expected) in [
+            (None, "Sent manual text (18 bytes)"),
+            (
+                Some("delivery failed for top-secret-literal"),
+                "Could not send manual text (18 bytes)",
+            ),
+        ] {
+            let source = MockBrainRuntime {
+                activity_snapshot: ActivitySnapshot {
+                    attention: vec![AttentionItem {
+                        activity: activity(),
+                        occurrences: 1,
+                        unresolved_occurrences: 1,
+                    }],
+                    unresolved_count: 1,
+                    ..ActivitySnapshot::default()
+                },
+                ..MockBrainRuntime::default()
+            };
+            let source = Arc::new(source);
+            let actions = Arc::new(SlowBrainActions {
+                error,
+                calls: AtomicUsize::new(0),
+                completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                delay: Duration::from_millis(250),
+            });
+            let runtime = BrainRuntime::new(source, actions.clone());
+            let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+
+            app.handle_key(key(KeyCode::Char('x')));
+            app.handle_key(key(KeyCode::Char('t')));
+            for character in "top-secret-literal".chars() {
+                app.handle_key(key(KeyCode::Char(character)));
+            }
+            let started = Instant::now();
+            app.handle_key(key(KeyCode::Enter));
+
+            assert!(started.elapsed() < Duration::from_millis(100));
+            assert_eq!(app.input_prompt(), None);
+            app.handle_key(key(KeyCode::Char('x')));
+            assert_eq!(
+                app.status(),
+                Some("A session action is already in progress")
+            );
+            wait_for_status(&mut app, expected);
+            assert_eq!(actions.calls.load(Ordering::SeqCst), 1);
+            assert!(!app.status().unwrap().contains("top-secret-literal"));
+        }
+    }
+
+    #[test]
+    fn in_flight_action_blocks_exit_and_navigation_until_completion() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut app, actions) = slow_fixture_app(Duration::from_millis(150), completed.clone());
+        dispatch_allow(&mut app);
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), None);
+        assert_eq!(app.status(), Some("Session action is still in progress"));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.status(), Some("Session action is still in progress"));
+
+        wait_for_status(&mut app, "Sent allow");
+        assert!(completed.load(Ordering::SeqCst));
+        assert_eq!(actions.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('q'))),
+            Some(BrainEffect::Exit)
+        );
+    }
+
+    #[test]
+    fn app_drop_joins_in_flight_action_worker() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut app, _) = slow_fixture_app(Duration::from_millis(100), completed.clone());
+        dispatch_allow(&mut app);
+
+        drop(app);
+
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn completed_action_outcome_has_priority_over_source_error_once() {
+        let source = Arc::new(ErrorAfterFirstSource {
+            snapshot_calls: AtomicUsize::new(0),
+        });
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let actions = Arc::new(SlowBrainActions {
+            error: None,
+            calls: AtomicUsize::new(0),
+            completed,
+            delay: Duration::from_millis(50),
+        });
+        let runtime = BrainRuntime::new(source, actions);
+        let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+        dispatch_allow(&mut app);
+        std::thread::sleep(Duration::from_millis(100));
+
+        app.refresh();
+        assert_eq!(app.status(), Some("Sent allow"));
+        app.refresh();
+        assert_eq!(app.status(), Some("Live: source failed"));
+    }
+
+    #[test]
+    fn navigation_completion_does_not_overwrite_completed_action_outcome() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut app, _) = slow_fixture_app(Duration::from_millis(50), completed);
+        dispatch_allow(&mut app);
+        std::thread::sleep(Duration::from_millis(100));
+
+        app.complete_navigation(Ok(NavigationOutcome::Attached));
+        assert_eq!(app.status(), Some("Sent allow"));
+        app.complete_navigation(Ok(NavigationOutcome::Attached));
+        assert_eq!(app.status(), Some("Returned from session"));
+    }
+
+    #[test]
+    fn refresh_polls_recovery_once_without_exposing_session_collections() {
+        let (mut app, mock) = fixture_app(false);
+        let before = mock
+            .actions()
+            .into_iter()
+            .filter(|action| *action == MockBrainAction::PollRecovery)
+            .count();
+
+        app.refresh();
+
+        let after = mock
+            .actions()
+            .into_iter()
+            .filter(|action| *action == MockBrainAction::PollRecovery)
+            .count();
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn action_mode_is_live_only_and_correction_key_is_unchanged() {
+        let (mut app, mock) = fixture_app(true);
+
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.input_prompt().unwrap().starts_with("Correction:"));
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert_eq!(app.input_prompt(), None);
+        assert!(non_poll_actions(&mock).is_empty());
+    }
+
+    #[test]
+    fn process_only_action_requires_recognized_attention_row() {
+        let (mut app, mock) = fixture_app(true);
+        let target = app.snapshot.attention[0].activity.session.as_mut().unwrap();
+        target.session_id = "process:7:9:4:pts0".into();
+        target.provenance = SessionTargetProvenance::RecognizedProcessAttention;
+
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.input_prompt(), None);
+
+        app.snapshot.attention[0].activity.rule_id = Some("actionable_prompt_attention".into());
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(app.input_prompt().is_some());
+        assert!(non_poll_actions(&mock).is_empty());
+    }
+
+    #[test]
+    fn opaque_native_prefixes_do_not_define_process_authority() {
+        for session_id in ["live:opaque-native", "process:opaque-native"] {
+            let (mut app, mock) = fixture_app(true);
+            let target = app.snapshot.attention[0].activity.session.as_mut().unwrap();
+            target.session_id = session_id.into();
+            target.provenance = SessionTargetProvenance::Structured;
+
+            app.handle_key(key(KeyCode::Char('x')));
+
+            assert!(app.input_prompt().is_some(), "rejected native {session_id}");
+            assert!(non_poll_actions(&mock).is_empty());
+        }
+    }
+
+    #[test]
+    fn unknown_target_provenance_fails_closed() {
+        let (mut app, mock) = fixture_app(true);
+        app.snapshot.attention[0]
+            .activity
+            .session
+            .as_mut()
+            .unwrap()
+            .provenance = SessionTargetProvenance::Unknown;
+
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert_eq!(app.input_prompt(), None);
+        assert_eq!(
+            app.status(),
+            Some("Session action authority is unavailable")
+        );
         assert!(non_poll_actions(&mock).is_empty());
     }
 
@@ -614,6 +1204,129 @@ mod tests {
             .collect()
     }
 
+    fn wait_for_actions(app: &mut BrainApp, mock: &MockBrainRuntime, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while non_poll_actions(mock).len() < count && Instant::now() < deadline {
+            app.refresh();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.refresh();
+    }
+
+    fn wait_for_status(app: &mut BrainApp, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app
+            .status()
+            .is_some_and(|status| status.starts_with(expected))
+            && Instant::now() < deadline
+        {
+            app.refresh();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            app.status()
+                .is_some_and(|status| status.starts_with(expected)),
+            "expected status prefix {expected:?}, got {:?}",
+            app.status()
+        );
+    }
+
+    struct SlowBrainActions {
+        error: Option<&'static str>,
+        calls: AtomicUsize,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+        delay: Duration,
+    }
+
+    impl BrainActions for SlowBrainActions {
+        fn record_correction(&self, _correction: CorrectionInput) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn mark_canonical(&self, _decision_id: &str, _note: Option<String>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn send_session_action(&self, _request: SessionActionRequest) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            self.completed.store(true, Ordering::SeqCst);
+            self.error.map_or(Ok(()), |error| Err(error.into()))
+        }
+    }
+
+    struct ErrorAfterFirstSource {
+        snapshot_calls: AtomicUsize,
+    }
+
+    impl BrainSource for ErrorAfterFirstSource {
+        fn snapshot(&self, _limits: SnapshotLimits) -> Result<ActivitySnapshot, String> {
+            if self.snapshot_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(ActivitySnapshot {
+                    attention: vec![AttentionItem {
+                        activity: activity(),
+                        occurrences: 1,
+                        unresolved_occurrences: 1,
+                    }],
+                    unresolved_count: 1,
+                    ..ActivitySnapshot::default()
+                })
+            } else {
+                Err("source failed".into())
+            }
+        }
+
+        fn review_queue(&self) -> Result<Vec<ReviewItemSummary>, String> {
+            Ok(Vec::new())
+        }
+
+        fn scorecard(&self) -> Result<ScorecardSummary, String> {
+            Ok(ScorecardSummary::default())
+        }
+
+        fn gate_mode(&self) -> BrainGateMode {
+            BrainGateMode::On
+        }
+
+        fn endpoint_health(&self) -> EndpointHealth {
+            EndpointHealth::default()
+        }
+    }
+
+    fn slow_fixture_app(
+        delay: Duration,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (BrainApp, Arc<SlowBrainActions>) {
+        let source = Arc::new(MockBrainRuntime {
+            activity_snapshot: ActivitySnapshot {
+                attention: vec![AttentionItem {
+                    activity: activity(),
+                    occurrences: 1,
+                    unresolved_occurrences: 1,
+                }],
+                unresolved_count: 1,
+                ..ActivitySnapshot::default()
+            },
+            ..MockBrainRuntime::default()
+        });
+        let actions = Arc::new(SlowBrainActions {
+            error: None,
+            calls: AtomicUsize::new(0),
+            completed,
+            delay,
+        });
+        let runtime = BrainRuntime::new(source, actions.clone());
+        (
+            BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark)),
+            actions,
+        )
+    }
+
+    fn dispatch_allow(app: &mut BrainApp) {
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Char('a')));
+    }
+
     fn activity() -> ActivityItem {
         let project_id = ProjectId::Stable("project-1".into());
         ActivityItem {
@@ -633,6 +1346,7 @@ mod tests {
                 project_id,
                 cwd: PathBuf::from("/work/project"),
                 provider_hints: vec!["tmux:brain".into()],
+                provenance: SessionTargetProvenance::Structured,
             }),
             state: ActivityState::Denied,
             delivery: DeliveryState::Delivered,
@@ -657,6 +1371,7 @@ mod tests {
 
     fn decision() -> DecisionSummary {
         DecisionSummary {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             id: "decision-1".into(),
             timestamp: "1".into(),
             action: "approve".into(),

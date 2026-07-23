@@ -6,13 +6,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use coding_brain_core::brain_activity::{
-    ActivityEvent, ActivityKind, ActivitySnapshot, CorrectionDisposition, SnapshotLimits,
+    ActivityEvent, ActivityKind, ActivitySnapshot, CorrectionDisposition, SessionTargetProvenance,
+    SnapshotLimits,
 };
+use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use coding_brain_core::runtime::{
     BrainActions, BrainGateMode, BrainSource, CacheSummary, CorrectionInput, CounterfactualSummary,
-    DecisionSummary, EndpointHealth, LatencySummary, ReviewItemSummary, RiskTierSummary,
-    ScorecardSummary,
+    DecisionSummary, EndpointHealth, LatencySummary, ProviderScoreSummary, ReviewItemSummary,
+    RiskTierSummary, ScorecardSummary, SessionActionRequest,
 };
+use coding_brain_core::session::AgentSession;
+use coding_brain_core::terminals::execute_guarded_action;
 
 use crate::{brain, config};
 
@@ -235,6 +239,27 @@ fn scorecard_from(decisions: &[DecisionSummary], events: &[ActivityEvent]) -> Sc
         .iter()
         .filter(|counterfactual| counterfactual.brain_was_right)
         .count();
+    let providers = [
+        AgentProvider::Codex,
+        AgentProvider::Claude,
+        AgentProvider::Antigravity,
+    ]
+    .into_iter()
+    .filter_map(|provider| {
+        let decisions = scored
+            .iter()
+            .filter(|decision| decision.provider == provider)
+            .count();
+        (decisions > 0).then(|| ProviderScoreSummary {
+            provider,
+            decisions,
+            correct: scored
+                .iter()
+                .filter(|decision| decision.provider == provider && decision.is_positive())
+                .count(),
+        })
+    })
+    .collect();
 
     ScorecardSummary {
         total_decisions: projected.len(),
@@ -259,6 +284,7 @@ fn scorecard_from(decisions: &[DecisionSummary], events: &[ActivityEvent]) -> Sc
                 override_rate_pct: summary.override_rate * 100.0,
             })
             .collect(),
+        providers,
         latency: LatencySummary {
             samples: latency.n,
             p50_ms: latency.p50_ms,
@@ -354,6 +380,7 @@ fn endpoint_reachable(endpoint: &str) -> bool {
 #[derive(Default)]
 pub struct LiveBrainActions {
     recovery: brain::recovery::RecoveryCoordinator,
+    action_discovery: Mutex<coding_brain_core::discovery::ProviderDiscoveryState>,
 }
 
 impl BrainActions for LiveBrainActions {
@@ -369,6 +396,111 @@ impl BrainActions for LiveBrainActions {
     fn mark_canonical(&self, decision_id: &str, note: Option<String>) -> Result<(), String> {
         brain::review::mark_by_id(decision_id, note.as_deref())
     }
+
+    fn send_session_action(&self, request: SessionActionRequest) -> Result<(), String> {
+        if request.target.provenance == SessionTargetProvenance::Unknown {
+            return Err("session action authority is unavailable".into());
+        }
+        let mut discovery = self
+            .action_discovery
+            .lock()
+            .map_err(|_| "provider discovery state is unavailable".to_string())?;
+        let sessions = coding_brain_core::discovery::scan_agent_sessions_with_state(&mut discovery);
+        drop(discovery);
+        let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
+        let link_path = state_root.join("session-links.jsonl");
+        let projection = match link_path.try_exists() {
+            Ok(false) => coding_brain_core::session_links::SessionIdentityProjection::default(),
+            Ok(true) => coding_brain_core::session_links::SessionLinkStore::at(&link_path)
+                .read_projection()
+                .map_err(|_| "session identity evidence is unavailable".to_string())?,
+            Err(_) => return Err("session identity evidence is unavailable".into()),
+        };
+        let native = AgentSessionKey::native(request.target.provider, &request.target.session_id);
+        let projected_live = projection.live_for(&native);
+        let exact = sessions
+            .iter()
+            .filter(|session| {
+                action_target_matches(
+                    session,
+                    request.target.provider,
+                    request.target.provenance,
+                    &request.target.session_id,
+                    projected_live,
+                )
+            })
+            .collect::<Vec<_>>();
+        let session = match exact.as_slice() {
+            [session] => *session,
+            [] => return Err("no exact live provider session for action".into()),
+            many => {
+                return Err(format!(
+                    "exact live provider session is ambiguous ({} matches)",
+                    many.len()
+                ));
+            }
+        };
+        execute_guarded_action(session, request.action)
+            .map(|_| ())
+            .map_err(|error| bounded_display(&error))
+    }
+}
+
+fn action_target_matches(
+    session: &AgentSession,
+    target_provider: AgentProvider,
+    target_provenance: SessionTargetProvenance,
+    target_session_id: &str,
+    projected_live: Option<&coding_brain_core::provider::LiveProcessIdentity>,
+) -> bool {
+    let live = session.live_process_identity();
+    if session.provider != target_provider || live.is_none() {
+        return false;
+    }
+    let live = live.as_ref().expect("live identity checked above");
+    match target_provenance {
+        SessionTargetProvenance::Unknown => false,
+        SessionTargetProvenance::Structured => {
+            if let Some(projected_live) = projected_live {
+                return live == projected_live;
+            }
+            session.session_id == target_session_id
+                && session.identity_provenance
+                    == coding_brain_core::session::SessionIdentityProvenance::Structured
+        }
+        SessionTargetProvenance::RecognizedProcessAttention => {
+            process_session_id(live) == target_session_id
+                || (is_process_only_session(session) && session.session_id == target_session_id)
+        }
+    }
+}
+
+fn process_session_id(identity: &coding_brain_core::provider::LiveProcessIdentity) -> String {
+    format!(
+        "live:{}:{}:{}:{}",
+        identity.pid,
+        identity.process_start_identity,
+        identity.tty.len(),
+        identity.tty
+    )
+}
+
+#[cfg(test)]
+fn discovery_process_session_id(
+    identity: &coding_brain_core::provider::LiveProcessIdentity,
+) -> String {
+    format!(
+        "process:{}:{}:{}:{}",
+        identity.pid,
+        identity.process_start_identity,
+        identity.tty.len(),
+        identity.tty
+    )
+}
+
+fn is_process_only_session(session: &AgentSession) -> bool {
+    session.identity_provenance
+        == coding_brain_core::session::SessionIdentityProvenance::ProcessOnly
 }
 
 fn record_correction_at_path(path: &Path, correction: CorrectionInput) -> Result<(), String> {
@@ -424,6 +556,29 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_actions_reject_unknown_authority_before_discovery() {
+        let actions = LiveBrainActions::default();
+        let request = SessionActionRequest {
+            target: coding_brain_core::brain_activity::SessionTarget {
+                provider: AgentProvider::Codex,
+                session_id: "live:opaque-native".into(),
+                turn_id: None,
+                tool_use_id: None,
+                project_id: coding_brain_core::project::ProjectId::Temporary("project".into()),
+                cwd: "/work/project".into(),
+                provider_hints: Vec::new(),
+                provenance: SessionTargetProvenance::Unknown,
+            },
+            action: coding_brain_core::terminals::TerminalSessionAction::Continue,
+        };
+
+        assert_eq!(
+            actions.send_session_action(request).unwrap_err(),
+            "session action authority is unavailable"
+        );
+    }
 
     #[test]
     fn gate_mode_resolution_fails_closed_for_invalid_explicit_state() {
@@ -511,7 +666,7 @@ mod tests {
 
     #[test]
     fn scorecard_preserves_accuracy_abstention_and_dangerous_false_approval() {
-        let decisions = vec![
+        let mut decisions = vec![
             summary(
                 "safe",
                 "approve",
@@ -534,6 +689,7 @@ mod tests {
                 Some("src/main.rs"),
             ),
         ];
+        decisions[1].provider = coding_brain_core::provider::AgentProvider::Claude;
 
         let scorecard = scorecard_from(&decisions, &[]);
 
@@ -542,6 +698,21 @@ mod tests {
         assert_eq!(scorecard.correct_decisions, 1);
         assert_eq!(scorecard.abstentions, 1);
         assert_eq!(scorecard.dangerous_false_approvals, 1);
+        assert_eq!(
+            scorecard.providers,
+            vec![
+                coding_brain_core::runtime::ProviderScoreSummary {
+                    provider: coding_brain_core::provider::AgentProvider::Codex,
+                    decisions: 1,
+                    correct: 1,
+                },
+                coding_brain_core::runtime::ProviderScoreSummary {
+                    provider: coding_brain_core::provider::AgentProvider::Claude,
+                    decisions: 1,
+                    correct: 0,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -604,6 +775,161 @@ mod tests {
     }
 
     #[test]
+    fn review_preserves_durable_decision_provider() {
+        let mut record = review_record();
+        record.provider = AgentProvider::Antigravity;
+
+        let queue = review_queue_from(
+            vec![record],
+            &[correction("review", CorrectionDisposition::BrainWrong)],
+        );
+
+        assert_eq!(queue[0].decision.provider, AgentProvider::Antigravity);
+    }
+
+    #[test]
+    fn action_target_match_requires_provenance_provider_and_exact_identity() {
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let session = discovered_session(provider, "native-1");
+            let live = session.live_process_identity().unwrap();
+            let synthetic_live = process_session_id(&live);
+
+            assert!(action_target_matches(
+                &session,
+                provider,
+                SessionTargetProvenance::Structured,
+                "native-1",
+                None
+            ));
+            assert!(!action_target_matches(
+                &session,
+                provider,
+                SessionTargetProvenance::Structured,
+                &synthetic_live,
+                None
+            ));
+            assert!(action_target_matches(
+                &session,
+                provider,
+                SessionTargetProvenance::RecognizedProcessAttention,
+                &synthetic_live,
+                None
+            ));
+            assert!(!action_target_matches(
+                &session,
+                provider,
+                SessionTargetProvenance::Unknown,
+                "native-1",
+                None
+            ));
+        }
+    }
+
+    #[test]
+    fn structured_target_cannot_collide_with_process_only_identity() {
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let mut session = discovered_session(provider, "placeholder");
+            let live = session.live_process_identity().unwrap();
+            let synthetic_process = discovery_process_session_id(&live);
+            session.session_id = synthetic_process.clone();
+            session.identity_provenance =
+                coding_brain_core::session::SessionIdentityProvenance::ProcessOnly;
+
+            assert!(!action_target_matches(
+                &session,
+                provider,
+                SessionTargetProvenance::Structured,
+                &synthetic_process,
+                None
+            ));
+            assert!(action_target_matches(
+                &session,
+                provider,
+                SessionTargetProvenance::RecognizedProcessAttention,
+                &synthetic_process,
+                None
+            ));
+            let wrong_provider = if provider == AgentProvider::Codex {
+                AgentProvider::Claude
+            } else {
+                AgentProvider::Codex
+            };
+            assert!(!action_target_matches(
+                &session,
+                wrong_provider,
+                SessionTargetProvenance::RecognizedProcessAttention,
+                &synthetic_process,
+                None
+            ));
+        }
+    }
+
+    #[test]
+    fn structured_target_uses_trusted_link_and_keeps_opaque_native_prefixes() {
+        let session = discovered_session(AgentProvider::Claude, "live:opaque-native");
+        let live = session.live_process_identity().unwrap();
+        let wrong_live = coding_brain_core::provider::LiveProcessIdentity::try_new(
+            AgentProvider::Claude,
+            77,
+            8_001,
+            "pts/8",
+        )
+        .unwrap();
+        assert!(!action_target_matches(
+            &session,
+            AgentProvider::Claude,
+            SessionTargetProvenance::Structured,
+            "live:opaque-native",
+            Some(&wrong_live)
+        ));
+        assert!(action_target_matches(
+            &session,
+            AgentProvider::Claude,
+            SessionTargetProvenance::Structured,
+            "linked-native",
+            Some(&live)
+        ));
+        assert!(action_target_matches(
+            &session,
+            AgentProvider::Claude,
+            SessionTargetProvenance::Structured,
+            "live:opaque-native",
+            None
+        ));
+    }
+
+    #[test]
+    fn structured_discovery_identity_is_not_inferred_from_process_shaped_text() {
+        let mut session = discovered_session(AgentProvider::Claude, "placeholder");
+        let live = session.live_process_identity().unwrap();
+        let colliding_id = discovery_process_session_id(&live);
+        session.session_id = colliding_id.clone();
+
+        assert!(action_target_matches(
+            &session,
+            AgentProvider::Claude,
+            SessionTargetProvenance::Structured,
+            &colliding_id,
+            None
+        ));
+        assert!(!action_target_matches(
+            &session,
+            AgentProvider::Claude,
+            SessionTargetProvenance::RecognizedProcessAttention,
+            &colliding_id,
+            None
+        ));
+    }
+
+    #[test]
     fn endpoint_probe_returns_immediately_while_slow_check_runs_in_background() {
         fn slow_probe(_endpoint: &str) -> bool {
             std::thread::sleep(Duration::from_millis(500));
@@ -639,6 +965,7 @@ mod tests {
         command: Option<&str>,
     ) -> DecisionSummary {
         DecisionSummary {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             id: id.into(),
             timestamp: "1".into(),
             action: action.into(),
@@ -748,5 +1075,20 @@ mod tests {
             cache_hit: None,
             canonical: None,
         }
+    }
+
+    fn discovered_session(provider: AgentProvider, id: &str) -> AgentSession {
+        let mut session = AgentSession::from_raw(coding_brain_core::session::RawAgentSession {
+            provider,
+            pid: 42,
+            process_start_identity: Some(9_001),
+            session_id: id.into(),
+            cwd: "/work/provider".into(),
+            started_at: 1,
+        });
+        session.tty = "pts/7".into();
+        session.identity_provenance =
+            coding_brain_core::session::SessionIdentityProvenance::Structured;
+        session
     }
 }

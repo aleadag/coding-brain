@@ -148,6 +148,7 @@ impl HookActivity {
             project_id: identity.id().clone(),
             cwd: request.lifecycle.cwd().to_path_buf(),
             provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
         };
         Ok(Self {
             activity_id: gen_activity_id(),

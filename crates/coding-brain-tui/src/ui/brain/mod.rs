@@ -103,7 +103,8 @@ fn render_footer(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &Brain
             .map(str::to_owned)
             .unwrap_or_else(|| match app.tab() {
                 BrainTab::Live => {
-                    "j/k select  Enter switch  c correct  Tab tabs  r refresh  q quit".into()
+                    "j/k select  Enter switch  x action  c correct  Tab tabs  r refresh  q quit"
+                        .into()
                 }
                 BrainTab::Review => {
                     "j/k select  m mark  n note+mark  s skip  Tab tabs  q quit".into()
@@ -147,6 +148,8 @@ mod tests {
         unknown.normalized_command = Some("cargo test".into());
         let mut recent = activity("recent-1", DeliveryState::Delivered);
         recent.state = ActivityState::Allowed;
+        recent.session.as_mut().unwrap().provider =
+            coding_brain_core::provider::AgentProvider::Claude;
         mock.activity_snapshot = ActivitySnapshot {
             attention: vec![AttentionItem {
                 activity: unknown,
@@ -172,10 +175,15 @@ mod tests {
             "execution not confirmed",
             "x3",
             "+1 more unresolved",
+            "Codex",
+            "Claude",
         ] {
             assert!(text.contains(expected), "missing {expected}:\n{text}");
         }
         for forbidden in ["PID", "send", "terminate", "route", "spawn"] {
+            assert!(!text.contains(forbidden), "found {forbidden}:\n{text}");
+        }
+        for forbidden in ["Usage", "Cost", "Quota", "Burn rate", "Token"] {
             assert!(!text.contains(forbidden), "found {forbidden}:\n{text}");
         }
     }
@@ -400,7 +408,10 @@ mod tests {
                 ..ActivitySnapshot::default()
             },
             review_queue: vec![ReviewItemSummary {
-                decision: decision(),
+                decision: DecisionSummary {
+                    provider: coding_brain_core::provider::AgentProvider::Antigravity,
+                    ..decision()
+                },
                 reason: "Critical-tier false-approve".into(),
                 score: 90.0,
             }],
@@ -422,6 +433,11 @@ mod tests {
                     false_approvals: 1,
                     ..RiskTierSummary::default()
                 }],
+                providers: vec![coding_brain_core::runtime::ProviderScoreSummary {
+                    provider: coding_brain_core::provider::AgentProvider::Antigravity,
+                    decisions: 3,
+                    correct: 2,
+                }],
                 ..ScorecardSummary::default()
             },
             endpoint_health: online(),
@@ -434,12 +450,16 @@ mod tests {
         assert!(review.contains("[ Review ]"));
         assert!(review.contains("Critical-tier false-approve"));
         assert!(review.contains("Mark canonical"));
+        assert!(review.contains("Antigravity"));
 
         app.handle_key(key(KeyCode::Tab));
         let scorecard = render_text(&app);
         assert!(scorecard.contains("Accuracy"));
         assert!(scorecard.contains("Dangerous false approvals"));
         assert!(scorecard.contains("Counterfactual"));
+        assert!(scorecard.contains("Antigravity"));
+        assert!(!scorecard.contains("Usage"));
+        assert!(!scorecard.contains("Cost"));
 
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Char('c')));
@@ -541,6 +561,7 @@ mod tests {
                 project_id,
                 cwd: PathBuf::from("/work/project"),
                 provider_hints: Vec::new(),
+                provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
             }),
             state: ActivityState::Denied,
             delivery,
@@ -561,6 +582,7 @@ mod tests {
 
     fn decision() -> DecisionSummary {
         DecisionSummary {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
             id: "decision-1".into(),
             timestamp: "1".into(),
             action: "approve".into(),

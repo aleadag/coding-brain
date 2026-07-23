@@ -1609,6 +1609,7 @@ mod tests {
             project_id: ProjectId::Temporary("project".into()),
             cwd: PathBuf::from(format!("/{}", "s".repeat(20_000))),
             provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
         });
         store.append(large).unwrap();
         let path = root.path().join("activity.jsonl");
@@ -1847,6 +1848,7 @@ mod tests {
             project_id: ProjectId::Temporary("p".repeat(5_000)),
             cwd: PathBuf::from(format!("/{}", "d".repeat(40_000))),
             provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
         });
         assert!(store.append(oversized).is_err());
         assert!(store.read().unwrap().events().is_empty());

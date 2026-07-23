@@ -76,11 +76,14 @@ pub fn capture_process_snapshot() -> ProcessSnapshot {
         return ProcessSnapshot::default();
     }
 
-    let Ok(output) = std::process::Command::new("ps")
-        .args(["-eo", process_snapshot_columns()])
-        .env_clear()
-        .output()
-    else {
+    let mut command = std::process::Command::new("ps");
+    command.args(["-eo", process_snapshot_columns()]);
+    capture_process_snapshot_with(&mut command)
+}
+
+fn capture_process_snapshot_with(command: &mut std::process::Command) -> ProcessSnapshot {
+    command.env_clear();
+    let Ok(output) = crate::terminals::run_bounded(command) else {
         return ProcessSnapshot::default();
     };
     if !output.status.success() {
@@ -393,6 +396,7 @@ fn looks_like_uuid(s: &str) -> bool {
 #[cfg(test)]
 mod provider_snapshot_tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn process_snapshot_command_uses_portable_elapsed_and_stable_start_columns() {
@@ -435,6 +439,28 @@ mod provider_snapshot_tests {
         assert!(empty.entries.is_empty());
         assert!(!malformed.succeeded);
         assert!(malformed.entries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_snapshot_command_is_time_bounded() {
+        let started = Instant::now();
+        let snapshot =
+            capture_process_snapshot_with(std::process::Command::new("sh").args(["-c", "sleep 2"]));
+
+        assert!(!snapshot.succeeded);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_snapshot_command_is_output_bounded() {
+        let snapshot = capture_process_snapshot_with(std::process::Command::new("sh").args([
+            "-c",
+            "i=0; while [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done",
+        ]));
+
+        assert!(!snapshot.succeeded);
     }
 
     #[test]

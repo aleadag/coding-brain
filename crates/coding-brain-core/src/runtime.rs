@@ -8,6 +8,8 @@ use std::sync::Arc;
 use crate::brain_activity::{
     ActivitySnapshot, CorrectionDisposition, SessionTarget, SnapshotLimits,
 };
+use crate::provider::AgentProvider;
+use crate::terminals::TerminalSessionAction;
 
 // ============================================================================
 // Brain
@@ -49,6 +51,8 @@ impl std::fmt::Display for BrainGateMode {
 /// keep treating them as opaque.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionSummary {
+    #[serde(default)]
+    pub provider: AgentProvider,
     pub id: String,
     pub timestamp: String,
     pub action: String,
@@ -158,9 +162,17 @@ pub struct ScorecardSummary {
     pub override_rate_pct: f64,
     pub canonical_decisions: usize,
     pub risk_tiers: Vec<RiskTierSummary>,
+    pub providers: Vec<ProviderScoreSummary>,
     pub latency: LatencySummary,
     pub cache: CacheSummary,
     pub counterfactuals: CounterfactualSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderScoreSummary {
+    pub provider: AgentProvider,
+    pub decisions: usize,
+    pub correct: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -212,6 +224,12 @@ pub struct CorrectionInput {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionActionRequest {
+    pub target: SessionTarget,
+    pub action: TerminalSessionAction,
+}
+
 pub trait BrainSource: Send + Sync {
     fn snapshot(&self, limits: SnapshotLimits) -> Result<ActivitySnapshot, String>;
     fn review_queue(&self) -> Result<Vec<ReviewItemSummary>, String>;
@@ -223,6 +241,7 @@ pub trait BrainSource: Send + Sync {
 pub trait BrainActions: Send + Sync {
     fn record_correction(&self, correction: CorrectionInput) -> Result<(), String>;
     fn mark_canonical(&self, decision_id: &str, note: Option<String>) -> Result<(), String>;
+    fn send_session_action(&self, request: SessionActionRequest) -> Result<(), String>;
     fn poll_recovery(&self) -> Vec<String> {
         Vec::new()
     }
@@ -354,6 +373,7 @@ pub struct MockBrainRuntime {
     pub endpoint_health: EndpointHealth,
     pub gate_mode: std::sync::Mutex<Option<BrainGateMode>>,
     pub actions_log: std::sync::Mutex<Vec<MockBrainAction>>,
+    pub session_action_error: std::sync::Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +384,7 @@ pub enum MockBrainAction {
         decision_id: String,
         note: Option<String>,
     },
+    SessionAction(SessionActionRequest),
 }
 
 impl MockBrainRuntime {
@@ -432,11 +453,25 @@ impl BrainActions for MockBrainRuntime {
             });
         Ok(())
     }
+
+    fn send_session_action(&self, request: SessionActionRequest) -> Result<(), String> {
+        self.actions_log
+            .lock()
+            .expect("brain actions_log poisoned")
+            .push(MockBrainAction::SessionAction(request));
+        self.session_action_error
+            .lock()
+            .expect("brain session_action_error poisoned")
+            .clone()
+            .map_or(Ok(()), Err)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::AgentProvider;
+    use crate::terminals::TerminalSessionAction;
 
     #[test]
     fn brain_runtime_records_exact_correction_and_canonical_inputs() {
@@ -466,6 +501,35 @@ mod tests {
                     note: Some("teach this".into()),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn brain_runtime_records_exact_session_action_request() {
+        let mock = Arc::new(MockBrainRuntime::default());
+        let runtime = BrainRuntime::new(mock.clone(), mock.clone());
+        let request = SessionActionRequest {
+            target: SessionTarget {
+                provider: AgentProvider::Claude,
+                session_id: "session-42".into(),
+                turn_id: Some("turn-7".into()),
+                tool_use_id: None,
+                project_id: crate::project::ProjectId::Stable("project-1".into()),
+                cwd: "/work/project".into(),
+                provider_hints: Vec::new(),
+                provenance: crate::brain_activity::SessionTargetProvenance::Structured,
+            },
+            action: TerminalSessionAction::Continue,
+        };
+
+        runtime
+            .actions
+            .send_session_action(request.clone())
+            .unwrap();
+
+        assert_eq!(
+            mock.actions(),
+            vec![MockBrainAction::SessionAction(request)]
         );
     }
 

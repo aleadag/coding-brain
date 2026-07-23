@@ -484,6 +484,7 @@ mod tests {
             project_id: ProjectId::Stable("project-1".into()),
             cwd: PathBuf::from("/work/project"),
             provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
         }
     }
 

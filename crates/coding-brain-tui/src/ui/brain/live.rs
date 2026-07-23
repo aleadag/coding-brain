@@ -39,8 +39,9 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
                 String::new()
             };
             ListItem::new(format!(
-                "{}  {}  {}{}",
+                "{}  {}  {}  {}{}",
                 activity_status(&item.activity),
+                provider_label(&item.activity),
                 project_label(&item.activity),
                 command_label(&item.activity),
                 occurrences
@@ -91,8 +92,9 @@ fn render_recent(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
             .iter()
             .map(|item| {
                 ListItem::new(format!(
-                    "{}  {}  {}",
+                    "{}  {}  {}  {}",
                     activity_status(item),
+                    provider_label(item),
                     project_label(item),
                     command_label(item)
                 ))
@@ -130,6 +132,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
             Span::raw(activity_status(item)),
         ]),
         Line::raw(format!("Activity: {}", item.activity_id)),
+        Line::raw(format!("Provider: {}", provider_label(item))),
         Line::raw(format!("Project: {}", project_label(item))),
         Line::raw(format!("Command: {}", command_label(item))),
     ];
@@ -151,6 +154,13 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
             .block(Block::default().title(" Decision ").borders(Borders::ALL)),
         area,
     );
+}
+
+fn provider_label(item: &ActivityItem) -> &'static str {
+    item.session
+        .as_ref()
+        .map(|session| session.provider.label())
+        .unwrap_or("Unknown")
 }
 
 pub(crate) fn activity_status(item: &ActivityItem) -> String {

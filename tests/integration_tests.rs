@@ -1593,6 +1593,7 @@ fn write_terminal_activity(decision_id: &str, session_id: &str, tool_use_id: &st
             project_id,
             cwd: home,
             provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
         }),
         state: coding_brain_core::brain_activity::ActivityState::Allowed,
         tool: Some("Bash".into()),

@@ -19,6 +19,14 @@ pub enum SessionStatus {
     Finished,     // Process exited
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionIdentityProvenance {
+    #[default]
+    Unknown,
+    Structured,
+    ProcessOnly,
+}
+
 impl fmt::Display for SessionStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -130,6 +138,7 @@ pub struct AgentSession {
     pub pid: u32,
     pub process_start_identity: Option<u64>,
     pub process_backed: bool,
+    pub identity_provenance: SessionIdentityProvenance,
     #[allow(dead_code)]
     pub session_id: String,
     /// Provider-native attachment evidence, when discovery supplies it.
@@ -353,6 +362,7 @@ impl AgentSession {
             pid: raw.pid,
             process_start_identity: raw.process_start_identity,
             process_backed: true,
+            identity_provenance: SessionIdentityProvenance::Unknown,
             session_id: raw.session_id,
             native_attach_id: None,
             cwd: raw.cwd,
@@ -576,6 +586,7 @@ impl AgentSession {
             started_at,
         });
         session.process_backed = false;
+        session.identity_provenance = SessionIdentityProvenance::Structured;
         session.jsonl_path = Some(jsonl_path);
         session.telemetry_status = TelemetryStatus::Pending;
         session.model_profile_source = "codex-transcript".into();
@@ -1124,6 +1135,10 @@ mod tests {
 
         assert_eq!(raw.provider, AgentProvider::Codex);
         assert_eq!(raw.process_start_identity, None);
+        assert_eq!(
+            AgentSession::from_raw(raw).identity_provenance,
+            SessionIdentityProvenance::Unknown
+        );
     }
 
     #[test]

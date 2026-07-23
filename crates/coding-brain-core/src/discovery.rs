@@ -11,7 +11,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::codex_transcript::{CodexEvent, parse_line};
 use crate::process::{ProcessSnapshot, ProcessSnapshotEntry, capture_process_snapshot};
 use crate::provider::AgentProvider;
-use crate::session::{AgentSession, RawAgentSession, SessionStatus};
+use crate::session::{AgentSession, RawAgentSession, SessionIdentityProvenance, SessionStatus};
 
 pub mod antigravity;
 pub mod claude;
@@ -138,6 +138,7 @@ fn session_from_provider_process(
         cwd: process.cwd.to_string_lossy().into_owned(),
         started_at: process.started_at,
     });
+    session.identity_provenance = SessionIdentityProvenance::ProcessOnly;
     session.status = SessionStatus::Unknown;
     apply_process_evidence(&mut session, process);
     session
@@ -364,6 +365,11 @@ fn session_from_live_process(
         cwd: process.cwd,
         started_at: process.started_at,
     });
+    session.identity_provenance = if transcript.is_some() {
+        SessionIdentityProvenance::Structured
+    } else {
+        SessionIdentityProvenance::ProcessOnly
+    };
     session.tty = process.tty;
     session.cpu_percent = process.cpu_percent;
     session.mem_mb = process.mem_mb;
@@ -1018,6 +1024,41 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "session-uuid");
         assert_eq!(sessions[0].native_attach_id.as_deref(), Some("agent-42"));
+        assert_eq!(
+            sessions[0].identity_provenance,
+            crate::session::SessionIdentityProvenance::Structured
+        );
+    }
+
+    #[test]
+    fn claude_structured_inventory_identity_survives_process_encoding_collision() {
+        let process = crate::process::ProcessSnapshotEntry::fixture(
+            42,
+            "pts/7",
+            "claude",
+            "/work/claude",
+            9_001,
+        );
+        let colliding_id = process_session_id(&process);
+        let entry = claude::ClaudeInventoryEntry {
+            provider: AgentProvider::Claude,
+            session_id: Some(colliding_id.clone()),
+            attach_id: None,
+            cwd: PathBuf::from("/work/claude"),
+            pid: Some(42),
+            started_at: Some(9_001),
+            status: None,
+        };
+
+        let sessions = claude::sessions_from_inventory(&[entry], false, true, &[process]);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, colliding_id);
+        assert!(sessions[0].process_backed);
+        assert_eq!(
+            sessions[0].identity_provenance,
+            crate::session::SessionIdentityProvenance::Structured
+        );
     }
 
     #[test]
@@ -1140,6 +1181,19 @@ mod tests {
         assert_eq!(claude.pid, 12);
         assert_eq!(claude.process_start_identity, Some(102));
         assert_eq!(claude.tty, "pts/2");
+        assert_eq!(
+            claude.identity_provenance,
+            crate::session::SessionIdentityProvenance::Structured
+        );
+
+        let codex_fallback = sessions
+            .iter()
+            .find(|session| session.provider == AgentProvider::Codex)
+            .unwrap();
+        assert_eq!(
+            codex_fallback.identity_provenance,
+            crate::session::SessionIdentityProvenance::ProcessOnly
+        );
 
         let claude_fallback = sessions.iter().find(|session| session.pid == 15).unwrap();
         assert_eq!(claude_fallback.provider, AgentProvider::Claude);
@@ -1148,6 +1202,10 @@ mod tests {
             crate::session::SessionStatus::Unknown
         );
         assert!(claude_fallback.live_process_identity().is_some());
+        assert_eq!(
+            claude_fallback.identity_provenance,
+            crate::session::SessionIdentityProvenance::ProcessOnly
+        );
 
         let agy = sessions
             .iter()
@@ -1155,6 +1213,10 @@ mod tests {
             .unwrap();
         assert_eq!(agy.status, crate::session::SessionStatus::Unknown);
         assert!(agy.live_process_identity().is_some());
+        assert_eq!(
+            agy.identity_provenance,
+            crate::session::SessionIdentityProvenance::ProcessOnly
+        );
     }
 
     #[test]
@@ -1811,6 +1873,10 @@ mod tests {
             sessions[0].jsonl_path.as_deref(),
             Some(std::path::Path::new("/tmp/rollout-live.jsonl"))
         );
+        assert_eq!(
+            sessions[0].identity_provenance,
+            SessionIdentityProvenance::Structured
+        );
     }
 
     #[test]
@@ -1838,6 +1904,10 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "codex-99");
         assert_eq!(sessions[0].jsonl_path, None);
+        assert_eq!(
+            sessions[0].identity_provenance,
+            SessionIdentityProvenance::ProcessOnly
+        );
     }
 
     #[test]

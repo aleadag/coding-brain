@@ -397,6 +397,7 @@ fn observation_event(
             project_id,
             cwd,
             provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
         }),
         state: ActivityState::Abstained,
         tool: Some(lifecycle.name().as_str().into()),
@@ -701,6 +702,7 @@ fn diagnostic_event(
             project_id,
             cwd,
             provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
         }),
         state: ActivityState::Error,
         tool: input.tool_name.clone(),
@@ -806,6 +808,7 @@ mod tests {
                 project_id,
                 cwd: cwd.to_path_buf(),
                 provider_hints: Vec::new(),
+                provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
             }),
             state,
             tool: Some("Bash".into()),
@@ -1132,6 +1135,8 @@ mod tests {
                     project_id,
                     cwd: temp.path().to_path_buf(),
                     provider_hints: Vec::new(),
+                    provenance:
+                        coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
                 }),
                 state: ActivityState::Allowed,
                 tool: Some("Bash".into()),
@@ -1303,6 +1308,8 @@ mod tests {
                     project_id,
                     cwd: temp.path().to_path_buf(),
                     provider_hints: Vec::new(),
+                    provenance:
+                        coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
                 }),
                 state: ActivityState::Allowed,
                 tool: Some("Bash".into()),
@@ -1372,6 +1379,8 @@ mod tests {
                     project_id,
                     cwd: temp.path().to_path_buf(),
                     provider_hints: Vec::new(),
+                    provenance:
+                        coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
                 }),
                 state: ActivityState::Allowed,
                 tool: Some("Bash".into()),
@@ -1579,6 +1588,8 @@ mod tests {
                     project_id,
                     cwd: temp.path().to_path_buf(),
                     provider_hints: Vec::new(),
+                    provenance:
+                        coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
                 }),
                 state: ActivityState::Observed,
                 tool: Some("Bash".into()),
@@ -1654,6 +1665,8 @@ mod tests {
                     project_id,
                     cwd: temp.path().to_path_buf(),
                     provider_hints: Vec::new(),
+                    provenance:
+                        coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
                 }),
                 state: ActivityState::Allowed,
                 tool: Some("Bash".into()),

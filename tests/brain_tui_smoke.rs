@@ -47,6 +47,21 @@ fn offline_brain_opens_live_keeps_review_and_exits_cleanly() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("Coding Brain"));
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    terminal
+        .draw(|frame| coding_brain_tui::ui::brain::render(frame, &app))
+        .unwrap();
+    let review = (0..terminal.backend().buffer().area.height)
+        .map(|y| {
+            (0..terminal.backend().buffer().area.width)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(review.contains("Claude"));
+    assert!(!review.contains("Usage"));
+    assert!(!review.contains("Cost"));
     assert_eq!(
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
         Some(BrainEffect::Exit)
@@ -55,6 +70,7 @@ fn offline_brain_opens_live_keeps_review_and_exits_cleanly() {
 
 fn decision() -> DecisionSummary {
     DecisionSummary {
+        provider: coding_brain_core::provider::AgentProvider::Claude,
         id: "decision-1".into(),
         timestamp: "1".into(),
         action: "deny".into(),

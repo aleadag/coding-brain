@@ -1004,6 +1004,8 @@ mod tests {
                         project_id: project_id.clone(),
                         cwd: temp.path().to_path_buf(),
                         provider_hints: Vec::new(),
+                        provenance:
+                            coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
                     }),
                     state: ActivityState::Allowed,
                     tool: Some("Bash".into()),
@@ -1062,6 +1064,8 @@ mod tests {
                     project_id,
                     cwd: temp.path().to_path_buf(),
                     provider_hints: Vec::new(),
+                    provenance:
+                        coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
                 }),
                 state: ActivityState::Allowed,
                 tool: Some("Bash".into()),
@@ -1119,6 +1123,7 @@ mod tests {
             project_id,
             cwd: temp.path().to_path_buf(),
             provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
         };
         activity
             .append(ActivityEvent {

@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, ProjectEvidence,
+    SessionTarget,
 };
 use coding_brain_core::project::ProjectId;
+use coding_brain_core::provider::AgentProvider;
 
 #[test]
 fn headless_emits_activity_without_a_session_roster() {
@@ -24,7 +26,16 @@ fn headless_emits_activity_without_a_session_roster() {
             cwd: "/work/project".into(),
             label: Some("project".into()),
         },
-        session: None,
+        session: Some(SessionTarget {
+            provider: AgentProvider::Antigravity,
+            session_id: "conversation-1".into(),
+            turn_id: Some("turn-1".into()),
+            tool_use_id: None,
+            project_id: ProjectId::Stable("project-1".into()),
+            cwd: "/work/project".into(),
+            provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
+        }),
         state: ActivityState::Denied,
         tool: Some("Bash".into()),
         normalized_command: Some("cargo test".into()),

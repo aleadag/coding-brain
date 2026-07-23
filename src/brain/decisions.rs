@@ -153,6 +153,7 @@ pub struct DecisionContext {
 impl From<&DecisionRecord> for coding_brain_core::runtime::DecisionSummary {
     fn from(r: &DecisionRecord) -> Self {
         Self {
+            provider: r.provider,
             id: r.decision_id.clone().unwrap_or_default(),
             timestamp: r.timestamp.clone(),
             action: r.brain_action.clone(),
@@ -1391,6 +1392,7 @@ mod tests {
             pid: 42,
             process_start_identity: None,
             process_backed: true,
+            identity_provenance: coding_brain_core::session::SessionIdentityProvenance::Unknown,
             session_id: "test-session".into(),
             native_attach_id: None,
             cwd: "/tmp".into(),

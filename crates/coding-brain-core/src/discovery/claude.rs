@@ -15,7 +15,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::process::ProcessSnapshotEntry;
 use crate::provider::AgentProvider;
-use crate::session::{AgentSession, RawAgentSession, SessionStatus};
+use crate::session::{AgentSession, RawAgentSession, SessionIdentityProvenance, SessionStatus};
 
 pub const MAX_INVENTORY_BYTES: usize = 1024 * 1024;
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -422,12 +422,20 @@ pub(crate) fn sessions_from_inventory(
         if stale && process_snapshot_succeeded && entry.pid.is_some() && pid_process.is_none() {
             continue;
         }
-        let session_id = entry
+        let identity = entry
             .session_id
             .clone()
             .or_else(|| entry.attach_id.as_ref().map(|id| format!("attach:{id}")))
-            .or_else(|| process.map(super::process_session_id));
-        let Some(session_id) = session_id else {
+            .map(|session_id| (session_id, SessionIdentityProvenance::Structured))
+            .or_else(|| {
+                process.map(|process| {
+                    (
+                        super::process_session_id(process),
+                        SessionIdentityProvenance::ProcessOnly,
+                    )
+                })
+            });
+        let Some((session_id, identity_provenance)) = identity else {
             continue;
         };
         if let Some(process) = process {
@@ -445,6 +453,7 @@ pub(crate) fn sessions_from_inventory(
                 .or_else(|| process.map(|process| process.started_at))
                 .unwrap_or_default(),
         });
+        session.identity_provenance = identity_provenance;
         session.process_backed = process.is_some();
         session.native_attach_id = entry.attach_id.clone();
         session.status = entry

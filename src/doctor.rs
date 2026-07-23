@@ -946,6 +946,7 @@ mod tests {
                 project_id,
                 cwd: PathBuf::from("/work/doctor-project"),
                 provider_hints: Vec::new(),
+                provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
             }),
             state,
             tool: Some(tool.into()),

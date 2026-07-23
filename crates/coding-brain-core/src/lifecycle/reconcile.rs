@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::discovery::transcript_summary_from_codex_jsonl;
 use crate::provider::{AgentProvider, AgentSessionKey};
-use crate::session::{AgentSession, SessionStatus};
+use crate::session::{AgentSession, SessionIdentityProvenance, SessionStatus};
 
 use super::{
     LifecycleEventName, ProjectedStatus, SessionLifecycleState, StoreCondition, StoreError,
@@ -299,7 +299,7 @@ pub fn apply_store_view(sessions: &mut [AgentSession], view: &StoreView, now_ms:
             .filter(|(_, session)| {
                 eligible_local_session(session)
                     && session.provider == AgentProvider::Codex
-                    && session.session_id.starts_with("codex-")
+                    && session.identity_provenance == SessionIdentityProvenance::ProcessOnly
                     && paths_match(Path::new(&session.cwd), &state.cwd)
                     && summary.mtime_ms >= session.started_at
             })
@@ -335,6 +335,7 @@ pub fn apply_store_view(sessions: &mut [AgentSession], view: &StoreView, now_ms:
         }
         let session = &mut sessions[session_index];
         session.session_id = session_id;
+        session.identity_provenance = SessionIdentityProvenance::Structured;
         session.jsonl_path = Some(summary.path);
         session.last_message_ts = session.last_message_ts.max(summary.mtime_ms);
         attach_state(session, state, now_ms);
@@ -410,7 +411,7 @@ fn mark_placeholder_reason(sessions: &mut [AgentSession], cwd: &Path, reason: &s
     for session in sessions.iter_mut().filter(|session| {
         eligible_local_session(session)
             && session.provider == AgentProvider::Codex
-            && session.session_id.starts_with("codex-")
+            && session.identity_provenance == SessionIdentityProvenance::ProcessOnly
             && paths_match(Path::new(&session.cwd), cwd)
     }) {
         session.lifecycle_diagnostic.ignored_reason = Some(reason.into());
@@ -469,7 +470,8 @@ mod tests {
     use std::path::Path;
 
     use crate::session::{
-        AgentSession, ApprovalEvidence, ApprovalObservation, RawAgentSession, SessionStatus,
+        AgentSession, ApprovalEvidence, ApprovalObservation, RawAgentSession,
+        SessionIdentityProvenance, SessionStatus,
     };
     use crate::terminals::Terminal;
 
@@ -501,14 +503,16 @@ mod tests {
     }
 
     fn raw_session(pid: u32, session_id: &str, cwd: &Path, started_at: u64) -> AgentSession {
-        AgentSession::from_raw(RawAgentSession {
+        let mut session = AgentSession::from_raw(RawAgentSession {
             provider: crate::provider::AgentProvider::Codex,
             pid,
             process_start_identity: None,
             session_id: session_id.into(),
             cwd: cwd.display().to_string(),
             started_at,
-        })
+        });
+        session.identity_provenance = SessionIdentityProvenance::ProcessOnly;
+        session
     }
 
     fn snapshot_with_event(
@@ -823,6 +827,10 @@ mod tests {
 
         assert_eq!(sessions[0].session_id, "session-7");
         assert_eq!(
+            sessions[0].identity_provenance,
+            SessionIdentityProvenance::Structured
+        );
+        assert_eq!(
             sessions[0].jsonl_path.as_deref(),
             Some(transcript.as_path())
         );
@@ -869,11 +877,11 @@ mod tests {
             raw_session(8, "codex-8", root.path(), now_ms - 2_000),
         ];
         apply_store_view(&mut sessions, &healthy_view(snapshot), now_ms);
-        assert!(
-            sessions
-                .iter()
-                .all(|session| session.session_id.starts_with("codex-"))
-        );
+        assert_eq!(sessions[0].session_id, "codex-7");
+        assert_eq!(sessions[1].session_id, "codex-8");
+        assert!(sessions.iter().all(|session| {
+            session.identity_provenance == SessionIdentityProvenance::ProcessOnly
+        }));
 
         for remote in [false, true] {
             let snapshot = snapshot_with_event(
@@ -896,6 +904,37 @@ mod tests {
             );
             assert_eq!(session.session_id, "codex-7");
         }
+    }
+
+    #[test]
+    fn structured_codex_prefixed_session_is_not_treated_as_a_process_placeholder() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = root.path().join("rollout.jsonl");
+        write_transcript(&transcript, "session-7", root.path());
+        let now_ms = now_ms();
+        let snapshot = snapshot_with_event(
+            "SessionStart",
+            "session-7",
+            root.path(),
+            Some(&transcript),
+            now_ms - 1_000,
+        );
+        let mut session = raw_session(7, "codex-7", root.path(), now_ms - 2_000);
+        session.identity_provenance = SessionIdentityProvenance::Structured;
+
+        apply_store_view(
+            std::slice::from_mut(&mut session),
+            &healthy_view(snapshot),
+            now_ms,
+        );
+
+        assert_eq!(session.session_id, "codex-7");
+        assert_eq!(
+            session.identity_provenance,
+            SessionIdentityProvenance::Structured
+        );
+        assert_eq!(session.jsonl_path, None);
+        assert_eq!(session.lifecycle_diagnostic.ignored_reason, None);
     }
 
     #[test]
