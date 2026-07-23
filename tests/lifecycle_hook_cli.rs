@@ -488,6 +488,16 @@ fn run_cli(home: &std::path::Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn run_init_check(home: &std::path::Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+        .args(["init", "--check"])
+        .env("HOME", home)
+        .env("PATH", "")
+        .current_dir(home)
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn init_noninteractive_selectors_write_stable_provider_marker_keys() {
     let home = tempfile::tempdir().unwrap();
@@ -552,7 +562,7 @@ fn subsequent_init_preserves_previous_provider_records_for_check_and_remove() {
     .unwrap();
     assert_eq!(marker["phases"]["hooks.codex"]["status"], "installed");
     assert_eq!(marker["phases"]["hooks.claude"]["status"], "installed");
-    assert!(run_cli(home.path(), &["init", "--check"]).status.success());
+    assert!(run_init_check(home.path()).status.success());
 
     let remove = run_cli(home.path(), &["init", "--remove"]);
     assert!(remove.status.success());
@@ -618,10 +628,10 @@ fn init_check_upgrade_and_remove_use_recorded_providers() {
         ],
     );
     assert!(init.status.success());
-    assert!(run_cli(home.path(), &["init", "--check"]).status.success());
+    assert!(run_init_check(home.path()).status.success());
 
     fs::remove_file(home.path().join(".claude/settings.json")).unwrap();
-    assert!(!run_cli(home.path(), &["init", "--check"]).status.success());
+    assert!(!run_init_check(home.path()).status.success());
     assert!(
         run_cli(home.path(), &["init", "--upgrade"])
             .status
