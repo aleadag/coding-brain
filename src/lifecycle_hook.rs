@@ -511,19 +511,19 @@ fn correlate_outcome(
                 })
         })
         .map_or(log.events().len(), |offset| pre_index + 1 + offset);
-    if next_pre_index < log.events().len() {
-        return diagnostic_correlation(
-            lifecycle,
-            input,
-            "orphan outcome: PreToolUse interval overlaps a later tool",
-        );
-    }
     let interval = &log.events()[pre_index + 1..next_pre_index];
     if !interval
         .iter()
         .any(|event| event.kind == ActivityKind::Decision)
     {
         return Correlation::None;
+    }
+    if next_pre_index < log.events().len() {
+        return diagnostic_correlation(
+            lifecycle,
+            input,
+            "orphan outcome: PreToolUse interval overlaps a later tool",
+        );
     }
     let Some(command) = input.normalized_bash_command() else {
         return diagnostic_correlation(
@@ -1782,21 +1782,21 @@ mod tests {
             &activity,
             hook_payload(temp.path(), "PreToolUse", "call-1", "cargo test", None),
         );
-        invoke_activity_hook(
-            &lifecycle,
-            &activity,
-            hook_payload(temp.path(), "PreToolUse", "call-2", "cargo test", None),
-        );
         activity
             .append(decision_event(
                 temp.path(),
                 "activity-1",
-                3,
+                2,
                 None,
                 "cargo test",
                 ActivityState::Allowed,
             ))
             .unwrap();
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(temp.path(), "PreToolUse", "call-2", "cargo test", None),
+        );
         invoke_activity_hook(
             &lifecycle,
             &activity,
@@ -1810,6 +1810,47 @@ mod tests {
         );
         assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 1));
         assert_diagnostics_are_metadata_only(&activity, &["done"]);
+    }
+
+    #[test]
+    fn interleaved_pre_interval_without_decision_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        activity
+            .append(decision_event(
+                temp.path(),
+                "unrelated-activity",
+                1,
+                None,
+                "cargo check",
+                ActivityState::Denied,
+            ))
+            .unwrap();
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(temp.path(), "PreToolUse", "call-1", "cargo test", None),
+        );
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(temp.path(), "PreToolUse", "call-2", "cargo test", None),
+        );
+
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(
+                temp.path(),
+                "PostToolUse",
+                "call-1",
+                "cargo test",
+                Some(serde_json::json!("done")),
+            ),
+        );
+
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 0));
     }
 
     #[test]
