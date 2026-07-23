@@ -38,8 +38,19 @@ Import the module from the `codexctl` flake input, then configure the public `pr
 {
   imports = [ inputs.codexctl.homeManagerModules.default ];
 
+  programs.claude-code = {
+    enable = true;
+  };
+  programs.antigravity-cli = {
+    enable = true;
+  };
   programs.coding-brain = {
     enable = true;
+    claudeHooks.enable = true;
+    antigravityHooks = {
+      enable = true;
+      extraDefinitions.my-linter.enabled = false;
+    };
     settings.brain = {
       endpoint = "http://localhost:11434/api/generate";
       model = "gemma4:e4b";
@@ -48,22 +59,27 @@ Import the module from the `codexctl` flake input, then configure the public `pr
 }
 ```
 
-The module installs its selected package, writes `coding-brain/config.toml`, and can merge eight Codex lifecycle, permission, and recovery definitions into `programs.codex.hooks`. Every command uses the package's immutable Nix store executable with explicit `--provider codex`; the Codex `Stop` definition calls `--recovery-hook --provider codex`. Unrelated Codex hooks remain independent.
+The module installs its selected package, writes `coding-brain/config.toml`, and configures provider hooks with immutable Nix store executable paths. Codex and Claude hooks merge through their Home Manager provider options, so definitions from other Nix modules remain in the generated provider settings.
 
-The module owns Codex hooks declaratively because Home Manager can merge `programs.codex.hooks`. It does not claim ownership of Claude or Antigravity JSON. Configure those providers imperatively after activation:
+Antigravity has an upstream enable option but no hooks option. When `antigravityHooks.enable` is true, Home Manager owns the complete `~/.gemini/config/hooks.json`; put every unrelated top-level definition under `antigravityHooks.extraDefinitions`. Each extra definition must be an object, not a scalar JSON value.
 
-```bash
-coding-brain init claude antigravity
-coding-brain doctor
-```
+`claudeHooks.enable` and `antigravityHooks.enable` follow genuine enabled provider modules by default. Antigravity hooks stay disabled for legacy Gemini configuration. Explicit enablement produces a targeted assertion when a provider is unsupported, disabled, or incompatible.
 
-This command safely merges `~/.claude/settings.json` and `~/.gemini/config/hooks.json`; no Home Manager option is required for those files.
+Before enabling declarative Antigravity hooks:
+
+1. Inspect `~/.gemini/config/hooks.json`.
+2. Copy every top-level definition except `coding-brain` into `antigravityHooks.extraDefinitions`.
+3. Move the complete file to a timestamped backup.
+4. Rebuild Home Manager.
+5. Restart Antigravity CLI and run `coding-brain doctor`.
+
+Do not set `force = true`. A Home Manager collision means the mutable file has not been migrated.
 
 Home Manager owns the read-only TOML settings above. Select the writable global mode separately with `coding-brain config set mode on`; an explicit mode state overrides legacy TOML mode fields without modifying the Home Manager file.
 
-Settings rendered by Nix are world-readable in the Nix store. Do not put tokens, credentials, or token-bearing URLs in `programs.coding-brain.settings`.
+Nix-generated TOML and JSON pass through the world-readable Nix store. Do not put tokens, credentials, token-bearing URLs, or token-bearing hook commands in `settings` or `antigravityHooks.extraDefinitions`.
 
-`codexHooks.enable` defaults to true only when Home Manager exposes `programs.codex.hooks` and `programs.codex.enable` is true. After changing the package, rebuild Home Manager, restart Codex, and inspect `/hooks` before trusting the changed executable path. Re-run `coding-brain init claude antigravity` after replacing the package so their imperative commands use the current executable.
+After changing the package, rebuild Home Manager, restart every configured provider, inspect Codex `/hooks`, and run `coding-brain doctor`. Run imperative init after a package change only for providers that are not managed declaratively.
 
 ## Managed hooks
 
@@ -74,6 +90,8 @@ coding-brain init codex
 coding-brain init claude antigravity
 coding-brain init all
 ```
+
+Use these commands only for providers that are not managed declaratively through Home Manager.
 
 `--plugin-only` remains a deprecated Codex-only alias for one compatibility release. Codex and Claude receive lifecycle handlers for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SubagentStart`, `SubagentStop`, and `Stop`, plus a `PermissionRequest` handler. Antigravity receives `PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, and `Stop` definitions.
 

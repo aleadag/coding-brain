@@ -70,7 +70,7 @@ coding-brain man
 - `--remove` removes all exact Coding Brain-managed provider hooks and the onboarding marker but preserves data and unrelated entries.
 - `--purge` additionally removes the previewed current and legacy global config/state targets after confirmation. It is irreversible.
 - `doctor` checks the executable, hook definitions, trust visibility, project identity, lifecycle state, outcome telemetry, endpoint privacy, transcript discovery, and terminal integration.
-- `doctor` emits one setup row for Codex, Claude, and Antigravity, plus separate Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback rows. An unselected absent provider is skipped; a selected provider with a missing executable is advisory; invalid or stale managed definitions fail with `coding-brain init <provider>` as the repair command.
+- `doctor` emits one setup row for Codex, Claude, and Antigravity, plus separate Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback rows. An unselected absent provider is skipped, while a selected provider with a missing executable is advisory. For invalid or stale declaratively managed hooks, rebuild Home Manager and restart the affected provider; for Codex, also inspect `/hooks` before rerunning `coding-brain doctor`. For imperatively managed providers, run the `coding-brain init <provider>` repair command shown in the provider row.
 
 Managed setup paths are:
 

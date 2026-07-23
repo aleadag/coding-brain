@@ -20,10 +20,13 @@
 brew upgrade coding-brain                 # Homebrew
 cargo install coding-brain                # crates.io
 curl -fsSL https://raw.githubusercontent.com/aleadag/coding-brain/main/install.sh | sh
-coding-brain init
-coding-brain doctor
-# Restart Codex after reviewing the new managed hooks.
 ```
+
+For hooks managed declaratively through Home Manager, rebuild Home Manager,
+restart every configured provider, inspect `/hooks` when Codex is configured,
+and run `coding-brain doctor`. For imperatively managed hooks, rerun
+`coding-brain init <provider>` for the exact providers you manage, restart
+them, and run `coding-brain doctor`.
 
 ## Changelog
 

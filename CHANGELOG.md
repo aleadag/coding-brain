@@ -11,6 +11,16 @@ All notable changes to codexctl are documented here.
 - You can configure Codex, Claude Code, and Antigravity CLI together with
   `coding-brain init codex|claude|antigravity|all`; bare interactive init
   detects providers and asks which managed hooks to install.
+- Home Manager users can enable declarative provider hooks with
+  `programs.coding-brain.claudeHooks.enable`,
+  `programs.coding-brain.antigravityHooks.enable`, and
+  `programs.coding-brain.antigravityHooks.extraDefinitions`. Claude hooks merge
+  with other provider-module settings, while Home Manager owns the complete
+  Antigravity `~/.gemini/config/hooks.json`; put every unrelated top-level
+  definition in `antigravityHooks.extraDefinitions`. Follow the
+  [Home Manager configuration guide](docs/configuration.md#home-manager) to
+  migrate existing Antigravity definitions, rebuild, restart providers, and
+  verify the result with `coding-brain doctor`.
 - Live now labels Brain activity by provider and offers exact-target one-shot
   allow, deny, continue, and bounded manual-text actions through `x` action
   mode. Claude background sessions can use native attach, while guarded tmux

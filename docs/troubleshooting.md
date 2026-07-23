@@ -10,7 +10,9 @@ Doctor reports separate `Codex setup`, `Claude setup`, and `Antigravity setup` r
 
 ## Hooks are missing or stale
 
-Run the exact repair command in the provider row, for example:
+For hooks managed declaratively through Home Manager, rebuild Home Manager and restart the affected provider. For Codex, inspect `/hooks`, then run `coding-brain doctor`.
+
+For providers that are not managed declaratively, run the exact repair command in the provider row, for example:
 
 ```bash
 coding-brain init codex
@@ -65,4 +67,6 @@ Normal startup and doctor do not modify old data. Before purge, reinstall the ol
 
 `coding-brain init --remove` removes managed hooks and the onboarding marker while preserving data. `coding-brain init --purge` previews the documented current and legacy global config/state targets, rechecks each target after confirmation, and deletes them. Purge is irreversible. It preserves project `.coding-brain.toml`, `.coding-brain/project.toml`, unrelated hooks, and sibling XDG files.
 
-For declarative Home Manager Codex hooks, disable `programs.coding-brain.codexHooks.enable` or revert the module configuration and rebuild. The module does not own Claude or Antigravity JSON; manage those with `coding-brain init claude antigravity`. Do not use imperative removal as the primary rollback for declaratively managed Codex definitions.
+For declarative Codex or Claude hooks, disable the corresponding `programs.coding-brain` hook option and rebuild; other provider-module hooks remain. For declarative Antigravity hooks, disable `antigravityHooks.enable` and rebuild. To return Antigravity to mutable configuration, restore the migration backup, remove only its top-level `coding-brain` definition, run `coding-brain init antigravity` to install a fresh Coding Brain entry, and verify with `coding-brain doctor`. The targeted removal is required because the installer preserves a modified managed definition instead of overwriting it.
+
+`coding-brain init --remove` is a full uninstall of all exact Coding Brain-managed provider hooks and the onboarding marker. Do not use it as a single-provider migration or rollback command.
