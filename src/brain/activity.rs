@@ -1224,39 +1224,54 @@ mod tests {
         store
             .append(event_at("target", ActivityState::Allowed, 1))
             .unwrap();
+        let store = store.with_limits(ActivityLimits {
+            lock_timeout_ms: 5_000,
+            ..ActivityLimits::default()
+        });
         let store = std::sync::Arc::new(store);
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let handles = (0..2)
-            .map(|index| {
-                let store = store.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    let marker = event_at(
-                        &format!("marker-{index}"),
-                        ActivityState::Observed,
-                        index + 2,
-                    );
-                    let mut outcome = event_at("target", ActivityState::Outcome, index + 4);
-                    outcome.outcome = Some(ActivityOutcome::Completed);
-                    barrier.wait();
-                    store
-                        .append_from_snapshot(|log| {
-                            let mut rows = vec![marker];
-                            if !log.events().iter().any(|event| {
-                                event.activity_id == "target"
-                                    && event.state == ActivityState::Outcome
-                            }) {
-                                rows.push(outcome);
-                            }
-                            rows
-                        })
-                        .unwrap();
+        let (lock_held_tx, lock_held_rx) = std::sync::mpsc::channel();
+
+        let first_store = store.clone();
+        let first = std::thread::spawn(move || {
+            let marker = event_at("marker-0", ActivityState::Observed, 2);
+            let mut outcome = event_at("target", ActivityState::Outcome, 4);
+            outcome.outcome = Some(ActivityOutcome::Completed);
+            first_store
+                .append_from_snapshot(|log| {
+                    lock_held_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(200));
+                    let mut rows = vec![marker];
+                    if !log.events().iter().any(|event| {
+                        event.activity_id == "target" && event.state == ActivityState::Outcome
+                    }) {
+                        rows.push(outcome);
+                    }
+                    rows
                 })
-            })
-            .collect::<Vec<_>>();
-        for handle in handles {
-            handle.join().unwrap();
-        }
+                .unwrap();
+        });
+
+        lock_held_rx.recv().unwrap();
+        let second_store = store.clone();
+        let second = std::thread::spawn(move || {
+            let marker = event_at("marker-1", ActivityState::Observed, 3);
+            let mut outcome = event_at("target", ActivityState::Outcome, 5);
+            outcome.outcome = Some(ActivityOutcome::Completed);
+            second_store
+                .append_from_snapshot(|log| {
+                    let mut rows = vec![marker];
+                    if !log.events().iter().any(|event| {
+                        event.activity_id == "target" && event.state == ActivityState::Outcome
+                    }) {
+                        rows.push(outcome);
+                    }
+                    rows
+                })
+                .unwrap();
+        });
+
+        first.join().unwrap();
+        second.join().unwrap();
         let events = store.read().unwrap().events().to_vec();
         assert_eq!(
             events
