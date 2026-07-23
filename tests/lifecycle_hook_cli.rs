@@ -1100,10 +1100,15 @@ fn prompt_payload(index: usize) -> Vec<u8> {
 
 #[cfg(unix)]
 fn run_permission_hook(home: &std::path::Path, input: &[u8]) -> Output {
+    let mut paths = vec![home.join("bin")];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let path = std::env::join_paths(paths).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_coding-brain"))
         .arg("--permission-hook")
         .env("HOME", home)
-        .env("PATH", home.join("bin"))
+        .env("PATH", path)
         .current_dir(home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1137,7 +1142,7 @@ fn write_brain_config(home: &std::path::Path) {
     let bin_dir = home.join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let curl = bin_dir.join("curl");
-    fs::write(&curl, format!("#!/bin/sh\nprintf '%s' '{body}'\n")).unwrap();
+    fs::write(&curl, format!("#!/usr/bin/env sh\nprintf '%s' '{body}'\n")).unwrap();
     fs::set_permissions(curl, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
@@ -1222,6 +1227,11 @@ fn permission_allow_is_suppressed_across_lifecycle_failure() {
     assert!(healthy_output.status.success());
     assert!(blocked_output.status.success());
     assert!(blocked_output.stdout.is_empty());
+    assert!(
+        !healthy_output.stdout.is_empty(),
+        "healthy permission hook wrote no response; stderr: {}",
+        String::from_utf8_lossy(&healthy_output.stderr)
+    );
     let response: serde_json::Value = serde_json::from_slice(&healthy_output.stdout).unwrap();
     assert_eq!(
         response["hookSpecificOutput"]["decision"]["behavior"],
