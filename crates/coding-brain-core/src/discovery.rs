@@ -1002,6 +1002,25 @@ mod tests {
     }
 
     #[test]
+    fn background_claude_attach_evidence_is_projected_explicitly() {
+        let entry = claude::ClaudeInventoryEntry {
+            provider: AgentProvider::Claude,
+            session_id: Some("session-uuid".into()),
+            attach_id: Some("agent-42".into()),
+            cwd: PathBuf::from("/work/claude"),
+            pid: None,
+            started_at: Some(1),
+            status: None,
+        };
+
+        let sessions = claude::sessions_from_inventory(&[entry], false, true, &[]);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "session-uuid");
+        assert_eq!(sessions[0].native_attach_id.as_deref(), Some("agent-42"));
+    }
+
+    #[test]
     fn rejects_malformed_and_oversized_claude_inventory() {
         assert!(claude::parse_inventory(b"not json").is_err());
         let oversized = vec![b' '; claude::MAX_INVENTORY_BYTES + 1];

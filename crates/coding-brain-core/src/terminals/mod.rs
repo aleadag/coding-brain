@@ -12,13 +12,19 @@ mod warp;
 mod wezterm;
 mod windows_terminal;
 
+use crate::provider::AgentProvider;
 use crate::session::{AgentSession, ApprovalEvidence, ApprovalObservation};
-use std::io::Read;
+#[cfg(unix)]
+use std::io::{self, Read};
 #[cfg(test)]
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::Stdio;
+use std::process::{Command, ExitStatus};
+#[cfg(any(unix, test))]
 use std::time::Duration;
 
+#[cfg(unix)]
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 const CAPTURE_LINES: usize = 80;
@@ -36,101 +42,208 @@ pub struct PaneCapture {
     pub text: String,
 }
 
-struct CapturedStream {
-    bytes: Vec<u8>,
-    oversized: bool,
+#[derive(Clone, PartialEq, Eq)]
+pub enum TerminalSessionAction {
+    Allow,
+    Deny,
+    Continue,
+    Text(String),
 }
 
-fn drain_bounded(mut stream: impl Read) -> Result<CapturedStream, ()> {
-    let mut bytes = Vec::new();
-    let mut oversized = false;
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = stream.read(&mut buffer).map_err(|_| ())?;
-        if read == 0 {
-            break;
+impl std::fmt::Debug for TerminalSessionAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Allow => formatter.write_str("Allow"),
+            Self::Deny => formatter.write_str("Deny"),
+            Self::Continue => formatter.write_str("Continue"),
+            Self::Text(text) => formatter
+                .debug_tuple("Text")
+                .field(&format_args!("<redacted:{} bytes>", text.len()))
+                .finish(),
         }
-        let remaining = MAX_CAPTURE_BYTES.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
-        oversized |= read > remaining;
     }
-    Ok(CapturedStream { bytes, oversized })
 }
 
-fn kill_and_reap(child: &mut std::process::Child) {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptEvidence {
+    pub provider: AgentProvider,
+    pub action: TerminalSessionAction,
+    pub backend: Terminal,
+    pub target: String,
+    pub pattern_version: u16,
+    pub fingerprint: u64,
+    pub tool_use_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalActionOutcome {
+    pub action: TerminalSessionAction,
+    pub backend: Terminal,
+    pub target: String,
+    pub prompt_cleared: bool,
+}
+
+trait GuardedTerminalBackend {
+    fn resolve_exact_target(&self, session: &AgentSession) -> Result<String, String>;
+    fn capture(&self, target: &str) -> Result<PaneCapture, String>;
+    fn send_literal(&self, target: &str, text: &str) -> Result<(), String>;
+    fn send_keys(&self, target: &str, keys: &[&str]) -> Result<(), String>;
+}
+
+struct TmuxGuardedBackend;
+
+impl GuardedTerminalBackend for TmuxGuardedBackend {
+    fn resolve_exact_target(&self, session: &AgentSession) -> Result<String, String> {
+        tmux::resolve_exact_target(session)
+    }
+
+    fn capture(&self, target: &str) -> Result<PaneCapture, String> {
+        tmux::capture_target(target)
+    }
+
+    fn send_literal(&self, target: &str, text: &str) -> Result<(), String> {
+        tmux::send_literal(target, text)
+    }
+
+    fn send_keys(&self, target: &str, keys: &[&str]) -> Result<(), String> {
+        tmux::send_keys(target, keys)
+    }
+}
+
+#[cfg(unix)]
+fn terminate_process_group(process_group: u32) {
+    if let Ok(process_group) = i32::try_from(process_group) {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminate_and_reap(child: &mut std::process::Child) {
+    terminate_process_group(child.id());
     let _ = child.kill();
     let _ = child.wait();
 }
 
-fn receive_stream(
-    receiver: &std::sync::mpsc::Receiver<Result<CapturedStream, ()>>,
-    started: std::time::Instant,
-    label: &str,
-) -> Result<CapturedStream, String> {
-    let remaining = CAPTURE_TIMEOUT.saturating_sub(started.elapsed());
-    if remaining.is_zero() {
-        return Err("terminal capture timed out".into());
+#[cfg(unix)]
+fn set_nonblocking(stream: &(impl std::os::fd::AsRawFd + ?Sized)) -> io::Result<()> {
+    let fd = stream.as_raw_fd();
+    // SAFETY: `fd` belongs to a live child pipe; `fcntl` only reads and updates
+    // that descriptor's file status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
     }
-    receiver
-        .recv_timeout(remaining)
-        .map_err(|error| match error {
-            std::sync::mpsc::RecvTimeoutError::Timeout => "terminal capture timed out".into(),
-            std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                format!("terminal capture {label} reader failed")
-            }
-        })?
-        .map_err(|_| format!("terminal capture {label} read failed"))
+    // SAFETY: `fd` is still owned by the live pipe and `flags` came from it.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
+#[cfg(unix)]
+fn read_available(
+    stream: &mut impl Read,
+    bytes: &mut Vec<u8>,
+    label: &str,
+) -> Result<bool, String> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(read) => {
+                let remaining = MAX_CAPTURE_BYTES.saturating_sub(bytes.len());
+                if read > remaining {
+                    return Err("terminal capture exceeded 64 KiB".into());
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(format!("terminal capture {label} read failed")),
+        }
+    }
+}
+
+#[cfg(unix)]
 pub(crate) fn run_bounded(command: &mut Command) -> Result<BoundedOutput, String> {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("terminal capture command failed: {error}"))?;
-    let Some(stdout) = child.stdout.take() else {
-        kill_and_reap(&mut child);
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_and_reap(&mut child);
         return Err("terminal capture stdout unavailable".into());
     };
-    let Some(stderr) = child.stderr.take() else {
-        kill_and_reap(&mut child);
+    let Some(mut stderr) = child.stderr.take() else {
+        terminate_and_reap(&mut child);
         return Err("terminal capture stderr unavailable".into());
     };
-    let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1);
-    let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = stdout_tx.send(drain_bounded(stdout));
-    });
-    std::thread::spawn(move || {
-        let _ = stderr_tx.send(drain_bounded(stderr));
-    });
+    if set_nonblocking(&stdout).is_err() || set_nonblocking(&stderr).is_err() {
+        terminate_and_reap(&mut child);
+        drop(stdout);
+        drop(stderr);
+        return Err("terminal capture pipe configuration failed".into());
+    }
+    let deadline = std::time::Instant::now() + CAPTURE_TIMEOUT;
+    let mut status = None;
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
 
-    let started = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Err(error) => {
-                kill_and_reap(&mut child);
-                return Err(format!("terminal capture wait failed: {error}"));
+    loop {
+        let read_result = (|| {
+            if stdout_open {
+                stdout_open = !read_available(&mut stdout, &mut stdout_bytes, "stdout")?;
             }
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < CAPTURE_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(5));
+            if stderr_open {
+                stderr_open = !read_available(&mut stderr, &mut stderr_bytes, "stderr")?;
             }
-            Ok(None) => {
-                kill_and_reap(&mut child);
-                return Err("terminal capture timed out".into());
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = read_result {
+            terminate_and_reap(&mut child);
+            drop(stdout);
+            drop(stderr);
+            return Err(error);
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(child_status) => status = child_status,
+                Err(error) => {
+                    terminate_and_reap(&mut child);
+                    drop(stdout);
+                    drop(stderr);
+                    return Err(format!("terminal capture wait failed: {error}"));
+                }
             }
         }
-    };
-    let stdout = receive_stream(&stdout_rx, started, "stdout")?;
-    let stderr = receive_stream(&stderr_rx, started, "stderr")?;
-    if stdout.oversized || stderr.oversized {
-        return Err("terminal capture exceeded 64 KiB".into());
+        if let Some(status) = status.filter(|_| !stdout_open && !stderr_open) {
+            terminate_process_group(child.id());
+            return Ok(BoundedOutput {
+                status,
+                stdout: stdout_bytes,
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            terminate_and_reap(&mut child);
+            drop(stdout);
+            drop(stderr);
+            return Err("terminal capture timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
-    Ok(BoundedOutput {
-        status,
-        stdout: stdout.bytes,
-    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn run_bounded(_command: &mut Command) -> Result<BoundedOutput, String> {
+    Err("guarded terminal capture is unsupported on this platform".into())
 }
 
 pub(crate) fn checked_capture(
@@ -1223,6 +1336,12 @@ pub fn switch_to_terminal(session: &AgentSession) -> Result<(), String> {
     }
 }
 
+/// Focuses only a terminal pane bound to the session's complete live process identity.
+pub fn focus_exact_terminal(session: &AgentSession) -> Result<(), String> {
+    let target = TmuxGuardedBackend.resolve_exact_target(session)?;
+    tmux::focus_target(&target)
+}
+
 #[allow(dead_code)]
 pub(crate) fn send_input(session: &AgentSession, text: &str) -> Result<(), String> {
     match detect_terminal() {
@@ -1502,6 +1621,431 @@ fn match_approval_prompt(
     })
 }
 
+const CLAUDE_RECOVERY_PATTERN_VERSION: u16 = 1;
+const ANTIGRAVITY_PERMISSION_PATTERN_VERSION: u16 = 1;
+const ANTIGRAVITY_RECOVERY_PATTERN_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedProviderPrompt {
+    pattern_version: u16,
+    block: String,
+    tool_use_id: Option<String>,
+    has_trailing_text: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LatestProviderPrompt {
+    Absent,
+    Incomplete,
+    Complete(ParsedProviderPrompt),
+}
+
+#[derive(Debug)]
+struct PromptLine {
+    exact: String,
+    lower: String,
+}
+
+fn prompt_lines(text: &str) -> Vec<PromptLine> {
+    let cleaned = strip_ansi(text);
+    cleaned
+        .lines()
+        .map(normalize_whitespace)
+        .filter(|line| !line.is_empty())
+        .map(|exact| PromptLine {
+            lower: exact.to_ascii_lowercase(),
+            exact,
+        })
+        .collect()
+}
+
+fn latest_question(lines: &[PromptLine], question: &str) -> Option<usize> {
+    lines.iter().rposition(|line| line.lower == question)
+}
+
+fn has_prompt_remnants(
+    lines: &[PromptLine],
+    provider: AgentProvider,
+    action: &TerminalSessionAction,
+) -> bool {
+    lines.iter().any(|line| match (provider, action) {
+        (AgentProvider::Claude, TerminalSessionAction::Continue) => {
+            matches!(
+                line.lower.as_str(),
+                "1. continue" | "2. stop" | "press enter to confirm"
+            ) || (line.lower.contains("claude")
+                && (line.lower.contains("stopped") || line.lower.contains("completing the task")))
+        }
+        (
+            AgentProvider::Antigravity,
+            TerminalSessionAction::Allow | TerminalSessionAction::Deny,
+        ) => {
+            line.lower.starts_with("tool use id:")
+                || line.lower.starts_with("request id:")
+                || matches!(
+                    line.lower.as_str(),
+                    "1. allow" | "2. deny" | "press enter to confirm"
+                )
+                || (line.lower.contains("antigravity")
+                    && (line.lower.contains("run a tool") || line.lower.contains("permission")))
+        }
+        (AgentProvider::Antigravity, TerminalSessionAction::Continue) => {
+            matches!(
+                line.lower.as_str(),
+                "1. continue" | "2. stop" | "press enter to confirm"
+            ) || (line.lower.contains("antigravity")
+                && (line.lower.contains("stopped") || line.lower.contains("completing the task")))
+        }
+        _ => false,
+    })
+}
+
+fn exact_fixed_prompt(
+    lines: &[PromptLine],
+    start: usize,
+    pattern_version: u16,
+    expected: &[&str],
+) -> LatestProviderPrompt {
+    let Some(candidate) = lines.get(start..start.saturating_add(expected.len())) else {
+        return LatestProviderPrompt::Incomplete;
+    };
+    if !candidate
+        .iter()
+        .zip(expected)
+        .all(|(line, expected)| line.lower == *expected)
+    {
+        return LatestProviderPrompt::Incomplete;
+    }
+    LatestProviderPrompt::Complete(ParsedProviderPrompt {
+        pattern_version,
+        block: candidate
+            .iter()
+            .map(|line| line.lower.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        tool_use_id: None,
+        has_trailing_text: lines.len() != start + expected.len(),
+    })
+}
+
+fn latest_claude_prompt(text: &str, action: &TerminalSessionAction) -> LatestProviderPrompt {
+    let lines = prompt_lines(text);
+    let expected = match action {
+        TerminalSessionAction::Continue => [
+            "claude stopped before completing the task.",
+            "1. continue",
+            "2. stop",
+            "press enter to confirm",
+        ],
+        _ => return LatestProviderPrompt::Absent,
+    };
+    let Some(start) = latest_question(&lines, expected[0]) else {
+        return if has_prompt_remnants(&lines, AgentProvider::Claude, action) {
+            LatestProviderPrompt::Incomplete
+        } else {
+            LatestProviderPrompt::Absent
+        };
+    };
+    exact_fixed_prompt(&lines, start, CLAUDE_RECOVERY_PATTERN_VERSION, &expected)
+}
+
+fn latest_antigravity_prompt(text: &str, action: &TerminalSessionAction) -> LatestProviderPrompt {
+    let lines = prompt_lines(text);
+    match action {
+        TerminalSessionAction::Allow | TerminalSessionAction::Deny => {
+            const QUESTION: &str = "antigravity wants to run a tool.";
+            let Some(start) = latest_question(&lines, QUESTION) else {
+                return if has_prompt_remnants(&lines, AgentProvider::Antigravity, action) {
+                    LatestProviderPrompt::Incomplete
+                } else {
+                    LatestProviderPrompt::Absent
+                };
+            };
+            let Some(candidate) = lines.get(start..start.saturating_add(5)) else {
+                return LatestProviderPrompt::Incomplete;
+            };
+            let tool_prefix = "tool use id:";
+            let tool_use_id = candidate[1]
+                .exact
+                .get(tool_prefix.len()..)
+                .map(str::trim)
+                .filter(|id| {
+                    candidate[1].lower.starts_with(tool_prefix)
+                        && !id.is_empty()
+                        && !id.chars().any(char::is_whitespace)
+                })
+                .map(str::to_owned);
+            if candidate[0].lower != QUESTION
+                || tool_use_id.is_none()
+                || candidate[2].lower != "1. allow"
+                || candidate[3].lower != "2. deny"
+                || candidate[4].lower != "press enter to confirm"
+            {
+                return LatestProviderPrompt::Incomplete;
+            }
+            LatestProviderPrompt::Complete(ParsedProviderPrompt {
+                pattern_version: ANTIGRAVITY_PERMISSION_PATTERN_VERSION,
+                block: candidate
+                    .iter()
+                    .map(|line| line.lower.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                tool_use_id,
+                has_trailing_text: lines.len() != start + candidate.len(),
+            })
+        }
+        TerminalSessionAction::Continue => {
+            const EXPECTED: [&str; 4] = [
+                "antigravity stopped before completing the task.",
+                "1. continue",
+                "2. stop",
+                "press enter to confirm",
+            ];
+            let Some(start) = latest_question(&lines, EXPECTED[0]) else {
+                return if has_prompt_remnants(&lines, AgentProvider::Antigravity, action) {
+                    LatestProviderPrompt::Incomplete
+                } else {
+                    LatestProviderPrompt::Absent
+                };
+            };
+            exact_fixed_prompt(
+                &lines,
+                start,
+                ANTIGRAVITY_RECOVERY_PATTERN_VERSION,
+                &EXPECTED,
+            )
+        }
+        TerminalSessionAction::Text(_) => LatestProviderPrompt::Absent,
+    }
+}
+
+fn recognized_provider_prompt(
+    candidate: LatestProviderPrompt,
+) -> Option<(u16, String, Option<String>)> {
+    let LatestProviderPrompt::Complete(prompt) = candidate else {
+        return None;
+    };
+    if prompt.has_trailing_text {
+        return None;
+    }
+    Some((prompt.pattern_version, prompt.block, prompt.tool_use_id))
+}
+
+fn match_semantic_prompt(
+    capture: &PaneCapture,
+    session: &AgentSession,
+    action: &TerminalSessionAction,
+) -> Option<PromptEvidence> {
+    let (pattern_version, block, tool_use_id) = match session.provider {
+        AgentProvider::Codex => {
+            let evidence = match_approval_prompt(capture, session)?;
+            if !matches!(
+                action,
+                TerminalSessionAction::Allow | TerminalSessionAction::Deny
+            ) {
+                return None;
+            }
+            (
+                evidence.prompt_pattern_version,
+                evidence.prompt_fingerprint.to_string(),
+                Some(evidence.call_id),
+            )
+        }
+        AgentProvider::Claude => {
+            recognized_provider_prompt(latest_claude_prompt(&capture.text, action))?
+        }
+        AgentProvider::Antigravity => {
+            recognized_provider_prompt(latest_antigravity_prompt(&capture.text, action))?
+        }
+    };
+    if session.provider == AgentProvider::Antigravity
+        && matches!(
+            action,
+            TerminalSessionAction::Allow | TerminalSessionAction::Deny
+        )
+    {
+        let current = tool_use_id.as_deref()?;
+        if session
+            .pending_tool_call_id
+            .as_deref()
+            .is_some_and(|pending| current != pending)
+        {
+            return None;
+        }
+    }
+    Some(PromptEvidence {
+        provider: session.provider,
+        action: action.clone(),
+        backend: capture.backend.clone(),
+        target: capture.target.clone(),
+        pattern_version,
+        fingerprint: if session.provider == AgentProvider::Codex {
+            block.parse().ok()?
+        } else {
+            fingerprint(&block)
+        },
+        tool_use_id,
+    })
+}
+
+fn post_prompt_advanced(
+    capture: &PaneCapture,
+    session: &AgentSession,
+    action: &TerminalSessionAction,
+    expected: &PromptEvidence,
+) -> bool {
+    let candidate = match session.provider {
+        AgentProvider::Codex => {
+            let question_present = prompt_lines(&capture.text).iter().any(|line| {
+                line.lower
+                    .contains("would you like to run the following command?")
+            });
+            return !question_present;
+        }
+        AgentProvider::Claude => latest_claude_prompt(&capture.text, action),
+        AgentProvider::Antigravity => latest_antigravity_prompt(&capture.text, action),
+    };
+    match candidate {
+        LatestProviderPrompt::Absent => true,
+        LatestProviderPrompt::Incomplete => false,
+        LatestProviderPrompt::Complete(prompt) if prompt.has_trailing_text => false,
+        LatestProviderPrompt::Complete(prompt) => expected
+            .tool_use_id
+            .as_deref()
+            .zip(prompt.tool_use_id.as_deref())
+            .is_some_and(|(previous, current)| previous != current),
+    }
+}
+
+fn semantic_keys(
+    provider: AgentProvider,
+    action: &TerminalSessionAction,
+) -> Option<&'static [&'static str]> {
+    match (provider, action) {
+        (AgentProvider::Codex, TerminalSessionAction::Allow) => Some(&["Enter"]),
+        (AgentProvider::Codex, TerminalSessionAction::Deny) => Some(&["3", "Enter"]),
+        (AgentProvider::Claude | AgentProvider::Antigravity, TerminalSessionAction::Allow) => {
+            Some(&["1", "Enter"])
+        }
+        (AgentProvider::Claude | AgentProvider::Antigravity, TerminalSessionAction::Deny) => {
+            Some(&["2", "Enter"])
+        }
+        (AgentProvider::Claude | AgentProvider::Antigravity, TerminalSessionAction::Continue) => {
+            Some(&["1", "Enter"])
+        }
+        _ => None,
+    }
+}
+
+fn validate_manual_text(text: &str) -> Result<(), String> {
+    if text.len() > 4096 {
+        return Err("manual text exceeds 4096 bytes".into());
+    }
+    if text.contains('\n') || text.contains('\r') {
+        return Err("manual text must be a single line".into());
+    }
+    if text.chars().any(|character| character.is_ascii_control()) {
+        return Err("manual text contains a control character".into());
+    }
+    Ok(())
+}
+
+fn checked_target_capture(
+    backend: &dyn GuardedTerminalBackend,
+    target: &str,
+) -> Result<PaneCapture, String> {
+    let capture = backend
+        .capture(target)
+        .map_err(|_| "guarded terminal capture failed".to_string())?;
+    if capture.target != target {
+        return Err("guarded terminal capture target changed".into());
+    }
+    if capture.text.len() > MAX_CAPTURE_BYTES || capture.text.lines().count() > CAPTURE_LINES {
+        return Err("guarded terminal capture exceeded bounds".into());
+    }
+    Ok(capture)
+}
+
+fn execute_guarded_action_with(
+    session: &AgentSession,
+    action: TerminalSessionAction,
+    backend: &dyn GuardedTerminalBackend,
+) -> Result<TerminalActionOutcome, String> {
+    if let TerminalSessionAction::Text(text) = &action {
+        validate_manual_text(text)?;
+    }
+    session.live_process_identity().ok_or_else(|| {
+        "guarded terminal action requires an exact live process identity".to_string()
+    })?;
+
+    let target = backend.resolve_exact_target(session)?;
+    let initial = checked_target_capture(backend, &target)?;
+
+    if let TerminalSessionAction::Text(text) = &action {
+        let baseline_fingerprint = fingerprint(&normalize_whitespace(&initial.text));
+        if backend.resolve_exact_target(session)? != target {
+            return Err("guarded terminal target changed; action cancelled".into());
+        }
+        backend
+            .send_literal(&target, text)
+            .map_err(|_| "guarded terminal literal send failed".to_string())?;
+        backend
+            .send_keys(&target, &["Enter"])
+            .map_err(|_| "guarded terminal key send failed".to_string())?;
+        let post = checked_target_capture(backend, &target)?;
+        if post.backend != initial.backend {
+            return Err("guarded terminal capture backend changed".into());
+        }
+        if fingerprint(&normalize_whitespace(&post.text)) == baseline_fingerprint {
+            return Err("terminal prompt did not advance after action".into());
+        }
+        return Ok(TerminalActionOutcome {
+            action: TerminalSessionAction::Text(String::new()),
+            backend: initial.backend,
+            target,
+            prompt_cleared: true,
+        });
+    }
+
+    let expected = match_semantic_prompt(&initial, session, &action)
+        .ok_or_else(|| "no recognized complete provider prompt for action".to_string())?;
+    if backend.resolve_exact_target(session)? != target {
+        return Err("guarded terminal target changed; action cancelled".into());
+    }
+    let recapture = checked_target_capture(backend, &target)?;
+    let current = match_semantic_prompt(&recapture, session, &action)
+        .ok_or_else(|| "provider prompt changed or disappeared".to_string())?;
+    if current != expected {
+        return Err("provider prompt changed; action cancelled".into());
+    }
+    let keys = semantic_keys(session.provider, &action)
+        .ok_or_else(|| "provider does not support this terminal action".to_string())?;
+    backend
+        .send_keys(&target, keys)
+        .map_err(|_| "guarded terminal key send failed".to_string())?;
+    let post = checked_target_capture(backend, &target)?;
+    if post.backend != initial.backend {
+        return Err("guarded terminal capture backend changed".into());
+    }
+    if !post_prompt_advanced(&post, session, &action, &expected) {
+        return Err("terminal prompt did not advance after action".into());
+    }
+
+    Ok(TerminalActionOutcome {
+        action,
+        backend: initial.backend,
+        target,
+        prompt_cleared: true,
+    })
+}
+
+pub fn execute_guarded_action(
+    session: &AgentSession,
+    action: TerminalSessionAction,
+) -> Result<TerminalActionOutcome, String> {
+    execute_guarded_action_with(session, action, &TmuxGuardedBackend)
+}
+
 fn refresh_approval_observation_with(
     io: &impl ApprovalIo,
     session: &mut AgentSession,
@@ -1636,6 +2180,483 @@ mod tests {
             self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct FakeGuardedBackend {
+        targets: std::sync::Mutex<VecDeque<Result<String, String>>>,
+        captures: std::sync::Mutex<VecDeque<Result<PaneCapture, String>>>,
+        literals: std::sync::Mutex<Vec<String>>,
+        keys: std::sync::Mutex<Vec<Vec<String>>>,
+        literal_error: Option<String>,
+        keys_error: Option<String>,
+    }
+
+    impl FakeGuardedBackend {
+        fn with_captures(captures: impl IntoIterator<Item = Result<PaneCapture, String>>) -> Self {
+            Self {
+                targets: std::sync::Mutex::new(
+                    [Ok("test-pane".into()), Ok("test-pane".into())]
+                        .into_iter()
+                        .collect(),
+                ),
+                captures: std::sync::Mutex::new(captures.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+
+        fn with_target_error(error: &str) -> Self {
+            Self {
+                targets: std::sync::Mutex::new([Err(error.into())].into_iter().collect()),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl GuardedTerminalBackend for FakeGuardedBackend {
+        fn resolve_exact_target(&self, _session: &AgentSession) -> Result<String, String> {
+            self.targets.lock().unwrap().pop_front().unwrap()
+        }
+
+        fn capture(&self, _target: &str) -> Result<PaneCapture, String> {
+            self.captures.lock().unwrap().pop_front().unwrap()
+        }
+
+        fn send_literal(&self, _target: &str, text: &str) -> Result<(), String> {
+            self.literals.lock().unwrap().push(text.into());
+            self.literal_error.clone().map_or(Ok(()), Err)
+        }
+
+        fn send_keys(&self, _target: &str, keys: &[&str]) -> Result<(), String> {
+            self.keys
+                .lock()
+                .unwrap()
+                .push(keys.iter().map(|key| (*key).into()).collect());
+            self.keys_error.clone().map_or(Ok(()), Err)
+        }
+    }
+
+    fn guarded_session(provider: crate::provider::AgentProvider) -> AgentSession {
+        let mut session = AgentSession::from_raw(RawAgentSession {
+            provider,
+            pid: 7,
+            process_start_identity: Some(99),
+            session_id: "session-7".into(),
+            cwd: "/repo".into(),
+            started_at: 0,
+        });
+        session.tty = "pts/7".into();
+        session.pending_tool_call_id = Some("tool-42".into());
+        session
+    }
+
+    fn guarded_capture(text: &str) -> PaneCapture {
+        PaneCapture {
+            backend: Terminal::Tmux,
+            target: "test-pane".into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn guarded_semantic_continue_requires_stable_prompt_and_post_action_advancement() {
+        let fixture = include_str!("../../../../tests/fixtures/claude-recovery-pane.txt");
+        let backend = FakeGuardedBackend::with_captures([
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture("Claude is working")),
+        ]);
+
+        let result = execute_guarded_action_with(
+            &guarded_session(crate::provider::AgentProvider::Claude),
+            TerminalSessionAction::Continue,
+            &backend,
+        )
+        .unwrap();
+
+        assert_eq!(result.action, TerminalSessionAction::Continue);
+        assert!(result.prompt_cleared);
+        assert_eq!(
+            backend.keys.lock().unwrap().as_slice(),
+            [vec!["1", "Enter"]]
+        );
+    }
+
+    #[test]
+    fn guarded_antigravity_allow_requires_matching_tool_identity() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
+        let changed = fixture.replace("tool-42", "tool-99");
+        let backend = FakeGuardedBackend::with_captures([
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(&changed)),
+        ]);
+
+        let error = execute_guarded_action_with(
+            &guarded_session(crate::provider::AgentProvider::Antigravity),
+            TerminalSessionAction::Allow,
+            &backend,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("prompt changed"));
+        assert!(backend.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn guarded_antigravity_permission_actions_send_only_fixed_semantic_keys() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
+        for (action, expected_keys) in [
+            (TerminalSessionAction::Allow, vec!["1", "Enter"]),
+            (TerminalSessionAction::Deny, vec!["2", "Enter"]),
+        ] {
+            let backend = FakeGuardedBackend::with_captures([
+                Ok(guarded_capture(fixture)),
+                Ok(guarded_capture(fixture)),
+                Ok(guarded_capture("Antigravity is working")),
+            ]);
+
+            let outcome = execute_guarded_action_with(
+                &guarded_session(crate::provider::AgentProvider::Antigravity),
+                action.clone(),
+                &backend,
+            )
+            .unwrap();
+
+            assert_eq!(outcome.action, action);
+            assert_eq!(backend.keys.lock().unwrap().as_slice(), [expected_keys]);
+            assert!(backend.literals.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn guarded_automatic_action_rejects_unknown_or_incomplete_prompt() {
+        for text in [
+            "unknown terminal contents",
+            "Antigravity wants to run a tool.\n  1. Allow\n",
+        ] {
+            let backend = FakeGuardedBackend::with_captures([Ok(guarded_capture(text))]);
+            let error = execute_guarded_action_with(
+                &guarded_session(crate::provider::AgentProvider::Antigravity),
+                TerminalSessionAction::Deny,
+                &backend,
+            )
+            .unwrap_err();
+            assert!(error.contains("recognized"));
+            assert!(backend.keys.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn guarded_automatic_action_rejects_backend_capture_beyond_bounds() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
+        for pane in [
+            format!("{}\n{fixture}", "x".repeat(MAX_CAPTURE_BYTES)),
+            format!("{}\n{fixture}", "log\n".repeat(CAPTURE_LINES)),
+        ] {
+            let backend = FakeGuardedBackend::with_captures([
+                Ok(guarded_capture(&pane)),
+                Ok(guarded_capture(&pane)),
+                Ok(guarded_capture("Antigravity is working")),
+            ]);
+
+            let result = execute_guarded_action_with(
+                &guarded_session(crate::provider::AgentProvider::Antigravity),
+                TerminalSessionAction::Allow,
+                &backend,
+            );
+
+            assert!(result.is_err());
+            assert!(backend.keys.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn guarded_newer_incomplete_provider_prompt_blocks_older_complete_prompt() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
+        let pane = format!("{fixture}\n\nAntigravity wants to run a tool.\nTool use ID: tool-99\n");
+        let backend = FakeGuardedBackend::with_captures([Ok(guarded_capture(&pane))]);
+
+        let error = execute_guarded_action_with(
+            &guarded_session(crate::provider::AgentProvider::Antigravity),
+            TerminalSessionAction::Allow,
+            &backend,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("recognized"));
+        assert!(backend.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn guarded_prompt_grammar_rejects_logged_quoted_out_of_order_and_stale_text() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
+        let invalid = [
+            fixture.replacen(
+                "Antigravity wants to run a tool.",
+                "log: Antigravity wants to run a tool.",
+                1,
+            ),
+            fixture.replacen(
+                "Antigravity wants to run a tool.",
+                "\"Antigravity wants to run a tool.\"",
+                1,
+            ),
+            fixture.replace("  1. Allow\n  2. Deny", "  2. Deny\n  1. Allow"),
+            format!("{fixture}\nterminal log: prior prompt copied"),
+            fixture
+                .lines()
+                .map(|line| format!("│{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ];
+        for pane in invalid {
+            let backend = FakeGuardedBackend::with_captures([
+                Ok(guarded_capture(&pane)),
+                Ok(guarded_capture(&pane)),
+                Ok(guarded_capture("Antigravity is working")),
+            ]);
+
+            let result = execute_guarded_action_with(
+                &guarded_session(crate::provider::AgentProvider::Antigravity),
+                TerminalSessionAction::Allow,
+                &backend,
+            );
+
+            assert!(result.is_err(), "invalid prompt authorized: {pane:?}");
+            assert!(backend.keys.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn guarded_antigravity_permission_requires_nonempty_exact_tool_identity() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt")
+            .replace("Tool use ID: tool-42", "Tool use ID:");
+        for pending_tool_call_id in [Some("tool-42".to_string()), None] {
+            let mut session = guarded_session(crate::provider::AgentProvider::Antigravity);
+            session.pending_tool_call_id = pending_tool_call_id;
+            let backend = FakeGuardedBackend::with_captures([
+                Ok(guarded_capture(&fixture)),
+                Ok(guarded_capture(&fixture)),
+                Ok(guarded_capture("Antigravity is working")),
+            ]);
+
+            let result =
+                execute_guarded_action_with(&session, TerminalSessionAction::Allow, &backend);
+
+            assert!(result.is_err());
+            assert!(backend.keys.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn guarded_antigravity_recovery_does_not_invent_tool_identity() {
+        let capture = guarded_capture(include_str!(
+            "../../../../tests/fixtures/antigravity-recovery-pane.txt"
+        ));
+
+        let evidence = match_semantic_prompt(
+            &capture,
+            &guarded_session(crate::provider::AgentProvider::Antigravity),
+            &TerminalSessionAction::Continue,
+        )
+        .unwrap();
+
+        assert_eq!(evidence.tool_use_id, None);
+    }
+
+    #[test]
+    fn guarded_ambiguous_or_expired_target_never_sends_input() {
+        for error in [
+            "multiple tmux panes matched the live process",
+            "process start identity changed",
+        ] {
+            let backend = FakeGuardedBackend::with_target_error(error);
+            let result = execute_guarded_action_with(
+                &guarded_session(crate::provider::AgentProvider::Antigravity),
+                TerminalSessionAction::Continue,
+                &backend,
+            );
+            assert!(result.is_err());
+            assert!(backend.keys.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn guarded_unchanged_post_action_prompt_is_not_success() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-recovery-pane.txt");
+        let backend = FakeGuardedBackend::with_captures([
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(fixture)),
+        ]);
+
+        let error = execute_guarded_action_with(
+            &guarded_session(crate::provider::AgentProvider::Antigravity),
+            TerminalSessionAction::Continue,
+            &backend,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("did not advance"));
+    }
+
+    #[test]
+    fn guarded_postverify_rejects_original_prompt_with_noise_or_newer_incomplete_candidate() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
+        for post in [
+            format!("{fixture}\nterminal log: incidental output"),
+            format!("{fixture}\n\nAntigravity wants to run a tool.\nTool use ID: tool-99\n"),
+        ] {
+            let backend = FakeGuardedBackend::with_captures([
+                Ok(guarded_capture(fixture)),
+                Ok(guarded_capture(fixture)),
+                Ok(guarded_capture(&post)),
+            ]);
+
+            let error = execute_guarded_action_with(
+                &guarded_session(crate::provider::AgentProvider::Antigravity),
+                TerminalSessionAction::Allow,
+                &backend,
+            )
+            .unwrap_err();
+
+            assert!(error.contains("did not advance"));
+        }
+    }
+
+    #[test]
+    fn guarded_postverify_rejects_prompt_with_mutated_question_anchor() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
+        for post in [
+            fixture.replace(
+                "Antigravity wants to run a tool.",
+                "Antigravity wants to run a tool!",
+            ),
+            fixture.replace(
+                "Antigravity wants to run a tool.",
+                "Antigravity requests permission to run a tool.",
+            ),
+        ] {
+            let backend = FakeGuardedBackend::with_captures([
+                Ok(guarded_capture(fixture)),
+                Ok(guarded_capture(fixture)),
+                Ok(guarded_capture(&post)),
+            ]);
+
+            let error = execute_guarded_action_with(
+                &guarded_session(crate::provider::AgentProvider::Antigravity),
+                TerminalSessionAction::Allow,
+                &backend,
+            )
+            .unwrap_err();
+
+            assert!(error.contains("did not advance"), "post capture: {post:?}");
+        }
+    }
+
+    #[test]
+    fn guarded_postverify_accepts_only_a_distinct_complete_tool_prompt_identity() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
+        let next = fixture.replace("tool-42", "tool-99");
+        let backend = FakeGuardedBackend::with_captures([
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(fixture)),
+            Ok(guarded_capture(&next)),
+        ]);
+
+        let outcome = execute_guarded_action_with(
+            &guarded_session(crate::provider::AgentProvider::Antigravity),
+            TerminalSessionAction::Allow,
+            &backend,
+        )
+        .unwrap();
+
+        assert!(outcome.prompt_cleared);
+    }
+
+    #[test]
+    fn guarded_manual_text_is_literal_redacted_and_requires_post_advancement() {
+        let secret = "C-c secret-token-42";
+        let backend = FakeGuardedBackend::with_captures([
+            Ok(guarded_capture("arbitrary unrecognized prompt")),
+            Ok(guarded_capture("agent resumed")),
+        ]);
+
+        let outcome = execute_guarded_action_with(
+            &guarded_session(crate::provider::AgentProvider::Claude),
+            TerminalSessionAction::Text(secret.into()),
+            &backend,
+        )
+        .unwrap();
+
+        assert_eq!(backend.literals.lock().unwrap().as_slice(), [secret]);
+        assert_eq!(backend.keys.lock().unwrap().as_slice(), [vec!["Enter"]]);
+        assert_eq!(outcome.action, TerminalSessionAction::Text(String::new()));
+        assert!(!format!("{outcome:?}").contains(secret));
+    }
+
+    #[test]
+    fn guarded_manual_text_rejects_multiline_control_and_oversized_input() {
+        for text in [
+            "line one\nline two".to_string(),
+            "contains\u{7f}control".to_string(),
+            "x".repeat(4097),
+        ] {
+            let backend = FakeGuardedBackend::default();
+            let error = execute_guarded_action_with(
+                &guarded_session(crate::provider::AgentProvider::Claude),
+                TerminalSessionAction::Text(text),
+                &backend,
+            )
+            .unwrap_err();
+            assert!(error.contains("manual text"));
+            assert!(backend.literals.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn guarded_manual_text_is_absent_from_send_errors() {
+        let secret = "secret-token-42";
+        let backend = FakeGuardedBackend {
+            targets: std::sync::Mutex::new(
+                [Ok("test-pane".into()), Ok("test-pane".into())]
+                    .into_iter()
+                    .collect(),
+            ),
+            captures: std::sync::Mutex::new([Ok(guarded_capture("prompt"))].into_iter().collect()),
+            literal_error: Some(format!("failed to send {secret}")),
+            ..FakeGuardedBackend::default()
+        };
+
+        let error = execute_guarded_action_with(
+            &guarded_session(crate::provider::AgentProvider::Claude),
+            TerminalSessionAction::Text(secret.into()),
+            &backend,
+        )
+        .unwrap_err();
+
+        assert!(!error.contains(secret));
+    }
+
+    #[test]
+    fn guarded_manual_text_rejects_changed_capture_backend() {
+        let backend = FakeGuardedBackend::with_captures([
+            Ok(guarded_capture("prompt")),
+            Ok(PaneCapture {
+                backend: Terminal::Kitty,
+                target: "test-pane".into(),
+                text: "advanced".into(),
+            }),
+        ]);
+
+        let error = execute_guarded_action_with(
+            &guarded_session(crate::provider::AgentProvider::Claude),
+            TerminalSessionAction::Text("continue".into()),
+            &backend,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("backend changed"));
     }
 
     #[test]
@@ -1909,6 +2930,137 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(error.contains("exceeded 64 KiB"));
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn assert_descendant_cleaned(pid_file: &std::path::Path) {
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while process_exists(pid) && started.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let was_cleaned = !process_exists(pid);
+        if !was_cleaned {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            was_cleaned,
+            "descendant {pid} survived bounded command cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_bounded_timeout_cleans_descendant_process_group_before_return() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("timeout-child.pid");
+        let error = run_bounded(Command::new("sh").args([
+            "-c",
+            "sleep 30 & child=$!; printf '%s' \"$child\" > \"$1\"; wait",
+            "sh",
+            pid_file.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert_descendant_cleaned(&pid_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_bounded_reader_timeout_cleans_pipe_holding_descendant_before_return() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("reader-child.pid");
+        let error = run_bounded(Command::new("sh").args([
+            "-c",
+            "sleep 30 & child=$!; printf '%s' \"$child\" > \"$1\"; exit 0",
+            "sh",
+            pid_file.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert_descendant_cleaned(&pid_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_bounded_oversize_cleans_detached_descendant_before_return() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("oversize-child.pid");
+        let error = run_bounded(Command::new("sh").args([
+            "-c",
+            "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s' \"$child\" > \"$1\"; i=0; while [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done",
+            "sh",
+            pid_file.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+
+        assert!(error.contains("exceeded 64 KiB"));
+        assert_descendant_cleaned(&pid_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_bounded_sets_id_descendant_cannot_hold_output_readers_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("setsid-child.pid");
+        let helper = std::env::current_exe().unwrap();
+        let helper_test = "terminals::tests::guarded_bounded_sets_id_output_holder_helper";
+        let started = std::time::Instant::now();
+        let error = run_bounded(
+            Command::new("sh")
+                .args([
+                    "-c",
+                    "\"$1\" --ignored --exact \"$2\" --nocapture & wait",
+                    "fixture",
+                ])
+                .arg(helper)
+                .arg(helper_test)
+                .env("CODING_BRAIN_SETSID_OUTPUT_PID", &pid_file),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_descendant_cleaned(&pid_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper selected explicitly by setsid regression"]
+    fn guarded_bounded_sets_id_output_holder_helper() {
+        use std::io::Write;
+
+        let Some(pid_file) = std::env::var_os("CODING_BRAIN_SETSID_OUTPUT_PID") else {
+            return;
+        };
+        assert_ne!(unsafe { libc::setsid() }, -1);
+        std::fs::write(pid_file, std::process::id().to_string()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        let mut stdout = stdout.lock();
+        let mut stderr = stderr.lock();
+        while std::time::Instant::now() < deadline {
+            if stdout.write_all(b"x").is_err()
+                || stdout.flush().is_err()
+                || stderr.write_all(b"y").is_err()
+                || stderr.flush().is_err()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]

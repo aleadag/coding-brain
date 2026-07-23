@@ -1,0 +1,7 @@
+Antigravity wants to run a tool.
+Tool use ID: tool-42
+
+  1. Allow
+  2. Deny
+
+Press Enter to confirm

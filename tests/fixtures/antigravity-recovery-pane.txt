@@ -1,0 +1,6 @@
+Antigravity stopped before completing the task.
+
+  1. Continue
+  2. Stop
+
+Press Enter to confirm

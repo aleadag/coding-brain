@@ -22,7 +22,7 @@ fn fake_agent_deck_resolves_attaches_and_restores_terminal() {
             r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
 if [ "$1" = "list" ]; then
-  printf '%s' '[{{"id":"deck-1","title":"project","path":"/work/project","future":true}}]'
+  printf '%s' '[{{"id":"deck-1","title":"project","path":"/work/project","tool":"codex","future":true}},{{"id":"deck-1","title":"project","path":"/work/project","tool":"claude"}}]'
   exit 0
 fi
 if [ "$1" = "session" ] && [ "$2" = "attach" ] && [ "$3" = "deck-1" ]; then

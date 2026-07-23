@@ -1392,6 +1392,7 @@ mod tests {
             process_start_identity: None,
             process_backed: true,
             session_id: "test-session".into(),
+            native_attach_id: None,
             cwd: "/tmp".into(),
             project_name: "test-proj".into(),
             started_at: 0,

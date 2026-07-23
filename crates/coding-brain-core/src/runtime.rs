@@ -286,6 +286,8 @@ pub enum NavigationError {
     OutputTooLarge { limit: usize },
     Malformed(String),
     MissingIdentity { index: usize, field: &'static str },
+    IdentityProjectionFailed(String),
+    DiscoveryFailed(String),
     NoMatch,
     Ambiguous { matches: usize },
 }
@@ -302,6 +304,12 @@ impl std::fmt::Display for NavigationError {
             Self::Malformed(detail) => write!(formatter, "invalid Agent Deck JSON: {detail}"),
             Self::MissingIdentity { index, field } => {
                 write!(formatter, "Agent Deck session {index} is missing {field}")
+            }
+            Self::IdentityProjectionFailed(detail) => {
+                write!(formatter, "session identity projection failed: {detail}")
+            }
+            Self::DiscoveryFailed(detail) => {
+                write!(formatter, "provider session discovery failed: {detail}")
             }
             Self::NoMatch => formatter.write_str("no matching Agent Deck session"),
             Self::Ambiguous { matches } => {

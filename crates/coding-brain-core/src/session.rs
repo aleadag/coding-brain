@@ -132,6 +132,8 @@ pub struct AgentSession {
     pub process_backed: bool,
     #[allow(dead_code)]
     pub session_id: String,
+    /// Provider-native attachment evidence, when discovery supplies it.
+    pub native_attach_id: Option<String>,
     pub cwd: String,
     pub project_name: String,
     pub started_at: u64,
@@ -352,6 +354,7 @@ impl AgentSession {
             process_start_identity: raw.process_start_identity,
             process_backed: true,
             session_id: raw.session_id,
+            native_attach_id: None,
             cwd: raw.cwd,
             project_name,
             started_at: raw.started_at,

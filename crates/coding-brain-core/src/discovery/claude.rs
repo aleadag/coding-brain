@@ -446,6 +446,7 @@ pub(crate) fn sessions_from_inventory(
                 .unwrap_or_default(),
         });
         session.process_backed = process.is_some();
+        session.native_attach_id = entry.attach_id.clone();
         session.status = entry
             .status
             .as_deref()
