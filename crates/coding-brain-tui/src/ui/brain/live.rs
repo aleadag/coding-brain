@@ -13,18 +13,61 @@ use ratatui::widgets::{
 
 use crate::brain_app::BrainApp;
 
+const WIDE_BREAKPOINT: u16 = 120;
+const MAX_NARROW_EVIDENCE_HEIGHT: u16 = 12;
+const MIN_LIST_HEIGHT: u16 = 3;
+
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
-    let areas = Layout::default()
+    if area.width >= WIDE_BREAKPOINT {
+        render_wide(frame, area, app);
+    } else {
+        render_narrow(frame, area, app);
+    }
+}
+
+fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
+        .split(area);
+    let lists = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(columns[0]);
+    render_attention(frame, lists[0], app);
+    render_recent(frame, lists[1], app);
+    render_evidence(frame, columns[1], app);
+}
+
+fn render_narrow(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
+    let evidence_height = evidence_height(app, area.width)
+        .min(MAX_NARROW_EVIDENCE_HEIGHT)
+        .min(area.height.saturating_sub(MIN_LIST_HEIGHT * 2));
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(38),
-            Constraint::Percentage(25),
-            Constraint::Min(7),
+            Constraint::Min(MIN_LIST_HEIGHT * 2),
+            Constraint::Length(evidence_height),
         ])
         .split(area);
-    render_attention(frame, areas[0], app);
-    render_recent(frame, areas[1], app);
-    render_detail(frame, areas[2], app);
+    let lists = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(rows[0]);
+    render_attention(frame, lists[0], app);
+    render_recent(frame, lists[1], app);
+    render_evidence(frame, rows[1], app);
+}
+
+fn evidence_height(app: &BrainApp, width: u16) -> u16 {
+    let inner_width = usize::from(width.saturating_sub(2).max(1));
+    let content_height = app.selected_live_activity().map_or(1, |item| {
+        evidence_lines(item)
+            .iter()
+            .map(|line| line.width().max(1).div_ceil(inner_width))
+            .sum()
+    });
+    content_height.saturating_add(2).min(usize::from(u16::MAX)) as u16
 }
 
 fn render_attention(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
@@ -76,8 +119,8 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
         .highlight_symbol("> ")
         .highlight_spacing(HighlightSpacing::Always);
     let mut state = ListState::default();
-    if !snapshot.attention.is_empty() && app.selection() < snapshot.attention.len() {
-        state.select(Some(app.selection()));
+    if let Some(index) = app.selected_attention_index() {
+        state.select(Some(index));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -111,21 +154,13 @@ fn render_recent(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
         .highlight_symbol("> ")
         .highlight_spacing(HighlightSpacing::Always);
     let mut state = ListState::default();
-    if app.selection() >= snapshot.attention.len() && !snapshot.recent.is_empty() {
-        state.select(Some(app.selection() - snapshot.attention.len()));
+    if let Some(index) = app.selected_recent_index() {
+        state.select(Some(index));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
-    let Some(item) = app.selected_live_activity() else {
-        frame.render_widget(
-            Paragraph::new("Select an activity to inspect its evidence")
-                .block(Block::default().title(" Decision ").borders(Borders::ALL)),
-            area,
-        );
-        return;
-    };
+fn evidence_lines(item: &ActivityItem) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -148,12 +183,21 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
     if let Some(note) = &item.note {
         lines.push(Line::raw(format!("Note: {note}")));
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().title(" Decision ").borders(Borders::ALL)),
-        area,
-    );
+    lines
+}
+
+fn evidence_paragraph(app: &BrainApp) -> Paragraph<'static> {
+    let lines = match app.selected_live_activity() {
+        Some(item) => evidence_lines(item),
+        None => vec![Line::raw("Select an activity to inspect its evidence")],
+    };
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(Block::default().title(" Evidence ").borders(Borders::ALL))
+}
+
+fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
+    frame.render_widget(evidence_paragraph(app), area);
 }
 
 fn provider_label(item: &ActivityItem) -> &'static str {

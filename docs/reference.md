@@ -13,7 +13,9 @@ coding-brain --headless --json
 
 The default command opens the Live, Review, and Scorecard TUI. `--headless` keeps evaluation and context-rot prevention active without taking over a terminal; activity remains visible to a Brain TUI running elsewhere.
 
-Live navigation is intentionally narrow: Enter switches to the exact source of the selected activity. Coding Brain may use provider-qualified Agent Deck navigation, native `claude attach` for an exact background identity, or terminal focus. It does not expose a session list, terminate sessions, route work, or spawn workers.
+Live navigation is intentionally narrow: `j`/`k` and the arrow keys move within the selected Needs Attention or Recent list, while `J`/`K` switches lists and restores each list's last valid selection. Enter switches to the exact source of the selected activity. Coding Brain may use provider-qualified Agent Deck navigation, native `claude attach` for an exact background identity, or terminal focus. It does not expose a session list, terminate sessions, route work, or spawn workers.
+
+At 120 columns and wider, Live keeps the selected activity's Evidence beside the stacked lists. Narrower terminals keep all three panes vertical and bound Evidence to its content, up to 12 rows.
 
 Press `x` in Live to enter one-shot action mode. The next key is `a` (allow), `d` (deny), `c` (continue), or `t` (bounded hidden literal text, sent with Enter). Escape cancels. Semantic actions require recognized prompt evidence and exact current authority; manual text still requires an operator-selected exact live target. Outside action mode, `c` keeps correction behavior and Enter keeps navigation behavior. Review and Scorecard do not dispatch session actions.
 

@@ -28,6 +28,10 @@ All notable changes to codexctl are documented here.
 
 ### Changed
 
+- Live now uses wide terminals for stacked Needs Attention and Recent lists
+  beside persistent Evidence; narrower terminals keep a bounded vertical
+  Evidence pane. Use `J`/`K` to switch lists without losing each list's
+  selection, while `j`/`k` and the arrow keys continue moving by row.
 - PostToolUse telemetry now records hook receipt independently and correlates
   current Codex Bash executions when PermissionRequest omits `tool_use_id`.
   Opaque unified-exec responses produce a neutral Completed outcome, not a

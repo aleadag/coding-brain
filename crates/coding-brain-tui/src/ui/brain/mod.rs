@@ -103,7 +103,7 @@ fn render_footer(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &Brain
             .map(str::to_owned)
             .unwrap_or_else(|| match app.tab() {
                 BrainTab::Live => {
-                    "j/k select  Enter switch  x action  c correct  Tab tabs  r refresh  q quit"
+                    "j/k select  J/K lists  Enter switch  x action  c correct  Tab tabs  r refresh  q quit"
                         .into()
                 }
                 BrainTab::Review => {
@@ -170,7 +170,7 @@ mod tests {
             "[ Live ]",
             "Needs Attention",
             "Recent",
-            "Decision",
+            "Evidence",
             "delivery unknown",
             "execution not confirmed",
             "x3",
@@ -225,7 +225,7 @@ mod tests {
         let mut app = fixture_app(mock);
 
         let attention_focused = render_text(&app);
-        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char('J')));
         let recent_focused = render_text(&app);
 
         assert_eq!(
@@ -238,6 +238,74 @@ mod tests {
         );
         assert_eq!(attention_focused.matches("> ").count(), 1);
         assert_eq!(recent_focused.matches("> ").count(), 1);
+    }
+
+    #[test]
+    fn live_switches_to_side_by_side_evidence_at_120_columns() {
+        let app = populated_live_app();
+        let narrow = render_text_at(&app, 119, 38);
+        let wide = render_text_at(&app, 120, 38);
+
+        let (narrow_attention_row, _) = title_position(&narrow, "Needs Attention");
+        let (narrow_recent_row, _) = title_position(&narrow, "Recent");
+        let (narrow_evidence_row, _) = title_position(&narrow, "Evidence");
+        assert!(narrow_attention_row < narrow_recent_row);
+        assert!(narrow_recent_row < narrow_evidence_row);
+
+        let (wide_attention_row, _) = title_position(&wide, "Needs Attention");
+        let (wide_recent_row, _) = title_position(&wide, "Recent");
+        let (wide_evidence_row, wide_evidence_column) = title_position(&wide, "Evidence");
+        assert_eq!(wide_attention_row, wide_evidence_row);
+        assert!(wide_recent_row > wide_attention_row);
+        assert!(wide_evidence_column >= 75);
+    }
+
+    #[test]
+    fn live_narrow_evidence_height_is_content_bounded() {
+        let app = populated_live_app_with_note(Some("wrapped evidence ".repeat(200)));
+
+        let text = render_text_at(&app, 119, 73);
+        let (evidence_top, _) = title_position(&text, "Evidence");
+        let footer_text = text
+            .lines()
+            .position(|line| line.contains("j/k select"))
+            .expect("Live footer");
+
+        assert!(footer_text - evidence_top - 1 <= 12, "{text}");
+        assert!(title_position(&text, "Recent").0 < evidence_top);
+    }
+
+    #[test]
+    fn live_list_jumps_keep_highlight_and_evidence_in_sync() {
+        let mut app = populated_live_app();
+
+        app.handle_key(key(KeyCode::Char('J')));
+        let recent = render_text_at(&app, 120, 38);
+        assert_eq!(recent.matches("> ").count(), 1);
+        assert!(
+            recent
+                .lines()
+                .any(|line| line.contains("> ") && line.contains("recent-1"))
+        );
+        assert!(recent.contains("Activity: recent-1"));
+
+        app.handle_key(key(KeyCode::Char('K')));
+        let attention = render_text_at(&app, 120, 38);
+        assert_eq!(attention.matches("> ").count(), 1);
+        assert!(
+            attention
+                .lines()
+                .any(|line| line.contains("> denied · delivery unknown")),
+            "{attention}"
+        );
+        assert!(attention.contains("Activity: attention-1"));
+    }
+
+    #[test]
+    fn live_footer_documents_list_jumps() {
+        let text = render_text(&populated_live_app());
+
+        assert!(text.contains("J/K lists"), "{text}");
     }
 
     #[test]
@@ -508,8 +576,33 @@ mod tests {
         )
     }
 
-    fn render_text(app: &BrainApp) -> String {
-        let backend = TestBackend::new(110, 38);
+    fn populated_live_app_with_note(note: Option<String>) -> BrainApp {
+        let mut attention = activity("attention-1", DeliveryState::Unknown);
+        attention.note = note;
+        let mut recent = activity("recent-1", DeliveryState::Delivered);
+        recent.state = ActivityState::Allowed;
+        fixture_app(MockBrainRuntime {
+            activity_snapshot: ActivitySnapshot {
+                attention: vec![AttentionItem {
+                    activity: attention,
+                    occurrences: 1,
+                    unresolved_occurrences: 1,
+                }],
+                recent: vec![recent],
+                unresolved_count: 1,
+                diagnostics: Default::default(),
+            },
+            endpoint_health: online(),
+            ..MockBrainRuntime::default()
+        })
+    }
+
+    fn populated_live_app() -> BrainApp {
+        populated_live_app_with_note(None)
+    }
+
+    fn render_text_at(app: &BrainApp, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -521,6 +614,17 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn render_text(app: &BrainApp) -> String {
+        render_text_at(app, 110, 38)
+    }
+
+    fn title_position(text: &str, title: &str) -> (usize, usize) {
+        text.lines()
+            .enumerate()
+            .find_map(|(row, line)| line.find(title).map(|column| (row, column)))
+            .unwrap_or_else(|| panic!("missing title {title}:\n{text}"))
     }
 
     fn content_column(text: &str, row_id: &str, content: &str) -> usize {

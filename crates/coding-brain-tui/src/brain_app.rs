@@ -37,6 +37,12 @@ impl BrainTab {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveList {
+    Attention,
+    Recent,
+}
+
 #[derive(Debug, Clone)]
 enum BrainInput {
     Correction {
@@ -107,6 +113,9 @@ pub struct BrainApp {
     gate_mode: BrainGateMode,
     endpoint_health: EndpointHealth,
     selection: usize,
+    live_list: LiveList,
+    live_attention_selection: usize,
+    live_recent_selection: usize,
     input: Option<BrainInput>,
     session_action_worker: SessionActionWorker,
     pending_action_status: Option<String>,
@@ -126,6 +135,9 @@ impl BrainApp {
             gate_mode: BrainGateMode::On,
             endpoint_health: EndpointHealth::default(),
             selection: 0,
+            live_list: LiveList::Attention,
+            live_attention_selection: 0,
+            live_recent_selection: 0,
             input: None,
             session_action_worker: SessionActionWorker::new(),
             pending_action_status: None,
@@ -229,15 +241,31 @@ impl BrainApp {
                 self.selection = 0;
                 None
             }
+            KeyCode::Char('J') if self.tab == BrainTab::Live => {
+                self.jump_live_list(LiveList::Recent);
+                None
+            }
+            KeyCode::Char('K') if self.tab == BrainTab::Live => {
+                self.jump_live_list(LiveList::Attention);
+                None
+            }
             KeyCode::Char('j') | KeyCode::Down => {
-                let len = self.current_len();
-                if len > 0 {
-                    self.selection = (self.selection + 1).min(len - 1);
+                if self.tab == BrainTab::Live {
+                    self.move_live_selection_down();
+                } else {
+                    let len = self.current_len();
+                    if len > 0 {
+                        self.selection = (self.selection + 1).min(len - 1);
+                    }
                 }
                 None
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.selection = self.selection.saturating_sub(1);
+                if self.tab == BrainTab::Live {
+                    self.move_live_selection_up();
+                } else {
+                    self.selection = self.selection.saturating_sub(1);
+                }
                 None
             }
             KeyCode::Char('r') => {
@@ -278,7 +306,7 @@ impl BrainApp {
     }
 
     pub fn begin_correction(&mut self) {
-        let Some(item) = self.snapshot.attention.get(self.selection) else {
+        let Some(item) = self.selected_attention() else {
             self.status = Some("Select a Needs Attention item first".into());
             return;
         };
@@ -296,7 +324,7 @@ impl BrainApp {
     pub fn choose_correction(&mut self, disposition: CorrectionDisposition, note: Option<String>) {
         let activity_id = match &self.input {
             Some(BrainInput::Correction { activity_id, .. }) => activity_id.clone(),
-            _ => match self.snapshot.attention.get(self.selection) {
+            _ => match self.selected_attention() {
                 Some(item) => item.activity_id.clone(),
                 None => return,
             },
@@ -545,26 +573,96 @@ impl BrainApp {
 
     fn current_len(&self) -> usize {
         match self.tab {
-            BrainTab::Live => self.snapshot.attention.len() + self.snapshot.recent.len(),
+            BrainTab::Live => self.live_len(self.live_list),
             BrainTab::Review => self.review_queue.len(),
             BrainTab::Scorecard => 0,
         }
     }
 
+    fn live_len(&self, list: LiveList) -> usize {
+        match list {
+            LiveList::Attention => self.snapshot.attention.len(),
+            LiveList::Recent => self.snapshot.recent.len(),
+        }
+    }
+
+    fn live_selection(&self, list: LiveList) -> usize {
+        match list {
+            LiveList::Attention => self.live_attention_selection,
+            LiveList::Recent => self.live_recent_selection,
+        }
+    }
+
+    fn live_selection_mut(&mut self, list: LiveList) -> &mut usize {
+        match list {
+            LiveList::Attention => &mut self.live_attention_selection,
+            LiveList::Recent => &mut self.live_recent_selection,
+        }
+    }
+
+    fn move_live_selection_down(&mut self) {
+        let len = self.live_len(self.live_list);
+        if len > 0 {
+            let next = (self.live_selection(self.live_list) + 1).min(len - 1);
+            *self.live_selection_mut(self.live_list) = next;
+        }
+    }
+
+    fn move_live_selection_up(&mut self) {
+        let current = self.live_selection(self.live_list);
+        *self.live_selection_mut(self.live_list) = current.saturating_sub(1);
+    }
+
+    fn jump_live_list(&mut self, target: LiveList) {
+        let len = self.live_len(target);
+        if len > 0 {
+            let clamped = self.live_selection(target).min(len - 1);
+            *self.live_selection_mut(target) = clamped;
+            self.live_list = target;
+        }
+    }
+
+    fn clamp_live_selection(&mut self) {
+        let attention_len = self.live_len(LiveList::Attention);
+        let recent_len = self.live_len(LiveList::Recent);
+        self.live_attention_selection = self
+            .live_attention_selection
+            .min(attention_len.saturating_sub(1));
+        self.live_recent_selection = self.live_recent_selection.min(recent_len.saturating_sub(1));
+        self.live_list = match (self.live_list, attention_len, recent_len) {
+            (_, 0, 0) => LiveList::Attention,
+            (LiveList::Attention, 0, _) => LiveList::Recent,
+            (LiveList::Recent, _, 0) => LiveList::Attention,
+            (list, _, _) => list,
+        };
+    }
+
     fn clamp_selection(&mut self) {
+        self.clamp_live_selection();
         self.selection = self.selection.min(self.current_len().saturating_sub(1));
     }
 
     pub fn selected_live_activity(&self) -> Option<&ActivityItem> {
-        self.snapshot
-            .attention
-            .get(self.selection)
-            .map(|item| &item.activity)
-            .or_else(|| {
-                self.snapshot
-                    .recent
-                    .get(self.selection.saturating_sub(self.snapshot.attention.len()))
-            })
+        match self.live_list {
+            LiveList::Attention => self
+                .snapshot
+                .attention
+                .get(self.live_attention_selection)
+                .map(|item| &item.activity),
+            LiveList::Recent => self.snapshot.recent.get(self.live_recent_selection),
+        }
+    }
+
+    pub fn selected_attention_index(&self) -> Option<usize> {
+        (self.live_list == LiveList::Attention)
+            .then_some(self.live_attention_selection)
+            .filter(|index| *index < self.snapshot.attention.len())
+    }
+
+    pub fn selected_recent_index(&self) -> Option<usize> {
+        (self.live_list == LiveList::Recent)
+            .then_some(self.live_recent_selection)
+            .filter(|index| *index < self.snapshot.recent.len())
     }
 
     pub fn tab(&self) -> BrainTab {
@@ -596,7 +694,11 @@ impl BrainApp {
     }
 
     pub fn selection(&self) -> usize {
-        self.selection
+        if self.tab == BrainTab::Live {
+            self.live_selection(self.live_list)
+        } else {
+            self.selection
+        }
     }
 
     pub fn status(&self) -> Option<&str> {
@@ -626,7 +728,8 @@ impl BrainApp {
     }
 
     pub fn selected_attention(&self) -> Option<&AttentionItem> {
-        self.snapshot.attention.get(self.selection)
+        self.selected_attention_index()
+            .and_then(|index| self.snapshot.attention.get(index))
     }
 }
 
@@ -692,6 +795,88 @@ mod tests {
         assert_eq!(app.tab(), BrainTab::Scorecard);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.tab(), BrainTab::Live);
+    }
+
+    #[test]
+    fn live_moves_within_lists_and_restores_each_list_selection() {
+        let (mut app, _) = fixture_app(true);
+        let mut second_attention = activity();
+        second_attention.activity_id = "attention-2".into();
+        app.snapshot.attention.push(AttentionItem {
+            activity: second_attention,
+            occurrences: 1,
+            unresolved_occurrences: 1,
+        });
+        let mut recent_1 = activity();
+        recent_1.activity_id = "recent-1".into();
+        let mut recent_2 = activity();
+        recent_2.activity_id = "recent-2".into();
+        app.snapshot.recent = vec![recent_1, recent_2];
+        app.clamp_selection();
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "attention-2"
+        );
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "attention-2"
+        );
+
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "recent-1"
+        );
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "recent-2"
+        );
+
+        app.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "attention-2"
+        );
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "recent-2"
+        );
+    }
+
+    #[test]
+    fn live_empty_jump_target_keeps_the_visible_selection() {
+        let (mut app, _) = fixture_app(true);
+        let selected = app.selected_live_activity().unwrap().activity_id.clone();
+
+        app.handle_key(key(KeyCode::Char('J')));
+
+        assert_eq!(app.selected_live_activity().unwrap().activity_id, selected);
+        assert_eq!(app.selected_attention_index(), Some(0));
+        assert_eq!(app.selected_recent_index(), None);
+    }
+
+    #[test]
+    fn live_clamps_remembered_rows_and_falls_back_from_an_empty_active_list() {
+        let (mut app, _) = fixture_app(true);
+        let mut recent = activity();
+        recent.activity_id = "recent-1".into();
+        app.snapshot.recent = vec![recent];
+        app.handle_key(key(KeyCode::Char('J')));
+        app.snapshot.recent.clear();
+
+        app.clamp_selection();
+
+        assert_eq!(app.selected_attention_index(), Some(0));
+        assert_eq!(app.selected_recent_index(), None);
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            app.snapshot.attention[0].activity_id
+        );
     }
 
     #[test]
