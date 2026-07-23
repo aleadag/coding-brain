@@ -203,7 +203,6 @@ let
     postToolUse
     subagentStart
     subagentStop
-    managedStop
   ];
   trustNotice = cfg.home.activation.codingBrainHookTrustNotice.data;
   unsupportedFailures = builtins.filter (item: !item.assertion) unsupportedHooks.config.assertions;
@@ -226,7 +225,7 @@ assert builtins.length disabledFailures == 1;
 assert lib.hasInfix "programs.codex.enable = true" (builtins.head disabledFailures).message;
 assert permission.matcher == "*";
 assert permissionHandler.type == "command";
-assert permissionHandler.command == "${expectedExe} --permission-hook";
+assert permissionHandler.command == "${expectedExe} --permission-hook --provider codex";
 assert permissionHandler.timeout == 30;
 assert permissionHandler.statusMessage == "Brain reviewing permission…";
 assert sessionStart.matcher == "startup|resume|clear|compact";
@@ -242,9 +241,11 @@ assert builtins.all (
     handler = builtins.elemAt entry.hooks 0;
   in
   handler.type == "command"
-  && handler.command == "${expectedExe} --lifecycle-hook"
+  && handler.command == "${expectedExe} --lifecycle-hook --provider codex"
   && handler.timeout == 2
 ) lifecycleEntries;
+assert (builtins.elemAt managedStop.hooks 0).command == "${expectedExe} --recovery-hook --provider codex";
+assert (builtins.elemAt managedStop.hooks 0).timeout == 30;
 assert
   stopHooks == [
     existingStop

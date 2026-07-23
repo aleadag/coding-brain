@@ -1,5 +1,5 @@
 pkgbase = coding-brain-bin
-	pkgdesc = Local brain for supervising and learning from Codex sessions
+	pkgdesc = Local brain for supervising and learning from coding-agent activity.
 	pkgver = 0.16.0
 	pkgrel = 1
 	url = https://github.com/aleadag/coding-brain

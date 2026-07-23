@@ -28,6 +28,77 @@ fn init_help_lists_all_provider_selectors() {
     }
 }
 
+#[test]
+fn init_provider_contract_covers_managed_paths_commands_and_compatibility_warning() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+        .args([
+            "init",
+            "all",
+            "--non-interactive",
+            "--skip-brain",
+            "--skip-skills",
+        ])
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let managed = [
+        (".codex/hooks.json", "--provider codex"),
+        (".claude/settings.json", "--provider claude"),
+        (".gemini/config/hooks.json", "--provider antigravity"),
+    ];
+    for (path, provider_arg) in managed {
+        let contents = std::fs::read_to_string(home.path().join(path)).unwrap();
+        assert!(
+            contents.contains(provider_arg),
+            "missing {provider_arg} in {path}"
+        );
+    }
+
+    let compatibility_home = tempfile::tempdir().unwrap();
+    let compatibility_project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(compatibility_project.path().join(".git")).unwrap();
+    let compatibility = std::process::Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+        .args(["init", "--non-interactive", "--skip-brain", "--skip-skills"])
+        .env("HOME", compatibility_home.path())
+        .env_remove("XDG_STATE_HOME")
+        .current_dir(compatibility_project.path())
+        .output()
+        .unwrap();
+    assert!(compatibility.status.success());
+    let compatibility_stderr = String::from_utf8(compatibility.stderr).unwrap();
+    assert_eq!(
+        compatibility_stderr.lines().next(),
+        Some(
+            "warning: provider-less --non-interactive is deprecated; use `coding-brain init codex --non-interactive` instead"
+        )
+    );
+    assert!(compatibility_home.path().join(".codex/hooks.json").exists());
+    assert!(
+        !compatibility_home
+            .path()
+            .join(".claude/settings.json")
+            .exists()
+    );
+    assert!(
+        !compatibility_home
+            .path()
+            .join(".gemini/config/hooks.json")
+            .exists()
+    );
+}
+
 /// Helper: create a minimal session for testing status inference.
 fn make_session(cpu: f32, last_message_age_secs: u64) -> AgentSession {
     let raw = RawAgentSession {

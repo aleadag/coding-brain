@@ -15,15 +15,15 @@ cat >"${OUT_DIR}/PKGBUILD" <<EOF
 pkgname=coding-brain-bin
 pkgver=${VERSION}
 pkgrel=1
-pkgdesc='Local brain for supervising and learning from Codex sessions'
+pkgdesc='Local brain for supervising and learning from coding-agent activity.'
 arch=('x86_64')
-url='https://github.com/aleadag/codexctl'
+url='https://github.com/aleadag/coding-brain'
 license=('MIT')
 provides=('coding-brain')
 conflicts=('coding-brain' 'coding-brain-git')
 source=(
-  "coding-brain-v\${pkgver}-x86_64-unknown-linux-musl.tar.gz::https://github.com/aleadag/codexctl/releases/download/v\${pkgver}/coding-brain-v\${pkgver}-x86_64-unknown-linux-musl.tar.gz"
-  "LICENSE::https://raw.githubusercontent.com/aleadag/codexctl/v\${pkgver}/LICENSE"
+  "coding-brain-v\${pkgver}-x86_64-unknown-linux-musl.tar.gz::https://github.com/aleadag/coding-brain/releases/download/v\${pkgver}/coding-brain-v\${pkgver}-x86_64-unknown-linux-musl.tar.gz"
+  "LICENSE::https://raw.githubusercontent.com/aleadag/coding-brain/v\${pkgver}/LICENSE"
 )
 sha256sums=(
   '${LINUX_INTEL_SHA}'
@@ -38,17 +38,17 @@ EOF
 
 cat >"${OUT_DIR}/.SRCINFO" <<EOF
 pkgbase = coding-brain-bin
-	pkgdesc = Local brain for supervising and learning from Codex sessions
+	pkgdesc = Local brain for supervising and learning from coding-agent activity.
 	pkgver = ${VERSION}
 	pkgrel = 1
-	url = https://github.com/aleadag/codexctl
+	url = https://github.com/aleadag/coding-brain
 	arch = x86_64
 	license = MIT
 	conflicts = coding-brain
 	conflicts = coding-brain-git
 	provides = coding-brain
-	source = coding-brain-v${VERSION}-x86_64-unknown-linux-musl.tar.gz::https://github.com/aleadag/codexctl/releases/download/v${VERSION}/coding-brain-v${VERSION}-x86_64-unknown-linux-musl.tar.gz
-	source = LICENSE::https://raw.githubusercontent.com/aleadag/codexctl/v${VERSION}/LICENSE
+	source = coding-brain-v${VERSION}-x86_64-unknown-linux-musl.tar.gz::https://github.com/aleadag/coding-brain/releases/download/v${VERSION}/coding-brain-v${VERSION}-x86_64-unknown-linux-musl.tar.gz
+	source = LICENSE::https://raw.githubusercontent.com/aleadag/coding-brain/v${VERSION}/LICENSE
 	sha256sums = ${LINUX_INTEL_SHA}
 	sha256sums = ${LICENSE_SHA}
 

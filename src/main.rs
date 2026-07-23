@@ -179,7 +179,7 @@ pub(crate) enum Command {
 #[command(
     name = "coding-brain",
     version,
-    about = "Supervise Codex sessions with a local brain that learns from you."
+    about = "Supervise coding-agent activity with a local brain that learns from you."
 )]
 pub(crate) struct Cli {
     /// Color theme: dark, light, or none (respects NO_COLOR env var)
@@ -400,7 +400,7 @@ fn maybe_print_star_prompt() {
     if first_run {
         eprintln!();
         eprintln!(
-            "\u{2b50} If Coding Brain is useful, star it: https://github.com/aleadag/codexctl"
+            "\u{2b50} If Coding Brain is useful, star it: https://github.com/aleadag/coding-brain"
         );
 
         if first_run {
@@ -413,9 +413,9 @@ fn maybe_print_star_prompt() {
 }
 
 /// First-run detection for the activation nudge (#322). Returns true when
-/// the user has neither onboarded nor installed Coding Brain Codex hooks.
-/// entries). When either is present, we assume the operator
-/// knows what they're doing and stay quiet.
+/// the user has neither onboarded nor installed a direct Codex hook entry.
+/// When either is present, we assume the operator knows what they're doing
+/// and stay quiet.
 fn is_first_run() -> bool {
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return false;
@@ -429,6 +429,9 @@ fn is_first_run() -> bool {
     !onboarded && !hooked
 }
 
+const FIRST_RUN_PROVIDER_MESSAGE: &str =
+    "Set up at least one provider before expecting Brain activity.";
+
 /// One-screen banner shown above Brain when the user hasn't
 /// onboarded yet (#322). Goes to stderr so it doesn't pollute stdout
 /// piping; appears before the alt-screen swap.
@@ -437,7 +440,7 @@ fn print_first_run_banner() {
     eprintln!("┌─────────────────────────────────────────────────────────────────┐");
     eprintln!("│  Welcome to Coding Brain.                                       │");
     eprintln!("│                                                                 │");
-    eprintln!("│  Brain activity will be empty until Codex hooks are installed.  │");
+    eprintln!("│  {FIRST_RUN_PROVIDER_MESSAGE:<63}│");
     eprintln!("│  Quit and run:                                                   │");
     eprintln!("│                                                                 │");
     eprintln!("│    coding-brain init    Interactive setup wizard                │");
@@ -1099,6 +1102,8 @@ mod brain_only_cli_tests {
         for flag in ["--run", "--parallel", "--decompose"] {
             assert!(!help.contains(flag), "{flag} remains in generated help");
         }
+        assert!(help.starts_with("Supervise coding-agent activity"));
+        assert!(!help.starts_with("Supervise Codex"));
     }
 
     #[test]
@@ -1153,6 +1158,12 @@ mod first_run_tests {
         let tmp = tempfile::tempdir().unwrap();
         set_home(tmp.path());
         assert!(is_first_run(), "fresh home should be first-run");
+    }
+
+    #[test]
+    fn banner_describes_provider_setup() {
+        assert!(FIRST_RUN_PROVIDER_MESSAGE.contains("provider"));
+        assert!(!FIRST_RUN_PROVIDER_MESSAGE.contains("Codex"));
     }
 
     #[test]

@@ -13,7 +13,9 @@ coding-brain --headless --json
 
 The default command opens the Live, Review, and Scorecard TUI. `--headless` keeps evaluation and context-rot prevention active without taking over a terminal; activity remains visible to a Brain TUI running elsewhere.
 
-Session navigation is intentionally narrow: Coding Brain can switch to the selected live session. It may use terminal-native focus or optional Agent Deck attach, but it does not send arbitrary messages, terminate sessions, route work, or spawn workers.
+Live navigation is intentionally narrow: Enter switches to the exact source of the selected activity. Coding Brain may use provider-qualified Agent Deck navigation, native `claude attach` for an exact background identity, or terminal focus. It does not expose a session list, terminate sessions, route work, or spawn workers.
+
+Press `x` in Live to enter one-shot action mode. The next key is `a` (allow), `d` (deny), `c` (continue), or `t` (bounded hidden literal text, sent with Enter). Escape cancels. Semantic actions require recognized prompt evidence and exact current authority; manual text still requires an operator-selected exact live target. Outside action mode, `c` keeps correction behavior and Enter keeps navigation behavior. Review and Scorecard do not dispatch session actions.
 
 ## Brain evaluation
 
@@ -46,7 +48,9 @@ Review and Scorecard in the TUI are the primary surfaces. These commands expose 
 
 ```bash
 coding-brain init
-coding-brain init --plugin-only
+coding-brain init codex
+coding-brain init claude antigravity
+coding-brain init all
 coding-brain init --check
 coding-brain init --upgrade
 coding-brain init --remove
@@ -56,13 +60,43 @@ coding-brain completions <shell>
 coding-brain man
 ```
 
-- `init` runs onboarding and creates stable project identity.
-- `--plugin-only` atomically refreshes exact managed Codex hooks.
+- Bare interactive `init` detects provider executables and asks which providers to configure. Detected providers are selected by default, but any listed provider can be selected for later installation.
+- Positional selectors are `codex`, `claude`, `antigravity`, and exclusive shorthand `all`. Multiple provider names are accepted and deduplicated; `all` cannot be combined with another selector.
+- Explicit selectors skip the provider picker and run the normal provider-neutral Brain onboarding.
+- New non-interactive setup must name a provider, such as `coding-brain init claude --non-interactive`. Provider-less `--non-interactive` is a deprecated Codex-only compatibility path.
+- `--plugin-only` is a deprecated Codex-only alias for `coding-brain init codex`.
 - `--check` compares onboarding records with current state.
-- `--upgrade` refreshes managed hooks and the marker version after reinstalling.
-- `--remove` removes managed hooks and the onboarding marker but preserves data.
+- `--upgrade` refreshes the installed or drifted providers recorded by prior onboarding and updates the marker version.
+- `--remove` removes all exact Coding Brain-managed provider hooks and the onboarding marker but preserves data and unrelated entries.
 - `--purge` additionally removes the previewed current and legacy global config/state targets after confirmation. It is irreversible.
 - `doctor` checks the executable, hook definitions, trust visibility, project identity, lifecycle state, outcome telemetry, endpoint privacy, transcript discovery, and terminal integration.
+- `doctor` emits one setup row for Codex, Claude, and Antigravity, plus separate Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback rows. An unselected absent provider is skipped; a selected provider with a missing executable is advisory; invalid or stale managed definitions fail with `coding-brain init <provider>` as the repair command.
+
+Managed setup paths are:
+
+| Provider | Managed path |
+| --- | --- |
+| Codex | project `.codex/hooks.json` or user `~/.codex/hooks.json` |
+| Claude Code | `~/.claude/settings.json` |
+| Antigravity CLI | `~/.gemini/config/hooks.json` |
+
+Multi-provider init parses, validates, and stages the complete selected set before replacement. It preserves unrelated and user-modified former managed entries. Its crash recovery uses recorded file evidence and does not overwrite a file changed concurrently after staging.
+
+## Provider capabilities
+
+| Capability | Codex | Claude Code | Antigravity CLI |
+| --- | --- | --- | --- |
+| Structured discovery | Rollout JSONL joined to live process evidence | Bounded `claude agents --json`, with process fallback | No external inventory; process discovery plus hook correlation |
+| Lifecycle hooks | Session, prompt, tool, subagent, and Stop events | Session, prompt, tool, subagent, and Stop events | Tool, invocation, and Stop events |
+| Permission guard | `PermissionRequest` allow/deny response | `PermissionRequest` allow/deny response; provider deny/ask policy remains authoritative | `PreToolUse` returns `allow` or `deny`; abstention and unsafe input return `ask` |
+| Stop continuation | Recovery hook can send guarded terminal `continue` in `auto` mode | Recovery hook can send guarded terminal `continue` in `auto` mode | `Stop` returns structured `continue` only after a validated automatic decision |
+| Native attach | Unavailable | Exact background identity via `claude attach` | Unavailable |
+| Terminal focus | Exact supported terminal target; optional Agent Deck | Exact supported terminal target; optional Agent Deck | Exact supported terminal target; optional Agent Deck |
+| Guarded input | Semantic allow/deny/continue and manual literal text through an exact tmux binding | Semantic allow/deny/continue and manual literal text through an exact tmux binding | Structured hooks first; guarded tmux for process-only, manual, or uncovered prompts |
+| Transcript context | Codex rollout JSONL | Unavailable: the hook transcript path is retained as lifecycle identity/status evidence, but records are not parsed into `AgentSession` context | Unavailable: the hook transcript path is retained as lifecycle identity/status evidence, but records are not parsed into `AgentSession` context; SQLite is not read |
+| Usage/cost surface | Unsupported; this provider feature adds no ingestion or dashboard/view | Unsupported; this provider feature adds no ingestion or dashboard/view | Unsupported; this provider feature adds no ingestion or dashboard/view |
+
+Automatic terminal input revalidates provider process identity, a unique pane, a versioned prompt fingerprint, and pending request evidence immediately before input, then verifies that the prompt cleared or advanced. A mismatch leaves the activity for manual attention. Terminal focus alone never grants input authority.
 
 ## Configuration helpers
 
@@ -80,4 +114,4 @@ Current config uses `.coding-brain.toml` and `$XDG_CONFIG_HOME/coding-brain/conf
 
 ## Product boundary
 
-Coding Brain keeps immediate judgment, learning evidence, review, and navigation local. It has no durable task queue, dependency executor, distributed peer transport, or embedded project tracker. Beads and Agent Deck are optional companion tools for different jobs.
+Coding Brain keeps immediate judgment, learning evidence, review, recovery, and navigation local. It is Brain activity rather than a general session dashboard. Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view. Coding Brain has no durable task queue, dependency executor, distributed peer transport, or embedded project tracker. Beads and Agent Deck are optional companion tools for different jobs.

@@ -4,25 +4,45 @@
 
 ```bash
 cargo install coding-brain
-coding-brain init
+coding-brain init codex              # or: claude, antigravity, several names, all
 coding-brain doctor
-# Restart Codex after doctor reports the new managed hooks.
+# Restart the configured agents after doctor reports current managed hooks.
 coding-brain
 ```
 
 The crates.io package and installed executable are both named `coding-brain`.
 
-During init, Coding Brain detects a local model endpoint, installs managed Codex hooks, offers optional skill suggestions, and creates `.coding-brain/project.toml`. Restart Codex and inspect `/hooks` before trusting the new commands. For non-interactive setup:
+An explicit selector skips provider detection. Bare interactive `coding-brain init` detects installed executables, selects them by default, and lets you choose providers you plan to install later. `all` selects Codex, Claude Code, and Antigravity CLI and cannot be combined with another selector.
+
+Init detects a local model endpoint, installs the selected managed hooks, offers optional skill suggestions, and creates `.coding-brain/project.toml`. Restart the configured agents after setup. For non-interactive setup, name at least one provider:
 
 ```bash
-coding-brain init --non-interactive --skip-brain --skip-skills
+coding-brain init codex claude --non-interactive --skip-brain --skip-skills
 ```
+
+The provider-less non-interactive form remains a deprecated Codex-only compatibility path and prints:
+
+```text
+warning: provider-less --non-interactive is deprecated; use `coding-brain init codex --non-interactive` instead
+```
+
+Managed provider files are:
+
+| Provider | Path |
+| --- | --- |
+| Codex | project `.codex/hooks.json` or user `~/.codex/hooks.json` |
+| Claude Code | `~/.claude/settings.json` |
+| Antigravity CLI | `~/.gemini/config/hooks.json` |
+
+Init validates and stages every selected file before replacement. Unrelated and user-modified former managed entries are preserved; a failed multi-provider replacement is recovered or rolled back only when the recorded file evidence still matches.
 
 ## Use the TUI
 
-Run `coding-brain` to open Live. Press the view keys shown in the footer to move between Live, Review, and Scorecard. Live presents active activity and attention; Review concentrates decisions worth correcting or retaining; Scorecard summarizes decision quality.
+Run `coding-brain` to open Live. Press the view keys shown in the footer to move between Live, Review, and Scorecard. Live presents provider-tagged Brain activity and attention; Review concentrates decisions worth correcting or retaining; Scorecard summarizes decision quality. These are Brain views, not a general session dashboard. Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view.
 
-Selecting "switch to session" suspends the TUI, focuses or attaches to the selected session, then restores the terminal when you return. If the session belongs to Agent Deck, Coding Brain can use Agent Deck for the attach. Agent Deck is optional and cancellation returns directly to the Brain TUI.
+Press Enter in Live to switch to the selected activity's source session. Coding Brain can use exact provider-qualified Agent Deck navigation, native `claude attach` for a background identity, or exact terminal focus; cancellation returns directly to the Brain TUI.
+
+For an activity with exact current authority, press `x` to enter one-shot action mode, then `a` to allow, `d` to deny, `c` to continue, or `t` to enter bounded hidden literal text. Press Enter to send manual text and Escape to cancel. Outside action mode, Enter keeps its navigation behavior. Review and Scorecard remain read-only for session actions.
 
 ## Add a local model
 
@@ -47,7 +67,7 @@ Coding Brain does not read the old config/state namespace and does not install a
 
 ```bash
 cargo install coding-brain
-coding-brain init
+coding-brain init codex
 coding-brain doctor
 # Restart Codex and review /hooks.
 ```

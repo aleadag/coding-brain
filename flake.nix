@@ -1,5 +1,5 @@
 {
-  description = "Orchestrate Codex sessions with a local-LLM brain that learns from you.";
+  description = "Local brain for supervising and learning from coding-agent activity.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -35,8 +35,8 @@
           nativeCheckInputs = [ pkgs.git ];
 
           meta = with pkgs.lib; {
-            description = "Orchestrate Codex sessions with a local-LLM brain that learns from you.";
-            homepage = "https://github.com/aleadag/codexctl";
+            description = "Local brain for supervising and learning from coding-agent activity.";
+            homepage = "https://github.com/aleadag/coding-brain";
             license = licenses.mit;
             mainProgram = "coding-brain";
             platforms = platforms.unix;
@@ -57,7 +57,7 @@
             rustfmt
             sqlite
           ];
-          env.GH_REPO = "aleadag/codexctl";
+          env.GH_REPO = "aleadag/coding-brain";
         };
       }
     )

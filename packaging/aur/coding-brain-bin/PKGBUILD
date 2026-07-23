@@ -3,7 +3,7 @@
 pkgname=coding-brain-bin
 pkgver=0.16.0
 pkgrel=1
-pkgdesc='Local brain for supervising and learning from Codex sessions'
+pkgdesc='Local brain for supervising and learning from coding-agent activity.'
 arch=('x86_64')
 url='https://github.com/aleadag/coding-brain'
 license=('MIT')

@@ -1,13 +1,15 @@
 # Coding Brain
 
-Coding Brain is a local TUI for supervising Codex through judgment and learning.
+Coding Brain is a local TUI for supervising Codex, Claude Code, and Antigravity CLI through judgment and learning.
 
 Current product boundary:
-- Live shows normalized activity and attention for active sessions.
+- Live shows provider-tagged Brain activity and attention, not a session dashboard.
 - Review collects denials, corrections, and uncertain decisions worth teaching from.
 - Scorecard reports decision quality and learning progress.
-- Lifecycle and permission hooks record bounded activity before transcript discovery catches up.
-- Session switching uses supported terminal APIs or optional Agent Deck navigation.
+- Structured lifecycle, permission, and recovery hooks record bounded activity before richer provider evidence catches up.
+- Session switching uses exact provider-qualified Agent Deck navigation, native Claude background attach, or supported terminal focus.
+- Guarded tmux actions require current process identity, a unique pane, and prompt revalidation; manual text also requires explicit Live selection.
+- Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view.
 - Coding Brain does not provide a mailbox, scheduler, durable task queue, dependency engine, or distributed coordinator.
 
 Current paths:
@@ -18,18 +20,24 @@ Current paths:
 
 Install and activate:
 - cargo install coding-brain
-- coding-brain init
+- coding-brain init codex (or claude, antigravity, several names, or all)
+- bare interactive init detects providers and asks; provider-less non-interactive init is deprecated Codex compatibility
 - coding-brain doctor
-- restart Codex and inspect /hooks
+- restart configured agents; inspect /hooks for Codex
 - coding-brain
+
+Managed provider paths:
+- Codex: project .codex/hooks.json or user ~/.codex/hooks.json
+- Claude Code: ~/.claude/settings.json
+- Antigravity CLI: ~/.gemini/config/hooks.json
 
 The crates.io package, executable, and internal Rust crates use the coding-brain namespace. There is no automatic migration or compatibility executable. Confirmed purge is irreversible; old global data remains available for rollback until purge.
 
 Documentation:
-- https://aleadag.github.io/codexctl/
-- https://aleadag.github.io/codexctl/quickstart/
-- https://aleadag.github.io/codexctl/configuration/
-- https://aleadag.github.io/codexctl/reference/
-- https://aleadag.github.io/codexctl/terminal-support/
-- https://aleadag.github.io/codexctl/troubleshooting/
-- https://aleadag.github.io/codexctl/contributing/
+- https://aleadag.github.io/coding-brain/
+- https://aleadag.github.io/coding-brain/quickstart/
+- https://aleadag.github.io/coding-brain/configuration/
+- https://aleadag.github.io/coding-brain/reference/
+- https://aleadag.github.io/coding-brain/terminal-support/
+- https://aleadag.github.io/coding-brain/troubleshooting/
+- https://aleadag.github.io/coding-brain/contributing/

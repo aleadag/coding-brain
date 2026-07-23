@@ -1118,6 +1118,7 @@ mod tests {
 
     #[test]
     fn provider_scan_uses_one_snapshot_and_merges_structured_and_process_evidence() {
+        let _guard = CODEX_HOME_LOCK.lock().unwrap();
         let now = Instant::now();
         let mut state = ProviderDiscoveryState::default();
         let mut process_scans = 0;

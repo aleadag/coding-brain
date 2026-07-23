@@ -1,6 +1,6 @@
-# codexctl
+# coding-brain
 
-Local-brain companion for supervising and learning from Codex sessions.
+Local-brain companion for supervising and learning from coding-agent activity.
 
 ## Build And Test
 
@@ -21,7 +21,7 @@ This is a three-crate Cargo workspace. Dependencies flow downward:
 coding-brain -> coding-brain-tui -> coding-brain-core
 ```
 
-The workspace crates are `coding-brain-core` and `coding-brain-tui`; the runtime integration is Codex-only.
+The workspace crates are `coding-brain-core` and `coding-brain-tui`; runtime integration supports Codex, Claude Code, and Antigravity CLI.
 
 ```text
 crates/
@@ -32,12 +32,13 @@ src/                   # coding-brain binary: brain, config, init, runtime
 
 `coding-brain-core` must not depend on binary-only modules. The TUI communicates with the binary through runtime traits in `crates/coding-brain-core/src/runtime.rs`.
 
-## Codex Integration
+## Provider Integration
 
 - Session discovery reads recursive `~/.codex/sessions/**/rollout-*.jsonl`.
-- Hook install writes `.codex/hooks.json` or `~/.codex/hooks.json`.
+- Claude discovery prefers bounded `claude agents --json`; Antigravity process fallback recognizes `agy`.
+- Hook install writes Codex `.codex/hooks.json` or `~/.codex/hooks.json`, Claude `~/.claude/settings.json`, and Antigravity `~/.gemini/config/hooks.json`.
 - Skill discovery scans `~/.codex/skills`, `~/.codex/plugins/*/skills`, and project `.codex/skills`.
-- Terminal launch paths invoke `codex` or `codex exec`.
+- Navigation may invoke Agent Deck, `claude attach`, or a supported terminal backend; guarded input uses tmux.
 
 ## Conventions
 
@@ -57,7 +58,7 @@ src/                   # coding-brain binary: brain, config, init, runtime
 
 ## Compatibility Notes
 
-Persistent state remains under `~/.codexctl` and config remains under `.codexctl.toml` / `~/.config/codexctl/config.toml` for existing installs. Do not rename those storage paths unless the task explicitly includes a data migration.
+Current config and state live under `$XDG_CONFIG_HOME/coding-brain` and `$XDG_STATE_HOME/coding-brain`. Legacy codexctl paths remain untouched for rollback. Do not rename or remove legacy paths unless the task explicitly includes a data migration.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker

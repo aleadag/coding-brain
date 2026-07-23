@@ -31,7 +31,9 @@ fn ordinary_commands_ignore_and_preserve_legacy_namespace() {
 
     let help = isolated_command(&temp).arg("--help").output().unwrap();
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).starts_with("Supervise Codex"));
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(help_stdout.starts_with("Supervise coding-agent activity"));
+    assert!(!help_stdout.starts_with("Supervise Codex"));
 
     let config = isolated_command(&temp)
         .args(["config", "show"])
@@ -58,6 +60,80 @@ fn ordinary_commands_ignore_and_preserve_legacy_namespace() {
 
     assert_eq!(std::fs::read(old_config).unwrap(), before_config);
     assert_eq!(std::fs::read(old_state).unwrap(), before_state);
+}
+
+#[test]
+fn front_door_metadata_is_provider_aware() {
+    let cargo = include_str!("../Cargo.toml");
+    let flake = include_str!("../flake.nix");
+    let agents = include_str!("../AGENTS.md");
+    let homebrew_renderer = include_str!("../scripts/render-homebrew-formula.sh");
+    let aur_renderer = include_str!("../scripts/render-aur-bin-files.sh");
+    let homebrew_formula = include_str!("../packaging/homebrew-core/coding-brain.rb");
+    let aur_pkgbuild = include_str!("../packaging/aur/coding-brain-bin/PKGBUILD");
+    let aur_srcinfo = include_str!("../packaging/aur/coding-brain-bin/.SRCINFO");
+    let nixpkgs_readme = include_str!("../packaging/nixpkgs/README.md");
+
+    let description = "Local brain for supervising and learning from coding-agent activity.";
+    for (name, metadata) in [
+        ("Cargo.toml", cargo),
+        ("flake.nix", flake),
+        ("Homebrew renderer", homebrew_renderer),
+        ("AUR renderer", aur_renderer),
+        ("Homebrew formula", homebrew_formula),
+        ("AUR PKGBUILD", aur_pkgbuild),
+        ("AUR .SRCINFO", aur_srcinfo),
+        ("nixpkgs README", nixpkgs_readme),
+    ] {
+        assert!(metadata.contains(description), "{name}");
+        assert!(!metadata.contains("Codex sessions"), "{name}");
+    }
+
+    assert!(agents.starts_with("# coding-brain\n\nLocal-brain companion for supervising and learning from coding-agent activity."));
+    assert!(agents.contains("$XDG_CONFIG_HOME/coding-brain"));
+    assert!(agents.contains("$XDG_STATE_HOME/coding-brain"));
+    assert!(agents.contains("Legacy codexctl paths remain untouched for rollback."));
+
+    for (name, metadata) in [
+        ("flake.nix", flake),
+        ("Homebrew renderer", homebrew_renderer),
+        ("AUR renderer", aur_renderer),
+    ] {
+        assert!(metadata.contains("aleadag/coding-brain"), "{name}");
+        assert!(!metadata.contains("aleadag/codexctl"), "{name}");
+    }
+}
+
+#[test]
+fn provider_documentation_scopes_usage_and_transcript_context() {
+    let readme = include_str!("../README.md");
+    let index = include_str!("../docs/index.md");
+    let llms = include_str!("../docs/llms.txt");
+    let quickstart = include_str!("../docs/quickstart.md");
+    let reference = include_str!("../docs/reference.md");
+    let boundary = "Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view.";
+
+    for (name, documentation) in [
+        ("README", readme),
+        ("documentation index", index),
+        ("LLM index", llms),
+        ("quick start", quickstart),
+        ("reference", reference),
+    ] {
+        assert!(documentation.contains(boundary), "{name}");
+        assert!(
+            !documentation.contains("does not collect or display token usage"),
+            "{name}"
+        );
+        assert!(
+            !documentation.contains("Intentionally not collected or displayed"),
+            "{name}"
+        );
+    }
+
+    assert!(reference.contains("not parsed into `AgentSession` context"));
+    assert!(reference.contains("retained as lifecycle identity/status evidence"));
+    assert!(reference.contains("SQLite is not read"));
 }
 
 #[test]

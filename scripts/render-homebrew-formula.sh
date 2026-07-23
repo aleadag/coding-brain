@@ -9,12 +9,12 @@ LINUX_INTEL_SHA="${4:?Linux x86_64 sha is required}"
 LINUX_ARM_SHA="${5:?Linux arm64 sha is required}"
 
 TAG="v${VERSION}"
-BASE_URL="https://github.com/aleadag/codexctl/releases/download/${TAG}"
+BASE_URL="https://github.com/aleadag/coding-brain/releases/download/${TAG}"
 
 cat <<EOF
 class CodingBrain < Formula
-  desc "Local brain for supervising and learning from Codex sessions"
-  homepage "https://github.com/aleadag/codexctl"
+  desc "Local brain for supervising and learning from coding-agent activity."
+  homepage "https://github.com/aleadag/coding-brain"
   version "${VERSION}"
   license "MIT"
 

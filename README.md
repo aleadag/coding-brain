@@ -1,14 +1,14 @@
 # Coding Brain
 
-Coding Brain is a local TUI for supervising Codex through judgment and learning. It observes hook and transcript evidence, evaluates permission requests with deterministic rules and an optional local LLM, and learns from operator corrections. It does not schedule work or replace a task tracker.
+Coding Brain is a local TUI for supervising Codex, Claude Code, and Antigravity CLI (`agy`) through judgment and learning. It observes hook, process, and transcript evidence, evaluates permission requests with deterministic rules and an optional local LLM, and learns from operator corrections. It does not schedule work or replace a task tracker.
 
 The default TUI has three views:
 
-- **Live** shows active sessions, current activity, attention state, and the latest Brain decision.
+- **Live** shows current Brain activity, attention state, and provider-tagged decisions.
 - **Review** collects denials, corrections, and other decisions worth teaching from.
 - **Scorecard** tracks decision quality and whether the Brain is improving.
 
-From Live or Review, you can switch to the selected session. If [Agent Deck](https://github.com/asheshgoplani/agent-deck) is installed and the session is managed by it, Coding Brain can attach through Agent Deck; this integration is optional.
+From Live, you can switch to the source session for the selected activity. Exact Claude background identities can use native attach; [Agent Deck](https://github.com/asheshgoplani/agent-deck) and terminal focus are optional fallbacks.
 
 ## Install and activate
 
@@ -16,9 +16,9 @@ The crates.io package and its executable are both named `coding-brain`:
 
 ```bash
 cargo install coding-brain
-coding-brain init
+coding-brain init codex              # or: claude, antigravity, several names, all
 coding-brain doctor
-# Restart Codex after doctor reports the new managed hooks.
+# Restart the configured agents after doctor reports current managed hooks.
 coding-brain
 ```
 
@@ -26,7 +26,9 @@ From this repository, use `cargo install --path .`. Nix users can install the de
 
 Project identity resolves in this order: a project-root `.coding-brain/project.toml` override, the canonical network `origin`, then a path-derived temporary identity. A normal Git clone with a usable network origin does not need `coding-brain init` for identity.
 
-Init still installs managed Codex hooks and creates an explicit manifest override, which is useful for local, `file:`, missing, or otherwise unusable origins. Review the generated commands with `/hooks` after restarting Codex. Hook events provide the first activity signal; transcript discovery then supplies richer session evidence.
+Bare interactive `coding-brain init` detects installed provider executables and asks what to configure, with detected providers selected by default. Explicit selectors skip that picker: `coding-brain init codex claude` configures both providers, while `all` is exclusive shorthand for all three. New automation should always provide a selector, for example `coding-brain init claude --non-interactive`.
+
+Init stages and validates the complete selected set before replacing provider files. It preserves unrelated entries and user-modified former managed entries, and its recovery journal uses file evidence to avoid overwriting concurrent edits. Managed paths are `.codex/hooks.json` or `~/.codex/hooks.json` for Codex, `~/.claude/settings.json` for Claude, and `~/.gemini/config/hooks.json` for Antigravity. Init also creates an explicit project identity override when needed.
 
 To enable local-model evaluation with Ollama:
 
@@ -61,7 +63,7 @@ coding-brain --brain-briefing --project my-project
 
 ## Product boundary
 
-Coding Brain owns immediate judgment, learning evidence, review, and session navigation. Durable tasks, dependency graphs, claims, blockers, and cross-session handoffs belong in an external tool such as [Beads](https://github.com/steveyegge/beads). Beads and Agent Deck are both optional; neither is a runtime dependency.
+Coding Brain owns immediate judgment, learning evidence, review, recovery, and source-session navigation. It is Brain activity, not a general session dashboard. Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view. Durable tasks, dependency graphs, claims, blockers, and cross-session handoffs belong in an external tool such as [Beads](https://github.com/steveyegge/beads). Beads and Agent Deck are both optional; neither is a runtime dependency.
 
 ## Breaking cutover from codexctl
 
@@ -84,7 +86,7 @@ crates/
 src/                   # coding-brain binary wiring, local brain, config, init
 ```
 
-Codex integration reads `~/.codex/sessions/**/rollout-*.jsonl`, installs hooks in `.codex/hooks.json` or `~/.codex/hooks.json`, and uses supported terminal backends for session focus. Agent Deck navigation is used only when explicitly requested from the TUI.
+Provider integration prefers structured evidence: Codex rollouts and hooks, bounded `claude agents --json` inventory and Claude hooks, and Antigravity tool/invocation/Stop hooks. Process discovery and exact-target terminal handling provide bounded fallback evidence. See the [capability matrix](docs/reference.md#provider-capabilities) for the limits of each path.
 
 ## Build and test
 

@@ -31,7 +31,7 @@ rustPlatform.buildRustPackage rec {
   cargoHash = lib.fakeHash;
 
   meta = {
-    description = "Supervise Codex sessions with a local brain that learns from you.";
+    description = "Local brain for supervising and learning from coding-agent activity.";
     homepage = "https://github.com/aleadag/coding-brain";
     license = lib.licenses.mit;
     mainProgram = "coding-brain";

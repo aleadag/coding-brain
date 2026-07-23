@@ -1,5 +1,5 @@
 class CodingBrain < Formula
-  desc "Local brain for supervising and learning from Codex sessions"
+  desc "Local brain for supervising and learning from coding-agent activity."
   homepage "https://github.com/aleadag/coding-brain"
   url "https://github.com/aleadag/coding-brain/archive/refs/tags/v0.49.3.tar.gz"
   sha256 "601bad4b04822b5910ddd05833de955d238874476270f0a0a26262a8a513b6fd"

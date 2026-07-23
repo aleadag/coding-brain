@@ -54,7 +54,7 @@ in
         lib.hasAttrByPath [ "programs" "codex" "hooks" ] options
         && config.programs.codex.enable
       '';
-      description = "Whether to merge the Coding Brain lifecycle and permission hooks into programs.codex.hooks.";
+      description = "Whether to merge Coding Brain's Codex lifecycle, permission, and recovery hooks into programs.codex.hooks.";
     };
   };
 
@@ -85,7 +85,7 @@ in
                 hooks = [
                   {
                     type = "command";
-                    command = "${executable} --lifecycle-hook";
+                    command = "${executable} --lifecycle-hook --provider codex";
                     timeout = 2;
                   }
                 ];
@@ -96,7 +96,7 @@ in
                 hooks = [
                   {
                     type = "command";
-                    command = "${executable} --lifecycle-hook";
+                    command = "${executable} --lifecycle-hook --provider codex";
                     timeout = 2;
                   }
                 ];
@@ -108,7 +108,7 @@ in
                 hooks = [
                   {
                     type = "command";
-                    command = "${executable} --lifecycle-hook";
+                    command = "${executable} --lifecycle-hook --provider codex";
                     timeout = 2;
                   }
                 ];
@@ -120,7 +120,7 @@ in
                 hooks = [
                   {
                     type = "command";
-                    command = "${executable} --permission-hook";
+                    command = "${executable} --permission-hook --provider codex";
                     timeout = 30;
                     statusMessage = "Brain reviewing permission…";
                   }
@@ -133,7 +133,7 @@ in
                 hooks = [
                   {
                     type = "command";
-                    command = "${executable} --lifecycle-hook";
+                    command = "${executable} --lifecycle-hook --provider codex";
                     timeout = 2;
                   }
                 ];
@@ -145,7 +145,7 @@ in
                 hooks = [
                   {
                     type = "command";
-                    command = "${executable} --lifecycle-hook";
+                    command = "${executable} --lifecycle-hook --provider codex";
                     timeout = 2;
                   }
                 ];
@@ -157,7 +157,7 @@ in
                 hooks = [
                   {
                     type = "command";
-                    command = "${executable} --lifecycle-hook";
+                    command = "${executable} --lifecycle-hook --provider codex";
                     timeout = 2;
                   }
                 ];
@@ -168,8 +168,8 @@ in
                 hooks = [
                   {
                     type = "command";
-                    command = "${executable} --lifecycle-hook";
-                    timeout = 2;
+                    command = "${executable} --recovery-hook --provider codex";
+                    timeout = 30;
                   }
                 ];
               }

@@ -6,6 +6,16 @@ All notable changes to codexctl are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- You can configure Codex, Claude Code, and Antigravity CLI together with
+  `coding-brain init codex|claude|antigravity|all`; bare interactive init
+  detects providers and asks which managed hooks to install.
+- Live now labels Brain activity by provider and offers exact-target one-shot
+  allow, deny, continue, and bounded manual-text actions through `x` action
+  mode. Claude background sessions can use native attach, while guarded tmux
+  fallback covers exact live targets when structured delivery is unavailable.
+
 ### Changed
 
 - PostToolUse telemetry now records hook receipt independently and correlates
@@ -18,7 +28,7 @@ All notable changes to codexctl are documented here.
   `~/.local/state/coding-brain/activity.jsonl` before upgrading if rollback
   matters.
 - **Breaking:** the installed executable is now `coding-brain`; the crates.io
-  package and internal Rust crates remain named `codexctl`. No compatibility
+  package and internal Rust crates use the `coding-brain` namespace. No compatibility
   executable is installed.
 - Coding Brain is now the only TUI. Its Live, Review, and Scorecard views focus
   on immediate judgment, learning, and session navigation; the dashboard,
@@ -26,9 +36,10 @@ All notable changes to codexctl are documented here.
 - Config moved to `~/.config/coding-brain/config.toml`, state moved to
   `~/.local/state/coding-brain/`, project config is `.coding-brain.toml`, and
   stable project identity lives in `.coding-brain/project.toml`.
-- Lifecycle and permission hooks now record bounded activity before transcript
-  discovery catches up. `coding-brain doctor` reports stale managed hooks,
-  project identity health, lifecycle state, and endpoint privacy advisories.
+- Provider lifecycle, permission, and recovery hooks now record bounded activity
+  before richer discovery catches up. `coding-brain doctor` reports Codex,
+  Claude, and Antigravity setup separately, with distinct navigation and guarded
+  terminal capability rows.
 - Existing codexctl data is not migrated or read. Run `coding-brain init` to
   replace exact managed hooks, restart Codex, and use confirmed
   `coding-brain init --purge` only after the old data is no longer needed for
