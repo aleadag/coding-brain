@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io;
+#[cfg(test)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// One managed Codex hook definition.
@@ -136,10 +138,12 @@ impl Default for LifecycleHookScope {
 }
 
 impl LifecycleHookScope {
+    #[cfg(test)]
     pub fn configured(&self) -> bool {
         self.events.values().any(|state| state.configured)
     }
 
+    #[cfg(test)]
     pub fn definitions_current(&self) -> bool {
         self.events
             .values()
@@ -155,10 +159,12 @@ pub struct LifecycleHookDiscovery {
 }
 
 impl LifecycleHookDiscovery {
+    #[cfg(test)]
     pub fn configured(&self) -> bool {
         self.global.configured() || self.project.configured()
     }
 
+    #[cfg(test)]
     pub fn duplicate_scopes(&self) -> bool {
         self.global.configured() && self.project.configured()
     }
@@ -303,6 +309,17 @@ fn parse_marker_array(value: &str) -> Option<Vec<String>> {
 }
 
 fn applicable_project_hook_paths(cwd: &Path, markers: &[String]) -> Vec<PathBuf> {
+    applicable_project_dirs_with_markers(cwd, markers)
+        .into_iter()
+        .map(|path| path.join(".codex/hooks.json"))
+        .collect()
+}
+
+pub(crate) fn applicable_project_dirs(home: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
+    applicable_project_dirs_with_markers(cwd, &project_root_markers(home))
+}
+
+fn applicable_project_dirs_with_markers(cwd: &Path, markers: &[String]) -> Vec<PathBuf> {
     let root = if markers.is_empty() {
         cwd
     } else {
@@ -317,9 +334,7 @@ fn applicable_project_hook_paths(cwd: &Path, markers: &[String]) -> Vec<PathBuf>
         .collect::<Vec<_>>();
     dirs.push(root.to_path_buf());
     dirs.reverse();
-    dirs.into_iter()
-        .map(|path| path.join(".codex/hooks.json"))
-        .collect()
+    dirs
 }
 
 fn scope_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> PermissionHookScope {
@@ -393,7 +408,7 @@ fn inspect_lifecycle_handlers(value: &serde_json::Value, scope: &mut LifecycleHo
                 state.unavailable |= command_uses_missing_absolute_binary(command);
                 let current = matcher == spec.matcher
                     && handler.get("type").and_then(serde_json::Value::as_str) == Some("command")
-                    && is_exact_current_command(command, &[spec.argument])
+                    && is_exact_current_codex_hook_command(command, spec.argument)
                     && handler.get("timeout").and_then(serde_json::Value::as_u64)
                         == Some(u64::from(spec.timeout))
                     && spec.status_message.is_none_or(|expected| {
@@ -487,14 +502,10 @@ fn entry_is_disabled(value: &serde_json::Value) -> bool {
         || value.get("disabled").and_then(serde_json::Value::as_bool) == Some(true)
 }
 
+#[cfg(test)]
 fn build_hooks_value() -> serde_json::Value {
     let executable = managed_executable();
     build_hooks_value_for(&executable)
-}
-
-#[cfg(not(test))]
-fn managed_executable() -> PathBuf {
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("coding-brain"))
 }
 
 #[cfg(test)]
@@ -502,6 +513,7 @@ fn managed_executable() -> PathBuf {
     PathBuf::from("coding-brain")
 }
 
+#[cfg(test)]
 fn build_hooks_value_for(executable: &Path) -> serde_json::Value {
     let mut hooks_map = serde_json::Map::new();
 
@@ -533,6 +545,7 @@ fn build_hooks_value_for(executable: &Path) -> serde_json::Value {
 }
 
 /// Check if codexctl hooks are already present in existing settings.
+#[cfg(test)]
 fn has_codexctl_hooks(existing: &serde_json::Value) -> bool {
     if let Some(hooks) = existing.get("hooks") {
         if let Some(obj) = hooks.as_object() {
@@ -585,12 +598,17 @@ fn is_exact_current_command(command: &str, expected_args: &[&str]) -> bool {
     is_exact_command(command, expected_args, is_current_program)
 }
 
+fn is_exact_current_codex_hook_command(command: &str, argument: &str) -> bool {
+    is_exact_current_command(command, &[argument])
+        || is_exact_current_command(command, &[argument, "--provider", "codex"])
+}
+
 fn is_exact_managed_command(command: &str, expected_args: &[&str]) -> bool {
     is_exact_command(command, expected_args, is_managed_program)
 }
 
 fn is_current_permission_command(command: &str) -> bool {
-    is_exact_current_command(command, &["--permission-hook"])
+    is_exact_current_codex_hook_command(command, "--permission-hook")
 }
 
 fn contains_managed_permission_flag(command: &str) -> bool {
@@ -608,6 +626,7 @@ fn is_managed_permission_command(command: &str) -> bool {
     is_exact_managed_command(command, &["--permission-hook"])
 }
 
+#[cfg(test)]
 fn is_managed_command(event: &str, command: &str) -> bool {
     match event {
         "PermissionRequest" => is_managed_permission_command(command),
@@ -627,6 +646,7 @@ fn is_managed_command(event: &str, command: &str) -> bool {
 
 /// Merge codexctl hooks into existing settings, preserving all other keys
 /// and any non-codexctl hooks already defined.
+#[cfg(test)]
 fn merge_hooks(existing: &mut serde_json::Value) {
     remove_codexctl_hooks(existing);
     let new_hooks = build_hooks_value();
@@ -655,6 +675,7 @@ fn merge_hooks(existing: &mut serde_json::Value) {
 
 /// Remove codexctl hooks from a matcher entry's inner hooks array.
 /// Returns the number removed and whether any hooks remain after filtering.
+#[cfg(test)]
 fn filter_managed_hooks(event: &str, matcher_entry: &mut serde_json::Value) -> (usize, bool) {
     if let Some(inner_hooks) = matcher_entry.get_mut("hooks") {
         if let Some(arr) = inner_hooks.as_array_mut() {
@@ -672,6 +693,7 @@ fn filter_managed_hooks(event: &str, matcher_entry: &mut serde_json::Value) -> (
 
 /// Remove all codexctl hook entries from settings, preserving everything else.
 /// Returns the number of hook entries removed.
+#[cfg(test)]
 fn remove_codexctl_hooks(settings: &mut serde_json::Value) -> usize {
     let mut removed = 0;
 
@@ -712,6 +734,7 @@ fn remove_codexctl_hooks(settings: &mut serde_json::Value) -> usize {
     removed
 }
 
+#[cfg(test)]
 fn write_hooks_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -735,123 +758,92 @@ fn write_hooks_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
 
 /// Run the uninit command: remove codexctl hooks from hooks.json.
 pub fn run_uninit(project: bool) -> io::Result<()> {
-    let path = settings_path(project);
-
-    if !path.exists() {
-        println!(
-            "No settings file at {} — nothing to remove.",
-            path.display()
-        );
-        return Ok(());
-    }
-
-    let content = std::fs::read_to_string(&path)?;
-    let mut settings = match serde_json::from_str::<serde_json::Value>(&content) {
-        Ok(v) if v.is_object() => v,
-        _ => {
-            eprintln!(
-                "Error: {} is not valid JSON — refusing to modify.",
-                path.display()
-            );
-            std::process::exit(1);
-        }
-    };
-
-    if !has_codexctl_hooks(&settings) {
-        println!(
-            "No managed Coding Brain hooks found in {} — nothing to remove.",
-            path.display()
-        );
-        return Ok(());
-    }
-
-    let removed = remove_codexctl_hooks(&mut settings);
-
-    // If the settings object is now empty (only had hooks), remove the file
-    let is_empty = settings.as_object().is_some_and(|obj| obj.is_empty());
-
-    if is_empty {
-        std::fs::remove_file(&path)?;
-        println!(
-            "Removed {removed} managed Coding Brain hook(s) — {} was empty and has been deleted.",
-            path.display()
-        );
+    super::recover_pending_hook_transaction()?;
+    let scope = if project {
+        super::provider_hooks::HookScope::Project
     } else {
-        let json = serde_json::to_string_pretty(&settings)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        write_hooks_atomically(&path, format!("{json}\n").as_bytes())?;
-        println!(
-            "Removed {removed} Coding Brain hook(s) from {}",
-            path.display()
-        );
-    }
-
+        super::provider_hooks::HookScope::Global
+    };
+    let plans = super::provider_hooks::stage_provider_hook_removal(
+        &[coding_brain_core::provider::AgentProvider::Codex],
+        scope,
+    )?;
+    report_preserved_entries(&plans);
+    super::provider_hooks::apply_hook_transaction(&plans)?;
+    println!(
+        "Removed exact managed Coding Brain hooks from {}",
+        settings_path(project).display()
+    );
     Ok(())
 }
 
 /// Run the init command: write Codex hooks into hooks.json.
 pub fn run_init(project: bool, dry_run: bool) -> io::Result<()> {
+    super::recover_pending_hook_transaction()?;
     let path = settings_path(project);
-
-    // Read existing settings or start fresh
-    let mut settings = if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(v) if v.is_object() => v,
-            Ok(_) => {
-                eprintln!(
-                    "Error: {} exists but is not a JSON object — refusing to overwrite.",
-                    path.display()
-                );
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!(
-                    "Error: {} contains invalid JSON: {} — refusing to overwrite.",
-                    path.display(),
-                    e
-                );
-                std::process::exit(1);
-            }
-        }
+    let scope = if project {
+        super::provider_hooks::HookScope::Project
     } else {
-        serde_json::json!({})
+        super::provider_hooks::HookScope::Global
     };
+    let plans = super::provider_hooks::stage_provider_hooks(
+        &[coding_brain_core::provider::AgentProvider::Codex],
+        scope,
+    )?;
+    let changed = plans
+        .iter()
+        .flat_map(|plan| &plan.edits)
+        .any(|edit| edit.original.as_deref() != Some(edit.replacement.as_slice()));
+    let preserved = plans
+        .iter()
+        .any(|plan| !plan.preserved_modified_entries.is_empty());
 
-    // Replace known managed entries with the current definitions. This makes
-    // init both an installer and an idempotent in-place upgrader.
-    let before = settings.clone();
-    merge_hooks(&mut settings);
-    let changed = settings != before;
+    report_preserved_entries(&plans);
 
     if dry_run {
-        // Show what would be written without actually writing
-        let json = serde_json::to_string_pretty(&settings)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        println!("Would write to {}:", path.display());
-        println!();
-        println!("{json}");
+        if changed {
+            println!(
+                "Would update managed Coding Brain hooks in {}",
+                path.display()
+            );
+        } else if preserved {
+            println!(
+                "No managed hook changes would be applied in {}; user-modified entries would be preserved",
+                path.display()
+            );
+        } else {
+            println!("Coding Brain hooks are current in {}", path.display());
+        }
         return Ok(());
     }
 
     if !changed {
-        println!("Coding Brain hooks are current in {}", path.display());
+        if preserved {
+            println!(
+                "No managed hook changes applied in {}; user-modified entries were preserved",
+                path.display()
+            );
+        } else {
+            println!("Coding Brain hooks are current in {}", path.display());
+        }
         return Ok(());
     }
 
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Write a complete sibling and atomically replace the original.
-    let json = serde_json::to_string_pretty(&settings)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    write_hooks_atomically(&path, format!("{json}\n").as_bytes())?;
-
+    super::provider_hooks::apply_hook_transaction(&plans)?;
     print_success(&path);
 
     Ok(())
+}
+
+fn report_preserved_entries(plans: &[super::provider_hooks::ProviderHookPlan]) {
+    for plan in plans {
+        for entry in &plan.preserved_modified_entries {
+            eprintln!(
+                "Preserved user-modified {} hook entry: {entry}",
+                plan.provider
+            );
+        }
+    }
 }
 
 fn print_success(path: &Path) {
@@ -869,6 +861,32 @@ fn print_success(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_codex_provider_dispatch_is_current() {
+        let permission = serde_json::json!({
+            "hooks": {"PermissionRequest": [{"matcher":"*","hooks":[{
+                "type":"command",
+                "command":"coding-brain --permission-hook --provider codex",
+                "timeout":30,
+                "statusMessage":"Brain reviewing permission…"
+            }]}]}
+        });
+        let mut permission_scope = PermissionHookScope::default();
+        inspect_permission_handlers(&permission, &mut permission_scope);
+        assert!(permission_scope.current);
+
+        let lifecycle = serde_json::json!({
+            "hooks": {"Stop": [{"hooks":[{
+                "type":"command",
+                "command":"coding-brain --recovery-hook --provider codex",
+                "timeout":30
+            }]}]}
+        });
+        let mut lifecycle_scope = LifecycleHookScope::default();
+        inspect_lifecycle_handlers(&lifecycle, &mut lifecycle_scope);
+        assert!(lifecycle_scope.events[&ManagedHookEvent::Stop].current);
+    }
 
     #[test]
     fn test_build_hooks_value() {

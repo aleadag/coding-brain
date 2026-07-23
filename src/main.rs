@@ -22,8 +22,9 @@ mod runtime;
 use std::io;
 use std::time::Duration;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
+use coding_brain_core::provider::AgentProvider;
 use crossterm::{
     event::{self, Event},
     execute,
@@ -47,6 +48,39 @@ pub(crate) enum ConfigAction {
     Init,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum InitProvider {
+    Codex,
+    Claude,
+    Antigravity,
+    All,
+}
+
+fn normalize_init_providers(values: &[InitProvider]) -> Result<Vec<AgentProvider>, String> {
+    if values.contains(&InitProvider::All) {
+        if values.iter().any(|value| *value != InitProvider::All) {
+            return Err("`all` cannot be combined with another provider selector".into());
+        }
+        return Ok(vec![
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ]);
+    }
+
+    let mut providers = Vec::new();
+    for candidate in [
+        (InitProvider::Codex, AgentProvider::Codex),
+        (InitProvider::Claude, AgentProvider::Claude),
+        (InitProvider::Antigravity, AgentProvider::Antigravity),
+    ] {
+        if values.contains(&candidate.0) {
+            providers.push(candidate.1);
+        }
+    }
+    Ok(providers)
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Command {
     /// Inspect or update Coding Brain configuration.
@@ -57,6 +91,12 @@ pub(crate) enum Command {
 
     /// Onboarding wizard (brain, hooks, skills). See issue #257.
     Init {
+        /// Agent providers whose managed hooks should be configured.
+        #[arg(
+            value_enum,
+            conflicts_with_all = ["check", "upgrade", "reset", "remove", "purge", "plugin_only"]
+        )]
+        providers: Vec<InitProvider>,
         /// Drift report comparing recorded onboarding against current state.
         #[arg(long, conflicts_with_all = ["reset", "remove", "non_interactive"])]
         check: bool,
@@ -76,10 +116,7 @@ pub(crate) enum Command {
         /// Skip the confirmation prompt for `--purge`.
         #[arg(long)]
         yes: bool,
-        /// Install (or re-install) just Codex hooks (#325).
-        /// Skip every other phase. Useful for users who already configured
-        /// brain and just want to refresh hook entries
-        /// after upgrading Coding Brain.
+        /// Deprecated Codex-only hook installer. Use `init codex`.
         #[arg(
             long,
             conflicts_with_all = ["check", "reset", "remove", "purge", "non_interactive"]
@@ -105,10 +142,10 @@ pub(crate) enum Command {
         #[arg(long)]
         skip_brain: bool,
 
-        /// Install Codex hooks (default in --non-interactive).
+        /// Install the selected provider hooks (default in --non-interactive).
         #[arg(long)]
         install_plugin: bool,
-        /// Skip the plugin phase.
+        /// Skip the selected provider hook phase.
         #[arg(long)]
         skip_plugin: bool,
 
@@ -579,6 +616,7 @@ fn run_main(cli: Cli) -> io::Result<()> {
         match command {
             Command::Config { .. } => unreachable!("config commands are dispatched after loading"),
             Command::Init {
+                providers,
                 check,
                 reset,
                 remove,
@@ -593,6 +631,8 @@ fn run_main(cli: Cli) -> io::Result<()> {
                 skip_plugin,
                 skip_skills,
             } => {
+                let providers = normalize_init_providers(providers)
+                    .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
                 if *check {
                     return init::run_check();
                 }
@@ -614,9 +654,20 @@ fn run_main(cli: Cli) -> io::Result<()> {
                     // #325 — install just the hook
                     // entries. The other three wizard phases stay where
                     // the previous run left them (no marker rewrite).
+                    eprintln!(
+                        "warning: --plugin-only is deprecated; use `coding-brain init codex` instead"
+                    );
                     return init::phases::install_plugin_now();
                 }
                 if *non_interactive {
+                    let providers = if providers.is_empty() {
+                        eprintln!(
+                            "warning: provider-less --non-interactive is deprecated; use `coding-brain init codex --non-interactive` instead"
+                        );
+                        vec![AgentProvider::Codex]
+                    } else {
+                        providers
+                    };
                     let install_plugin_opt = if *skip_plugin {
                         Some(false)
                     } else if *install_plugin {
@@ -630,9 +681,15 @@ fn run_main(cli: Cli) -> io::Result<()> {
                         install_plugin: install_plugin_opt,
                         skip_skills: *skip_skills,
                     };
-                    return init::run_non_interactive(&answers);
+                    return init::run_non_interactive(&answers, &providers);
                 }
-                return init::run_wizard();
+                let providers = if providers.is_empty() {
+                    let detected = init::state::detect_provider_executables();
+                    init::prompt::select_providers(&detected)?
+                } else {
+                    providers
+                };
+                return init::run_wizard(&providers);
             }
 
             Command::Completions { shell } => {
@@ -828,6 +885,63 @@ mod default_brain_cli_tests {
             early_config_action(&cli),
             Some(ConfigAction::Show)
         ));
+    }
+}
+
+#[cfg(test)]
+mod provider_init_cli_tests {
+    use super::*;
+
+    #[test]
+    fn init_accepts_and_normalizes_positional_provider_selectors() {
+        let cli =
+            Cli::try_parse_from(["coding-brain", "init", "claude", "codex", "claude"]).unwrap();
+        let Some(Command::Init { providers, .. }) = cli.command else {
+            panic!("expected init command");
+        };
+
+        assert_eq!(
+            normalize_init_providers(&providers).unwrap(),
+            vec![AgentProvider::Codex, AgentProvider::Claude]
+        );
+    }
+
+    #[test]
+    fn init_all_is_exclusive_and_expands_to_every_provider() {
+        assert_eq!(
+            normalize_init_providers(&[InitProvider::All]).unwrap(),
+            vec![
+                AgentProvider::Codex,
+                AgentProvider::Claude,
+                AgentProvider::Antigravity,
+            ]
+        );
+        assert_eq!(
+            normalize_init_providers(&[InitProvider::All, InitProvider::All]).unwrap(),
+            vec![
+                AgentProvider::Codex,
+                AgentProvider::Claude,
+                AgentProvider::Antigravity,
+            ]
+        );
+        assert!(normalize_init_providers(&[InitProvider::All, InitProvider::Codex]).is_err());
+    }
+
+    #[test]
+    fn init_provider_selectors_conflict_with_administrative_modes_and_plugin_only() {
+        for mode in [
+            "--check",
+            "--upgrade",
+            "--remove",
+            "--reset",
+            "--purge",
+            "--plugin-only",
+        ] {
+            assert!(
+                Cli::try_parse_from(["coding-brain", "init", "claude", mode]).is_err(),
+                "provider selector unexpectedly accepted with {mode}"
+            );
+        }
     }
 }
 

@@ -6,6 +6,8 @@
 
 use std::io;
 
+use coding_brain_core::provider::AgentProvider;
+
 use super::hooks;
 use super::marker::PhaseRecord;
 use super::prompt;
@@ -206,6 +208,40 @@ fn install_plugin_hooks() -> io::Result<()> {
 /// running the rest of the wizard. Kept under the old name for CLI stability.
 pub fn install_plugin_now() -> io::Result<()> {
     install_plugin_hooks()
+}
+
+pub fn install_provider_hooks(providers: &[AgentProvider]) -> io::Result<Vec<PhaseStatus>> {
+    let plans = super::provider_hooks::stage_provider_hooks(
+        providers,
+        super::provider_hooks::HookScope::Global,
+    )?;
+    report_preserved_provider_entries(&plans);
+    super::provider_hooks::apply_hook_transaction(&plans)?;
+    Ok(providers
+        .iter()
+        .copied()
+        .map(state::detect_provider_hooks)
+        .collect())
+}
+
+pub fn remove_provider_hooks(providers: &[AgentProvider]) -> io::Result<()> {
+    let plans = super::provider_hooks::stage_provider_hook_removal(
+        providers,
+        super::provider_hooks::HookScope::Global,
+    )?;
+    report_preserved_provider_entries(&plans);
+    super::provider_hooks::apply_hook_transaction(&plans)
+}
+
+fn report_preserved_provider_entries(plans: &[super::provider_hooks::ProviderHookPlan]) {
+    for plan in plans {
+        for entry in &plan.preserved_modified_entries {
+            eprintln!(
+                "Preserved user-modified {} hook entry: {entry}",
+                plan.provider
+            );
+        }
+    }
 }
 
 // ===================== Skills ============================================

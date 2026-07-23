@@ -10,6 +10,24 @@ use coding_brain::session::{
 };
 use coding_brain_core::provider::AgentProvider;
 
+#[test]
+fn init_help_lists_all_provider_selectors() {
+    let project = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+        .args(["init", "--help"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    for provider in ["codex", "claude", "antigravity", "all"] {
+        assert!(
+            help.contains(provider),
+            "missing provider {provider}: {help}"
+        );
+    }
+}
+
 /// Helper: create a minimal session for testing status inference.
 fn make_session(cpu: f32, last_message_age_secs: u64) -> AgentSession {
     let raw = RawAgentSession {

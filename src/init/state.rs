@@ -12,7 +12,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use coding_brain_core::provider::AgentProvider;
+
 use super::hooks;
+use super::provider_hooks::{self, HookScope};
 
 /// The shape every phase's probe returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +101,69 @@ pub fn detect_plugin() -> PhaseStatus {
     detect_plugin_at(home.as_deref(), &cwd)
 }
 
+pub fn detect_provider_hooks(provider: AgentProvider) -> PhaseStatus {
+    match provider_hooks::stage_provider_hooks(&[provider], HookScope::Global) {
+        Ok(plans)
+            if plans.iter().all(|plan| {
+                plan.edits.is_empty() && plan.preserved_modified_entries.is_empty()
+            }) =>
+        {
+            PhaseStatus::Installed {
+                details: format!("managed {} hooks", provider.label()),
+            }
+        }
+        Ok(plans)
+            if plans
+                .iter()
+                .any(|plan| !plan.preserved_modified_entries.is_empty()) =>
+        {
+            PhaseStatus::Drift {
+                reason: format!("user-modified {} hook entries preserved", provider.label()),
+            }
+        }
+        Ok(_) => PhaseStatus::NotInstalled,
+        Err(error) => PhaseStatus::Drift {
+            reason: error.to_string(),
+        },
+    }
+}
+
+pub fn detect_provider_executables() -> Vec<AgentProvider> {
+    detect_provider_executables_with(executable_on_path)
+}
+
+fn detect_provider_executables_with(mut available: impl FnMut(&str) -> bool) -> Vec<AgentProvider> {
+    [
+        (AgentProvider::Codex, "codex"),
+        (AgentProvider::Claude, "claude"),
+        (AgentProvider::Antigravity, "agy"),
+    ]
+    .into_iter()
+    .filter_map(|(provider, executable)| available(executable).then_some(provider))
+    .collect()
+}
+
+fn executable_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| executable_file(&directory.join(name)))
+}
+
+#[cfg(unix)]
+fn executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn executable_file(path: &std::path::Path) -> bool {
+    path.is_file() || path.with_extension("exe").is_file()
+}
+
 fn detect_plugin_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -> PhaseStatus {
     let discovery = hooks::discover_permission_hooks_at(home, cwd);
     if !discovery.configured() {
@@ -128,49 +194,6 @@ pub fn detect_skills() -> PhaseStatus {
     PhaseStatus::NotInstalled
 }
 
-// ---------------- Aggregate report -----------------------------------------
-
-/// Full snapshot used by `init --check` and the wizard's opening summary.
-#[derive(Debug, Clone)]
-pub struct EnvironmentReport {
-    pub brain: PhaseStatus,
-    pub plugin: PhaseStatus,
-    pub skills: PhaseStatus,
-}
-
-impl EnvironmentReport {
-    pub fn detect() -> Self {
-        Self {
-            brain: detect_brain(),
-            plugin: detect_plugin(),
-            skills: detect_skills(),
-        }
-    }
-
-    pub fn render_human(&self) -> String {
-        let mut out = String::new();
-        for (label, status) in self.entries() {
-            let detail = status.details().unwrap_or("");
-            let marker = match status {
-                PhaseStatus::Installed { .. } => "✓",
-                PhaseStatus::NotInstalled => "·",
-                PhaseStatus::Drift { .. } => "⚠",
-                PhaseStatus::Skipped => "—",
-            };
-            out.push_str(&format!("  {marker} {label:<10} {detail}\n"));
-        }
-        out
-    }
-
-    pub fn entries(&self) -> [(&'static str, &PhaseStatus); 3] {
-        [
-            ("brain", &self.brain),
-            ("plugin", &self.plugin),
-            ("skills", &self.skills),
-        ]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,13 +210,6 @@ mod tests {
         );
         assert_eq!(PhaseStatus::Drift { reason: "y".into() }.label(), "drift");
         assert_eq!(PhaseStatus::Skipped.label(), "skipped");
-    }
-
-    #[test]
-    fn environment_report_renders_three_lines() {
-        let r = EnvironmentReport::detect();
-        let rendered = r.render_human();
-        assert_eq!(rendered.lines().count(), 3);
     }
 
     #[test]
@@ -254,6 +270,15 @@ mod tests {
         assert_eq!(
             detect_plugin_at(Some(&home), &cwd),
             PhaseStatus::NotInstalled
+        );
+    }
+
+    #[test]
+    fn provider_executable_detection_uses_provider_command_names_in_stable_order() {
+        let detected = detect_provider_executables_with(|name| matches!(name, "claude" | "agy"));
+        assert_eq!(
+            detected,
+            vec![AgentProvider::Claude, AgentProvider::Antigravity]
         );
     }
 }

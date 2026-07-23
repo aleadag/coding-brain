@@ -22,6 +22,10 @@ use coding_brain_core::lifecycle::{LifecycleStore, StoreCondition, coding_brain_
 
 use crate::brain::activity::ActivityStore;
 
+use coding_brain_core::provider::AgentProvider;
+
+use crate::init::provider_hooks::ProviderHookInspection;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
@@ -63,17 +67,50 @@ pub struct Check {
 /// session discovery last because it's the integration that ties it all
 /// together.
 pub fn run_all_checks() -> Vec<Check> {
-    vec![
-        check_binary_on_path(),
-        check_codex_hooks(),
+    let mut checks = Vec::new();
+    if let Some(check) =
+        provider_hook_recovery_check(crate::init::provider_hooks::recover_hook_transaction())
+    {
+        checks.push(check);
+    }
+    checks.extend([check_binary_on_path()]);
+    checks.extend(check_provider_setups());
+    checks.extend([
         check_codex_hook_trust(),
         check_lifecycle_state(),
         check_outcome_telemetry(),
         check_project_identity(),
         check_brain_endpoint(),
         check_session_discovery(),
-        check_terminal_integration(),
-    ]
+    ]);
+    checks.extend(check_terminal_capabilities());
+    checks
+}
+
+fn provider_hook_recovery_check(
+    result: io::Result<crate::init::provider_hooks::RecoveryReport>,
+) -> Option<Check> {
+    match result {
+        Ok(report) if report.concurrent_paths.is_empty() => None,
+        Ok(report) => Some(Check {
+            name: "Provider hook recovery".into(),
+            status: CheckStatus::Advisory,
+            message: format!(
+                "preserved {} concurrently modified provider configuration(s)",
+                report.concurrent_paths.len()
+            ),
+            fix_hint: Some("Review the preserved provider hook configuration files.".into()),
+        }),
+        Err(_) => Some(Check {
+            name: "Provider hook recovery".into(),
+            status: CheckStatus::Fail,
+            message: "pending provider hook transaction could not be recovered".into(),
+            fix_hint: Some(
+                "Inspect the provider configurations and hook transaction journal before retrying."
+                    .into(),
+            ),
+        }),
+    }
 }
 
 /// Human-readable renderer. Lays out one row per check, two-space
@@ -135,6 +172,149 @@ fn counts(checks: &[Check]) -> (usize, usize, usize) {
 
 // ─── individual checks ──────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSetupState {
+    Current,
+    Degraded,
+    Stale,
+    Unavailable,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderSetupEvidence {
+    recorded: bool,
+    executable_available: bool,
+    hooks: ProviderHookInspection,
+}
+
+fn check_provider_setups() -> Vec<Check> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let marker = crate::init::marker::load(&crate::init::marker::default_path())
+        .ok()
+        .flatten();
+    let executables = crate::init::state::detect_provider_executables();
+    let Some(home) = home.as_deref() else {
+        return [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ]
+        .into_iter()
+        .map(|provider| {
+            check_provider_setup(
+                provider,
+                ProviderSetupEvidence {
+                    recorded: false,
+                    executable_available: executables.contains(&provider),
+                    hooks: ProviderHookInspection::Invalid,
+                },
+            )
+        })
+        .collect();
+    };
+    check_provider_setups_at(home, &cwd, marker.as_ref(), &executables)
+}
+
+fn check_provider_setups_at(
+    home: &Path,
+    cwd: &Path,
+    marker: Option<&crate::init::marker::OnboardingMarker>,
+    executables: &[AgentProvider],
+) -> Vec<Check> {
+    let recorded = marker
+        .map(crate::init::marker::OnboardingMarker::upgrade_providers)
+        .unwrap_or_default();
+
+    [
+        AgentProvider::Codex,
+        AgentProvider::Claude,
+        AgentProvider::Antigravity,
+    ]
+    .into_iter()
+    .map(|provider| {
+        let hooks = crate::init::provider_hooks::inspect_provider_hooks_at(provider, home, cwd);
+        check_provider_setup(
+            provider,
+            ProviderSetupEvidence {
+                recorded: recorded.contains(&provider),
+                executable_available: executables.contains(&provider),
+                hooks,
+            },
+        )
+    })
+    .collect()
+}
+
+fn check_provider_setup(provider: AgentProvider, evidence: ProviderSetupEvidence) -> Check {
+    let (state, message) = match evidence.hooks {
+        ProviderHookInspection::Invalid => (
+            ProviderSetupState::Stale,
+            "invalid or unsafe managed definitions".to_string(),
+        ),
+        ProviderHookInspection::Stale => (
+            ProviderSetupState::Stale,
+            "managed definition stale".to_string(),
+        ),
+        ProviderHookInspection::Duplicate if !evidence.executable_available => (
+            ProviderSetupState::Unavailable,
+            "unavailable: provider executable is absent; managed definitions are duplicated"
+                .to_string(),
+        ),
+        ProviderHookInspection::Duplicate => (
+            ProviderSetupState::Degraded,
+            "degraded: managed definitions are duplicated across scopes".to_string(),
+        ),
+        ProviderHookInspection::Missing if evidence.recorded && !evidence.executable_available => (
+            ProviderSetupState::Unavailable,
+            "unavailable: provider executable is absent and managed definitions are missing"
+                .to_string(),
+        ),
+        ProviderHookInspection::Missing if evidence.executable_available => (
+            ProviderSetupState::Degraded,
+            "degraded: executable available with process fallback; structured hooks missing"
+                .to_string(),
+        ),
+        ProviderHookInspection::Missing => (
+            ProviderSetupState::Skipped,
+            "skipped: provider was not selected and executable is absent".to_string(),
+        ),
+        ProviderHookInspection::Current if !evidence.executable_available => (
+            ProviderSetupState::Unavailable,
+            "unavailable: managed definitions current, but provider executable is absent"
+                .to_string(),
+        ),
+        ProviderHookInspection::Current => (
+            ProviderSetupState::Current,
+            "current: executable and managed definitions are available".to_string(),
+        ),
+    };
+    let status = match state {
+        ProviderSetupState::Current => CheckStatus::Pass,
+        ProviderSetupState::Degraded | ProviderSetupState::Unavailable => CheckStatus::Advisory,
+        ProviderSetupState::Stale => CheckStatus::Fail,
+        ProviderSetupState::Skipped => CheckStatus::Skipped,
+    };
+    let fix_hint = (!matches!(
+        state,
+        ProviderSetupState::Current | ProviderSetupState::Skipped
+    ))
+    .then(|| {
+        format!(
+            "Repair {} setup with `coding-brain init {}`.",
+            provider.label(),
+            provider.as_str()
+        )
+    });
+    Check {
+        name: format!("{} setup", provider.label()),
+        status,
+        message,
+        fix_hint,
+    }
+}
+
 fn check_binary_on_path() -> Check {
     // Compare the running binary against what `which coding-brain` resolves
     // to. Mismatches mean the user is running one binary while their
@@ -186,12 +366,7 @@ fn check_binary_on_path() -> Check {
     }
 }
 
-fn check_codex_hooks() -> Check {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    check_codex_hooks_at(home.as_deref(), &cwd)
-}
-
+#[cfg(test)]
 fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -> Check {
     let Some(home) = home else {
         return Check {
@@ -685,53 +860,48 @@ fn check_session_discovery() -> Check {
     // matches. The signal we want is "the scanner runs and finds at
     // least one session." Zero sessions is normal if no Codex is
     // running; advise instead of fail.
-    let sessions = coding_brain_core::discovery::scan_sessions();
+    let sessions = coding_brain_core::discovery::scan_agent_sessions_with_state(
+        &mut coding_brain_core::discovery::ProviderDiscoveryState::default(),
+    );
+    check_session_discovery_for(&sessions)
+}
+
+fn check_session_discovery_for(sessions: &[coding_brain_core::session::AgentSession]) -> Check {
+    let counts = coding_brain_core::health::provider_session_counts(sessions);
+    let message = coding_brain_core::health::format_provider_session_counts(&counts);
     if sessions.is_empty() {
         Check {
             name: "session discovery".into(),
             status: CheckStatus::Advisory,
-            message: "0 sessions discovered (no Codex running?)".into(),
+            message,
             fix_hint: Some(
-                "Start a Codex session in another terminal (`codex`) and re-run `coding-brain doctor`."
-                    .into(),
+                "Start a selected provider session and re-run `coding-brain doctor`.".into(),
             ),
         }
     } else {
         Check {
             name: "session discovery".into(),
             status: CheckStatus::Pass,
-            message: format!("{} session(s) discovered", sessions.len()),
+            message,
             fix_hint: None,
         }
     }
 }
 
-fn check_terminal_integration() -> Check {
-    // Re-use the existing terminal doctor report. We collapse it to a
-    // one-line summary (the detailed view is still available via the
-    // legacy `--doctor` flag).
-    let report = coding_brain_core::terminals::doctor_report();
-    if report.terminal == "Unknown" {
-        return Check {
-            name: "terminal integration".into(),
-            status: CheckStatus::Advisory,
-            message: "terminal not recognized".into(),
-            fix_hint: Some(
-                "Tab switching + input automation work in: Ghostty, Kitty, tmux, WezTerm, Warp, iTerm2, Terminal.app, Gnome Terminal, Windows Terminal."
-                    .into(),
-            ),
-        };
-    }
-    let action_count = report.actions.len();
-    Check {
-        name: "terminal integration".into(),
-        status: CheckStatus::Pass,
-        message: format!(
-            "{} on {} ({} actions supported)",
-            report.terminal, report.platform, action_count
-        ),
-        fix_hint: None,
-    }
+fn check_terminal_capabilities() -> Vec<Check> {
+    coding_brain_core::terminals::provider_capability_diagnostics()
+        .into_iter()
+        .map(|capability| Check {
+            name: capability.name.into(),
+            status: match capability.status {
+                coding_brain_core::terminals::DoctorStatus::Ready => CheckStatus::Pass,
+                coding_brain_core::terminals::DoctorStatus::Blocked => CheckStatus::Fail,
+                coding_brain_core::terminals::DoctorStatus::Unsupported => CheckStatus::Advisory,
+            },
+            message: capability.detail,
+            fix_hint: capability.fix,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -743,8 +913,10 @@ mod tests {
         ProjectEvidence, SessionTarget,
     };
     use coding_brain_core::project::ProjectId;
+    use coding_brain_core::provider::AgentProvider;
 
     use crate::brain::activity::ActivityStore;
+    use crate::init::provider_hooks::ProviderHookInspection;
 
     fn telemetry_event(
         activity_id: &str,
@@ -1059,7 +1231,6 @@ mod tests {
                 .contains("state-directory ownership and permissions")
         );
     }
-
     fn fixture_paths(home: &Path) -> coding_brain_core::paths::CodingBrainPaths {
         coding_brain_core::paths::CodingBrainPaths::resolve(
             &coding_brain_core::paths::PathEnvironment::new(None, None, Some(home.to_path_buf())),
@@ -1197,6 +1368,15 @@ mod tests {
             },
         ];
         assert_eq!(exit_code(&checks), 1);
+    }
+
+    #[test]
+    fn provider_hook_recovery_failure_is_a_failing_check() {
+        let check = provider_hook_recovery_check(Err(io::Error::other("invalid journal")))
+            .expect("recovery failure must be visible");
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(exit_code(&[check]), 1);
     }
 
     #[test]
@@ -1456,5 +1636,300 @@ mod tests {
 
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(check.message.contains("definitions missing"));
+    }
+
+    #[test]
+    fn provider_setup_matrix_maps_internal_states_to_existing_severity() {
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            for hooks in [
+                ProviderHookInspection::Missing,
+                ProviderHookInspection::Current,
+                ProviderHookInspection::Duplicate,
+                ProviderHookInspection::Stale,
+                ProviderHookInspection::Invalid,
+            ] {
+                for recorded in [false, true] {
+                    for executable_available in [false, true] {
+                        let (status, state) = match hooks {
+                            ProviderHookInspection::Invalid => (CheckStatus::Fail, "invalid"),
+                            ProviderHookInspection::Stale => {
+                                (CheckStatus::Fail, "definition stale")
+                            }
+                            ProviderHookInspection::Duplicate if executable_available => {
+                                (CheckStatus::Advisory, "degraded")
+                            }
+                            ProviderHookInspection::Duplicate => {
+                                (CheckStatus::Advisory, "unavailable")
+                            }
+                            ProviderHookInspection::Missing if executable_available => {
+                                (CheckStatus::Advisory, "degraded")
+                            }
+                            ProviderHookInspection::Missing if recorded => {
+                                (CheckStatus::Advisory, "unavailable")
+                            }
+                            ProviderHookInspection::Missing => (CheckStatus::Skipped, "skipped"),
+                            ProviderHookInspection::Current if executable_available => {
+                                (CheckStatus::Pass, "current")
+                            }
+                            ProviderHookInspection::Current => {
+                                (CheckStatus::Advisory, "unavailable")
+                            }
+                        };
+                        let check = check_provider_setup(
+                            provider,
+                            ProviderSetupEvidence {
+                                recorded,
+                                executable_available,
+                                hooks,
+                            },
+                        );
+                        assert_eq!(check.name, format!("{} setup", provider.label()));
+                        assert_eq!(check.status, status, "{provider} {state}");
+                        assert!(check.message.contains(state), "{provider} {state}");
+                        if let Some(hint) = check.fix_hint {
+                            assert!(hint.contains(provider.label()));
+                            assert!(
+                                hint.contains(&format!("coding-brain init {}", provider.as_str()))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsafe_or_stale_definition_fails_even_when_provider_was_not_selected() {
+        for hooks in [
+            ProviderHookInspection::Stale,
+            ProviderHookInspection::Invalid,
+        ] {
+            let check = check_provider_setup(
+                AgentProvider::Claude,
+                ProviderSetupEvidence {
+                    recorded: false,
+                    executable_available: false,
+                    hooks,
+                },
+            );
+            assert_eq!(check.status, CheckStatus::Fail);
+        }
+    }
+
+    #[test]
+    fn skipped_marker_provider_is_unselected_while_installed_marker_is_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let record = |status: &str| crate::init::marker::PhaseRecord {
+            status: status.into(),
+            ..Default::default()
+        };
+        let mut marker = crate::init::marker::OnboardingMarker::default();
+        marker
+            .phases
+            .insert("hooks.claude".into(), record("skipped"));
+        let checks = check_provider_setups_at(&home, &project, Some(&marker), &[]);
+        assert_eq!(checks[1].status, CheckStatus::Skipped);
+
+        marker
+            .phases
+            .insert("hooks.claude".into(), record("installed"));
+        let plan = crate::init::provider_hooks::stage_provider_hooks_at(
+            &[AgentProvider::Claude],
+            crate::init::provider_hooks::HookScope::Global,
+            &home,
+            &project,
+        )
+        .unwrap();
+        let edit = &plan[0].edits[0];
+        std::fs::create_dir_all(edit.path.parent().unwrap()).unwrap();
+        std::fs::write(&edit.path, &edit.replacement).unwrap();
+        let checks = check_provider_setups_at(&home, &project, Some(&marker), &[]);
+        assert_eq!(checks[1].status, CheckStatus::Advisory);
+        assert!(checks[1].message.contains("unavailable"));
+    }
+
+    #[test]
+    fn nested_cwd_provider_setup_uses_ancestor_project_scope() {
+        for provider in [AgentProvider::Codex, AgentProvider::Claude] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let root = temp.path().join("project");
+            let cwd = root.join("nested/work");
+            std::fs::create_dir_all(root.join(".git")).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            let plans = crate::init::provider_hooks::stage_provider_hooks_at(
+                &[provider],
+                crate::init::provider_hooks::HookScope::Project,
+                &home,
+                &root,
+            )
+            .unwrap();
+            let edit = &plans[0].edits[0];
+            std::fs::create_dir_all(edit.path.parent().unwrap()).unwrap();
+            std::fs::write(&edit.path, &edit.replacement).unwrap();
+            let mut marker = crate::init::marker::OnboardingMarker::default();
+            marker.phases.insert(
+                format!("hooks.{}", provider.as_str()),
+                crate::init::marker::PhaseRecord {
+                    status: "installed".into(),
+                    ..Default::default()
+                },
+            );
+
+            let checks = check_provider_setups_at(&home, &cwd, Some(&marker), &[provider]);
+            let check = checks
+                .iter()
+                .find(|check| check.name == format!("{} setup", provider.label()))
+                .unwrap();
+
+            assert_eq!(check.status, CheckStatus::Pass);
+            assert!(check.message.contains("current"));
+        }
+    }
+
+    #[test]
+    fn home_project_alias_is_one_current_provider_setup() {
+        for provider in [AgentProvider::Codex, AgentProvider::Claude] {
+            for nested in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let home = temp.path().join("home");
+                let cwd = if nested {
+                    home.join("nested/work")
+                } else {
+                    home.clone()
+                };
+                std::fs::create_dir_all(home.join(".git")).unwrap();
+                std::fs::create_dir_all(&cwd).unwrap();
+                let plans = crate::init::provider_hooks::stage_provider_hooks_at(
+                    &[provider],
+                    crate::init::provider_hooks::HookScope::Global,
+                    &home,
+                    &cwd,
+                )
+                .unwrap();
+                let edit = &plans[0].edits[0];
+                std::fs::create_dir_all(edit.path.parent().unwrap()).unwrap();
+                std::fs::write(&edit.path, &edit.replacement).unwrap();
+
+                let checks = check_provider_setups_at(&home, &cwd, None, &[provider]);
+                let check = checks
+                    .iter()
+                    .find(|check| check.name == format!("{} setup", provider.label()))
+                    .unwrap();
+
+                assert_eq!(
+                    check.status,
+                    CheckStatus::Pass,
+                    "{provider} nested={nested}"
+                );
+                assert!(check.message.contains("current"));
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_check_reports_only_provider_counts() {
+        let sessions = [
+            provider_session(AgentProvider::Claude, "private-session-id"),
+            provider_session(AgentProvider::Codex, "another-private-id"),
+        ];
+
+        let check = check_session_discovery_for(&sessions);
+
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.message, "Codex: 1, Claude: 1, Antigravity: 0");
+        assert!(!check.message.contains("private"));
+    }
+
+    fn provider_session(
+        provider: AgentProvider,
+        id: &str,
+    ) -> coding_brain_core::session::AgentSession {
+        coding_brain_core::session::AgentSession::from_raw(
+            coding_brain_core::session::RawAgentSession {
+                provider,
+                pid: 1,
+                process_start_identity: Some(1),
+                session_id: id.into(),
+                cwd: "/work".into(),
+                started_at: 1,
+            },
+        )
+    }
+
+    #[test]
+    fn human_and_json_provider_rows_are_deterministic_and_bounded() {
+        let checks = [
+            check_provider_setup(
+                AgentProvider::Codex,
+                ProviderSetupEvidence {
+                    recorded: true,
+                    executable_available: true,
+                    hooks: ProviderHookInspection::Current,
+                },
+            ),
+            check_provider_setup(
+                AgentProvider::Claude,
+                ProviderSetupEvidence {
+                    recorded: true,
+                    executable_available: false,
+                    hooks: ProviderHookInspection::Current,
+                },
+            ),
+            check_provider_setup(
+                AgentProvider::Antigravity,
+                ProviderSetupEvidence {
+                    recorded: false,
+                    executable_available: false,
+                    hooks: ProviderHookInspection::Missing,
+                },
+            ),
+        ];
+
+        let human = render_checks(&checks);
+        let json = render_checks_json(&checks).unwrap();
+
+        assert!(human.find("Codex setup").unwrap() < human.find("Claude setup").unwrap());
+        assert!(human.find("Claude setup").unwrap() < human.find("Antigravity setup").unwrap());
+        assert!(json.len() < 2_048);
+        assert!(!json.contains("hooks.json"));
+        assert!(!json.contains("/home/"));
+        assert_eq!(json, render_checks_json(&checks).unwrap());
+    }
+
+    #[test]
+    fn terminal_capability_rows_render_separately_in_human_and_json_output() {
+        let checks = check_terminal_capabilities();
+
+        assert_eq!(
+            checks
+                .iter()
+                .map(|check| check.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Agent Deck navigation",
+                "Claude native attach",
+                "Guarded semantic input",
+                "Focus-only fallback",
+            ]
+        );
+        let human = render_checks(&checks);
+        let json = render_checks_json(&checks).unwrap();
+        for name in [
+            "Agent Deck navigation",
+            "Claude native attach",
+            "Guarded semantic input",
+            "Focus-only fallback",
+        ] {
+            assert!(human.contains(name));
+            assert!(json.contains(name));
+        }
     }
 }

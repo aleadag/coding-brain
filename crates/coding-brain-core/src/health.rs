@@ -1,6 +1,39 @@
 #![allow(dead_code)]
 
+use crate::provider::AgentProvider;
 use crate::session::AgentSession;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSessionCount {
+    pub provider: AgentProvider,
+    pub count: usize,
+}
+
+/// Aggregate live discovery by provider without exposing session identities.
+pub fn provider_session_counts(sessions: &[AgentSession]) -> Vec<ProviderSessionCount> {
+    [
+        AgentProvider::Codex,
+        AgentProvider::Claude,
+        AgentProvider::Antigravity,
+    ]
+    .into_iter()
+    .map(|provider| ProviderSessionCount {
+        provider,
+        count: sessions
+            .iter()
+            .filter(|session| session.provider == provider)
+            .count(),
+    })
+    .collect()
+}
+
+pub fn format_provider_session_counts(counts: &[ProviderSessionCount]) -> String {
+    counts
+        .iter()
+        .map(|entry| format!("{}: {}", entry.provider.label(), entry.count))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Tunable thresholds for the health checks below. Lives here (not in
 /// `config`) because health is a foundational `coding-brain-core` concern; the
@@ -533,10 +566,54 @@ fn check_repetition(session: &AgentSession, t: &HealthThresholds) -> Option<Heal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::AgentProvider;
     use crate::session::{RawAgentSession, SessionStatus, TelemetryStatus};
 
     fn defaults() -> HealthThresholds {
         HealthThresholds::default()
+    }
+
+    fn provider_session(provider: AgentProvider, id: &str) -> AgentSession {
+        AgentSession::from_raw(RawAgentSession {
+            provider,
+            pid: 1,
+            process_start_identity: Some(1),
+            session_id: id.into(),
+            cwd: "/work".into(),
+            started_at: 1,
+        })
+    }
+
+    #[test]
+    fn provider_session_counts_are_aggregate_stable_and_identity_free() {
+        let sessions = vec![
+            provider_session(AgentProvider::Claude, "secret-claude-id"),
+            provider_session(AgentProvider::Codex, "secret-codex-id"),
+            provider_session(AgentProvider::Claude, "another-secret-id"),
+        ];
+
+        let counts = provider_session_counts(&sessions);
+
+        assert_eq!(
+            counts,
+            vec![
+                ProviderSessionCount {
+                    provider: AgentProvider::Codex,
+                    count: 1,
+                },
+                ProviderSessionCount {
+                    provider: AgentProvider::Claude,
+                    count: 2,
+                },
+                ProviderSessionCount {
+                    provider: AgentProvider::Antigravity,
+                    count: 0,
+                },
+            ]
+        );
+        let summary = format_provider_session_counts(&counts);
+        assert_eq!(summary, "Codex: 1, Claude: 2, Antigravity: 0");
+        assert!(!summary.contains("secret"));
     }
 
     fn make_session() -> AgentSession {

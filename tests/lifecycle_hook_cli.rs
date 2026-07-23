@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use coding_brain_core::lifecycle::{LifecycleEventName, LifecycleStore, ProjectedStatus};
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
+use sha2::{Digest, Sha256};
 
 const PROMPT: &[u8] = include_bytes!("fixtures/hooks/user-prompt-submit.json");
 const CLAUDE_STOP: &[u8] = include_bytes!("fixtures/hooks/claude-stop.json");
@@ -481,6 +482,610 @@ fn run_cli(home: &std::path::Path, args: &[&str]) -> Output {
         .current_dir(home)
         .output()
         .unwrap()
+}
+
+#[test]
+fn init_noninteractive_selectors_write_stable_provider_marker_keys() {
+    let home = tempfile::tempdir().unwrap();
+    let output = run_cli(
+        home.path(),
+        &[
+            "init",
+            "claude",
+            "antigravity",
+            "--non-interactive",
+            "--skip-brain",
+            "--skip-skills",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let marker: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            home.path()
+                .join(".local/state/coding-brain/onboarding.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker["phases"]["hooks.claude"]["status"], "installed");
+    assert_eq!(marker["phases"]["hooks.antigravity"]["status"], "installed");
+    assert!(marker["phases"].get("plugin").is_none());
+    assert!(marker["phases"].get("hooks.codex").is_none());
+    assert!(home.path().join(".claude/settings.json").exists());
+    assert!(home.path().join(".gemini/config/hooks.json").exists());
+    assert!(!home.path().join(".codex/hooks.json").exists());
+}
+
+#[test]
+fn subsequent_init_preserves_previous_provider_records_for_check_and_remove() {
+    let home = tempfile::tempdir().unwrap();
+    for provider in ["claude", "codex"] {
+        let output = run_cli(
+            home.path(),
+            &[
+                "init",
+                provider,
+                "--non-interactive",
+                "--skip-brain",
+                "--skip-skills",
+            ],
+        );
+        assert!(output.status.success());
+    }
+
+    let marker: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            home.path()
+                .join(".local/state/coding-brain/onboarding.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker["phases"]["hooks.codex"]["status"], "installed");
+    assert_eq!(marker["phases"]["hooks.claude"]["status"], "installed");
+    assert!(run_cli(home.path(), &["init", "--check"]).status.success());
+
+    let remove = run_cli(home.path(), &["init", "--remove"]);
+    assert!(remove.status.success());
+    for path in [".codex/hooks.json", ".claude/settings.json"] {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(home.path().join(path)).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({}));
+    }
+}
+
+#[test]
+fn init_legacy_noninteractive_and_plugin_only_print_exact_replacements() {
+    let home = tempfile::tempdir().unwrap();
+    let noninteractive = run_cli(
+        home.path(),
+        &["init", "--non-interactive", "--skip-brain", "--skip-skills"],
+    );
+    assert!(noninteractive.status.success());
+    assert_eq!(
+        String::from_utf8(noninteractive.stderr)
+            .unwrap()
+            .lines()
+            .next(),
+        Some(
+            "warning: provider-less --non-interactive is deprecated; use `coding-brain init codex --non-interactive` instead"
+        )
+    );
+
+    let plugin_only = run_cli(home.path(), &["init", "--plugin-only"]);
+    assert!(plugin_only.status.success());
+    assert_eq!(
+        String::from_utf8(plugin_only.stderr)
+            .unwrap()
+            .lines()
+            .next(),
+        Some("warning: --plugin-only is deprecated; use `coding-brain init codex` instead")
+    );
+}
+
+#[test]
+fn init_all_cannot_be_combined_with_another_selector() {
+    let home = tempfile::tempdir().unwrap();
+    let output = run_cli(home.path(), &["init", "all", "codex", "--non-interactive"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("`all` cannot be combined with another provider selector")
+    );
+}
+
+#[test]
+fn init_check_upgrade_and_remove_use_recorded_providers() {
+    let home = tempfile::tempdir().unwrap();
+    let init = run_cli(
+        home.path(),
+        &[
+            "init",
+            "claude",
+            "antigravity",
+            "--non-interactive",
+            "--skip-brain",
+            "--skip-skills",
+        ],
+    );
+    assert!(init.status.success());
+    assert!(run_cli(home.path(), &["init", "--check"]).status.success());
+
+    fs::remove_file(home.path().join(".claude/settings.json")).unwrap();
+    assert!(!run_cli(home.path(), &["init", "--check"]).status.success());
+    assert!(
+        run_cli(home.path(), &["init", "--upgrade"])
+            .status
+            .success()
+    );
+    assert!(home.path().join(".claude/settings.json").exists());
+    assert!(!home.path().join(".codex/hooks.json").exists());
+
+    let claude_path = home.path().join(".claude/settings.json");
+    let mut claude: serde_json::Value =
+        serde_json::from_slice(&fs::read(&claude_path).unwrap()).unwrap();
+    claude["keep"] = serde_json::json!("claude-user-setting");
+    fs::write(&claude_path, serde_json::to_vec_pretty(&claude).unwrap()).unwrap();
+    let antigravity_path = home.path().join(".gemini/config/hooks.json");
+    let mut antigravity: serde_json::Value =
+        serde_json::from_slice(&fs::read(&antigravity_path).unwrap()).unwrap();
+    antigravity["keep"] = serde_json::json!({"command": "antigravity-user-setting"});
+    fs::write(
+        &antigravity_path,
+        serde_json::to_vec_pretty(&antigravity).unwrap(),
+    )
+    .unwrap();
+
+    let remove = run_cli(home.path(), &["init", "--remove"]);
+    assert!(
+        remove.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let claude: serde_json::Value =
+        serde_json::from_slice(&fs::read(&claude_path).unwrap()).unwrap();
+    let antigravity: serde_json::Value =
+        serde_json::from_slice(&fs::read(&antigravity_path).unwrap()).unwrap();
+    assert_eq!(claude, serde_json::json!({"keep": "claude-user-setting"}));
+    assert_eq!(
+        antigravity,
+        serde_json::json!({"keep": {"command": "antigravity-user-setting"}})
+    );
+    assert!(
+        !home
+            .path()
+            .join(".local/state/coding-brain/onboarding.json")
+            .exists()
+    );
+}
+
+#[test]
+fn init_upgrade_retries_drift_and_leaves_skipped_providers_untouched() {
+    let home = tempfile::tempdir().unwrap();
+    let marker = home
+        .path()
+        .join(".local/state/coding-brain/onboarding.json");
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(
+        &marker,
+        br#"{"version":"0.0.1","completed_at":"now","phases":{"hooks.claude":{"status":"drift"},"hooks.antigravity":{"status":"skipped"}}}"#,
+    )
+    .unwrap();
+
+    let upgrade = run_cli(home.path(), &["init", "--upgrade"]);
+
+    assert!(
+        upgrade.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+    assert!(home.path().join(".claude/settings.json").exists());
+    assert!(!home.path().join(".gemini/config/hooks.json").exists());
+    assert!(!home.path().join(".codex/hooks.json").exists());
+}
+
+#[test]
+fn init_remove_keeps_marker_when_multi_provider_staging_fails() {
+    let home = tempfile::tempdir().unwrap();
+    let init = run_cli(
+        home.path(),
+        &[
+            "init",
+            "claude",
+            "antigravity",
+            "--non-interactive",
+            "--skip-brain",
+            "--skip-skills",
+        ],
+    );
+    assert!(init.status.success());
+    let marker = home
+        .path()
+        .join(".local/state/coding-brain/onboarding.json");
+    let marker_before = fs::read(&marker).unwrap();
+    let claude_path = home.path().join(".claude/settings.json");
+    let claude_before = fs::read(&claude_path).unwrap();
+    let antigravity = home.path().join(".gemini/config/hooks.json");
+    fs::remove_file(&antigravity).unwrap();
+    fs::create_dir(&antigravity).unwrap();
+
+    let remove = run_cli(home.path(), &["init", "--remove"]);
+
+    assert!(!remove.status.success());
+    assert_eq!(fs::read(&marker).unwrap(), marker_before);
+    assert_eq!(fs::read(&claude_path).unwrap(), claude_before);
+}
+
+#[test]
+fn init_remove_cleans_all_exact_provider_hooks_without_marker_authority() {
+    for marker_state in ["missing", "corrupt", "subset"] {
+        let home = tempfile::tempdir().unwrap();
+        let init = run_cli(
+            home.path(),
+            &[
+                "init",
+                "all",
+                "--non-interactive",
+                "--skip-brain",
+                "--skip-skills",
+            ],
+        );
+        assert!(init.status.success());
+        let marker = home
+            .path()
+            .join(".local/state/coding-brain/onboarding.json");
+        match marker_state {
+            "missing" => fs::remove_file(&marker).unwrap(),
+            "corrupt" => fs::write(&marker, b"{broken").unwrap(),
+            "subset" => fs::write(
+                &marker,
+                br#"{"version":"0.58.0","completed_at":"now","phases":{"hooks.codex":{"status":"installed"}}}"#,
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        }
+
+        let remove = run_cli(home.path(), &["init", "--remove"]);
+        assert!(
+            remove.status.success(),
+            "{marker_state}: {}",
+            String::from_utf8_lossy(&remove.stderr)
+        );
+        for path in [
+            ".codex/hooks.json",
+            ".claude/settings.json",
+            ".gemini/config/hooks.json",
+        ] {
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(home.path().join(path)).unwrap()).unwrap();
+            assert_eq!(value, serde_json::json!({}), "{marker_state}: {path}");
+        }
+    }
+}
+
+#[test]
+fn init_remove_preserves_unrelated_and_modified_entries_without_marker_authority() {
+    let home = tempfile::tempdir().unwrap();
+    assert!(
+        run_cli(
+            home.path(),
+            &[
+                "init",
+                "all",
+                "--non-interactive",
+                "--skip-brain",
+                "--skip-skills",
+            ],
+        )
+        .status
+        .success()
+    );
+    let codex_path = home.path().join(".codex/hooks.json");
+    let mut codex: serde_json::Value =
+        serde_json::from_slice(&fs::read(&codex_path).unwrap()).unwrap();
+    codex["keep"] = serde_json::json!("codex-user-setting");
+    fs::write(&codex_path, serde_json::to_vec_pretty(&codex).unwrap()).unwrap();
+
+    let claude_path = home.path().join(".claude/settings.json");
+    let mut claude: serde_json::Value =
+        serde_json::from_slice(&fs::read(&claude_path).unwrap()).unwrap();
+    claude["keep"] = serde_json::json!("claude-user-setting");
+    let command = claude["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    claude["hooks"]["Stop"][0]["hooks"][0]["command"] =
+        serde_json::json!(format!("{command} --user-option"));
+    fs::write(&claude_path, serde_json::to_vec_pretty(&claude).unwrap()).unwrap();
+
+    let antigravity_path = home.path().join(".gemini/config/hooks.json");
+    let mut antigravity: serde_json::Value =
+        serde_json::from_slice(&fs::read(&antigravity_path).unwrap()).unwrap();
+    antigravity["keep"] = serde_json::json!({"command": "user-setting"});
+    let command = antigravity["coding-brain"]["Stop"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    antigravity["coding-brain"]["Stop"][0]["command"] =
+        serde_json::json!(format!("{command} --user-option"));
+    fs::write(
+        &antigravity_path,
+        serde_json::to_vec_pretty(&antigravity).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        home.path()
+            .join(".local/state/coding-brain/onboarding.json"),
+        b"{broken",
+    )
+    .unwrap();
+
+    let remove = run_cli(home.path(), &["init", "--remove"]);
+
+    assert!(remove.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&codex_path).unwrap()).unwrap(),
+        serde_json::json!({"keep": "codex-user-setting"})
+    );
+    let claude: serde_json::Value =
+        serde_json::from_slice(&fs::read(&claude_path).unwrap()).unwrap();
+    assert_eq!(claude["keep"], "claude-user-setting");
+    assert!(
+        claude["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("--user-option")
+    );
+    let antigravity: serde_json::Value =
+        serde_json::from_slice(&fs::read(&antigravity_path).unwrap()).unwrap();
+    assert_eq!(antigravity["keep"]["command"], "user-setting");
+    assert!(
+        antigravity["coding-brain"]["Stop"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("--user-option")
+    );
+}
+
+#[test]
+fn init_purge_removes_all_exact_provider_hooks_without_a_marker() {
+    let home = tempfile::tempdir().unwrap();
+    assert!(
+        run_cli(
+            home.path(),
+            &[
+                "init",
+                "all",
+                "--non-interactive",
+                "--skip-brain",
+                "--skip-skills",
+            ],
+        )
+        .status
+        .success()
+    );
+    fs::remove_file(
+        home.path()
+            .join(".local/state/coding-brain/onboarding.json"),
+    )
+    .unwrap();
+
+    let purge = run_cli(home.path(), &["init", "--purge", "--yes"]);
+
+    assert!(purge.status.success());
+    for path in [
+        ".codex/hooks.json",
+        ".claude/settings.json",
+        ".gemini/config/hooks.json",
+    ] {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(home.path().join(path)).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({}), "{path}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_purge_stops_before_deleting_targets_when_provider_staging_fails() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempfile::tempdir().unwrap();
+    assert!(
+        run_cli(
+            home.path(),
+            &[
+                "init",
+                "all",
+                "--non-interactive",
+                "--skip-brain",
+                "--skip-skills",
+            ],
+        )
+        .status
+        .success()
+    );
+
+    let marker = home
+        .path()
+        .join(".local/state/coding-brain/onboarding.json");
+    let state_sentinel = home.path().join(".local/state/coding-brain/keep");
+    let config = home.path().join(".config/coding-brain/config.toml");
+    let legacy_state = home.path().join(".codexctl/keep");
+    let legacy_config = home.path().join(".config/codexctl/config.toml");
+    for (path, contents) in [
+        (&state_sentinel, b"state".as_slice()),
+        (&config, b"config".as_slice()),
+        (&legacy_state, b"legacy-state".as_slice()),
+        (&legacy_config, b"legacy-config".as_slice()),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    let codex = home.path().join(".codex/hooks.json");
+    let claude = home.path().join(".claude/settings.json");
+    let antigravity = home.path().join(".gemini/config/hooks.json");
+    let antigravity_target = home.path().join("antigravity-hooks-target.json");
+    let antigravity_before = fs::read(&antigravity).unwrap();
+    fs::remove_file(&antigravity).unwrap();
+    fs::write(&antigravity_target, &antigravity_before).unwrap();
+    symlink(&antigravity_target, &antigravity).unwrap();
+
+    let preserved_files = [
+        (&marker, fs::read(&marker).unwrap()),
+        (&state_sentinel, fs::read(&state_sentinel).unwrap()),
+        (&config, fs::read(&config).unwrap()),
+        (&legacy_state, fs::read(&legacy_state).unwrap()),
+        (&legacy_config, fs::read(&legacy_config).unwrap()),
+        (&codex, fs::read(&codex).unwrap()),
+        (&claude, fs::read(&claude).unwrap()),
+    ];
+
+    let purge = run_cli(home.path(), &["init", "--purge", "--yes"]);
+
+    assert!(!purge.status.success());
+    for (path, contents) in preserved_files {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            contents,
+            "{} changed",
+            path.display()
+        );
+    }
+    assert!(
+        antigravity
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&antigravity_target).unwrap(), antigravity_before);
+}
+
+fn install_crash_journal(home: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let target = home.join(name);
+    let original = b"{\"original\":true}\n".to_vec();
+    let replacement = b"{\"replacement\":true}\n".to_vec();
+    fs::write(&target, &replacement).unwrap();
+    let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let journal = serde_json::json!({
+        "schema_version": 2,
+        "transaction_id": "integration-crash",
+        "edits": [{
+            "path": target,
+            "original": original,
+            "original_mode": null,
+            "original_hash": hash(&original),
+            "replacement": replacement,
+            "replacement_hash": hash(&replacement)
+        }],
+        "replaced_paths": [target],
+        "in_flight": null
+    });
+    let path = home.join(".local/state/coding-brain/brain/hook-install-transaction.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    target
+}
+
+#[test]
+fn init_plugin_only_recovers_before_the_current_hooks_early_return() {
+    let home = tempfile::tempdir().unwrap();
+    assert!(
+        run_cli(home.path(), &["init", "--plugin-only"])
+            .status
+            .success()
+    );
+    let target = install_crash_journal(home.path(), "plugin-recovery.json");
+
+    let output = run_cli(home.path(), &["init", "--plugin-only"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(target).unwrap(), b"{\"original\":true}\n");
+}
+
+#[test]
+fn init_plugin_only_reports_preserved_collision_without_calling_it_current() {
+    let home = tempfile::tempdir().unwrap();
+    assert!(
+        run_cli(home.path(), &["init", "--plugin-only"])
+            .status
+            .success()
+    );
+    let hooks_path = home.path().join(".codex/hooks.json");
+    let mut hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(&hooks_path).unwrap()).unwrap();
+    hooks["hooks"]["Stop"][0]["hooks"][0]["command"] = serde_json::json!(format!(
+        "{} --user-option",
+        hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+    ));
+    let original = serde_json::to_vec_pretty(&hooks).unwrap();
+    fs::write(&hooks_path, &original).unwrap();
+
+    let output = run_cli(home.path(), &["init", "--plugin-only"]);
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Preserved user-modified"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("hooks are current"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No managed hook changes applied"));
+    assert_eq!(fs::read(hooks_path).unwrap(), original);
+}
+
+#[test]
+fn init_reset_recovers_a_pending_hook_transaction_first() {
+    let home = tempfile::tempdir().unwrap();
+    let target = install_crash_journal(home.path(), "reset-recovery.json");
+
+    let output = run_cli(home.path(), &["init", "--reset"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(target).unwrap(), b"{\"original\":true}\n");
+}
+
+#[test]
+fn init_purge_recovers_a_pending_hook_transaction_first() {
+    let home = tempfile::tempdir().unwrap();
+    let target = install_crash_journal(home.path(), "purge-recovery.json");
+
+    let output = run_cli(home.path(), &["init", "--purge", "--yes"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(target).unwrap(), b"{\"original\":true}\n");
+}
+
+#[test]
+fn doctor_fails_when_pending_hook_recovery_is_invalid() {
+    let home = tempfile::tempdir().unwrap();
+    let journal = home
+        .path()
+        .join(".local/state/coding-brain/brain/hook-install-transaction.json");
+    fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    fs::write(journal, b"not json").unwrap();
+
+    let output = run_cli(home.path(), &["doctor"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Provider hook recovery"));
 }
 
 fn prompt_payload(index: usize) -> Vec<u8> {

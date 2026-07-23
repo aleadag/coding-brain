@@ -17,6 +17,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use coding_brain_core::provider::AgentProvider;
 use serde::{Deserialize, Serialize};
 
 /// Snapshot of a single phase's recorded outcome.
@@ -44,6 +45,69 @@ pub struct OnboardingMarker {
     /// Per-phase records keyed by phase id (`budget`, `brain`, …).
     #[serde(default)]
     pub phases: std::collections::BTreeMap<String, PhaseRecord>,
+}
+
+impl OnboardingMarker {
+    /// Providers explicitly represented by provider hook phase keys. Legacy
+    /// `plugin` records are projected as Codex without rewriting the marker.
+    pub fn recorded_providers(&self) -> Vec<AgentProvider> {
+        let mut providers = Vec::new();
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let key = format!("hooks.{}", provider.as_str());
+            if self.phases.contains_key(&key)
+                || (provider == AgentProvider::Codex && self.phases.contains_key("plugin"))
+            {
+                providers.push(provider);
+            }
+        }
+        providers
+    }
+
+    /// Providers whose hook phase was recorded as installed.
+    pub fn selected_providers(&self) -> Vec<AgentProvider> {
+        self.recorded_providers()
+            .into_iter()
+            .filter(|provider| {
+                let key = format!("hooks.{}", provider.as_str());
+                self.phases
+                    .get(&key)
+                    .or_else(|| {
+                        (*provider == AgentProvider::Codex)
+                            .then(|| self.phases.get("plugin"))
+                            .flatten()
+                    })
+                    .is_some_and(|record| record.status == "installed")
+            })
+            .collect()
+    }
+
+    /// Providers whose prior hook phase should be retried during upgrade.
+    /// A stable provider key takes precedence over the legacy `plugin` key.
+    pub fn upgrade_providers(&self) -> Vec<AgentProvider> {
+        let selected = self.selected_providers();
+        self.recorded_providers()
+            .into_iter()
+            .filter(|provider| {
+                selected.contains(provider)
+                    || self
+                        .provider_record(*provider)
+                        .is_some_and(|record| record.status == "drift")
+            })
+            .collect()
+    }
+
+    pub fn provider_record(&self, provider: AgentProvider) -> Option<&PhaseRecord> {
+        let key = format!("hooks.{}", provider.as_str());
+        self.phases.get(&key).or_else(|| {
+            (provider == AgentProvider::Codex)
+                .then(|| self.phases.get("plugin"))
+                .flatten()
+        })
+    }
 }
 
 /// Default location: `<state-root>/onboarding.json`. Used in production;
@@ -143,5 +207,53 @@ mod tests {
         clear(&p).unwrap(); // present — removed
         assert!(!p.exists());
         clear(&p).unwrap(); // missing again — OK
+    }
+
+    #[test]
+    fn selected_providers_use_stable_hook_keys_and_project_legacy_plugin_to_codex() {
+        let installed = PhaseRecord {
+            status: "installed".into(),
+            ..Default::default()
+        };
+        let mut current = OnboardingMarker::default();
+        current
+            .phases
+            .insert("hooks.claude".into(), installed.clone());
+        current
+            .phases
+            .insert("hooks.antigravity".into(), installed.clone());
+        assert_eq!(
+            current.selected_providers(),
+            vec![AgentProvider::Claude, AgentProvider::Antigravity]
+        );
+
+        let mut legacy = OnboardingMarker::default();
+        legacy.phases.insert("plugin".into(), installed);
+        assert_eq!(legacy.selected_providers(), vec![AgentProvider::Codex]);
+        assert!(!legacy.phases.contains_key("hooks.codex"));
+    }
+
+    #[test]
+    fn upgrade_providers_include_installed_and_drift_with_stable_override() {
+        let record = |status: &str| PhaseRecord {
+            status: status.into(),
+            ..Default::default()
+        };
+        let mut marker = OnboardingMarker::default();
+        marker.phases.insert("plugin".into(), record("drift"));
+        marker
+            .phases
+            .insert("hooks.codex".into(), record("skipped"));
+        marker.phases.insert("hooks.claude".into(), record("drift"));
+        marker
+            .phases
+            .insert("hooks.antigravity".into(), record("not_installed"));
+        assert_eq!(marker.upgrade_providers(), vec![AgentProvider::Claude]);
+
+        marker.phases.remove("hooks.codex");
+        assert_eq!(
+            marker.upgrade_providers(),
+            vec![AgentProvider::Codex, AgentProvider::Claude]
+        );
     }
 }

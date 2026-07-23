@@ -365,6 +365,94 @@ impl DoctorCheck {
     }
 }
 
+/// Provider-aware navigation and input capabilities. These remain separate so
+/// focus support is never presented as permission to inject input.
+pub fn provider_capability_diagnostics() -> Vec<DoctorCheck> {
+    let tmux = command_on_path("tmux");
+    provider_capability_diagnostics_with(
+        command_on_path("agent-deck"),
+        command_on_path("claude"),
+        tmux,
+        tmux,
+    )
+}
+
+fn provider_capability_diagnostics_with(
+    agent_deck: bool,
+    claude: bool,
+    tmux: bool,
+    focus: bool,
+) -> Vec<DoctorCheck> {
+    let availability = |available, name, ready, unavailable| {
+        if available {
+            DoctorCheck::ready(name, ready)
+        } else {
+            DoctorCheck::unsupported(name, unavailable)
+        }
+    };
+    vec![
+        availability(
+            agent_deck,
+            "Agent Deck navigation",
+            "Agent Deck is available for exact provider session navigation.",
+            "Agent Deck is unavailable; provider-native attach or exact focus fallback may still work.",
+        ),
+        availability(
+            claude,
+            "Claude native attach",
+            "Claude native attach is available for exact background-agent identities.",
+            "Claude native attach is unavailable because `claude` is not on PATH.",
+        ),
+        availability(
+            tmux,
+            "Guarded semantic input",
+            "The tmux backend is installed for guarded semantic input; exact identity and prompt revalidation are still required.",
+            "Guarded semantic input is unavailable because tmux is not on PATH.",
+        ),
+        availability(
+            focus,
+            "Focus-only fallback",
+            "The tmux backend is installed for exact-target focus fallback independently of input authorization.",
+            "Focus-only terminal fallback is unavailable in the detected terminal.",
+        ),
+    ]
+}
+
+fn command_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        let candidate = directory.join(name);
+        executable_file(&candidate)
+    })
+}
+
+#[cfg(unix)]
+fn executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn executable_file(path: &std::path::Path) -> bool {
+    path.is_file() || path.with_extension("exe").is_file()
+}
+
+fn terminal_focus_available(terminal: &Terminal) -> bool {
+    matches!(
+        terminal,
+        Terminal::Kitty | Terminal::Tmux | Terminal::WezTerm
+    ) || cfg!(target_os = "macos")
+        && matches!(
+            terminal,
+            Terminal::Ghostty | Terminal::Warp | Terminal::ITerm2 | Terminal::Apple
+        )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DoctorReport {
     pub terminal: String,
@@ -784,14 +872,7 @@ pub fn doctor_report() -> DoctorReport {
 }
 
 fn navigation_doctor_report_for(terminal: Terminal) -> DoctorReport {
-    let supported = matches!(
-        terminal,
-        Terminal::Kitty | Terminal::Tmux | Terminal::WezTerm
-    ) || cfg!(target_os = "macos")
-        && matches!(
-            terminal,
-            Terminal::Ghostty | Terminal::Warp | Terminal::ITerm2 | Terminal::Apple
-        );
+    let supported = terminal_focus_available(&terminal);
     let action = if supported {
         DoctorCheck::ready(
             TerminalAction::Switch.label(),
@@ -3437,6 +3518,27 @@ mod tests {
                 .iter()
                 .all(|action| action.status == DoctorStatus::Unsupported)
         );
+    }
+
+    #[test]
+    fn provider_capability_diagnostics_keep_navigation_and_input_separate() {
+        let checks = provider_capability_diagnostics_with(true, false, true, false);
+
+        assert_eq!(
+            checks.iter().map(|check| check.name).collect::<Vec<_>>(),
+            vec![
+                "Agent Deck navigation",
+                "Claude native attach",
+                "Guarded semantic input",
+                "Focus-only fallback",
+            ]
+        );
+        assert_eq!(checks[0].status, DoctorStatus::Ready);
+        assert_eq!(checks[1].status, DoctorStatus::Unsupported);
+        assert_eq!(checks[2].status, DoctorStatus::Ready);
+        assert_eq!(checks[3].status, DoctorStatus::Unsupported);
+        assert!(checks[2].detail.contains("input"));
+        assert!(checks[3].detail.to_ascii_lowercase().contains("focus"));
     }
 
     #[test]

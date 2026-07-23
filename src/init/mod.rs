@@ -3,7 +3,7 @@
 //! Tracking issue: <https://github.com/aleadag/codexctl/issues/257>.
 //!
 //! This module owns the single canonical first-run flow for getting a
-//! Coding Brain install ready: local-LLM brain detection, Codex hook install, and
+//! Coding Brain install ready: local-LLM brain detection, provider hook install, and
 //! curated skill suggestions.
 //!
 //! Public surface:
@@ -18,7 +18,8 @@
 //!
 //! Module layout:
 //!
-//! * `hooks.rs` — managed Codex hook installation.
+//! * `hooks.rs` — legacy Codex hook compatibility helpers.
+//! * `provider_hooks/` — transactional managed provider hook installation.
 //! * `marker.rs` — Coding Brain onboarding marker read/write.
 //! * `prompt.rs` — minimal stdin/stdout prompt helpers.
 //! * `state.rs` — environment detection (probes ollama and hooks.json).
@@ -28,40 +29,63 @@ pub mod hooks;
 pub mod marker;
 pub mod phases;
 pub mod prompt;
+pub mod provider_hooks;
 pub mod state;
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
+use coding_brain_core::provider::AgentProvider;
 
 use marker::{OnboardingMarker, PhaseRecord};
-use phases::{Answers, Phase};
+use phases::Answers;
 use state::PhaseStatus;
+
+const ALL_PROVIDERS: [AgentProvider; 3] = [
+    AgentProvider::Codex,
+    AgentProvider::Claude,
+    AgentProvider::Antigravity,
+];
 
 /// Interactive wizard — walks every phase in `registry()` order, prompts,
 /// applies, and updates the onboarding marker.
-pub fn run_wizard() -> io::Result<()> {
+pub fn run_wizard(providers: &[AgentProvider]) -> io::Result<()> {
+    require_providers(providers)?;
+    recover_pending_hook_transaction()?;
     let registry = phases::registry();
-    print_banner(&registry);
+    print_banner(registry.len());
 
-    let report = state::EnvironmentReport::detect();
     println!("Current state:");
-    print!("{}", report.render_human());
+    print_current_state(providers);
 
-    let total = registry.len();
     let mut new_records = std::collections::BTreeMap::new();
     let stamp = timestamp_now();
 
-    for (idx, phase) in registry.iter().enumerate() {
-        prompt::section_header(idx + 1, total, phase.label());
-        let status = phase.run_interactive()?;
-        print_outcome(phase.label(), &status);
-        new_records.insert(
-            phase.id().to_string(),
-            phases::record_from_status(&status, &stamp),
-        );
+    let brain = &registry[0];
+    prompt::section_header(1, 3, brain.label());
+    let brain_status = brain.run_interactive()?;
+    print_outcome(brain.label(), &brain_status);
+    new_records.insert(
+        brain.id().to_string(),
+        phases::record_from_status(&brain_status, &stamp),
+    );
+
+    prompt::section_header(2, 3, "Provider hooks");
+    let hook_statuses = phases::install_provider_hooks(providers)?;
+    record_provider_hook_statuses(&mut new_records, providers, &hook_statuses, &stamp);
+    for (provider, status) in providers.iter().zip(&hook_statuses) {
+        print_outcome(&format!("{} hooks", provider.label()), status);
     }
+
+    let skills = &registry[2];
+    prompt::section_header(3, 3, skills.label());
+    let skills_status = skills.run_interactive()?;
+    print_outcome(skills.label(), &skills_status);
+    new_records.insert(
+        skills.id().to_string(),
+        phases::record_from_status(&skills_status, &stamp),
+    );
 
     ensure_project_identity()?;
     persist_marker(new_records, &stamp)?;
@@ -76,29 +100,101 @@ pub fn run_wizard() -> io::Result<()> {
 /// a `PhaseStatus::Skipped` record so `--check` knows the difference between
 /// "not configured because you don't want it" and "should be configured but
 /// isn't yet."
-pub fn run_non_interactive(answers: &Answers) -> io::Result<()> {
+pub fn run_non_interactive(answers: &Answers, providers: &[AgentProvider]) -> io::Result<()> {
+    require_providers(providers)?;
+    recover_pending_hook_transaction()?;
     let registry = phases::registry();
     let mut new_records = std::collections::BTreeMap::new();
     let stamp = timestamp_now();
-    for phase in &registry {
-        let status = phase.run_non_interactive(answers)?;
-        println!(
-            "{label}: {status_label}{detail}",
-            label = phase.label(),
-            status_label = status.label(),
-            detail = status
-                .details()
-                .map(|d| format!(" ({d})"))
-                .unwrap_or_default(),
-        );
-        new_records.insert(
-            phase.id().to_string(),
-            phases::record_from_status(&status, &stamp),
-        );
+
+    let brain = &registry[0];
+    let brain_status = brain.run_non_interactive(answers)?;
+    print_non_interactive_status(brain.label(), &brain_status);
+    new_records.insert(
+        brain.id().to_string(),
+        phases::record_from_status(&brain_status, &stamp),
+    );
+
+    let hook_statuses = if answers.install_plugin == Some(false) {
+        vec![PhaseStatus::Skipped; providers.len()]
+    } else {
+        phases::install_provider_hooks(providers)?
+    };
+    record_provider_hook_statuses(&mut new_records, providers, &hook_statuses, &stamp);
+    for (provider, status) in providers.iter().zip(&hook_statuses) {
+        print_non_interactive_status(&format!("{} hooks", provider.label()), status);
     }
+
+    let skills = &registry[2];
+    let skills_status = skills.run_non_interactive(answers)?;
+    print_non_interactive_status(skills.label(), &skills_status);
+    new_records.insert(
+        skills.id().to_string(),
+        phases::record_from_status(&skills_status, &stamp),
+    );
+
     ensure_project_identity()?;
     persist_marker(new_records, &stamp)?;
     Ok(())
+}
+
+fn require_providers(providers: &[AgentProvider]) -> io::Result<()> {
+    if providers.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "select at least one provider",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn print_current_state(providers: &[AgentProvider]) {
+    for (label, status) in std::iter::once(("brain".to_string(), state::detect_brain()))
+        .chain(providers.iter().map(|provider| {
+            (
+                format!("hooks.{}", provider.as_str()),
+                state::detect_provider_hooks(*provider),
+            )
+        }))
+        .chain(std::iter::once((
+            "skills".to_string(),
+            state::detect_skills(),
+        )))
+    {
+        let marker = match status {
+            PhaseStatus::Installed { .. } => "✓",
+            PhaseStatus::NotInstalled => "·",
+            PhaseStatus::Drift { .. } => "⚠",
+            PhaseStatus::Skipped => "—",
+        };
+        println!("  {marker} {label:<20} {}", status.details().unwrap_or(""));
+    }
+}
+
+fn print_non_interactive_status(label: &str, status: &PhaseStatus) {
+    println!(
+        "{label}: {status_label}{detail}",
+        status_label = status.label(),
+        detail = status
+            .details()
+            .map(|details| format!(" ({details})"))
+            .unwrap_or_default(),
+    );
+}
+
+fn record_provider_hook_statuses(
+    records: &mut std::collections::BTreeMap<String, PhaseRecord>,
+    providers: &[AgentProvider],
+    statuses: &[PhaseStatus],
+    stamp: &str,
+) {
+    for (provider, status) in providers.iter().zip(statuses) {
+        records.insert(
+            format!("hooks.{}", provider.as_str()),
+            phases::record_from_status(status, stamp),
+        );
+    }
 }
 
 fn ensure_project_identity() -> io::Result<()> {
@@ -114,7 +210,7 @@ fn ensure_project_identity() -> io::Result<()> {
 /// marker. Exits with code 1 (via returned `io::Result`) when drift is
 /// detected so CI can gate on `init --check`.
 pub fn run_check() -> io::Result<()> {
-    let registry = phases::registry();
+    recover_pending_hook_transaction()?;
     let recorded = marker::load(&marker::default_path())?;
 
     if recorded.is_none() {
@@ -136,33 +232,43 @@ pub fn run_check() -> io::Result<()> {
     println!();
     println!("Phase status (current → recorded):");
 
-    let mut drift_count = 0;
-    for phase in &registry {
-        let current = phase.detect();
-        let recorded_status = recorded
-            .phases
-            .get(phase.id())
-            .map(|r| r.status.as_str())
-            .unwrap_or("(no record)");
+    let registry = phases::registry();
+    let mut checks = registry
+        .iter()
+        .filter(|phase| phase.id() != "plugin")
+        .map(|phase| {
+            (
+                phase.id().to_string(),
+                phase.detect(),
+                recorded.phases.get(phase.id()),
+            )
+        })
+        .collect::<Vec<_>>();
+    checks.extend(recorded.recorded_providers().into_iter().map(|provider| {
+        (
+            format!("hooks.{}", provider.as_str()),
+            state::detect_provider_hooks(provider),
+            recorded.provider_record(provider),
+        )
+    }));
 
+    let mut drift_count = 0;
+    for (id, current, record) in checks {
+        let recorded_status = record
+            .map(|value| value.status.as_str())
+            .unwrap_or("(no record)");
         let drifted = is_drift(&current, recorded_status);
         let marker_char = if drifted { "⚠" } else { "✓" };
-        let current_detail = current.details().unwrap_or("");
+        let detail = current
+            .details()
+            .filter(|detail| !detail.is_empty())
+            .map(|detail| format!("   [{detail}]"))
+            .unwrap_or_default();
         println!(
-            "  {marker} {label:<10} {cur:<14} ← {rec}{detail}",
-            marker = marker_char,
-            label = phase.id(),
-            cur = current.label(),
-            rec = recorded_status,
-            detail = if current_detail.is_empty() {
-                String::new()
-            } else {
-                format!("   [{current_detail}]")
-            }
+            "  {marker_char} {id:<20} {current:<14} ← {recorded_status}{detail}",
+            current = current.label(),
         );
-        if drifted {
-            drift_count += 1;
-        }
+        drift_count += usize::from(drifted);
     }
 
     if drift_count > 0 {
@@ -180,18 +286,29 @@ pub fn run_check() -> io::Result<()> {
 
 /// Remove every Coding Brain-managed artifact without erasing user-owned setup.
 pub fn run_remove() -> io::Result<()> {
-    let registry = phases::registry();
+    recover_pending_hook_transaction()?;
+    let providers = ALL_PROVIDERS;
     let mut errors = Vec::new();
-    for phase in &registry {
-        if let Err(e) = phase.remove() {
-            errors.push(format!("{}: {e}", phase.id()));
+    for phase in phases::registry()
+        .into_iter()
+        .filter(|phase| phase.id() != "plugin")
+    {
+        if let Err(error) = phase.remove() {
+            errors.push(format!("{}: {error}", phase.id()));
         } else {
             println!("  removed: {}", phase.label());
         }
     }
-    marker::clear(&marker::default_path())?;
-    println!("Cleared onboarding marker.");
+    if let Err(error) = phases::remove_provider_hooks(&providers) {
+        errors.push(format!("provider hooks: {error}"));
+    } else {
+        for provider in &providers {
+            println!("  removed: {} hooks", provider.label());
+        }
+    }
     if errors.is_empty() {
+        marker::clear(&marker::default_path())?;
+        println!("Cleared onboarding marker.");
         Ok(())
     } else {
         Err(io::Error::other(format!(
@@ -204,6 +321,7 @@ pub fn run_remove() -> io::Result<()> {
 /// Clear the marker so the next `init` run prompts again. Does NOT touch any
 /// installed artifacts.
 pub fn run_reset() -> io::Result<()> {
+    recover_pending_hook_transaction()?;
     marker::clear(&marker::default_path())?;
     println!("Cleared onboarding marker — `coding-brain init` will start from scratch next run.");
     Ok(())
@@ -224,6 +342,10 @@ pub fn run_reset() -> io::Result<()> {
 ///    from the running binary's `CARGO_PKG_VERSION`, rewrite the version
 ///    field (other phase records preserved).
 pub fn run_upgrade() -> io::Result<()> {
+    recover_pending_hook_transaction()?;
+    let providers = marker::load(&marker::default_path())?
+        .map(|marker| marker.upgrade_providers())
+        .unwrap_or_default();
     println!("coding-brain init upgrade");
     println!("======================");
     println!();
@@ -233,9 +355,10 @@ pub fn run_upgrade() -> io::Result<()> {
     // 1. Hook entries. `hooks::run_init` prints its own report; we follow
     // it with our progress line so the operator sees both the file path
     // touched and the per-step ✓ summary.
-    println!("  [1/2] Codex hook entries");
-    match hooks::run_init(false, false) {
-        Ok(()) => println!("        \u{2713} refreshed"),
+    println!("  [1/2] Recorded provider hook entries");
+    match phases::install_provider_hooks(&providers) {
+        Ok(_) if providers.is_empty() => println!("        \u{2014} no recorded providers"),
+        Ok(_) => println!("        \u{2713} refreshed {} provider(s)", providers.len()),
         Err(e) => {
             println!("        \u{2717} {e}");
             had_error = true;
@@ -263,6 +386,17 @@ pub fn run_upgrade() -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn recover_pending_hook_transaction() -> io::Result<()> {
+    let report = provider_hooks::recover_hook_transaction()?;
+    for path in report.concurrent_paths {
+        eprintln!(
+            "Preserved concurrently modified provider configuration during recovery: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Bump the marker's `version` field to the running binary's
 /// `CARGO_PKG_VERSION` when they differ. Returns `Some((from, to))` on
 /// bump, `None` when already current or when no marker exists yet (a
@@ -282,6 +416,7 @@ fn upgrade_marker_version() -> io::Result<Option<(String, String)>> {
 }
 
 pub fn run_purge(assume_yes: bool) -> io::Result<()> {
+    recover_pending_hook_transaction()?;
     let environment = PathEnvironment::current();
     let targets = preview_purge_targets(&environment)?;
 
@@ -304,12 +439,10 @@ pub fn run_purge(assume_yes: bool) -> io::Result<()> {
         return Ok(());
     }
 
-    let remove_errors = match remove_managed_hooks_silent() {
-        Ok(()) => Vec::new(),
-        Err(e) => vec![format!("hook/marker removal: {e}")],
-    };
+    remove_managed_hooks_silent()
+        .map_err(|error| io::Error::other(format!("purge errors: provider hooks: {error}")))?;
 
-    let mut errors = remove_errors;
+    let mut errors = Vec::new();
     for target in &targets {
         if let Err(error) = remove_previewed_target(target) {
             errors.push(format!("{}: {error}", target.path.display()));
@@ -459,16 +592,16 @@ fn remove_previewed_target(target: &PurgeTarget) -> io::Result<()> {
 /// Remove only the managed hook entries. The marker lives under the previewed
 /// state root, so purge must not access it before the target identity check.
 fn remove_managed_hooks_silent() -> io::Result<()> {
-    phases::PluginPhase.remove()
+    phases::remove_provider_hooks(&ALL_PROVIDERS)
 }
 
 // ---------------- internal helpers ------------------------------------------
 
-fn print_banner(registry: &[Box<dyn Phase>]) {
+fn print_banner(phase_count: usize) {
     println!();
     println!(
         "coding-brain init — opinionated onboarding ({} phases)",
-        registry.len()
+        phase_count
     );
     println!("══════════════════════════════════════════════════════════════");
     println!();
@@ -484,15 +617,35 @@ fn print_outcome(label: &str, status: &PhaseStatus) {
 }
 
 fn persist_marker(
-    phase_records: std::collections::BTreeMap<String, PhaseRecord>,
+    mut phase_records: std::collections::BTreeMap<String, PhaseRecord>,
     stamp: &str,
 ) -> io::Result<()> {
+    let prior = marker::load(&marker::default_path())?;
+    preserve_provider_records(&mut phase_records, prior.as_ref());
     let marker_value = OnboardingMarker {
         version: env!("CARGO_PKG_VERSION").to_string(),
         completed_at: stamp.to_string(),
         phases: phase_records,
     };
     marker::save(&marker::default_path(), &marker_value)
+}
+
+fn preserve_provider_records(
+    phase_records: &mut std::collections::BTreeMap<String, PhaseRecord>,
+    prior: Option<&OnboardingMarker>,
+) {
+    phase_records.remove("plugin");
+    let Some(prior) = prior else {
+        return;
+    };
+    for provider in ALL_PROVIDERS {
+        let key = format!("hooks.{}", provider.as_str());
+        if !phase_records.contains_key(&key)
+            && let Some(record) = prior.provider_record(provider)
+        {
+            phase_records.insert(key, record.clone());
+        }
+    }
 }
 
 fn timestamp_now() -> String {
@@ -582,7 +735,6 @@ mod tests {
         }
 
         crate::config::Config::load();
-        let _ = state::EnvironmentReport::detect();
         run_upgrade().unwrap();
 
         for (relative, contents) in sentinels {
@@ -710,5 +862,27 @@ mod tests {
         for record in records.values() {
             assert_eq!(record.status, "skipped");
         }
+    }
+
+    #[test]
+    fn later_init_preserves_stable_provider_records_and_projects_legacy_plugin() {
+        let installed = PhaseRecord {
+            status: "installed".into(),
+            ..Default::default()
+        };
+        let mut prior = OnboardingMarker::default();
+        prior
+            .phases
+            .insert("hooks.claude".into(), installed.clone());
+        prior.phases.insert("plugin".into(), installed.clone());
+        let mut current = std::collections::BTreeMap::new();
+        current.insert("hooks.antigravity".into(), installed);
+
+        preserve_provider_records(&mut current, Some(&prior));
+
+        assert!(current.contains_key("hooks.codex"));
+        assert!(current.contains_key("hooks.claude"));
+        assert!(current.contains_key("hooks.antigravity"));
+        assert!(!current.contains_key("plugin"));
     }
 }
