@@ -399,11 +399,15 @@ impl ActivityStore {
 
     pub fn snapshot(&self, limits: SnapshotLimits) -> Result<ActivitySnapshot, ActivityStoreError> {
         let log = self.read()?;
-        Ok(project_snapshot(
-            log,
-            limits,
-            self.now_ms.unwrap_or_else(epoch_ms),
-        ))
+        Ok(self.project_snapshot(&log, limits))
+    }
+
+    pub(crate) fn project_snapshot(
+        &self,
+        log: &ActivityLog,
+        limits: SnapshotLimits,
+    ) -> ActivitySnapshot {
+        project_snapshot(log, limits, self.now_ms.unwrap_or_else(epoch_ms))
     }
 
     pub fn compact_if_needed(&self) -> Result<bool, ActivityStoreError> {
@@ -673,7 +677,7 @@ fn find_tail_start(file: &mut File, length: u64) -> io::Result<u64> {
     Ok(0)
 }
 
-fn project_snapshot(log: ActivityLog, limits: SnapshotLimits, now_ms: u64) -> ActivitySnapshot {
+fn project_snapshot(log: &ActivityLog, limits: SnapshotLimits, now_ms: u64) -> ActivitySnapshot {
     let mut groups = HashMap::<String, Vec<&ActivityEvent>>::new();
     for event in &log.events {
         groups
@@ -792,7 +796,7 @@ fn project_snapshot(log: ActivityLog, limits: SnapshotLimits, now_ms: u64) -> Ac
         recent,
         diagnostic_events,
         unresolved_count,
-        diagnostics: log.diagnostics,
+        diagnostics: log.diagnostics.clone(),
     }
 }
 

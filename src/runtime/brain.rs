@@ -6,14 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use coding_brain_core::brain_activity::{
-    ActivityEvent, ActivityKind, ActivitySnapshot, CorrectionDisposition, SessionTargetProvenance,
-    SnapshotLimits,
+    ActivityEvent, ActivityKind, CorrectionDisposition, SessionTargetProvenance, SnapshotLimits,
 };
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use coding_brain_core::runtime::{
-    BrainActions, BrainGateMode, BrainSource, CacheSummary, CorrectionInput, CounterfactualSummary,
-    DecisionSummary, EndpointHealth, LatencySummary, ProviderScoreSummary, ReviewItemSummary,
-    RiskTierSummary, ScorecardSummary, SessionActionRequest,
+    BrainActions, BrainGateMode, BrainRefresh, BrainSource, BrainSourceError, CacheSummary,
+    CorrectionInput, CounterfactualSummary, DecisionSummary, EndpointHealth, LatencySummary,
+    ProviderScoreSummary, ReviewItemSummary, RiskTierSummary, ScorecardSummary,
+    SessionActionRequest,
 };
 use coding_brain_core::session::AgentSession;
 use coding_brain_core::terminals::execute_guarded_action;
@@ -122,32 +122,25 @@ impl LiveBrainSource {
 }
 
 impl BrainSource for LiveBrainSource {
-    fn snapshot(&self, limits: SnapshotLimits) -> Result<ActivitySnapshot, String> {
-        let paths = brain::distill::current_paths().map_err(|error| error.to_string())?;
-        brain::activity::ActivityStore::at(paths.state_root().join("activity.jsonl"))
-            .snapshot(limits)
-            .map_err(|error| error.to_string())
-    }
-
-    fn review_queue(&self) -> Result<Vec<ReviewItemSummary>, String> {
-        let records = brain::decisions::read_learning_decisions();
-        let paths = brain::distill::current_paths().map_err(|error| error.to_string())?;
-        let events = brain::activity::ActivityStore::at(paths.state_root().join("activity.jsonl"))
-            .read()
-            .map_err(|error| error.to_string())?;
-        Ok(review_queue_from(records, events.events()))
-    }
-
-    fn scorecard(&self) -> Result<ScorecardSummary, String> {
-        let decisions = brain::decisions::read_learning_decisions()
-            .into_iter()
-            .map(|record| DecisionSummary::from(&record))
+    fn refresh(&self, limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
+        let paths = brain::distill::current_paths()
+            .map_err(|error| BrainSourceError::Other(error.to_string()))?;
+        let store = brain::activity::ActivityStore::at(paths.state_root().join("activity.jsonl"));
+        let activity = store.read().map_err(|error| match error {
+            brain::activity::ActivityStoreError::LockTimeout => BrainSourceError::Busy,
+            other => BrainSourceError::Other(other.to_string()),
+        })?;
+        let records = brain::decisions::read_learning_decisions_from_activity(activity.events());
+        let decisions = records
+            .iter()
+            .map(DecisionSummary::from)
             .collect::<Vec<_>>();
-        let paths = brain::distill::current_paths().map_err(|error| error.to_string())?;
-        let events = brain::activity::ActivityStore::at(paths.state_root().join("activity.jsonl"))
-            .read()
-            .map_err(|error| error.to_string())?;
-        Ok(scorecard_from(&decisions, events.events()))
+
+        Ok(BrainRefresh {
+            snapshot: store.project_snapshot(&activity, limits),
+            review_queue: review_queue_from(records, activity.events()),
+            scorecard: scorecard_from(&decisions, activity.events()),
+        })
     }
 
     fn gate_mode(&self) -> BrainGateMode {
@@ -555,7 +548,86 @@ fn epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use fs2::FileExt;
+
     use super::*;
+
+    struct RefreshEnvGuard {
+        home: Option<std::ffi::OsString>,
+        xdg_config_home: Option<std::ffi::OsString>,
+        xdg_state_home: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for RefreshEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the test holds HOME_ENV_LOCK for the guard's lifetime.
+            unsafe {
+                match self.home.take() {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+                match self.xdg_config_home.take() {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+                match self.xdg_state_home.take() {
+                    Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                    None => std::env::remove_var("XDG_STATE_HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_brain_refresh_reports_busy_during_activity_lock_contention() {
+        let _env_lock = crate::config::HOME_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let config_home = temp.path().join("config");
+        let state_home = temp.path().join("state");
+        let _env = RefreshEnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+        };
+        // SAFETY: this test holds HOME_ENV_LOCK and the guard restores all values.
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            std::env::set_var("XDG_STATE_HOME", &state_home);
+        }
+        let state_root = state_home.join("coding-brain");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(state_root.join("activity.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+
+        let source = LiveBrainSource::default();
+
+        let unlocker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            FileExt::unlock(&lock).unwrap();
+        });
+        assert!(source.refresh(SnapshotLimits::default()).is_ok());
+        unlocker.join().unwrap();
+
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_root.join("activity.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        assert!(matches!(
+            source.refresh(SnapshotLimits::default()),
+            Err(BrainSourceError::Busy)
+        ));
+        FileExt::unlock(&lock).unwrap();
+        assert!(source.refresh(SnapshotLimits::default()).is_ok());
+    }
 
     #[test]
     fn live_actions_reject_unknown_authority_before_discovery() {

@@ -228,10 +228,30 @@ pub struct SessionActionRequest {
     pub action: TerminalSessionAction,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BrainRefresh {
+    pub snapshot: ActivitySnapshot,
+    pub review_queue: Vec<ReviewItemSummary>,
+    pub scorecard: ScorecardSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrainSourceError {
+    Busy,
+    Other(String),
+}
+
+impl std::fmt::Display for BrainSourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => formatter.write_str("brain data is busy"),
+            Self::Other(error) => formatter.write_str(error),
+        }
+    }
+}
+
 pub trait BrainSource: Send + Sync {
-    fn snapshot(&self, limits: SnapshotLimits) -> Result<ActivitySnapshot, String>;
-    fn review_queue(&self) -> Result<Vec<ReviewItemSummary>, String>;
-    fn scorecard(&self) -> Result<ScorecardSummary, String>;
+    fn refresh(&self, limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError>;
     fn gate_mode(&self) -> BrainGateMode;
     fn endpoint_health(&self) -> EndpointHealth;
 }
@@ -400,16 +420,12 @@ impl MockBrainRuntime {
 }
 
 impl BrainSource for MockBrainRuntime {
-    fn snapshot(&self, _limits: SnapshotLimits) -> Result<ActivitySnapshot, String> {
-        Ok(self.activity_snapshot.clone())
-    }
-
-    fn review_queue(&self) -> Result<Vec<ReviewItemSummary>, String> {
-        Ok(self.review_queue.clone())
-    }
-
-    fn scorecard(&self) -> Result<ScorecardSummary, String> {
-        Ok(self.scorecard.clone())
+    fn refresh(&self, _limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
+        Ok(BrainRefresh {
+            snapshot: self.activity_snapshot.clone(),
+            review_queue: self.review_queue.clone(),
+            scorecard: self.scorecard.clone(),
+        })
     }
 
     fn gate_mode(&self) -> BrainGateMode {
@@ -540,10 +556,33 @@ mod tests {
         assert!(
             runtime
                 .source
-                .snapshot(crate::brain_activity::SnapshotLimits::default())
+                .refresh(crate::brain_activity::SnapshotLimits::default())
                 .unwrap()
+                .snapshot
                 .recent
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn mock_source_returns_one_refresh_bundle() {
+        let mock = MockBrainRuntime {
+            activity_snapshot: ActivitySnapshot {
+                unresolved_count: 2,
+                ..ActivitySnapshot::default()
+            },
+            review_queue: Vec::new(),
+            scorecard: ScorecardSummary {
+                total_decisions: 3,
+                ..ScorecardSummary::default()
+            },
+            ..MockBrainRuntime::default()
+        };
+
+        let refresh = mock.refresh(SnapshotLimits::default()).unwrap();
+
+        assert_eq!(refresh.snapshot.unresolved_count, 2);
+        assert!(refresh.review_queue.is_empty());
+        assert_eq!(refresh.scorecard.total_decisions, 3);
     }
 }

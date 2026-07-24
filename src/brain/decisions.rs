@@ -867,6 +867,12 @@ pub(crate) fn read_learning_decisions() -> Vec<DecisionRecord> {
     read_distillation_decisions().1
 }
 
+pub(crate) fn read_learning_decisions_from_activity(
+    events: &[ActivityEvent],
+) -> Vec<DecisionRecord> {
+    filter_learning_decisions(read_all_decisions(), events)
+}
+
 pub(crate) fn read_distillation_decisions() -> (Vec<DecisionRecord>, Vec<DecisionRecord>) {
     let decisions = read_all_decisions();
     let environment = PathEnvironment::new(

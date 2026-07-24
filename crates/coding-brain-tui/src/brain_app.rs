@@ -8,8 +8,8 @@ use coding_brain_core::brain_activity::{
     SnapshotLimits, redact_activity_text,
 };
 use coding_brain_core::runtime::{
-    BrainEffect, BrainGateMode, BrainRuntime, CorrectionInput, EndpointHealth, ReviewItemSummary,
-    ScorecardSummary, SessionActionRequest, SessionNavigation,
+    BrainEffect, BrainGateMode, BrainRuntime, BrainSourceError, CorrectionInput, EndpointHealth,
+    ReviewItemSummary, ScorecardSummary, SessionActionRequest, SessionNavigation,
 };
 use coding_brain_core::terminals::TerminalSessionAction;
 use coding_brain_core::theme::Theme;
@@ -20,6 +20,8 @@ use crate::terminal_suspend::NavigationOutcome;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_NOTE_CHARS: usize = 512;
 const MAX_MANUAL_TEXT_BYTES: usize = 4_096;
+const BUSY_RETRYING_STATUS: &str = "Brain data busy; retrying";
+const BUSY_STALE_STATUS: &str = "Brain data busy; showing previous refresh";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrainTab {
@@ -169,6 +171,7 @@ pub struct BrainApp {
     session_action_worker: SessionActionWorker,
     pending_action_status: Option<String>,
     status: Option<String>,
+    has_successful_refresh: bool,
     refreshed_at: Instant,
 }
 
@@ -193,6 +196,7 @@ impl BrainApp {
             session_action_worker: SessionActionWorker::new(),
             pending_action_status: None,
             status: None,
+            has_successful_refresh: false,
             refreshed_at: Instant::now() - REFRESH_INTERVAL,
         };
         app.refresh();
@@ -204,22 +208,35 @@ impl BrainApp {
     }
 
     fn refresh_state(&mut self) -> bool {
-        let mut errors = Vec::new();
         let recovery = self.runtime.actions.poll_recovery();
         if let Some(status) = self.poll_session_action_delivery() {
             self.pending_action_status = Some(status);
         }
-        match self.runtime.source.snapshot(SnapshotLimits::default()) {
-            Ok(snapshot) => self.snapshot = snapshot,
-            Err(error) => errors.push(format!("Live: {error}")),
-        }
-        match self.runtime.source.review_queue() {
-            Ok(queue) => self.review_queue = queue,
-            Err(error) => errors.push(format!("Review: {error}")),
-        }
-        match self.runtime.source.scorecard() {
-            Ok(scorecard) => self.scorecard = scorecard,
-            Err(error) => errors.push(format!("Scorecard: {error}")),
+        let mut source_error = None;
+        let mut busy_status = None;
+        match self.runtime.source.refresh(SnapshotLimits::default()) {
+            Ok(refresh) => {
+                self.snapshot = refresh.snapshot;
+                self.review_queue = refresh.review_queue;
+                self.scorecard = refresh.scorecard;
+                self.has_successful_refresh = true;
+                if matches!(
+                    self.status.as_deref(),
+                    Some(BUSY_RETRYING_STATUS | BUSY_STALE_STATUS)
+                ) {
+                    self.status = None;
+                }
+            }
+            Err(BrainSourceError::Other(error)) => {
+                source_error = Some(format!("Brain: {}", bounded_status(&error)));
+            }
+            Err(BrainSourceError::Busy) => {
+                busy_status = Some(if self.has_successful_refresh {
+                    BUSY_STALE_STATUS
+                } else {
+                    BUSY_RETRYING_STATUS
+                });
+            }
         }
         self.gate_mode = self.runtime.source.gate_mode();
         self.endpoint_health = self.runtime.source.endpoint_health();
@@ -228,11 +245,19 @@ impl BrainApp {
         if let Some(status) = self.pending_action_status.take() {
             self.status = Some(status);
             true
-        } else if !errors.is_empty() {
-            self.status = Some(errors.join(" · "));
+        } else if let Some(error) = source_error {
+            self.status = Some(error);
             false
         } else if !recovery.is_empty() {
             self.status = Some(recovery.join(" · "));
+            false
+        } else if let Some(status) = busy_status
+            && self
+                .status
+                .as_deref()
+                .is_none_or(|current| matches!(current, BUSY_RETRYING_STATUS | BUSY_STALE_STATUS))
+        {
+            self.status = Some(status.into());
             false
         } else {
             false
@@ -889,6 +914,7 @@ fn bounded_status(status: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -901,9 +927,9 @@ mod tests {
     };
     use coding_brain_core::project::ProjectId;
     use coding_brain_core::runtime::{
-        BrainActions, BrainEffect, BrainRuntime, BrainSource, CorrectionInput, DecisionSummary,
-        EndpointHealth, MockBrainAction, MockBrainRuntime, ReviewItemSummary, ScorecardSummary,
-        SessionActionRequest,
+        BrainActions, BrainEffect, BrainRefresh, BrainRuntime, BrainSource, BrainSourceError,
+        CorrectionInput, DecisionSummary, EndpointHealth, MockBrainAction, MockBrainRuntime,
+        ReviewItemSummary, SessionActionRequest,
     };
     use coding_brain_core::terminals::TerminalSessionAction;
     use coding_brain_core::theme::{Theme, ThemeMode};
@@ -1385,6 +1411,7 @@ mod tests {
     fn completed_action_outcome_has_priority_over_source_error_once() {
         let source = Arc::new(ErrorAfterFirstSource {
             snapshot_calls: AtomicUsize::new(0),
+            error: "source failed".into(),
         });
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let actions = Arc::new(SlowBrainActions {
@@ -1401,7 +1428,76 @@ mod tests {
         app.refresh();
         assert_eq!(app.status(), Some("Sent allow"));
         app.refresh();
-        assert_eq!(app.status(), Some("Live: source failed"));
+        assert_eq!(app.status(), Some("Brain: source failed"));
+    }
+
+    #[test]
+    fn refresh_source_error_is_redacted_and_bounded() {
+        let source = Arc::new(ErrorAfterFirstSource {
+            snapshot_calls: AtomicUsize::new(1),
+            error: format!("source failed token=top-secret-literal {}", "x".repeat(700)),
+        });
+        let actions = Arc::new(MockBrainRuntime::default());
+        let runtime = BrainRuntime::new(source, actions);
+        let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+
+        app.refresh();
+
+        let status = app.status().unwrap();
+        let error = status.strip_prefix("Brain: ").unwrap();
+        assert!(!status.contains("top-secret-literal"));
+        assert!(error.chars().count() <= MAX_NOTE_CHARS);
+    }
+
+    #[test]
+    fn cold_start_busy_reports_retrying() {
+        let app = scripted_app([Err(BrainSourceError::Busy)]);
+
+        assert_eq!(app.status(), Some("Brain data busy; retrying"));
+    }
+
+    #[test]
+    fn busy_refresh_retains_all_views_then_recovers_atomically() {
+        let mut app = scripted_app([
+            Ok(refresh_fixture("old", 1, 1)),
+            Err(BrainSourceError::Busy),
+            Ok(refresh_fixture("new", 2, 2)),
+        ]);
+
+        app.refresh();
+        assert_refresh_fixture(&app, "old", 1, 1);
+        assert_eq!(
+            app.status(),
+            Some("Brain data busy; showing previous refresh")
+        );
+
+        app.refresh();
+        assert_refresh_fixture(&app, "new", 2, 2);
+        assert_eq!(app.status(), None);
+    }
+
+    #[test]
+    fn busy_refresh_does_not_overwrite_higher_priority_status() {
+        let mut app = scripted_app([
+            Ok(refresh_fixture("old", 1, 1)),
+            Err(BrainSourceError::Busy),
+        ]);
+        app.status = Some("Sent allow".into());
+
+        app.refresh();
+
+        assert_eq!(app.status(), Some("Sent allow"));
+    }
+
+    #[test]
+    fn recovery_warning_outranks_busy_information() {
+        let source = Arc::new(ScriptedBrainSource {
+            refreshes: std::sync::Mutex::new([Err(BrainSourceError::Busy)].into_iter().collect()),
+        });
+        let runtime = BrainRuntime::new(source, Arc::new(RecoveryWarningActions));
+        let app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+
+        assert_eq!(app.status(), Some("Recovered interrupted activity"));
     }
 
     #[test]
@@ -1772,31 +1868,117 @@ mod tests {
 
     struct ErrorAfterFirstSource {
         snapshot_calls: AtomicUsize,
+        error: String,
+    }
+
+    struct ScriptedBrainSource {
+        refreshes: std::sync::Mutex<VecDeque<Result<BrainRefresh, BrainSourceError>>>,
+    }
+
+    impl BrainSource for ScriptedBrainSource {
+        fn refresh(&self, _limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
+            self.refreshes
+                .lock()
+                .expect("scripted refreshes poisoned")
+                .pop_front()
+                .expect("unexpected refresh")
+        }
+
+        fn gate_mode(&self) -> BrainGateMode {
+            BrainGateMode::On
+        }
+
+        fn endpoint_health(&self) -> EndpointHealth {
+            EndpointHealth::default()
+        }
+    }
+
+    struct RecoveryWarningActions;
+
+    impl BrainActions for RecoveryWarningActions {
+        fn record_correction(&self, _correction: CorrectionInput) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn mark_canonical(&self, _decision_id: &str, _note: Option<String>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn send_session_action(&self, _request: SessionActionRequest) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn poll_recovery(&self) -> Vec<String> {
+            vec!["Recovered interrupted activity".into()]
+        }
+    }
+
+    fn scripted_app<const N: usize>(
+        refreshes: [Result<BrainRefresh, BrainSourceError>; N],
+    ) -> BrainApp {
+        let source = Arc::new(ScriptedBrainSource {
+            refreshes: std::sync::Mutex::new(refreshes.into_iter().collect()),
+        });
+        let actions = Arc::new(MockBrainRuntime::default());
+        BrainApp::new(
+            BrainRuntime::new(source, actions),
+            Theme::from_mode(ThemeMode::Dark),
+        )
+    }
+
+    fn refresh_fixture(marker: &str, review_count: usize, total: usize) -> BrainRefresh {
+        let mut live = activity();
+        live.activity_id = marker.into();
+        let mut review_decision = decision();
+        review_decision.id = marker.into();
+        BrainRefresh {
+            snapshot: ActivitySnapshot {
+                recent: vec![live],
+                ..ActivitySnapshot::default()
+            },
+            review_queue: (0..review_count)
+                .map(|_| ReviewItemSummary {
+                    decision: review_decision.clone(),
+                    reason: "fixture".into(),
+                    score: 1.0,
+                })
+                .collect(),
+            scorecard: ScorecardSummary {
+                total_decisions: total,
+                ..ScorecardSummary::default()
+            },
+        }
+    }
+
+    fn assert_refresh_fixture(app: &BrainApp, marker: &str, review_count: usize, total: usize) {
+        assert_eq!(app.snapshot.recent[0].activity_id, marker);
+        assert_eq!(app.review_queue.len(), review_count);
+        assert!(
+            app.review_queue
+                .iter()
+                .all(|item| item.decision.id == marker)
+        );
+        assert_eq!(app.scorecard.total_decisions, total);
     }
 
     impl BrainSource for ErrorAfterFirstSource {
-        fn snapshot(&self, _limits: SnapshotLimits) -> Result<ActivitySnapshot, String> {
+        fn refresh(&self, _limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
             if self.snapshot_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                Ok(ActivitySnapshot {
-                    attention: vec![AttentionItem {
-                        activity: activity(),
-                        occurrences: 1,
-                        unresolved_occurrences: 1,
-                    }],
-                    unresolved_count: 1,
-                    ..ActivitySnapshot::default()
+                Ok(BrainRefresh {
+                    snapshot: ActivitySnapshot {
+                        attention: vec![AttentionItem {
+                            activity: activity(),
+                            occurrences: 1,
+                            unresolved_occurrences: 1,
+                        }],
+                        unresolved_count: 1,
+                        ..ActivitySnapshot::default()
+                    },
+                    ..BrainRefresh::default()
                 })
             } else {
-                Err("source failed".into())
+                Err(BrainSourceError::Other(self.error.clone()))
             }
-        }
-
-        fn review_queue(&self) -> Result<Vec<ReviewItemSummary>, String> {
-            Ok(Vec::new())
-        }
-
-        fn scorecard(&self) -> Result<ScorecardSummary, String> {
-            Ok(ScorecardSummary::default())
         }
 
         fn gate_mode(&self) -> BrainGateMode {
