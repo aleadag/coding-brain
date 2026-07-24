@@ -1,0 +1,1 @@
+{"session_id":"root-1","turn_id":"turn-child-1","agent_id":"child-1","agent_type":"explorer","transcript_path":"/tmp/rollout-child-1.jsonl","cwd":"/work/coding-brain","hook_event_name":"PermissionRequest","permission_mode":"default","tool_name":"apply_patch","tool_input":{"patch":"do not persist me"}}

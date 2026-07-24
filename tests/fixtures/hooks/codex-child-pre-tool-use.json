@@ -1,0 +1,1 @@
+{"session_id":"root-1","turn_id":"turn-child-1","agent_id":"child-1","agent_type":"explorer","transcript_path":"/tmp/rollout-child-1.jsonl","cwd":"/work/coding-brain","hook_event_name":"PreToolUse","permission_mode":"default","tool_name":"Bash","tool_input":{"command":"do not persist me"},"tool_use_id":"call-child-1"}

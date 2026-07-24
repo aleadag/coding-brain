@@ -73,6 +73,98 @@ fn post_tool_payload(cwd: &Path, command: &str) -> Vec<u8> {
     .unwrap()
 }
 
+fn child_fixture(
+    fixture: &[u8],
+    session_id: &str,
+    agent_id: &str,
+    turn_id: &str,
+    tool_use_id: Option<&str>,
+) -> Vec<u8> {
+    let mut payload: serde_json::Value = serde_json::from_slice(fixture).unwrap();
+    payload["session_id"] = serde_json::json!(session_id);
+    payload["agent_id"] = serde_json::json!(agent_id);
+    payload["turn_id"] = serde_json::json!(turn_id);
+    if let Some(tool_use_id) = tool_use_id {
+        payload["tool_use_id"] = serde_json::json!(tool_use_id);
+    }
+    serde_json::to_vec(&payload).unwrap()
+}
+
+fn subagent_start_payload(home: &Path, agent_id: &str, turn_id: &str) -> Vec<u8> {
+    let payload = child_fixture(
+        include_bytes!("fixtures/hooks/subagent-start.json"),
+        "root-1",
+        agent_id,
+        turn_id,
+        None,
+    );
+    with_payload_cwd(payload, home)
+}
+
+fn child_pre_payload(home: &Path, agent_id: &str, turn_id: &str, tool_use_id: &str) -> Vec<u8> {
+    let payload = child_fixture(
+        include_bytes!("fixtures/hooks/codex-child-pre-tool-use.json"),
+        "root-1",
+        agent_id,
+        turn_id,
+        Some(tool_use_id),
+    );
+    with_child_bash_command(payload, home)
+}
+
+fn child_post_payload(home: &Path, agent_id: &str, turn_id: &str, tool_use_id: &str) -> Vec<u8> {
+    let payload = child_fixture(
+        include_bytes!("fixtures/hooks/codex-child-post-tool-use.json"),
+        "root-1",
+        agent_id,
+        turn_id,
+        Some(tool_use_id),
+    );
+    with_child_bash_command(payload, home)
+}
+
+fn subagent_stop_payload(home: &Path, agent_id: &str, turn_id: &str) -> Vec<u8> {
+    let payload = child_fixture(
+        include_bytes!("fixtures/hooks/subagent-stop.json"),
+        "root-1",
+        agent_id,
+        turn_id,
+        None,
+    );
+    with_payload_cwd(payload, home)
+}
+
+fn child_permission_payload(home: &Path, agent_id: &str, turn_id: &str) -> Vec<u8> {
+    let payload = child_fixture(
+        include_bytes!("fixtures/hooks/codex-child-permission-request.json"),
+        "root-1",
+        agent_id,
+        turn_id,
+        None,
+    );
+    let mut value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert!(value.get("tool_use_id").is_none());
+    // Preserve the real child callback's identity shape while using the
+    // existing supported-tool decision path for this lifecycle test.
+    value["tool_name"] = serde_json::json!("Bash");
+    value["tool_input"] = serde_json::json!({"command": "printf child"});
+    value["cwd"] = serde_json::json!(home);
+    serde_json::to_vec(&value).unwrap()
+}
+
+fn with_payload_cwd(payload: Vec<u8>, cwd: &Path) -> Vec<u8> {
+    let mut payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    payload["cwd"] = serde_json::json!(cwd);
+    serde_json::to_vec(&payload).unwrap()
+}
+
+fn with_child_bash_command(payload: Vec<u8>, cwd: &Path) -> Vec<u8> {
+    let mut payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    payload["tool_input"] = serde_json::json!({"command": "printf child"});
+    payload["cwd"] = serde_json::json!(cwd);
+    serde_json::to_vec(&payload).unwrap()
+}
+
 fn run_permission_hook(home: &Path, payload: &[u8]) -> Output {
     let mut child = spawn_permission_hook(home);
     child.stdin.take().unwrap().write_all(payload).unwrap();
@@ -251,7 +343,7 @@ fn run_provider_recovery_hook(
 }
 
 #[test]
-fn recovery_hook_without_trusted_live_link_publishes_no_stop() {
+fn recovery_hook_without_trusted_live_link_persists_stop_without_recovery() {
     let home = tempfile::tempdir().unwrap();
     let mut payload: serde_json::Value =
         serde_json::from_slice(include_bytes!("fixtures/hooks/antigravity-stop.json")).unwrap();
@@ -272,7 +364,7 @@ fn recovery_hook_without_trusted_live_link_publishes_no_stop() {
     );
     let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
     let view = lifecycle.read().unwrap();
-    assert!(view.snapshot.is_none());
+    assert!(view.snapshot.is_some());
     assert!(activity(home.path()).read().unwrap().events().is_empty());
 }
 
@@ -347,7 +439,11 @@ fn seed_ignored_permission(home: &Path, provider: AgentProvider, ignored_reason:
             )
             .unwrap(),
         ),
-        IgnoreReason::ActiveSubagentCapacity => unreachable!(),
+        IgnoreReason::ActiveSubagentCapacity
+        | IgnoreReason::SequenceExhausted
+        | IgnoreReason::UnprovenSubagent
+        | IgnoreReason::ProviderSessionMismatch
+        | IgnoreReason::SubagentTurnMismatch => unreachable!(),
     }
 }
 
@@ -514,6 +610,246 @@ fn model_action_requires_proposal_and_terminal_before_delivery() {
     let snapshot = store.snapshot(SnapshotLimits::default()).unwrap();
     assert_eq!(snapshot.recent[0].delivery, DeliveryState::Delivered);
     assert!(!snapshot.recent[0].tool_execution_confirmed);
+}
+
+#[test]
+fn interleaved_codex_children_receive_isolated_permission_decisions() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-a", "turn-a"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-b", "turn-b"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_pre_payload(home.path(), "child-a", "turn-a", "tool-a"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_pre_payload(home.path(), "child-b", "turn-b", "tool-b"),
+    );
+
+    let child_a = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload(home.path(), "child-a", "turn-a"),
+    );
+    let child_b = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload(home.path(), "child-b", "turn-b"),
+    );
+
+    assert!(
+        !child_a.stdout.is_empty(),
+        "child-a stderr: {}",
+        String::from_utf8_lossy(&child_a.stderr)
+    );
+    assert!(
+        !child_b.stdout.is_empty(),
+        "child-b stderr: {}",
+        String::from_utf8_lossy(&child_b.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&child_a.stderr).contains("AmbiguousTurn"));
+    assert!(!String::from_utf8_lossy(&child_b.stderr).contains("AmbiguousTurn"));
+
+    let mut mismatched_provider: serde_json::Value = serde_json::from_slice(&child_post_payload(
+        home.path(),
+        "child-b",
+        "turn-b",
+        "tool-b",
+    ))
+    .unwrap();
+    mismatched_provider["session_id"] = serde_json::json!("other-root");
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &serde_json::to_vec(&mismatched_provider).unwrap(),
+    );
+    assert!(
+        !activity(home.path())
+            .read()
+            .unwrap()
+            .events()
+            .iter()
+            .any(|event| event.state == ActivityState::Outcome)
+    );
+
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_post_payload(home.path(), "child-b", "turn-b", "tool-b"),
+    );
+
+    let log = activity(home.path()).read().unwrap();
+    assert_eq!(
+        log.events()
+            .iter()
+            .filter(|event| {
+                event.state == ActivityState::Outcome
+                    && event.session.as_ref().is_some_and(|session| {
+                        session.session_id == "child-b"
+                            && session.provider_session_id.as_deref() == Some("root-1")
+                    })
+            })
+            .count(),
+        1
+    );
+    assert!(!log.events().iter().any(|event| {
+        event.state == ActivityState::Outcome
+            && event
+                .session
+                .as_ref()
+                .is_some_and(|session| session.session_id == "child-a")
+    }));
+
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_stop_payload(home.path(), "child-b", "turn-b"),
+    );
+    let replay = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload(home.path(), "child-b", "turn-b"),
+    );
+    assert!(replay.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&replay.stderr).contains("UnprovenSubagent"));
+
+    let log = activity(home.path()).read().unwrap();
+    for (event_name, child_id) in [("SubagentStart", "child-a"), ("SubagentStop", "child-b")] {
+        assert!(log.events().iter().any(|event| {
+            event.kind == ActivityKind::Lifecycle
+                && event.tool.as_deref() == Some(event_name)
+                && event.session.as_ref().is_some_and(|session| {
+                    session.session_id == child_id
+                        && session.provider_session_id.as_deref() == Some("root-1")
+                })
+        }));
+    }
+}
+
+#[test]
+fn stopped_codex_child_post_tool_use_never_records_an_outcome() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-a", "turn-a"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_pre_payload(home.path(), "child-a", "turn-a", "tool-a"),
+    );
+    let permission = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload(home.path(), "child-a", "turn-a"),
+    );
+    assert!(!permission.stdout.is_empty());
+
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_stop_payload(home.path(), "child-a", "turn-a"),
+    );
+    let post = run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_post_payload(home.path(), "child-a", "turn-a", "tool-a"),
+    );
+
+    assert!(post.status.success());
+    let log = activity(home.path()).read().unwrap();
+    assert!(
+        !log.events()
+            .iter()
+            .any(|event| event.state == ActivityState::Outcome)
+    );
+    assert!(!log.events().iter().any(|event| {
+        event.kind == ActivityKind::Lifecycle
+            && event.tool.as_deref() == Some("PostToolUse")
+            && event
+                .session
+                .as_ref()
+                .is_some_and(|session| session.session_id == "child-a")
+    }));
+}
+
+#[test]
+fn ignored_codex_child_pre_tool_use_never_becomes_a_fallback_anchor() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+
+    let ignored_pre = run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_pre_payload(home.path(), "child-a", "turn-a", "tool-a"),
+    );
+    assert!(String::from_utf8_lossy(&ignored_pre.stderr).contains("UnprovenSubagent"));
+
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-a", "turn-a"),
+    );
+    let permission = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload(home.path(), "child-a", "turn-a"),
+    );
+    assert!(!permission.stdout.is_empty());
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_post_payload(home.path(), "child-a", "turn-a", "tool-a"),
+    );
+
+    let log = activity(home.path()).read().unwrap();
+    assert!(!log.events().iter().any(|event| {
+        event.kind == ActivityKind::Lifecycle
+            && event.tool.as_deref() == Some("PreToolUse")
+            && event
+                .session
+                .as_ref()
+                .is_some_and(|session| session.session_id == "child-a")
+    }));
+    assert!(
+        !log.events()
+            .iter()
+            .any(|event| event.state == ActivityState::Outcome)
+    );
 }
 
 #[test]
