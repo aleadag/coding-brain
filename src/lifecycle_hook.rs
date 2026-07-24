@@ -10,7 +10,7 @@ use coding_brain_core::brain_activity::{
     ProjectEvidence, SessionTarget, bounded_activity_identifier, lossless_redacted_activity_text,
 };
 use coding_brain_core::lifecycle::{
-    ApplyOutcome, LifecycleEvent, LifecycleStore, coding_brain_state_root,
+    ApplyOutcome, LifecycleEvent, LifecycleStore, RecordedLifecycleEvent, coding_brain_state_root,
 };
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::project::ProjectIdentity;
@@ -164,11 +164,36 @@ pub(crate) fn run_with_activity<R: Read, W: Write, E: Write>(
 fn run_provider_with_activity<R: Read, E: Write>(
     provider: AgentProvider,
     stdin: R,
+    stderr: E,
+    store: &LifecycleStore,
+    activity: Option<&ActivityStore>,
+    session_links: Option<&SessionLinkStore>,
+    antigravity_event: Option<&str>,
+) {
+    run_provider_with_activity_and_live_process(
+        provider,
+        stdin,
+        stderr,
+        store,
+        activity,
+        session_links,
+        antigravity_event,
+        crate::provider_hooks::live_parent_process(provider),
+        crate::provider_hooks::revalidate_live_process,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_provider_with_activity_and_live_process<R: Read, E: Write>(
+    provider: AgentProvider,
+    stdin: R,
     mut stderr: E,
     store: &LifecycleStore,
     activity: Option<&ActivityStore>,
     session_links: Option<&SessionLinkStore>,
     antigravity_event: Option<&str>,
+    live_process: Option<coding_brain_core::provider::LiveProcessIdentity>,
+    revalidate_live_process: impl Fn(&coding_brain_core::provider::LiveProcessIdentity) -> bool,
 ) {
     let input = match read_bounded_hook_input(stdin) {
         Ok(input) => input,
@@ -184,7 +209,7 @@ fn run_provider_with_activity<R: Read, E: Write>(
             return;
         }
     };
-    parsed.live_process = crate::provider_hooks::live_parent_process(provider);
+    parsed.live_process = live_process;
     let activity_input = LifecycleActivityInput::from_parsed(&parsed, &input);
     let event = match LifecycleEvent::from_parts_with_turn_initial_step(
         parsed.identity.clone(),
@@ -197,22 +222,29 @@ fn run_provider_with_activity<R: Read, E: Write>(
             return;
         }
     };
-    if let Err(error) = store.record(event.clone()) {
-        write_diagnostic(&mut stderr, error);
-    }
-    if let (Some(session_links), Some(live_process)) = (session_links, parsed.live_process.clone())
-        && crate::provider_hooks::revalidate_live_process(&live_process)
-        && let Err(error) = session_links.append(SessionIdentityLink {
-            schema_version: SESSION_IDENTITY_LINK_SCHEMA_VERSION,
-            recorded_at_ms: epoch_ms(),
-            provider,
-            native_session_id: parsed.identity.session_id().to_string(),
-            live_process,
-        })
+    let lifecycle_applied = match store.record(event.clone()) {
+        Ok(ApplyOutcome::Applied) => true,
+        Ok(ApplyOutcome::Ignored(reason)) => {
+            write_diagnostic(&mut stderr, format!("lifecycle event ignored: {reason:?}"));
+            false
+        }
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            false
+        }
+    };
+    if lifecycle_applied
+        && let (Some(session_links), Some(live_process)) =
+            (session_links, parsed.live_process.clone())
+        && revalidate_live_process(&live_process)
+        && let Err(error) =
+            session_links.append(session_identity_link(&parsed.identity, live_process))
     {
         write_diagnostic(&mut stderr, error);
     }
-    if let Some(activity) = activity {
+    if let Some(activity) = activity
+        && lifecycle_applied
+    {
         let result = if event.name().as_str() == "PostToolUse" {
             let observation = match observation_event(&event, &activity_input) {
                 Ok(observation) => observation,
@@ -260,13 +292,36 @@ pub(crate) fn persist_provider_hook(
     activity: Option<&ActivityStore>,
     session_links: Option<&SessionLinkStore>,
 ) -> Result<RecordedProviderHook, String> {
+    persist_provider_hook_with_live_process(
+        provider,
+        antigravity_event,
+        input,
+        store,
+        activity,
+        session_links,
+        crate::provider_hooks::live_parent_process(provider),
+        crate::provider_hooks::revalidate_live_process,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_provider_hook_with_live_process(
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+    input: &[u8],
+    store: &LifecycleStore,
+    activity: Option<&ActivityStore>,
+    session_links: Option<&SessionLinkStore>,
+    live_process: Option<coding_brain_core::provider::LiveProcessIdentity>,
+    revalidate_live_process: impl Fn(&coding_brain_core::provider::LiveProcessIdentity) -> bool,
+) -> Result<RecordedProviderHook, String> {
     let mut parsed = match parse_lifecycle(provider, antigravity_event, input) {
         Ok(parsed) => parsed,
         Err(error) => {
             return Err(error.to_string());
         }
     };
-    parsed.live_process = crate::provider_hooks::live_parent_process(provider);
+    parsed.live_process = live_process;
     let activity_input = LifecycleActivityInput::from_parsed(&parsed, input);
     let event = match LifecycleEvent::from_parts_with_turn_initial_step(
         parsed.identity.clone(),
@@ -278,27 +333,28 @@ pub(crate) fn persist_provider_hook(
             return Err(error.to_string());
         }
     };
-    let is_stop = event.name() == coding_brain_core::lifecycle::LifecycleEventName::Stop;
     let (recorded, recovery_link_persisted) = persist_recovery_event_in_order(
-        is_stop,
+        requires_recovery_link(&event),
+        || {
+            store
+                .record_with_sequence(event.clone())
+                .map_err(|error| error.to_string())
+        },
         || {
             let (Some(session_links), Some(live_process)) =
                 (session_links, parsed.live_process.clone())
             else {
                 return Ok(false);
             };
-            if !crate::provider_hooks::revalidate_live_process(&live_process) {
+            if !revalidate_live_process(&live_process) {
                 return Ok(false);
             }
-            let native_session_id = parsed.identity.session_id().to_string();
+            let native_session_id = linked_native_session_id(&parsed.identity).to_string();
             session_links
-                .append(SessionIdentityLink {
-                    schema_version: SESSION_IDENTITY_LINK_SCHEMA_VERSION,
-                    recorded_at_ms: epoch_ms(),
-                    provider,
-                    native_session_id: native_session_id.clone(),
-                    live_process: live_process.clone(),
-                })
+                .append(session_identity_link(
+                    &parsed.identity,
+                    live_process.clone(),
+                ))
                 .map_err(|error| error.to_string())?;
             let projection = session_links
                 .read_projection()
@@ -310,13 +366,11 @@ pub(crate) fn persist_provider_hook(
                     && projection.live_for(&native) == Some(&live_process),
             )
         },
-        || {
-            store
-                .record_with_sequence(event.clone())
-                .map_err(|error| error.to_string())
-        },
     )?;
-    if let Some(activity) = activity {
+    let lifecycle_applied = recorded.outcome == ApplyOutcome::Applied;
+    if let Some(activity) = activity
+        && lifecycle_applied
+    {
         let result = if event.name().as_str() == "PostToolUse" {
             let observation = observation_event(&event, &activity_input)?;
             activity
@@ -345,20 +399,25 @@ pub(crate) fn persist_provider_hook(
     })
 }
 
-fn persist_recovery_event_in_order<T>(
+fn requires_recovery_link(event: &LifecycleEvent) -> bool {
+    event.name() == coding_brain_core::lifecycle::LifecycleEventName::Stop
+        && event.identity().provider_session_id().is_none()
+}
+
+fn persist_recovery_event_in_order(
     requires_link: bool,
+    publish_lifecycle: impl FnOnce() -> Result<RecordedLifecycleEvent, String>,
     persist_and_verify_link: impl FnOnce() -> Result<bool, String>,
-    publish_lifecycle: impl FnOnce() -> Result<T, String>,
-) -> Result<(T, bool), String> {
-    let link_persisted = if requires_link {
-        persist_and_verify_link()?
-    } else {
-        false
-    };
-    if requires_link && !link_persisted {
+) -> Result<(RecordedLifecycleEvent, bool), String> {
+    let recorded = publish_lifecycle()?;
+    if !requires_link || recorded.outcome != ApplyOutcome::Applied {
+        return Ok((recorded, false));
+    }
+    let link_persisted = persist_and_verify_link()?;
+    if !link_persisted {
         return Err("exact recovery identity link unavailable".into());
     }
-    publish_lifecycle().map(|recorded| (recorded, link_persisted))
+    Ok((recorded, true))
 }
 
 fn append_observation(
@@ -380,6 +439,7 @@ fn observation_event(
         .map_err(|error| error.to_string())?;
     let project_id = identity.id().clone();
     let cwd = lifecycle.identity().cwd().to_path_buf();
+    let (session_id, provider_session_id) = activity_session_identity(lifecycle);
     Ok(ActivityEvent {
         schema_version: ACTIVITY_SCHEMA_VERSION,
         kind: ActivityKind::Lifecycle,
@@ -397,11 +457,8 @@ fn observation_event(
         },
         session: Some(SessionTarget {
             provider: lifecycle.identity().provider(),
-            session_id: lifecycle.identity().session_id().to_string(),
-            provider_session_id: lifecycle
-                .identity()
-                .provider_session_id()
-                .map(str::to_string),
+            session_id,
+            provider_session_id,
             turn_id: lifecycle.identity().turn_id().map(str::to_string),
             tool_use_id: input
                 .tool_use_id
@@ -428,6 +485,55 @@ fn observation_event(
     })
 }
 
+fn activity_session_identity(lifecycle: &LifecycleEvent) -> (String, Option<String>) {
+    match (lifecycle.identity().provider(), lifecycle.kind()) {
+        (
+            AgentProvider::Codex,
+            coding_brain_core::lifecycle::LifecycleEventKind::SubagentStart { agent_id }
+            | coding_brain_core::lifecycle::LifecycleEventKind::SubagentStop { agent_id },
+        ) => (
+            agent_id.clone(),
+            Some(lifecycle.identity().session_id().to_owned()),
+        ),
+        _ => (
+            lifecycle.identity().session_id().to_owned(),
+            lifecycle
+                .identity()
+                .provider_session_id()
+                .map(str::to_owned),
+        ),
+    }
+}
+
+fn matches_lifecycle_identity(
+    session: &SessionTarget,
+    identity: &coding_brain_core::lifecycle::LifecycleIdentity,
+) -> bool {
+    session.provider == identity.provider()
+        && session.session_id == identity.session_id()
+        && session.provider_session_id.as_deref() == identity.provider_session_id()
+        && session.turn_id.as_deref() == identity.turn_id()
+}
+
+fn linked_native_session_id(identity: &coding_brain_core::lifecycle::LifecycleIdentity) -> &str {
+    identity
+        .provider_session_id()
+        .unwrap_or_else(|| identity.session_id())
+}
+
+fn session_identity_link(
+    identity: &coding_brain_core::lifecycle::LifecycleIdentity,
+    live_process: coding_brain_core::provider::LiveProcessIdentity,
+) -> SessionIdentityLink {
+    SessionIdentityLink {
+        schema_version: SESSION_IDENTITY_LINK_SCHEMA_VERSION,
+        recorded_at_ms: epoch_ms(),
+        provider: identity.provider(),
+        native_session_id: linked_native_session_id(identity).to_owned(),
+        live_process,
+    }
+}
+
 fn correlate_outcome(
     log: &ActivityLog,
     lifecycle: &LifecycleEvent,
@@ -445,9 +551,7 @@ fn correlate_outcome(
     let exact_activity_ids = unique_activity_ids(log.events().iter().filter(|event| {
         event.kind == ActivityKind::Decision
             && event.session.as_ref().is_some_and(|session| {
-                session.provider == identity.provider()
-                    && session.session_id == identity.session_id()
-                    && session.turn_id.as_deref() == identity.turn_id()
+                matches_lifecycle_identity(session, identity)
                     && session.tool_use_id.as_deref() == Some(tool_use_id.as_str())
             })
     }));
@@ -462,7 +566,11 @@ fn correlate_outcome(
         let exact_activity_id = &exact_activity_ids[0];
         if identity.provider() == AgentProvider::Antigravity
             && first_terminal_with_index(log, exact_activity_id).is_some_and(|(_, event)| {
-                event.state == ActivityState::Abstained
+                event
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| matches_lifecycle_identity(session, identity))
+                    && event.state == ActivityState::Abstained
                     && event.reasoning.as_deref() == Some(UNSUPPORTED_PERMISSION_TOOL_REASON)
             })
         {
@@ -487,11 +595,10 @@ fn correlate_outcome(
         .any(|event| event.kind == ActivityKind::Decision);
     let has_provider_decision = log.events().iter().any(|event| {
         event.kind == ActivityKind::Decision
-            && event.session.as_ref().is_some_and(|session| {
-                session.provider == identity.provider()
-                    && session.session_id == identity.session_id()
-                    && session.turn_id.as_deref() == identity.turn_id()
-            })
+            && event
+                .session
+                .as_ref()
+                .is_some_and(|session| matches_lifecycle_identity(session, identity))
     });
     if has_any_decision && !has_provider_decision {
         return Correlation::None;
@@ -505,9 +612,7 @@ fn correlate_outcome(
             event.kind == ActivityKind::Lifecycle
                 && event.tool.as_deref() == Some("PreToolUse")
                 && event.session.as_ref().is_some_and(|session| {
-                    session.provider == identity.provider()
-                        && session.session_id == identity.session_id()
-                        && session.turn_id.as_deref() == identity.turn_id()
+                    matches_lifecycle_identity(session, identity)
                         && session.tool_use_id.as_deref() == Some(tool_use_id.as_str())
                 })
         })
@@ -526,11 +631,10 @@ fn correlate_outcome(
         .position(|event| {
             event.kind == ActivityKind::Lifecycle
                 && event.tool.as_deref() == Some("PreToolUse")
-                && event.session.as_ref().is_some_and(|session| {
-                    session.provider == identity.provider()
-                        && session.session_id == identity.session_id()
-                        && session.turn_id.as_deref() == identity.turn_id()
-                })
+                && event
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| matches_lifecycle_identity(session, identity))
         })
         .map_or(log.events().len(), |offset| pre_index + 1 + offset);
     let interval = &log.events()[pre_index + 1..next_pre_index];
@@ -563,11 +667,10 @@ fn correlate_outcome(
                 && event.decision_id.is_some()
                 && event.tool.as_deref() == Some("Bash")
                 && event.normalized_command.as_deref() == Some(command.as_str())
-                && event.session.as_ref().is_some_and(|session| {
-                    session.provider == identity.provider()
-                        && session.session_id == identity.session_id()
-                        && session.turn_id.as_deref() == identity.turn_id()
-                })
+                && event
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| matches_lifecycle_identity(session, identity))
                 && first_allowed_terminal_with_index(log, &event.activity_id)
                     .is_some_and(|(first_index, _)| first_index == index))
             .then_some(event)
@@ -607,7 +710,13 @@ fn correlate_candidates(
 ) -> Correlation {
     let candidates = activity_ids
         .iter()
-        .filter_map(|activity_id| first_allowed_terminal(log, activity_id))
+        .filter_map(|activity_id| {
+            first_allowed_terminal(log, activity_id).filter(|event| {
+                event.session.as_ref().is_some_and(|session| {
+                    matches_lifecycle_identity(session, lifecycle.identity())
+                })
+            })
+        })
         .collect::<Vec<_>>();
     if candidates.len() != 1 {
         return diagnostic_correlation(lifecycle, input, diagnostic);
@@ -620,9 +729,7 @@ fn correlate_candidates(
             && event.activity_id == matched.activity_id
             && event.outcome == Some(outcome)
             && event.session.as_ref().is_some_and(|session| {
-                session.provider == lifecycle.identity().provider()
-                    && session.session_id == lifecycle.identity().session_id()
-                    && session.turn_id.as_deref() == lifecycle.identity().turn_id()
+                matches_lifecycle_identity(session, lifecycle.identity())
                     && session.tool_use_id.as_deref() == post_id.as_deref()
             })
     });
@@ -713,6 +820,7 @@ fn diagnostic_event(
         .map_err(|error| error.to_string())?;
     let project_id = identity.id().clone();
     let cwd = lifecycle.identity().cwd().to_path_buf();
+    let (session_id, provider_session_id) = activity_session_identity(lifecycle);
     Ok(ActivityEvent {
         schema_version: ACTIVITY_SCHEMA_VERSION,
         kind: ActivityKind::Diagnostic,
@@ -725,11 +833,8 @@ fn diagnostic_event(
         },
         session: Some(SessionTarget {
             provider: lifecycle.identity().provider(),
-            session_id: lifecycle.identity().session_id().to_string(),
-            provider_session_id: lifecycle
-                .identity()
-                .provider_session_id()
-                .map(str::to_string),
+            session_id,
+            provider_session_id,
             turn_id: lifecycle.identity().turn_id().map(str::to_string),
             tool_use_id: input.normalized_tool_use_id(),
             project_id,
@@ -805,7 +910,10 @@ mod tests {
         MAX_ACTIVITY_FIELD_BYTES, ProjectEvidence, SessionTarget, SnapshotLimits,
         bounded_redacted_activity_text,
     };
-    use coding_brain_core::lifecycle::{LifecycleStore, StoreCondition};
+    use coding_brain_core::lifecycle::{
+        IgnoreReason, LifecycleEventKind, LifecycleIdentity, LifecycleStore, MAX_SESSIONS,
+        StoreCondition,
+    };
     use coding_brain_core::project::ProjectId;
     use fs2::FileExt;
 
@@ -883,6 +991,169 @@ mod tests {
         value
     }
 
+    fn seed_codex_child(lifecycle: &LifecycleStore, cwd: &Path, child_id: &str, turn_id: &str) {
+        let root = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "root-1".into(),
+            Some(turn_id.into()),
+            None,
+            cwd.to_path_buf(),
+        )
+        .unwrap();
+        assert_eq!(
+            lifecycle
+                .record(
+                    LifecycleEvent::from_parts(
+                        root,
+                        LifecycleEventKind::SubagentStart {
+                            agent_id: child_id.into(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+    }
+
+    fn seed_active_tool(lifecycle: &LifecycleStore, provider: AgentProvider, cwd: &Path) {
+        if provider == AgentProvider::Antigravity {
+            let invocation = LifecycleIdentity::try_new(
+                provider,
+                "agy-conversation-1".into(),
+                Some("invocation-1".into()),
+                None,
+                cwd.to_path_buf(),
+            )
+            .unwrap();
+            assert_eq!(
+                lifecycle
+                    .record(
+                        LifecycleEvent::from_parts_with_turn_initial_step(
+                            invocation,
+                            LifecycleEventKind::UserPromptSubmit,
+                            Some(0),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                ApplyOutcome::Applied
+            );
+        }
+        let identity = match provider {
+            AgentProvider::Codex => LifecycleIdentity::try_new(
+                provider,
+                "session-1".into(),
+                Some("turn-1".into()),
+                None,
+                cwd.to_path_buf(),
+            ),
+            AgentProvider::Antigravity => LifecycleIdentity::try_new(
+                provider,
+                "agy-conversation-1".into(),
+                Some("step-5".into()),
+                None,
+                cwd.to_path_buf(),
+            ),
+            AgentProvider::Claude => unreachable!(),
+        }
+        .unwrap();
+        assert_eq!(
+            lifecycle
+                .record(
+                    LifecycleEvent::from_parts(identity, LifecycleEventKind::PreToolUse).unwrap()
+                )
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+    }
+
+    fn child_post_payload(cwd: &Path, child_id: &str, turn_id: &str) -> Vec<u8> {
+        let mut payload: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/hooks/codex-child-post-tool-use.json"
+        ))
+        .unwrap();
+        payload["cwd"] = serde_json::json!(cwd);
+        payload["session_id"] = serde_json::json!("root-1");
+        payload["agent_id"] = serde_json::json!(child_id);
+        payload["turn_id"] = serde_json::json!(turn_id);
+        payload["tool_use_id"] = serde_json::json!("call-1");
+        payload["tool_input"] = serde_json::json!({"command": "cargo test"});
+        serde_json::to_vec(&payload).unwrap()
+    }
+
+    fn child_pre_payload(cwd: &Path, child_id: &str, turn_id: &str) -> Vec<u8> {
+        let mut payload: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/hooks/codex-child-pre-tool-use.json"
+        ))
+        .unwrap();
+        payload["cwd"] = serde_json::json!(cwd);
+        payload["session_id"] = serde_json::json!("root-1");
+        payload["agent_id"] = serde_json::json!(child_id);
+        payload["turn_id"] = serde_json::json!(turn_id);
+        payload["tool_use_id"] = serde_json::json!("call-1");
+        payload["tool_input"] = serde_json::json!({"command": "cargo test"});
+        serde_json::to_vec(&payload).unwrap()
+    }
+
+    fn root_stop_payload(cwd: &Path, session_id: &str, turn_id: &str) -> Vec<u8> {
+        let mut payload: Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/hooks/stop.json")).unwrap();
+        payload["cwd"] = serde_json::json!(cwd);
+        payload["session_id"] = serde_json::json!(session_id);
+        payload["turn_id"] = serde_json::json!(turn_id);
+        serde_json::to_vec(&payload).unwrap()
+    }
+
+    fn root_event(
+        cwd: &Path,
+        session_id: &str,
+        turn_id: &str,
+        kind: LifecycleEventKind,
+    ) -> LifecycleEvent {
+        LifecycleEvent::from_parts(
+            LifecycleIdentity::try_new(
+                AgentProvider::Codex,
+                session_id.into(),
+                Some(turn_id.into()),
+                None,
+                cwd.to_path_buf(),
+            )
+            .unwrap(),
+            kind,
+        )
+        .unwrap()
+    }
+
+    fn assert_only_trusted_process_link(
+        link_path: &Path,
+        trusted_process: &coding_brain_core::provider::LiveProcessIdentity,
+        claimed_process: &coding_brain_core::provider::LiveProcessIdentity,
+    ) {
+        let rows = fs::read_to_string(link_path).unwrap();
+        let links = rows
+            .lines()
+            .map(|row| serde_json::from_str::<SessionIdentityLink>(row).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].native_session_id, "trusted-root");
+        assert_eq!(&links[0].live_process, trusted_process);
+
+        let projection = SessionLinkStore::at(link_path).read_projection().unwrap();
+        let trusted_key = coding_brain_core::provider::AgentSessionKey::native(
+            AgentProvider::Codex,
+            "trusted-root",
+        );
+        let claimed_key = coding_brain_core::provider::AgentSessionKey::native(
+            AgentProvider::Codex,
+            "claimed-root",
+        );
+        assert_eq!(projection.native_for(trusted_process), Some("trusted-root"));
+        assert_eq!(projection.live_for(&trusted_key), Some(trusted_process));
+        assert_eq!(projection.native_for(claimed_process), None);
+        assert_eq!(projection.live_for(&claimed_key), None);
+    }
+
     fn invoke_activity_hook(
         lifecycle: &LifecycleStore,
         activity: &ActivityStore,
@@ -950,6 +1221,7 @@ mod tests {
         lifecycle: &LifecycleStore,
         activity: &ActivityStore,
     ) {
+        seed_active_tool(lifecycle, provider, cwd);
         match provider {
             AgentProvider::Codex => {
                 invoke_activity_hook(
@@ -1175,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_stop_persistence_does_not_publish_without_exact_link() {
+    fn strict_stop_persistence_keeps_accepted_stop_without_exact_link() {
         let temp = tempfile::tempdir().unwrap();
         let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
         let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
@@ -1195,43 +1467,342 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(lifecycle.read().unwrap().snapshot.is_none());
+        assert!(lifecycle.read().unwrap().snapshot.is_some());
         assert!(activity.read().unwrap().events().is_empty());
     }
 
     #[test]
-    fn strict_stop_persistence_verifies_link_before_publishing_lifecycle() {
+    fn rejected_root_stops_do_not_replace_a_trusted_process_link() {
+        for failure in ["io", "newer-schema", "capacity"] {
+            let temp = tempfile::tempdir().unwrap();
+            let lifecycle_path = temp.path().join("lifecycle");
+            let lifecycle = LifecycleStore::at(&lifecycle_path);
+            match failure {
+                "io" => fs::write(&lifecycle_path, b"occupied").unwrap(),
+                "newer-schema" => {
+                    fs::create_dir_all(lifecycle.hooks_dir()).unwrap();
+                    fs::write(lifecycle.snapshot_path(), br#"{"schema_version":4}"#).unwrap();
+                }
+                "capacity" => {
+                    for index in 0..MAX_SESSIONS {
+                        assert_eq!(
+                            lifecycle
+                                .record(root_event(
+                                    temp.path(),
+                                    &format!("session-{index}"),
+                                    "turn-a",
+                                    LifecycleEventKind::PreToolUse,
+                                ))
+                                .unwrap(),
+                            ApplyOutcome::Applied
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let link_path = temp.path().join("session-links.jsonl");
+            let links = SessionLinkStore::at(&link_path);
+            let trusted_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+                AgentProvider::Codex,
+                4100,
+                9001,
+                "pts/7",
+            )
+            .unwrap();
+            let claimed_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+                AgentProvider::Codex,
+                4200,
+                9002,
+                "pts/8",
+            )
+            .unwrap();
+            links
+                .append(SessionIdentityLink {
+                    schema_version: SESSION_IDENTITY_LINK_SCHEMA_VERSION,
+                    recorded_at_ms: 1,
+                    provider: AgentProvider::Codex,
+                    native_session_id: "trusted-root".into(),
+                    live_process: trusted_process.clone(),
+                })
+                .unwrap();
+
+            let result = persist_provider_hook_with_live_process(
+                AgentProvider::Codex,
+                None,
+                &root_stop_payload(temp.path(), "claimed-root", "turn-a"),
+                &lifecycle,
+                None,
+                Some(&links),
+                Some(claimed_process.clone()),
+                |_| true,
+            );
+
+            assert!(result.is_err(), "failure={failure}");
+            assert_only_trusted_process_link(&link_path, &trusted_process, &claimed_process);
+        }
+    }
+
+    #[test]
+    fn ignored_root_stops_do_not_replace_a_trusted_process_link() {
+        for ignored in ["duplicate", "stale", "ambiguous"] {
+            let temp = tempfile::tempdir().unwrap();
+            let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+            if ignored != "ambiguous" {
+                assert_eq!(
+                    lifecycle
+                        .record(root_event(
+                            temp.path(),
+                            "claimed-root",
+                            "turn-a",
+                            LifecycleEventKind::Stop,
+                        ))
+                        .unwrap(),
+                    ApplyOutcome::Applied
+                );
+            }
+            if ignored != "duplicate" {
+                assert_eq!(
+                    lifecycle
+                        .record(root_event(
+                            temp.path(),
+                            "claimed-root",
+                            "turn-b",
+                            LifecycleEventKind::UserPromptSubmit,
+                        ))
+                        .unwrap(),
+                    ApplyOutcome::Applied
+                );
+            }
+            let link_path = temp.path().join("session-links.jsonl");
+            let links = SessionLinkStore::at(&link_path);
+            let trusted_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+                AgentProvider::Codex,
+                4100,
+                9001,
+                "pts/7",
+            )
+            .unwrap();
+            let claimed_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+                AgentProvider::Codex,
+                4200,
+                9002,
+                "pts/8",
+            )
+            .unwrap();
+            links
+                .append(SessionIdentityLink {
+                    schema_version: SESSION_IDENTITY_LINK_SCHEMA_VERSION,
+                    recorded_at_ms: 1,
+                    provider: AgentProvider::Codex,
+                    native_session_id: "trusted-root".into(),
+                    live_process: trusted_process.clone(),
+                })
+                .unwrap();
+
+            let recorded = persist_provider_hook_with_live_process(
+                AgentProvider::Codex,
+                None,
+                &root_stop_payload(temp.path(), "claimed-root", "turn-a"),
+                &lifecycle,
+                None,
+                Some(&links),
+                Some(claimed_process.clone()),
+                |_| true,
+            )
+            .unwrap();
+
+            assert_eq!(
+                recorded.outcome,
+                ApplyOutcome::Ignored(match ignored {
+                    "duplicate" => IgnoreReason::Duplicate,
+                    "stale" => IgnoreReason::RecentTurn,
+                    "ambiguous" => IgnoreReason::AmbiguousTurn,
+                    _ => unreachable!(),
+                })
+            );
+            assert!(!recorded.recovery_link_persisted);
+            assert_only_trusted_process_link(&link_path, &trusted_process, &claimed_process);
+        }
+    }
+
+    #[test]
+    fn accepted_root_stop_persists_lifecycle_before_exact_recovery_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let link_path = temp.path().join("session-links.jsonl");
+        let links = SessionLinkStore::at(&link_path);
+        let live_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+            AgentProvider::Codex,
+            4200,
+            9002,
+            "pts/8",
+        )
+        .unwrap();
+
+        let recorded = persist_provider_hook_with_live_process(
+            AgentProvider::Codex,
+            None,
+            &root_stop_payload(temp.path(), "claimed-root", "turn-a"),
+            &lifecycle,
+            None,
+            Some(&links),
+            Some(live_process.clone()),
+            |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(recorded.outcome, ApplyOutcome::Applied);
+        assert!(recorded.recovery_link_persisted);
+        let snapshot = lifecycle.read().unwrap().snapshot.unwrap();
+        let root_key = coding_brain_core::provider::AgentSessionKey::native(
+            AgentProvider::Codex,
+            "claimed-root",
+        );
+        let root = &snapshot.sessions[&root_key.storage_key()];
+        assert_eq!(
+            root.latest_event.as_ref().map(|event| event.as_str()),
+            Some("Stop")
+        );
+        let rows = fs::read_to_string(&link_path).unwrap();
+        assert_eq!(rows.lines().count(), 1);
+        let projection = links.read_projection().unwrap();
+        assert_eq!(projection.native_for(&live_process), Some("claimed-root"));
+        assert_eq!(projection.live_for(&root_key), Some(&live_process));
+    }
+
+    #[test]
+    fn strict_stop_persistence_publishes_lifecycle_before_verifying_link() {
         let order = std::cell::RefCell::new(Vec::new());
         let result = persist_recovery_event_in_order(
             true,
             || {
-                order.borrow_mut().push("link");
-                Ok(true)
+                order.borrow_mut().push("stop");
+                Ok(RecordedLifecycleEvent {
+                    outcome: ApplyOutcome::Applied,
+                    sequence: 7,
+                })
             },
             || {
-                order.borrow_mut().push("stop");
-                Ok(7_u64)
+                order.borrow_mut().push("link");
+                Ok(true)
             },
         )
         .unwrap();
         order.borrow_mut().push("evaluation");
 
-        assert_eq!(result, (7, true));
-        assert_eq!(order.into_inner(), vec!["link", "stop", "evaluation"]);
+        assert_eq!(
+            result,
+            (
+                RecordedLifecycleEvent {
+                    outcome: ApplyOutcome::Applied,
+                    sequence: 7,
+                },
+                true
+            )
+        );
+        assert_eq!(order.into_inner(), vec!["stop", "link", "evaluation"]);
 
         let published = std::cell::Cell::new(false);
         assert!(
             persist_recovery_event_in_order(
                 true,
-                || Ok(false),
                 || {
                     published.set(true);
-                    Ok(())
+                    Ok(RecordedLifecycleEvent {
+                        outcome: ApplyOutcome::Applied,
+                        sequence: 7,
+                    })
                 },
+                || Ok(false),
             )
             .is_err()
         );
-        assert!(!published.get());
+        assert!(published.get());
+    }
+
+    #[test]
+    fn linked_child_stop_publishes_without_attempting_recovery_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "root-session".into(),
+            Some("turn-1".into()),
+            None,
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        let child_identity = LifecycleIdentity::try_new_with_provider_session(
+            AgentProvider::Codex,
+            "child-a".into(),
+            Some("root-session".into()),
+            Some("turn-1".into()),
+            None,
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        let root_stop =
+            LifecycleEvent::from_parts(root_identity, LifecycleEventKind::Stop).unwrap();
+        let child_stop =
+            LifecycleEvent::from_parts(child_identity, LifecycleEventKind::Stop).unwrap();
+
+        assert!(requires_recovery_link(&root_stop));
+        assert!(!requires_recovery_link(&child_stop));
+
+        let link_attempted = std::cell::Cell::new(false);
+        let published = std::cell::Cell::new(false);
+        let result = persist_recovery_event_in_order(
+            requires_recovery_link(&child_stop),
+            || {
+                published.set(true);
+                Ok(RecordedLifecycleEvent {
+                    outcome: ApplyOutcome::Applied,
+                    sequence: 7,
+                })
+            },
+            || {
+                link_attempted.set(true);
+                Ok(true)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            (
+                RecordedLifecycleEvent {
+                    outcome: ApplyOutcome::Applied,
+                    sequence: 7,
+                },
+                false
+            )
+        );
+        assert!(!link_attempted.get());
+        assert!(published.get());
+    }
+
+    #[test]
+    fn claude_subagent_topology_audit_remains_parent_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Claude,
+            "claude-session".into(),
+            Some("turn-1".into()),
+            None,
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        let event = LifecycleEvent::from_parts(
+            identity,
+            LifecycleEventKind::SubagentStart {
+                agent_id: "claude-child".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            activity_session_identity(&event),
+            ("claude-session".into(), None)
+        );
     }
 
     #[test]
@@ -1313,7 +1884,7 @@ mod tests {
 
         let store = LifecycleStore::at(temp.path().join("newer"));
         fs::create_dir_all(store.hooks_dir()).unwrap();
-        let newer = br#"{"schema_version":3}"#;
+        let newer = br#"{"schema_version":4}"#;
         fs::write(store.snapshot_path(), newer).unwrap();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1427,8 +1998,11 @@ mod tests {
             Some(serde_json::json!({"exit_code": 0})),
         );
 
+        seed_active_tool(&lifecycle, AgentProvider::Codex, temp.path());
         assert!(invoke_activity_hook(&lifecycle, &activity, post.clone()).is_empty());
-        assert!(invoke_activity_hook(&lifecycle, &activity, post).is_empty());
+        assert!(
+            invoke_activity_hook(&lifecycle, &activity, post).contains("lifecycle event ignored")
+        );
 
         let events = activity.read().unwrap().events().to_vec();
         let outcomes = events
@@ -1443,7 +2017,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.tool.as_deref() == Some("PostToolUse"))
                 .count(),
-            2
+            1
         );
     }
 
@@ -1932,6 +2506,464 @@ mod tests {
     }
 
     #[test]
+    fn persist_provider_hook_ignored_child_post_does_not_record_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        seed_codex_child(&lifecycle, temp.path(), "child-a", "turn-a");
+        let stop = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "root-1".into(),
+            Some("turn-a".into()),
+            None,
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        assert_eq!(
+            lifecycle
+                .record(
+                    LifecycleEvent::from_parts(
+                        stop,
+                        LifecycleEventKind::SubagentStop {
+                            agent_id: "child-a".into(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        let mut decision = decision_event(
+            temp.path(),
+            "activity-1",
+            1,
+            Some("call-1"),
+            "cargo test",
+            ActivityState::Allowed,
+        );
+        let session = decision.session.as_mut().unwrap();
+        session.session_id = "child-a".into();
+        session.provider_session_id = Some("root-1".into());
+        session.turn_id = Some("turn-a".into());
+        activity.append(decision).unwrap();
+
+        let recorded = persist_provider_hook(
+            AgentProvider::Codex,
+            None,
+            &child_post_payload(temp.path(), "child-a", "turn-a"),
+            &lifecycle,
+            Some(&activity),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recorded.outcome,
+            ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent)
+        );
+        assert_eq!(outcome_and_diagnostic_counts(&activity).0, 0);
+    }
+
+    #[test]
+    fn persist_provider_hook_ignored_child_pre_does_not_record_lifecycle_observation() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+
+        let recorded = persist_provider_hook(
+            AgentProvider::Codex,
+            None,
+            &child_pre_payload(temp.path(), "child-a", "turn-a"),
+            &lifecycle,
+            Some(&activity),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recorded.outcome,
+            ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent)
+        );
+        assert!(
+            !activity
+                .read()
+                .unwrap()
+                .events()
+                .iter()
+                .any(|event| event.kind == ActivityKind::Lifecycle)
+        );
+    }
+
+    #[test]
+    fn root_and_sibling_callbacks_keep_one_root_process_link() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SessionLinkStore::at(temp.path().join("session-links.jsonl"));
+        let live_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+            AgentProvider::Codex,
+            4242,
+            9001,
+            "pts/7",
+        )
+        .expect("live process");
+        let root = LifecycleIdentity::try_new_with_provider_session(
+            AgentProvider::Codex,
+            "root-session".into(),
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<PathBuf>::None,
+            temp.path().to_path_buf(),
+        )
+        .expect("root identity");
+        let child_a = LifecycleIdentity::try_new_with_provider_session(
+            AgentProvider::Codex,
+            "child-a".into(),
+            Some("root-session".into()),
+            Option::<String>::None,
+            Option::<PathBuf>::None,
+            temp.path().to_path_buf(),
+        )
+        .expect("child identity");
+        let child_b = LifecycleIdentity::try_new_with_provider_session(
+            AgentProvider::Codex,
+            "child-b".into(),
+            Some("root-session".into()),
+            Option::<String>::None,
+            Option::<PathBuf>::None,
+            temp.path().to_path_buf(),
+        )
+        .expect("child identity");
+
+        for identity in [&root, &child_a, &child_b] {
+            store
+                .append(session_identity_link(identity, live_process.clone()))
+                .expect("append link");
+        }
+
+        let projection = store.read_projection().expect("read projection");
+        let root_key = coding_brain_core::provider::AgentSessionKey::native(
+            AgentProvider::Codex,
+            "root-session",
+        );
+        let child_a_key =
+            coding_brain_core::provider::AgentSessionKey::native(AgentProvider::Codex, "child-a");
+        let child_b_key =
+            coding_brain_core::provider::AgentSessionKey::native(AgentProvider::Codex, "child-b");
+        assert_eq!(
+            projection.native_for(&live_process),
+            Some("root-session"),
+            "sibling callbacks must not remap a shared root process to the last child"
+        );
+        assert_eq!(projection.live_for(&root_key), Some(&live_process));
+        assert_eq!(projection.live_for(&child_a_key), None);
+        assert_eq!(projection.live_for(&child_b_key), None);
+    }
+
+    #[test]
+    fn accepted_root_and_child_callbacks_publish_only_root_process_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let link_path = temp.path().join("session-links.jsonl");
+        let links = SessionLinkStore::at(&link_path);
+        let live_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+            AgentProvider::Codex,
+            4242,
+            9001,
+            "pts/7",
+        )
+        .unwrap();
+        let root_key =
+            coding_brain_core::provider::AgentSessionKey::native(AgentProvider::Codex, "root-1");
+        let child_key =
+            coding_brain_core::provider::AgentSessionKey::native(AgentProvider::Codex, "child-a");
+        let mut root_payload: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/hooks/subagent-start.json"
+        ))
+        .unwrap();
+        root_payload["cwd"] = serde_json::json!(temp.path());
+        root_payload["session_id"] = serde_json::json!("root-1");
+        root_payload["turn_id"] = serde_json::json!("turn-a");
+        root_payload["agent_id"] = serde_json::json!("child-a");
+        let mut stderr = Vec::new();
+
+        run_provider_with_activity_and_live_process(
+            AgentProvider::Codex,
+            Cursor::new(serde_json::to_vec(&root_payload).unwrap()),
+            &mut stderr,
+            &lifecycle,
+            None,
+            Some(&links),
+            None,
+            Some(live_process.clone()),
+            |_| true,
+        );
+
+        assert!(stderr.is_empty());
+        let snapshot = lifecycle.read().unwrap().snapshot.unwrap();
+        let root = &snapshot.sessions[&root_key.storage_key()];
+        assert!(root.active_subagents.contains_key("child-a"));
+        assert_eq!(fs::read_to_string(&link_path).unwrap().lines().count(), 1);
+        let projection = links.read_projection().unwrap();
+        assert_eq!(projection.native_for(&live_process), Some("root-1"));
+        assert_eq!(projection.live_for(&root_key), Some(&live_process));
+        assert_eq!(projection.live_for(&child_key), None);
+
+        run_provider_with_activity_and_live_process(
+            AgentProvider::Codex,
+            Cursor::new(child_pre_payload(temp.path(), "child-a", "turn-a")),
+            &mut stderr,
+            &lifecycle,
+            None,
+            Some(&links),
+            None,
+            Some(live_process.clone()),
+            |_| true,
+        );
+
+        assert!(stderr.is_empty());
+        let snapshot = lifecycle.read().unwrap().snapshot.unwrap();
+        let child = &snapshot.sessions[&child_key.storage_key()];
+        assert_eq!(child.provider_session_id.as_deref(), Some("root-1"));
+        assert_eq!(child.current_turn.as_deref(), Some("turn-a"));
+        assert_eq!(
+            child.latest_event.as_ref().map(|event| event.as_str()),
+            Some("PreToolUse")
+        );
+        let rows = fs::read_to_string(&link_path).unwrap();
+        let links = rows
+            .lines()
+            .map(|row| serde_json::from_str::<SessionIdentityLink>(row).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().all(|link| {
+            link.native_session_id == "root-1" && link.live_process == live_process
+        }));
+        let projection = SessionLinkStore::at(&link_path).read_projection().unwrap();
+        assert_eq!(projection.native_for(&live_process), Some("root-1"));
+        assert_eq!(projection.live_for(&root_key), Some(&live_process));
+        assert_eq!(projection.live_for(&child_key), None);
+    }
+
+    #[test]
+    fn rejected_child_callbacks_do_not_publish_session_links() {
+        for mismatch in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+            if mismatch {
+                seed_codex_child(&lifecycle, temp.path(), "child-a", "turn-a");
+            }
+            let link_path = temp.path().join("session-links.jsonl");
+            let links = SessionLinkStore::at(&link_path);
+            let live_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+                AgentProvider::Codex,
+                4242,
+                9001,
+                "pts/7",
+            )
+            .unwrap();
+            let trusted_root = if mismatch { "root-1" } else { "trusted-root" };
+            links
+                .append(SessionIdentityLink {
+                    schema_version: SESSION_IDENTITY_LINK_SCHEMA_VERSION,
+                    recorded_at_ms: 1,
+                    provider: AgentProvider::Codex,
+                    native_session_id: trusted_root.into(),
+                    live_process: live_process.clone(),
+                })
+                .unwrap();
+            let mut payload: Value =
+                serde_json::from_slice(&child_pre_payload(temp.path(), "child-a", "turn-a"))
+                    .unwrap();
+            let claimed_root = if mismatch { "other-root" } else { "root-1" };
+            payload["session_id"] = serde_json::json!(claimed_root);
+            let mut stderr = Vec::new();
+
+            run_provider_with_activity_and_live_process(
+                AgentProvider::Codex,
+                Cursor::new(serde_json::to_vec(&payload).unwrap()),
+                &mut stderr,
+                &lifecycle,
+                None,
+                Some(&links),
+                None,
+                Some(live_process.clone()),
+                |_| true,
+            );
+
+            assert!(!stderr.is_empty(), "mismatch={mismatch}");
+            assert_eq!(fs::read_to_string(&link_path).unwrap().lines().count(), 1);
+            let projection = links.read_projection().unwrap();
+            let trusted_key = coding_brain_core::provider::AgentSessionKey::native(
+                AgentProvider::Codex,
+                trusted_root,
+            );
+            let claimed_key = coding_brain_core::provider::AgentSessionKey::native(
+                AgentProvider::Codex,
+                claimed_root,
+            );
+            let child_key = coding_brain_core::provider::AgentSessionKey::native(
+                AgentProvider::Codex,
+                "child-a",
+            );
+            assert_eq!(projection.native_for(&live_process), Some(trusted_root));
+            assert_eq!(projection.live_for(&trusted_key), Some(&live_process));
+            assert_eq!(projection.live_for(&claimed_key), None);
+            assert_eq!(projection.live_for(&child_key), None);
+        }
+    }
+
+    #[test]
+    fn lifecycle_store_errors_do_not_publish_session_links() {
+        for newer_schema in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let lifecycle_path = temp.path().join("lifecycle");
+            if newer_schema {
+                let lifecycle = LifecycleStore::at(&lifecycle_path);
+                fs::create_dir_all(lifecycle.hooks_dir()).unwrap();
+                fs::write(lifecycle.snapshot_path(), br#"{"schema_version":4}"#).unwrap();
+            } else {
+                fs::write(&lifecycle_path, b"occupied").unwrap();
+            }
+            let lifecycle = LifecycleStore::at(&lifecycle_path);
+            let link_path = temp.path().join("session-links.jsonl");
+            let links = SessionLinkStore::at(&link_path);
+            let live_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+                AgentProvider::Codex,
+                4242,
+                9001,
+                "pts/7",
+            )
+            .unwrap();
+            links
+                .append(SessionIdentityLink {
+                    schema_version: SESSION_IDENTITY_LINK_SCHEMA_VERSION,
+                    recorded_at_ms: 1,
+                    provider: AgentProvider::Codex,
+                    native_session_id: "trusted-root".into(),
+                    live_process: live_process.clone(),
+                })
+                .unwrap();
+            let mut stderr = Vec::new();
+
+            run_provider_with_activity_and_live_process(
+                AgentProvider::Codex,
+                Cursor::new(child_pre_payload(temp.path(), "child-a", "turn-a")),
+                &mut stderr,
+                &lifecycle,
+                None,
+                Some(&links),
+                None,
+                Some(live_process.clone()),
+                |_| true,
+            );
+
+            assert!(!stderr.is_empty(), "newer_schema={newer_schema}");
+            assert_eq!(fs::read_to_string(&link_path).unwrap().lines().count(), 1);
+            let projection = links.read_projection().unwrap();
+            let trusted_key = coding_brain_core::provider::AgentSessionKey::native(
+                AgentProvider::Codex,
+                "trusted-root",
+            );
+            let claimed_key = coding_brain_core::provider::AgentSessionKey::native(
+                AgentProvider::Codex,
+                "root-1",
+            );
+            let child_key = coding_brain_core::provider::AgentSessionKey::native(
+                AgentProvider::Codex,
+                "child-a",
+            );
+            assert_eq!(projection.native_for(&live_process), Some("trusted-root"));
+            assert_eq!(projection.live_for(&trusted_key), Some(&live_process));
+            assert_eq!(projection.live_for(&claimed_key), None);
+            assert_eq!(projection.live_for(&child_key), None);
+        }
+    }
+
+    #[test]
+    fn post_tool_use_after_lifecycle_persistence_failure_does_not_record_outcome() {
+        for newer_schema in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let lifecycle_path = temp.path().join("lifecycle");
+            if newer_schema {
+                let store = LifecycleStore::at(&lifecycle_path);
+                fs::create_dir_all(store.hooks_dir()).unwrap();
+                fs::write(store.snapshot_path(), br#"{"schema_version":4}"#).unwrap();
+            } else {
+                fs::write(&lifecycle_path, b"occupied").unwrap();
+            }
+            let lifecycle = LifecycleStore::at(&lifecycle_path);
+            let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+            activity
+                .append(decision_event(
+                    temp.path(),
+                    "activity-1",
+                    1,
+                    Some("call-1"),
+                    "cargo test",
+                    ActivityState::Allowed,
+                ))
+                .unwrap();
+
+            let stderr = invoke_activity_hook(
+                &lifecycle,
+                &activity,
+                hook_payload(
+                    temp.path(),
+                    "PostToolUse",
+                    "call-1",
+                    "cargo test",
+                    Some(serde_json::json!({"exit_code": 0})),
+                ),
+            );
+
+            assert!(!stderr.is_empty(), "newer_schema={newer_schema}");
+            assert_eq!(outcome_and_diagnostic_counts(&activity).0, 0);
+        }
+    }
+
+    #[test]
+    fn shared_activity_id_with_foreign_terminal_is_diagnostic_not_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        seed_codex_child(&lifecycle, temp.path(), "child-a", "turn-a");
+
+        let mut current = decision_event(
+            temp.path(),
+            "shared-activity",
+            1,
+            Some("call-1"),
+            "cargo test",
+            ActivityState::Observed,
+        );
+        let session = current.session.as_mut().unwrap();
+        session.session_id = "child-a".into();
+        session.provider_session_id = Some("root-1".into());
+        session.turn_id = Some("turn-a".into());
+        activity.append(current.clone()).unwrap();
+
+        let mut foreign = current;
+        foreign.recorded_at_ms = 2;
+        foreign.state = ActivityState::Allowed;
+        foreign.session.as_mut().unwrap().session_id = "child-b".into();
+        activity.append(foreign.clone()).unwrap();
+
+        let mut matching_after_foreign = foreign;
+        matching_after_foreign.recorded_at_ms = 3;
+        matching_after_foreign.session.as_mut().unwrap().session_id = "child-a".into();
+        activity.append(matching_after_foreign).unwrap();
+
+        let stderr = invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            serde_json::from_slice(&child_post_payload(temp.path(), "child-a", "turn-a")).unwrap(),
+        );
+
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 1));
+        assert!(stderr.contains("orphan outcome"));
+    }
+
+    #[test]
     fn post_tool_use_falls_back_within_unique_pre_interval() {
         let temp = tempfile::tempdir().unwrap();
         let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
@@ -1991,7 +3023,7 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_pre_tools_do_not_guess() {
+    fn ignored_duplicate_pre_does_not_make_fallback_ambiguous() {
         let temp = tempfile::tempdir().unwrap();
         let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
         let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
@@ -2026,8 +3058,7 @@ mod tests {
                 Some(serde_json::json!("done")),
             ),
         );
-        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 1));
-        assert_diagnostics_are_metadata_only(&activity, &["done"]);
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (1, 0));
     }
 
     #[test]
@@ -2072,7 +3103,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_after_next_pre_is_outside_the_fallback_interval() {
+    fn ignored_duplicate_pre_does_not_end_the_fallback_interval() {
         let temp = tempfile::tempdir().unwrap();
         let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
         let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
@@ -2119,7 +3150,7 @@ mod tests {
             ),
         );
 
-        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 1));
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (1, 0));
     }
 
     #[test]
@@ -2362,7 +3393,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.tool.as_deref() == Some("PostToolUse"))
                 .count(),
-            2
+            1
         );
     }
 
@@ -2396,6 +3427,7 @@ mod tests {
             Some(serde_json::json!({"exit_code": 7})),
         );
 
+        seed_active_tool(&lifecycle, AgentProvider::Codex, temp.path());
         invoke_activity_hook(&lifecycle, &activity, completed);
         invoke_activity_hook(&lifecycle, &activity, failed.clone());
         invoke_activity_hook(&lifecycle, &activity, failed);
@@ -2406,14 +3438,14 @@ mod tests {
                 .iter()
                 .filter_map(|event| event.outcome)
                 .collect::<Vec<_>>(),
-            [ActivityOutcome::Completed, ActivityOutcome::Failed]
+            [ActivityOutcome::Completed]
         );
         assert_eq!(
             events
                 .iter()
                 .filter(|event| event.tool.as_deref() == Some("PostToolUse"))
                 .count(),
-            3
+            1
         );
         assert!(
             !serde_json::to_string(&events)
@@ -2608,7 +3640,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for handle in handles {
-            assert!(handle.join().unwrap().is_empty());
+            let stderr = handle.join().unwrap();
+            assert!(stderr.is_empty() || stderr.contains("lifecycle event ignored"));
         }
         assert_eq!(outcome_and_diagnostic_counts(&activity).0, 1);
         assert_eq!(
@@ -2619,7 +3652,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.tool.as_deref() == Some("PostToolUse"))
                 .count(),
-            2
+            1
         );
     }
 

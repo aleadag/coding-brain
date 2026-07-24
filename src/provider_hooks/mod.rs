@@ -194,6 +194,25 @@ pub(super) fn identity(
         .map_err(Into::into)
 }
 
+pub(super) fn linked_identity(
+    provider: AgentProvider,
+    session_id: String,
+    provider_session_id: String,
+    turn_id: Option<String>,
+    transcript_path: Option<PathBuf>,
+    cwd: PathBuf,
+) -> Result<LifecycleIdentity, HookInputError> {
+    LifecycleIdentity::try_new_with_provider_session(
+        provider,
+        session_id,
+        Some(provider_session_id),
+        turn_id,
+        transcript_path,
+        cwd,
+    )
+    .map_err(Into::into)
+}
+
 pub(super) fn optional_id(
     value: Option<String>,
     field: &'static str,

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -8,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use coding_brain_core::lifecycle::{
     ApplyOutcome, LifecycleEvent, LifecycleEventKind, LifecycleEventName, LifecycleIdentity,
-    LifecycleStore, ProjectedStatus,
+    LifecycleStore, MAX_SESSIONS, ProjectedStatus,
 };
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use sha2::{Digest, Sha256};
@@ -1152,6 +1153,28 @@ fn prompt_payload(index: usize) -> Vec<u8> {
 }
 
 #[cfg(unix)]
+fn codex_child_permission_payload(
+    cwd: &std::path::Path,
+    session_id: &str,
+    agent_id: &str,
+    turn_id: &str,
+    command: &str,
+) -> Vec<u8> {
+    let mut payload: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "fixtures/hooks/codex-child-permission-request.json"
+    ))
+    .unwrap();
+    payload["cwd"] = serde_json::json!(cwd);
+    payload["session_id"] = serde_json::json!(session_id);
+    payload["agent_id"] = serde_json::json!(agent_id);
+    payload["turn_id"] = serde_json::json!(turn_id);
+    payload["tool_name"] = serde_json::json!("Bash");
+    payload["tool_input"] = serde_json::json!({"command": command});
+    assert!(payload.get("tool_use_id").is_none());
+    serde_json::to_vec(&payload).unwrap()
+}
+
+#[cfg(unix)]
 fn run_permission_hook(home: &std::path::Path, input: &[u8]) -> Output {
     let mut paths = vec![home.join("bin")];
     if let Some(existing) = std::env::var_os("PATH") {
@@ -1316,6 +1339,158 @@ fn permission_allow_is_suppressed_across_lifecycle_failure() {
             .join(".local/state/coding-brain/.star-prompted")
             .exists()
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn child_permission_without_topology_suppresses_model_allow() {
+    let home = tempfile::tempdir().unwrap();
+    write_brain_config(home.path());
+
+    let output = run_permission_hook(
+        home.path(),
+        &codex_child_permission_payload(home.path(), "root-1", "child-a", "turn-a", "printf child"),
+    );
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("lifecycle"));
+    let activity = coding_brain::brain::activity::ActivityStore::at(
+        home.path().join(".local/state/coding-brain/activity.jsonl"),
+    )
+    .read()
+    .unwrap();
+    assert!(!activity.events().iter().any(|event| {
+        event.state == coding_brain_core::brain_activity::ActivityState::Allowed
+            && event
+                .session
+                .as_ref()
+                .is_some_and(|session| session.session_id == "child-a")
+    }));
+}
+
+#[test]
+#[cfg(unix)]
+fn deterministic_child_deny_survives_missing_topology() {
+    let home = tempfile::tempdir().unwrap();
+    write_brain_config(home.path());
+
+    let output = run_permission_hook(
+        home.path(),
+        &codex_child_permission_payload(home.path(), "root-1", "child-a", "turn-a", "rm -rf /"),
+    );
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response["hookSpecificOutput"]["decision"]["behavior"],
+        "deny"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("allow"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("UnprovenSubagent"));
+    let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
+    assert!(
+        !lifecycle
+            .read()
+            .unwrap()
+            .snapshot
+            .unwrap()
+            .sessions
+            .contains_key(&AgentSessionKey::native(AgentProvider::Codex, "child-a").storage_key())
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn child_permission_at_global_capacity_does_not_evict_or_authorize() {
+    let home = tempfile::tempdir().unwrap();
+    write_brain_config(home.path());
+    let lifecycle_store = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
+    let root = LifecycleIdentity::try_new(
+        AgentProvider::Codex,
+        "root-1".into(),
+        Some("turn-a".into()),
+        None,
+        home.path().to_path_buf(),
+    )
+    .unwrap();
+    assert_eq!(
+        lifecycle_store
+            .record(
+                LifecycleEvent::from_parts(root.clone(), LifecycleEventKind::UserPromptSubmit)
+                    .unwrap()
+            )
+            .unwrap(),
+        ApplyOutcome::Applied
+    );
+    for index in 0..MAX_SESSIONS - 1 {
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            format!("other-{index}"),
+            Some("turn-1".into()),
+            None,
+            home.path().to_path_buf(),
+        )
+        .unwrap();
+        assert_eq!(
+            lifecycle_store
+                .record(
+                    LifecycleEvent::from_parts(identity, LifecycleEventKind::UserPromptSubmit)
+                        .unwrap(),
+                )
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+    }
+    assert_eq!(
+        lifecycle_store
+            .record(
+                LifecycleEvent::from_parts(
+                    root,
+                    LifecycleEventKind::SubagentStart {
+                        agent_id: "child-a".into(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ApplyOutcome::Applied
+    );
+    let before = lifecycle_store.read().unwrap().snapshot.unwrap();
+    assert_eq!(before.sessions.len(), MAX_SESSIONS);
+
+    let permission = run_permission_hook(
+        home.path(),
+        &codex_child_permission_payload(home.path(), "root-1", "child-a", "turn-a", "printf child"),
+    );
+
+    assert!(permission.status.success());
+    assert!(permission.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&permission.stderr).contains("capacity"));
+    let after = lifecycle_store.read().unwrap().snapshot.unwrap();
+    assert_eq!(after.sessions.len(), MAX_SESSIONS);
+    assert_eq!(
+        after.sessions.keys().collect::<BTreeSet<_>>(),
+        before.sessions.keys().collect::<BTreeSet<_>>()
+    );
+    assert!(
+        !after
+            .sessions
+            .contains_key(&AgentSessionKey::native(AgentProvider::Codex, "child-a").storage_key())
+    );
+    let activity = coding_brain::brain::activity::ActivityStore::at(
+        home.path().join(".local/state/coding-brain/activity.jsonl"),
+    )
+    .read()
+    .unwrap();
+    assert!(!activity.events().iter().any(|event| {
+        event.kind == coding_brain_core::brain_activity::ActivityKind::Decision
+            && event.state == coding_brain_core::brain_activity::ActivityState::Delivered
+            && event
+                .session
+                .as_ref()
+                .is_some_and(|session| session.session_id == "child-a")
+    }));
 }
 
 #[test]

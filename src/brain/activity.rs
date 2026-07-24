@@ -314,6 +314,7 @@ impl ActivityStore {
                     .is_some_and(|(candidate, current)| {
                         candidate.provider == current.provider
                             && candidate.session_id == current.session_id
+                            && candidate.provider_session_id == current.provider_session_id
                     })
         };
         if log

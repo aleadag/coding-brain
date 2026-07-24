@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use super::input::{
     SessionStartSource,
 };
 
-pub const LIFECYCLE_SCHEMA_VERSION: u32 = 2;
+pub const LIFECYCLE_SCHEMA_VERSION: u32 = 3;
 pub const MAX_RECENT_TURNS: usize = 32;
 pub const MAX_ACTIVE_SUBAGENTS: usize = 64;
 pub const MAX_ANTIGRAVITY_INVOCATION_STEPS: usize = 256;
@@ -30,6 +30,10 @@ pub enum IgnoreReason {
     RecentTurn,
     AmbiguousTurn,
     ActiveSubagentCapacity,
+    SequenceExhausted,
+    UnprovenSubagent,
+    ProviderSessionMismatch,
+    SubagentTurnMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +46,8 @@ pub enum ApplyOutcome {
 pub struct ActiveSubagentState {
     pub started_sequence: u64,
     pub received_at_ms: u64,
+    #[serde(default)]
+    pub turn_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -54,6 +60,8 @@ struct EventSignature {
 pub struct SessionLifecycleState {
     pub cwd: PathBuf,
     pub transcript_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
     pub current_turn: Option<String>,
     pub turn_open: bool,
     pub recent_turns: VecDeque<String>,
@@ -79,6 +87,7 @@ impl SessionLifecycleState {
         Self {
             cwd: event.identity().cwd().to_path_buf(),
             transcript_path: event.identity().transcript_path().map(PathBuf::from),
+            provider_session_id: event.identity().provider_session_id().map(str::to_owned),
             current_turn: None,
             turn_open: false,
             recent_turns: VecDeque::new(),
@@ -212,26 +221,218 @@ impl LifecycleSnapshot {
             turn_id: event.identity().turn_id().map(str::to_owned),
             kind: event.kind().clone(),
         };
+        if self.next_sequence == 0 || self.next_sequence >= u64::MAX - 1 {
+            return ApplyOutcome::Ignored(IgnoreReason::SequenceExhausted);
+        }
+        let codex_topology = event.identity().provider() == AgentProvider::Codex;
+
+        if codex_topology
+            && self.sessions.get(&session_key).is_some_and(|state| {
+                state.provider_session_id.as_deref() != event.identity().provider_session_id()
+            })
+        {
+            return ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch);
+        }
+
+        if codex_topology && let Some(provider_session_id) = event.identity().provider_session_id()
+        {
+            let provider_key =
+                AgentSessionKey::native(event.identity().provider(), provider_session_id)
+                    .storage_key();
+            let Some(proven) = self
+                .sessions
+                .get(&provider_key)
+                .and_then(|state| state.active_subagents.get(event.identity().session_id()))
+            else {
+                return ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent);
+            };
+            if Some(proven.turn_id.as_str()) != event.identity().turn_id() {
+                return ApplyOutcome::Ignored(IgnoreReason::SubagentTurnMismatch);
+            }
+        }
+
+        if let LifecycleEventKind::SessionStart { source } = event.kind() {
+            {
+                let state = self
+                    .sessions
+                    .entry(session_key.clone())
+                    .or_insert_with(|| SessionLifecycleState::new(&event));
+                if state.last_signature.as_ref() == Some(&signature) {
+                    return state.ignore(IgnoreReason::Duplicate);
+                }
+                let sequence = self.next_sequence;
+                self.next_sequence += 1;
+                state.cwd = event.identity().cwd().to_path_buf();
+                state.transcript_path = event.identity().transcript_path().map(PathBuf::from);
+                if *source != SessionStartSource::Compact {
+                    state.clear_transient_status();
+                }
+                state.session_start_source = Some(*source);
+                accept_event(state, &event, signature, sequence, received_at_ms);
+            }
+            if codex_topology && *source != SessionStartSource::Compact {
+                self.remove_linked_children(
+                    event.identity().provider(),
+                    event.identity().session_id(),
+                    true,
+                );
+            }
+            self.refresh_linked_provider(&event, received_at_ms);
+            return ApplyOutcome::Applied;
+        }
+
+        if let LifecycleEventKind::SubagentStart { agent_id } = event.kind() {
+            if self.has_active_child_elsewhere(event.identity().provider(), agent_id, &session_key)
+            {
+                return ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch);
+            }
+            if codex_topology {
+                let child_key =
+                    AgentSessionKey::native(event.identity().provider(), agent_id).storage_key();
+                if self.sessions.get(&child_key).is_some_and(|state| {
+                    state.provider_session_id.as_deref() != Some(event.identity().session_id())
+                }) {
+                    return ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch);
+                }
+            }
+        }
+
+        if codex_topology && let LifecycleEventKind::SubagentStart { agent_id } = event.kind() {
+            let turn_id = event
+                .identity()
+                .turn_id()
+                .expect("validated turn-scoped lifecycle event");
+            let sequence = self.next_sequence;
+            let state = self
+                .sessions
+                .entry(session_key)
+                .or_insert_with(|| SessionLifecycleState::new(&event));
+            if state.last_signature.as_ref() == Some(&signature) {
+                return state.ignore(IgnoreReason::Duplicate);
+            }
+            if state.active_subagents.contains_key(agent_id) {
+                return state.ignore(IgnoreReason::Duplicate);
+            }
+            if state.active_subagents.len() >= MAX_ACTIVE_SUBAGENTS {
+                return state.ignore(IgnoreReason::ActiveSubagentCapacity);
+            }
+
+            self.next_sequence += 1;
+            state.cwd = event.identity().cwd().to_path_buf();
+            state.transcript_path = event.identity().transcript_path().map(PathBuf::from);
+            state.session_start_source = None;
+            state.active_subagents.insert(
+                agent_id.clone(),
+                ActiveSubagentState {
+                    started_sequence: sequence,
+                    received_at_ms,
+                    turn_id: turn_id.to_owned(),
+                },
+            );
+            state.set_status(
+                event.name(),
+                ProjectedStatus::Processing,
+                sequence,
+                received_at_ms,
+            );
+            accept_event(state, &event, signature, sequence, received_at_ms);
+            self.refresh_linked_provider(&event, received_at_ms);
+            return ApplyOutcome::Applied;
+        }
+
+        if codex_topology && let LifecycleEventKind::SubagentStop { agent_id } = event.kind() {
+            let turn_id = event
+                .identity()
+                .turn_id()
+                .expect("validated turn-scoped lifecycle event");
+            let child_key =
+                AgentSessionKey::native(event.identity().provider(), agent_id).storage_key();
+            let Some(parent) = self.sessions.get(&session_key) else {
+                return if self.has_active_child_elsewhere(
+                    event.identity().provider(),
+                    agent_id,
+                    &session_key,
+                ) {
+                    ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch)
+                } else {
+                    ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+                };
+            };
+            let Some(active) = parent.active_subagents.get(agent_id) else {
+                return if self.has_active_child_elsewhere(
+                    event.identity().provider(),
+                    agent_id,
+                    &session_key,
+                ) {
+                    ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch)
+                } else {
+                    ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+                };
+            };
+            if active.turn_id != turn_id {
+                return ApplyOutcome::Ignored(IgnoreReason::SubagentTurnMismatch);
+            }
+            if parent.last_signature.as_ref() == Some(&signature) {
+                return ApplyOutcome::Ignored(IgnoreReason::Duplicate);
+            }
+            if self.sessions.get(&child_key).is_some_and(|state| {
+                state.provider_session_id.as_deref() != Some(event.identity().session_id())
+            }) {
+                return ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch);
+            }
+
+            let sequence = self.next_sequence;
+            self.next_sequence += 1;
+            let state = self
+                .sessions
+                .get_mut(&session_key)
+                .expect("validated parent state");
+            state.active_subagents.remove(agent_id);
+            accept_event(state, &event, signature, sequence, received_at_ms);
+            self.remove_linked_children(event.identity().provider(), agent_id, false);
+            self.refresh_linked_provider(&event, received_at_ms);
+            return ApplyOutcome::Applied;
+        }
+
+        if !codex_topology
+            && matches!(
+                event.kind(),
+                LifecycleEventKind::SubagentStart { .. } | LifecycleEventKind::SubagentStop { .. }
+            )
+        {
+            let state = self.sessions.get(&session_key);
+            if state.is_some_and(|state| state.last_signature.as_ref() == Some(&signature)) {
+                return ApplyOutcome::Ignored(IgnoreReason::Duplicate);
+            }
+            match event.kind() {
+                LifecycleEventKind::SubagentStart { agent_id }
+                    if state.is_some_and(|state| state.active_subagents.contains_key(agent_id)) =>
+                {
+                    return ApplyOutcome::Ignored(IgnoreReason::Duplicate);
+                }
+                LifecycleEventKind::SubagentStart { .. }
+                    if state.is_some_and(|state| {
+                        state.active_subagents.len() >= MAX_ACTIVE_SUBAGENTS
+                    }) =>
+                {
+                    return ApplyOutcome::Ignored(IgnoreReason::ActiveSubagentCapacity);
+                }
+                LifecycleEventKind::SubagentStop { agent_id }
+                    if state.is_none_or(|state| !state.active_subagents.contains_key(agent_id)) =>
+                {
+                    return ApplyOutcome::Ignored(IgnoreReason::Duplicate);
+                }
+                _ => {}
+            }
+        }
+
         let state = self
             .sessions
-            .entry(session_key)
+            .entry(session_key.clone())
             .or_insert_with(|| SessionLifecycleState::new(&event));
 
         if state.last_signature.as_ref() == Some(&signature) {
             return state.ignore(IgnoreReason::Duplicate);
-        }
-
-        if let LifecycleEventKind::SessionStart { source } = event.kind() {
-            let sequence = self.next_sequence;
-            self.next_sequence += 1;
-            state.cwd = event.identity().cwd().to_path_buf();
-            state.transcript_path = event.identity().transcript_path().map(PathBuf::from);
-            if *source != SessionStartSource::Compact {
-                state.clear_transient_status();
-            }
-            state.session_start_source = Some(*source);
-            accept_event(state, &event, signature, sequence, received_at_ms);
-            return ApplyOutcome::Applied;
         }
 
         let turn_id = event
@@ -282,25 +483,6 @@ impl LifecycleSnapshot {
             }
         }
 
-        match event.kind() {
-            LifecycleEventKind::SubagentStart { agent_id }
-                if state.active_subagents.contains_key(agent_id) =>
-            {
-                return state.ignore(IgnoreReason::Duplicate);
-            }
-            LifecycleEventKind::SubagentStart { .. }
-                if state.active_subagents.len() >= MAX_ACTIVE_SUBAGENTS =>
-            {
-                return state.ignore(IgnoreReason::ActiveSubagentCapacity);
-            }
-            LifecycleEventKind::SubagentStop { agent_id }
-                if !state.active_subagents.contains_key(agent_id) =>
-            {
-                return state.ignore(IgnoreReason::Duplicate);
-            }
-            _ => {}
-        }
-
         let sequence = self.next_sequence;
         self.next_sequence += 1;
         state.cwd = event.identity().cwd().to_path_buf();
@@ -343,6 +525,7 @@ impl LifecycleSnapshot {
                     ActiveSubagentState {
                         started_sequence: sequence,
                         received_at_ms,
+                        turn_id: turn_id.to_owned(),
                     },
                 );
                 state.set_status(
@@ -372,7 +555,93 @@ impl LifecycleSnapshot {
         }
 
         accept_event(state, &event, signature, sequence, received_at_ms);
+        self.refresh_linked_provider(&event, received_at_ms);
+        if matches!(event.kind(), LifecycleEventKind::Stop) && codex_topology {
+            self.remove_linked_children(
+                event.identity().provider(),
+                event.identity().session_id(),
+                true,
+            );
+        }
         ApplyOutcome::Applied
+    }
+
+    fn has_active_child_elsewhere(
+        &self,
+        provider: AgentProvider,
+        agent_id: &str,
+        excluded_session_key: &str,
+    ) -> bool {
+        self.sessions.iter().any(|(storage_key, state)| {
+            storage_key != excluded_session_key
+                && AgentSessionKey::from_storage_key(storage_key)
+                    .is_some_and(|key| key.provider == provider)
+                && state.active_subagents.contains_key(agent_id)
+        })
+    }
+
+    fn remove_linked_children(
+        &mut self,
+        provider: AgentProvider,
+        provider_session_id: &str,
+        retain_root: bool,
+    ) {
+        let root_key = AgentSessionKey::native(provider, provider_session_id).storage_key();
+        let mut subtree = BTreeSet::from([root_key.clone()]);
+        loop {
+            let descendants = self
+                .sessions
+                .iter()
+                .filter_map(|(storage_key, state)| {
+                    let provider_session_id = state.provider_session_id.as_deref()?;
+                    let key = AgentSessionKey::from_storage_key(storage_key)?;
+                    subtree
+                        .contains(
+                            &AgentSessionKey::native(key.provider, provider_session_id)
+                                .storage_key(),
+                        )
+                        .then(|| storage_key.clone())
+                })
+                .collect::<BTreeSet<_>>();
+            if descendants.is_subset(&subtree) {
+                break;
+            }
+            subtree.extend(descendants);
+        }
+        if retain_root {
+            subtree.remove(&root_key);
+        }
+        self.sessions
+            .retain(|storage_key, _| !subtree.contains(storage_key));
+        for (storage_key, state) in &mut self.sessions {
+            let Some(key) = AgentSessionKey::from_storage_key(storage_key) else {
+                continue;
+            };
+            state.active_subagents.retain(|agent_id, _| {
+                !subtree.contains(&AgentSessionKey::native(key.provider, agent_id).storage_key())
+            });
+        }
+    }
+
+    fn refresh_linked_provider(&mut self, event: &LifecycleEvent, received_at_ms: u64) {
+        if event.identity().provider() != AgentProvider::Codex {
+            return;
+        }
+        let Some(provider_session_id) = event.identity().provider_session_id() else {
+            return;
+        };
+        let provider_key =
+            AgentSessionKey::native(event.identity().provider(), provider_session_id).storage_key();
+        let provider = self
+            .sessions
+            .get_mut(&provider_key)
+            .expect("validated linked provider state");
+        provider
+            .active_subagents
+            .get_mut(event.identity().session_id())
+            .expect("validated linked subagent state")
+            .received_at_ms = received_at_ms;
+        provider.latest_received_at_ms = received_at_ms;
     }
 }
 
@@ -450,12 +719,226 @@ mod tests {
         event(LifecycleEventName::Stop, Some(turn), None)
     }
 
-    fn subagent_start(turn: &str, agent: &str) -> LifecycleEvent {
-        event(LifecycleEventName::SubagentStart, Some(turn), Some(agent))
+    fn subagent_start(root: &str, agent: &str, turn: &str) -> LifecycleEvent {
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            root.into(),
+            Some(turn.into()),
+            None,
+            "/work/project".into(),
+        )
+        .unwrap();
+        LifecycleEvent::from_parts(
+            identity,
+            LifecycleEventKind::SubagentStart {
+                agent_id: agent.into(),
+            },
+        )
+        .unwrap()
     }
 
-    fn subagent_stop(turn: &str, agent: &str) -> LifecycleEvent {
-        event(LifecycleEventName::SubagentStop, Some(turn), Some(agent))
+    fn subagent_stop(root: &str, agent: &str, turn: &str) -> LifecycleEvent {
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            root.into(),
+            Some(turn.into()),
+            None,
+            "/work/project".into(),
+        )
+        .unwrap();
+        LifecycleEvent::from_parts(
+            identity,
+            LifecycleEventKind::SubagentStop {
+                agent_id: agent.into(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn provider_subagent_event(
+        provider: AgentProvider,
+        root: &str,
+        agent: &str,
+        turn: &str,
+        start: bool,
+    ) -> LifecycleEvent {
+        let identity = LifecycleIdentity::try_new(
+            provider,
+            root.into(),
+            Some(turn.into()),
+            None,
+            "/work/project".into(),
+        )
+        .unwrap();
+        LifecycleEvent::from_parts(
+            identity,
+            if start {
+                LifecycleEventKind::SubagentStart {
+                    agent_id: agent.into(),
+                }
+            } else {
+                LifecycleEventKind::SubagentStop {
+                    agent_id: agent.into(),
+                }
+            },
+        )
+        .unwrap()
+    }
+
+    fn linked_tool(child: &str, provider_session: &str, turn: &str) -> LifecycleEvent {
+        LifecycleEvent::from_parts(
+            LifecycleIdentity::try_new_with_provider_session(
+                AgentProvider::Codex,
+                child.into(),
+                Some(provider_session.into()),
+                Some(turn.into()),
+                None,
+                PathBuf::from("/work/project"),
+            )
+            .unwrap(),
+            LifecycleEventKind::PreToolUse,
+        )
+        .unwrap()
+    }
+
+    fn unlinked_post_tool(child: &str, turn: &str) -> LifecycleEvent {
+        LifecycleEvent::from_parts(
+            LifecycleIdentity::try_new(
+                AgentProvider::Codex,
+                child.into(),
+                Some(turn.into()),
+                None,
+                PathBuf::from("/work/project"),
+            )
+            .unwrap(),
+            LifecycleEventKind::PostToolUse,
+        )
+        .unwrap()
+    }
+
+    fn linked_session_start(child: &str, provider_session: &str, turn: &str) -> LifecycleEvent {
+        LifecycleEvent::from_parts(
+            LifecycleIdentity::try_new_with_provider_session(
+                AgentProvider::Codex,
+                child.into(),
+                Some(provider_session.into()),
+                Some(turn.into()),
+                None,
+                PathBuf::from("/work/project"),
+            )
+            .unwrap(),
+            LifecycleEventKind::SessionStart {
+                source: SessionStartSource::Startup,
+            },
+        )
+        .unwrap()
+    }
+
+    fn linked_subagent_start(
+        child: &str,
+        provider_session: &str,
+        turn: &str,
+        nested: &str,
+    ) -> LifecycleEvent {
+        LifecycleEvent::from_parts(
+            LifecycleIdentity::try_new_with_provider_session(
+                AgentProvider::Codex,
+                child.into(),
+                Some(provider_session.into()),
+                Some(turn.into()),
+                None,
+                PathBuf::from("/work/project"),
+            )
+            .unwrap(),
+            LifecycleEventKind::SubagentStart {
+                agent_id: nested.into(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn linked_subagent_stop(
+        child: &str,
+        provider_session: &str,
+        turn: &str,
+        nested: &str,
+    ) -> LifecycleEvent {
+        LifecycleEvent::from_parts(
+            LifecycleIdentity::try_new_with_provider_session(
+                AgentProvider::Codex,
+                child.into(),
+                Some(provider_session.into()),
+                Some(turn.into()),
+                None,
+                PathBuf::from("/work/project"),
+            )
+            .unwrap(),
+            LifecycleEventKind::SubagentStop {
+                agent_id: nested.into(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn root_session_start(root: &str) -> LifecycleEvent {
+        LifecycleEvent::from_parts(
+            LifecycleIdentity::try_new(
+                AgentProvider::Codex,
+                root.into(),
+                None,
+                None,
+                PathBuf::from("/work/project"),
+            )
+            .unwrap(),
+            LifecycleEventKind::SessionStart {
+                source: SessionStartSource::Startup,
+            },
+        )
+        .unwrap()
+    }
+
+    fn nested_chain(snapshot: &mut LifecycleSnapshot) {
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-a", "turn-a"), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(
+                linked_subagent_start("child-a", "root", "turn-a", "child-b"),
+                2,
+            ),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(
+                linked_subagent_start("child-b", "child-a", "turn-a", "child-c"),
+                3,
+            ),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-c", "child-b", "turn-a"), 4),
+            ApplyOutcome::Applied
+        );
+    }
+
+    fn root_stop(root: &str, turn: &str) -> LifecycleEvent {
+        LifecycleEvent::from_parts(
+            LifecycleIdentity::try_new(
+                AgentProvider::Codex,
+                root.into(),
+                Some(turn.into()),
+                None,
+                PathBuf::from("/work/project"),
+            )
+            .unwrap(),
+            LifecycleEventKind::Stop,
+        )
+        .unwrap()
+    }
+
+    fn native_key(session: &str) -> String {
+        AgentSessionKey::native(AgentProvider::Codex, session).storage_key()
     }
 
     fn permission(turn: &str, disposition: PermissionDisposition) -> LifecycleEvent {
@@ -479,6 +962,581 @@ mod tests {
             "/work/antigravity".into(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn interleaved_codex_siblings_have_independent_turn_state() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-a", "turn-a"), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-b", "turn-b"), 2),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-a", "root", "turn-a"), 3),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-b", "root", "turn-b"), 4),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            snapshot.sessions[&native_key("child-a")]
+                .current_turn
+                .as_deref(),
+            Some("turn-a")
+        );
+        assert_eq!(
+            snapshot.sessions[&native_key("child-b")]
+                .current_turn
+                .as_deref(),
+            Some("turn-b")
+        );
+    }
+
+    #[test]
+    fn linked_child_without_active_topology_is_rejected() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(linked_tool("child-a", "root", "turn-a"), 1),
+            ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent)
+        );
+        assert!(!snapshot.sessions.contains_key(&native_key("child-a")));
+    }
+
+    #[test]
+    fn unlinked_event_cannot_mutate_existing_linked_child() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-a", "turn-a"), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-a", "root", "turn-a"), 2),
+            ApplyOutcome::Applied
+        );
+        let before = snapshot.sessions[&native_key("child-a")].clone();
+        let next_sequence = snapshot.next_sequence;
+
+        assert_eq!(
+            snapshot.apply(unlinked_post_tool("child-a", "turn-a"), 3),
+            ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch)
+        );
+        assert_eq!(snapshot.sessions[&native_key("child-a")], before);
+        assert_eq!(snapshot.next_sequence, next_sequence);
+    }
+
+    #[test]
+    fn linked_session_start_refreshes_parent_topology_lease() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-a", "turn-a"), 1),
+            ApplyOutcome::Applied
+        );
+        let before = snapshot.sessions[&native_key("root")].clone();
+
+        assert_eq!(
+            snapshot.apply(linked_session_start("child-a", "root", "turn-a"), 2),
+            ApplyOutcome::Applied
+        );
+
+        let root = &snapshot.sessions[&native_key("root")];
+        assert_eq!(root.latest_event, before.latest_event);
+        assert_eq!(root.status_event, before.status_event);
+        assert_eq!(root.current_turn, before.current_turn);
+        assert_eq!(root.last_signature, before.last_signature);
+        assert_eq!(root.latest_sequence, before.latest_sequence);
+        assert_eq!(root.latest_received_at_ms, 2);
+        assert_eq!(root.active_subagents["child-a"].received_at_ms, 2);
+    }
+
+    #[test]
+    fn linked_subagent_start_refreshes_parent_topology_lease() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-a", "turn-a"), 1),
+            ApplyOutcome::Applied
+        );
+        let before = snapshot.sessions[&native_key("root")].clone();
+
+        assert_eq!(
+            snapshot.apply(
+                linked_subagent_start("child-a", "root", "turn-a", "nested-a"),
+                2
+            ),
+            ApplyOutcome::Applied
+        );
+
+        let root = &snapshot.sessions[&native_key("root")];
+        assert_eq!(root.latest_event, before.latest_event);
+        assert_eq!(root.status_event, before.status_event);
+        assert_eq!(root.current_turn, before.current_turn);
+        assert_eq!(root.last_signature, before.last_signature);
+        assert_eq!(root.latest_sequence, before.latest_sequence);
+        assert_eq!(root.latest_received_at_ms, 2);
+        assert_eq!(root.active_subagents["child-a"].received_at_ms, 2);
+    }
+
+    #[test]
+    fn linked_subagent_stop_refreshes_outer_topology_and_removes_subtree() {
+        let mut snapshot = LifecycleSnapshot::default();
+        nested_chain(&mut snapshot);
+        let before = snapshot.sessions[&native_key("root")].clone();
+
+        assert_eq!(
+            snapshot.apply(
+                linked_subagent_stop("child-a", "root", "turn-a", "child-b"),
+                5,
+            ),
+            ApplyOutcome::Applied
+        );
+
+        let root = &snapshot.sessions[&native_key("root")];
+        assert_eq!(root.latest_event, before.latest_event);
+        assert_eq!(root.status_event, before.status_event);
+        assert_eq!(root.current_turn, before.current_turn);
+        assert_eq!(root.last_signature, before.last_signature);
+        assert_eq!(root.latest_sequence, before.latest_sequence);
+        assert_eq!(root.latest_received_at_ms, 5);
+        assert_eq!(root.active_subagents["child-a"].received_at_ms, 5);
+        assert!(
+            !snapshot.sessions[&native_key("child-a")]
+                .active_subagents
+                .contains_key("child-b")
+        );
+        assert!(!snapshot.sessions.contains_key(&native_key("child-b")));
+        assert!(!snapshot.sessions.contains_key(&native_key("child-c")));
+    }
+
+    #[test]
+    fn provider_stop_removes_transitive_linked_subtree() {
+        let mut snapshot = LifecycleSnapshot::default();
+        nested_chain(&mut snapshot);
+
+        assert_eq!(
+            snapshot.apply(root_stop("root", "root-turn"), 5),
+            ApplyOutcome::Applied
+        );
+
+        assert!(snapshot.sessions.contains_key(&native_key("root")));
+        assert!(!snapshot.sessions.contains_key(&native_key("child-a")));
+        assert!(!snapshot.sessions.contains_key(&native_key("child-b")));
+        assert!(!snapshot.sessions.contains_key(&native_key("child-c")));
+        assert!(
+            snapshot.sessions[&native_key("root")]
+                .active_subagents
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn provider_restart_removes_transitive_linked_subtree() {
+        let mut snapshot = LifecycleSnapshot::default();
+        nested_chain(&mut snapshot);
+
+        assert_eq!(
+            snapshot.apply(root_session_start("root"), 5),
+            ApplyOutcome::Applied
+        );
+
+        assert!(snapshot.sessions.contains_key(&native_key("root")));
+        assert!(!snapshot.sessions.contains_key(&native_key("child-a")));
+        assert!(!snapshot.sessions.contains_key(&native_key("child-b")));
+        assert!(!snapshot.sessions.contains_key(&native_key("child-c")));
+        assert!(
+            snapshot.sessions[&native_key("root")]
+                .active_subagents
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delayed_event_from_reused_child_id_is_rejected() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-a", "turn-old"), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(subagent_stop("root", "child-a", "turn-old"), 2),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-a", "turn-new"), 3),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-a", "root", "turn-old"), 4),
+            ApplyOutcome::Ignored(IgnoreReason::SubagentTurnMismatch)
+        );
+        assert!(!snapshot.sessions.contains_key(&native_key("child-a")));
+        assert_eq!(
+            snapshot.sessions[&native_key("root")].active_subagents["child-a"].turn_id,
+            "turn-new"
+        );
+    }
+
+    #[test]
+    fn subagent_stop_removes_only_the_exact_linked_child() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-a", "turn-a"), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-b", "turn-b"), 2),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-a", "root", "turn-a"), 3),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-b", "root", "turn-b"), 4),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(subagent_stop("root", "child-a", "turn-a"), 5),
+            ApplyOutcome::Applied
+        );
+
+        assert!(!snapshot.sessions.contains_key(&native_key("child-a")));
+        assert!(snapshot.sessions.contains_key(&native_key("child-b")));
+        assert!(
+            !snapshot.sessions[&native_key("root")]
+                .active_subagents
+                .contains_key("child-a")
+        );
+        assert!(
+            snapshot.sessions[&native_key("root")]
+                .active_subagents
+                .contains_key("child-b")
+        );
+    }
+
+    #[test]
+    fn provider_stop_removes_all_linked_children() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-a", "turn-a"), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-b", "turn-b"), 2),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-a", "root", "turn-a"), 3),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-b", "root", "turn-b"), 4),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(root_stop("root", "root-turn"), 5),
+            ApplyOutcome::Applied
+        );
+
+        assert!(!snapshot.sessions.contains_key(&native_key("child-a")));
+        assert!(!snapshot.sessions.contains_key(&native_key("child-b")));
+        assert!(
+            snapshot.sessions[&native_key("root")]
+                .active_subagents
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mismatched_provider_session_cannot_clean_up_child() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(subagent_start("root-a", "child-a", "turn-a"), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-a", "root-a", "turn-a"), 2),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(subagent_stop("root-b", "child-a", "turn-a"), 3),
+            ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch)
+        );
+
+        assert!(snapshot.sessions.contains_key(&native_key("root-a")));
+        assert!(snapshot.sessions.contains_key(&native_key("child-a")));
+        assert!(
+            snapshot.sessions[&native_key("root-a")]
+                .active_subagents
+                .contains_key("child-a")
+        );
+        assert!(!snapshot.sessions.contains_key(&native_key("root-b")));
+    }
+
+    #[test]
+    fn duplicate_child_start_cannot_transfer_authority_between_roots() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(subagent_start("root-a", "child-a", "turn-a"), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_tool("child-a", "root-b", "turn-b"), 2),
+            ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent)
+        );
+        let before = snapshot.clone();
+
+        assert_eq!(
+            snapshot.apply(subagent_start("root-b", "child-a", "turn-b"), 3),
+            ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch)
+        );
+        assert_eq!(snapshot, before);
+        assert_eq!(
+            snapshot.apply(subagent_stop("root-b", "child-a", "turn-b"), 4),
+            ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch)
+        );
+        assert!(
+            snapshot.sessions[&native_key("root-a")]
+                .active_subagents
+                .contains_key("child-a")
+        );
+        assert!(!snapshot.sessions.contains_key(&native_key("root-b")));
+    }
+
+    #[test]
+    fn child_identity_isolated_between_providers() {
+        let mut snapshot = LifecycleSnapshot::default();
+        let claude_root =
+            AgentSessionKey::native(AgentProvider::Claude, "claude-root").storage_key();
+        assert_eq!(
+            snapshot.apply(subagent_start("codex-root", "child-a", "codex-turn"), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(
+                provider_subagent_event(
+                    AgentProvider::Claude,
+                    "claude-root",
+                    "child-a",
+                    "claude-turn",
+                    true,
+                ),
+                2,
+            ),
+            ApplyOutcome::Applied
+        );
+
+        assert!(
+            snapshot.sessions[&native_key("codex-root")]
+                .active_subagents
+                .contains_key("child-a")
+        );
+        assert!(
+            snapshot.sessions[&claude_root]
+                .active_subagents
+                .contains_key("child-a")
+        );
+        assert_eq!(
+            snapshot.apply(
+                provider_subagent_event(
+                    AgentProvider::Claude,
+                    "claude-root",
+                    "child-a",
+                    "claude-turn",
+                    false,
+                ),
+                3,
+            ),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            snapshot.sessions[&native_key("codex-root")]
+                .active_subagents
+                .contains_key("child-a")
+        );
+        assert!(snapshot.sessions[&claude_root].active_subagents.is_empty());
+    }
+
+    #[test]
+    fn child_start_rejects_incompatible_existing_session_linkage() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(unlinked_post_tool("child-a", "child-turn"), 1),
+            ApplyOutcome::Applied
+        );
+        let before = snapshot.clone();
+
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child-a", "turn-a"), 2),
+            ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch)
+        );
+        assert_eq!(snapshot, before);
+        assert!(!snapshot.sessions.contains_key(&native_key("root")));
+    }
+
+    #[test]
+    fn claude_subagent_events_preserve_legacy_turn_projection() {
+        let mut snapshot = LifecycleSnapshot::default();
+        let key = AgentSessionKey::native(AgentProvider::Claude, "claude-root").storage_key();
+
+        assert_eq!(
+            snapshot.apply(
+                provider_subagent_event(
+                    AgentProvider::Claude,
+                    "claude-root",
+                    "child-a",
+                    "turn-a",
+                    true,
+                ),
+                1,
+            ),
+            ApplyOutcome::Applied
+        );
+        let state = &snapshot.sessions[&key];
+        assert_eq!(state.current_turn.as_deref(), Some("turn-a"));
+        assert!(state.turn_open);
+        assert!(state.active_subagents.contains_key("child-a"));
+
+        assert_eq!(
+            snapshot.apply(
+                provider_subagent_event(
+                    AgentProvider::Claude,
+                    "claude-root",
+                    "child-a",
+                    "turn-a",
+                    false,
+                ),
+                2,
+            ),
+            ApplyOutcome::Applied
+        );
+        let state = &snapshot.sessions[&key];
+        assert_eq!(state.current_turn.as_deref(), Some("turn-a"));
+        assert!(state.turn_open);
+        assert!(state.active_subagents.is_empty());
+        assert_eq!(state.status_event, Some(LifecycleEventName::SubagentStart));
+    }
+
+    #[test]
+    fn ignored_claude_unknown_subagent_stop_is_snapshot_neutral() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(
+                provider_subagent_event(
+                    AgentProvider::Claude,
+                    "claude-root",
+                    "child-a",
+                    "turn-a",
+                    true,
+                ),
+                1,
+            ),
+            ApplyOutcome::Applied
+        );
+        let before = snapshot.clone();
+
+        assert_eq!(
+            snapshot.apply(
+                provider_subagent_event(
+                    AgentProvider::Claude,
+                    "claude-root",
+                    "missing",
+                    "turn-b",
+                    false,
+                ),
+                2,
+            ),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+        assert_eq!(snapshot, before);
+    }
+
+    #[test]
+    fn ignored_claude_duplicate_subagent_start_is_snapshot_neutral() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(
+                provider_subagent_event(
+                    AgentProvider::Claude,
+                    "claude-root",
+                    "child-a",
+                    "turn-a",
+                    true,
+                ),
+                1,
+            ),
+            ApplyOutcome::Applied
+        );
+        let before = snapshot.clone();
+
+        assert_eq!(
+            snapshot.apply(
+                provider_subagent_event(
+                    AgentProvider::Claude,
+                    "claude-root",
+                    "child-a",
+                    "turn-b",
+                    true,
+                ),
+                2,
+            ),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+        assert_eq!(snapshot, before);
+    }
+
+    #[test]
+    fn ignored_claude_subagent_capacity_is_snapshot_neutral() {
+        let mut snapshot = LifecycleSnapshot::default();
+        for index in 0..MAX_ACTIVE_SUBAGENTS {
+            assert_eq!(
+                snapshot.apply(
+                    provider_subagent_event(
+                        AgentProvider::Claude,
+                        "claude-root",
+                        &format!("child-{index}"),
+                        "turn-a",
+                        true,
+                    ),
+                    index as u64 + 1,
+                ),
+                ApplyOutcome::Applied
+            );
+        }
+        let before = snapshot.clone();
+
+        assert_eq!(
+            snapshot.apply(
+                provider_subagent_event(
+                    AgentProvider::Claude,
+                    "claude-root",
+                    "overflow",
+                    "turn-b",
+                    true,
+                ),
+                100,
+            ),
+            ApplyOutcome::Ignored(IgnoreReason::ActiveSubagentCapacity)
+        );
+        assert_eq!(snapshot, before);
+    }
+
+    #[test]
+    fn exhausted_sequence_allocation_is_fail_safe() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(snapshot.apply(prompt("turn-1"), 1), ApplyOutcome::Applied);
+        snapshot.next_sequence = u64::MAX - 1;
+        let before = snapshot.clone();
+
+        assert!(matches!(
+            snapshot.apply(post_tool("turn-1"), 2),
+            ApplyOutcome::Ignored(_)
+        ));
+        assert_eq!(snapshot, before);
     }
 
     fn invocation(turn: &str, initial_step: u64) -> LifecycleEvent {
@@ -723,11 +1781,11 @@ mod tests {
     fn subagent_stop_is_idempotent_and_does_not_close_parent() {
         let mut snapshot = LifecycleSnapshot::default();
         snapshot.apply(prompt("turn-1"), 1_000);
-        snapshot.apply(subagent_start("turn-1", "agent-1"), 2_000);
+        snapshot.apply(subagent_start("session-1", "agent-1", "turn-1"), 2_000);
         let status_time = snapshot.sessions[&session_key()].status_received_at_ms;
-        snapshot.apply(subagent_stop("turn-1", "agent-1"), 3_000);
+        snapshot.apply(subagent_stop("session-1", "agent-1", "turn-1"), 3_000);
         assert_eq!(
-            snapshot.apply(subagent_stop("turn-1", "agent-1"), 4_000),
+            snapshot.apply(subagent_stop("session-1", "agent-1", "turn-1"), 4_000),
             ApplyOutcome::Ignored(IgnoreReason::Duplicate)
         );
         let state = snapshot.sessions.get(&session_key()).unwrap();
@@ -775,7 +1833,7 @@ mod tests {
         let mut snapshot = LifecycleSnapshot::default();
         snapshot.apply(pre_tool("turn-1"), 1_000);
         assert_eq!(
-            snapshot.apply(subagent_stop("turn-1", "missing"), 2_000),
+            snapshot.apply(subagent_stop("session-1", "missing", "turn-1"), 2_000),
             ApplyOutcome::Ignored(IgnoreReason::Duplicate)
         );
         let state = &snapshot.sessions[&session_key()];
@@ -808,7 +1866,7 @@ mod tests {
         for index in 0..64 {
             assert_eq!(
                 snapshot.apply(
-                    subagent_start("turn-1", &format!("agent-{index}")),
+                    subagent_start("session-1", &format!("agent-{index}"), "turn-1"),
                     index + 2
                 ),
                 ApplyOutcome::Applied
@@ -816,7 +1874,7 @@ mod tests {
         }
         let next_sequence = snapshot.next_sequence;
         assert_eq!(
-            snapshot.apply(subagent_start("turn-1", "agent-64"), 100),
+            snapshot.apply(subagent_start("session-1", "agent-64", "turn-1"), 100),
             ApplyOutcome::Ignored(IgnoreReason::ActiveSubagentCapacity)
         );
         assert_eq!(snapshot.next_sequence, next_sequence);
@@ -831,7 +1889,7 @@ mod tests {
             permission("turn-1", PermissionDisposition::NeedsInput),
             2_000,
         );
-        snapshot.apply(subagent_start("turn-1", "agent-1"), 3_000);
+        snapshot.apply(subagent_start("session-1", "agent-1", "turn-1"), 3_000);
 
         let before = snapshot.sessions[&session_key()].clone();
         assert_eq!(
@@ -940,7 +1998,7 @@ mod tests {
         ] {
             let mut snapshot = LifecycleSnapshot::default();
             snapshot.apply(prompt("turn-1"), 1_000);
-            snapshot.apply(subagent_start("turn-1", "agent-1"), 2_000);
+            snapshot.apply(subagent_start("session-1", "agent-1", "turn-1"), 2_000);
             snapshot.apply(
                 session_start(AgentProvider::Codex, "session-1", "/work/codexctl", source),
                 3_000,
@@ -1048,7 +2106,7 @@ mod tests {
             ),
             (post_tool("turn-1"), Some(ProjectedStatus::Processing)),
             (
-                subagent_start("turn-1", "agent-1"),
+                subagent_start("session-1", "agent-1", "turn-1"),
                 Some(ProjectedStatus::Processing),
             ),
             (stop("turn-1"), Some(ProjectedStatus::Idle)),
