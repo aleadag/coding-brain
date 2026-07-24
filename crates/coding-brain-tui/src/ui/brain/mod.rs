@@ -146,6 +146,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
 
     use super::*;
 
@@ -415,6 +416,144 @@ mod tests {
         );
         assert_eq!(attention_focused.matches("> ").count(), 1);
         assert_eq!(recent_focused.matches("> ").count(), 1);
+    }
+
+    #[test]
+    fn live_active_row_uses_theme_highlight_without_shifting_content() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::None] {
+            let mut app = populated_live_app_with_theme(mode);
+            let theme = *app.theme();
+
+            let attention_buffer = render_buffer_at(&app, 110, 38);
+            let attention_text = buffer_text(&attention_buffer);
+            let attention_row = attention_text
+                .lines()
+                .position(|line| line.contains("attention-1"))
+                .unwrap();
+            let attention_column = content_column(&attention_text, "attention-1", "attention-1");
+            let recent_row = attention_text
+                .lines()
+                .position(|line| line.contains("recent-1"))
+                .unwrap();
+            let recent_column = content_column(&attention_text, "recent-1", "recent-1");
+
+            assert_eq!(
+                attention_buffer[(attention_column as u16, attention_row as u16)].fg,
+                theme.header
+            );
+            assert!(
+                attention_buffer[(attention_column as u16, attention_row as u16)]
+                    .modifier
+                    .contains(Modifier::BOLD)
+            );
+            assert!(
+                !attention_buffer[(recent_column as u16, recent_row as u16)]
+                    .modifier
+                    .contains(Modifier::BOLD)
+            );
+            assert_eq!(attention_text.matches("> ").count(), 1);
+
+            app.handle_key(key(KeyCode::Char('J')));
+            let recent_buffer = render_buffer_at(&app, 110, 38);
+            let recent_text = buffer_text(&recent_buffer);
+            let attention_row_after = recent_text
+                .lines()
+                .position(|line| line.contains("attention-1"))
+                .unwrap();
+            let attention_column_after = content_column(&recent_text, "attention-1", "attention-1");
+            let recent_row_after = recent_text
+                .lines()
+                .position(|line| line.contains("recent-1"))
+                .unwrap();
+            let recent_column_after = content_column(&recent_text, "recent-1", "recent-1");
+
+            assert!(
+                !recent_buffer[(attention_column_after as u16, attention_row_after as u16)]
+                    .modifier
+                    .contains(Modifier::BOLD)
+            );
+            assert_eq!(
+                recent_buffer[(recent_column_after as u16, recent_row_after as u16)].fg,
+                theme.header
+            );
+            assert!(
+                recent_buffer[(recent_column_after as u16, recent_row_after as u16)]
+                    .modifier
+                    .contains(Modifier::BOLD)
+            );
+            assert_eq!(attention_column, attention_column_after);
+            assert_eq!(recent_column, recent_column_after);
+            assert!(
+                recent_text
+                    .lines()
+                    .nth(recent_row_after)
+                    .unwrap()
+                    .contains("ALLOW")
+            );
+            assert_eq!(recent_text.matches("> ").count(), 1);
+        }
+    }
+
+    #[test]
+    fn selectable_non_live_lists_use_theme_highlight_for_active_row() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::None] {
+            let mut review = fixture_app_with_theme(
+                MockBrainRuntime {
+                    review_queue: vec![ReviewItemSummary {
+                        decision: decision(),
+                        reason: "review-highlight-target".into(),
+                        score: 90.0,
+                    }],
+                    ..MockBrainRuntime::default()
+                },
+                mode,
+            );
+            review.handle_key(key(KeyCode::Tab));
+            let theme = *review.theme();
+            let review_buffer = render_buffer_at(&review, 110, 38);
+            let review_text = buffer_text(&review_buffer);
+            let review_row = review_text
+                .lines()
+                .position(|line| line.contains("review-highlight-target"))
+                .unwrap();
+            let review_column = content_column(
+                &review_text,
+                "review-highlight-target",
+                "review-highlight-target",
+            );
+            let review_cell = &review_buffer[(review_column as u16, review_row as u16)];
+            assert_eq!(review_cell.fg, theme.header);
+            assert!(review_cell.modifier.contains(Modifier::BOLD));
+            assert_eq!(review_text.matches("> ").count(), 1);
+
+            let mut diagnostics = populated_diagnostics_app(mode);
+            let diagnostics_buffer = render_buffer_at(&diagnostics, 120, 38);
+            let diagnostics_text = buffer_text(&diagnostics_buffer);
+            let rows = diagnostics_text
+                .lines()
+                .enumerate()
+                .filter_map(|(row, line)| {
+                    line.contains("Codex  project  Bash")
+                        .then(|| line.find("Codex").map(|column| (row, column)))
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 2);
+            let selected = &diagnostics_buffer[(rows[0].1 as u16, rows[0].0 as u16)];
+            let inactive = &diagnostics_buffer[(rows[1].1 as u16, rows[1].0 as u16)];
+            assert_eq!(selected.fg, theme.header);
+            assert!(selected.modifier.contains(Modifier::BOLD));
+            assert!(!inactive.modifier.contains(Modifier::BOLD));
+            assert_eq!(diagnostics_text.matches("> ").count(), 1);
+
+            diagnostics.handle_key(key(KeyCode::Char('j')));
+            let moved_buffer = render_buffer_at(&diagnostics, 120, 38);
+            let formerly_selected = &moved_buffer[(rows[0].1 as u16, rows[0].0 as u16)];
+            let now_selected = &moved_buffer[(rows[1].1 as u16, rows[1].0 as u16)];
+            assert!(!formerly_selected.modifier.contains(Modifier::BOLD));
+            assert_eq!(now_selected.fg, theme.header);
+            assert!(now_selected.modifier.contains(Modifier::BOLD));
+        }
     }
 
     #[test]
@@ -959,11 +1098,38 @@ mod tests {
         populated_live_app_with_note(None)
     }
 
-    fn render_text_at(app: &BrainApp, width: u16, height: u16) -> String {
+    fn populated_live_app_with_theme(mode: ThemeMode) -> BrainApp {
+        let mut attention = activity("attention-1", DeliveryState::Unknown);
+        attention.normalized_command = Some("attention-1".into());
+        let mut recent = activity("recent-1", DeliveryState::Delivered);
+        recent.state = ActivityState::Allowed;
+        fixture_app_with_theme(
+            MockBrainRuntime {
+                activity_snapshot: ActivitySnapshot {
+                    attention: vec![AttentionItem {
+                        activity: attention,
+                        occurrences: 1,
+                        unresolved_occurrences: 1,
+                    }],
+                    recent: vec![recent],
+                    unresolved_count: 1,
+                    ..ActivitySnapshot::default()
+                },
+                endpoint_health: online(),
+                ..MockBrainRuntime::default()
+            },
+            mode,
+        )
+    }
+
+    fn render_buffer_at(app: &BrainApp, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, app)).unwrap();
-        let buffer = terminal.backend().buffer();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
@@ -972,6 +1138,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn render_text_at(app: &BrainApp, width: u16, height: u16) -> String {
+        buffer_text(&render_buffer_at(app, width, height))
     }
 
     fn render_text(app: &BrainApp) -> String {

@@ -138,7 +138,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
     } else {
         events
             .iter()
-            .map(|item| ListItem::new(diagnostic_row(item, row_width, app)))
+            .map(|item| ListItem::new(diagnostic_row(item, row_width)))
             .collect()
     };
     let list = List::new(items)
@@ -147,7 +147,11 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
                 .title(format!(" Recent Diagnostics ({}) ", events.len()))
                 .borders(Borders::ALL),
         )
-        .highlight_style(Style::default())
+        .highlight_style(
+            Style::default()
+                .fg(app.theme().header)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("> ")
         .highlight_spacing(HighlightSpacing::Always);
     let mut state = ListState::default();
@@ -157,8 +161,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn diagnostic_row(item: &ActivityItem, width: usize, app: &BrainApp) -> Line<'static> {
-    let theme = app.theme();
+fn diagnostic_row(item: &ActivityItem, width: usize) -> Line<'static> {
     let provider = item
         .session
         .as_ref()
@@ -177,12 +180,7 @@ fn diagnostic_row(item: &ActivityItem, width: usize, app: &BrainApp) -> Line<'st
     } else {
         text
     };
-    Line::from(Span::styled(
-        text,
-        Style::default()
-            .fg(theme.header)
-            .add_modifier(Modifier::BOLD),
-    ))
+    Line::raw(text)
 }
 
 fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {

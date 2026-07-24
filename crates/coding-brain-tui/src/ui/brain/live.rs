@@ -115,7 +115,11 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
                 .title(format!(" Needs Attention ({}) ", snapshot.unresolved_count))
                 .borders(Borders::ALL),
         )
-        .highlight_style(Style::default())
+        .highlight_style(
+            Style::default()
+                .fg(app.theme().header)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("> ")
         .highlight_spacing(HighlightSpacing::Always);
     let mut state = ListState::default();
@@ -139,7 +143,11 @@ fn render_recent(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
     };
     let list = List::new(items)
         .block(Block::default().title(" Recent ").borders(Borders::ALL))
-        .highlight_style(Style::default())
+        .highlight_style(
+            Style::default()
+                .fg(app.theme().header)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("> ")
         .highlight_spacing(HighlightSpacing::Always);
     let mut state = ListState::default();

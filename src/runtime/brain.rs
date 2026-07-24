@@ -775,6 +775,46 @@ mod tests {
     }
 
     #[test]
+    fn persisted_brain_wrong_correction_updates_review_and_scorecard_projections() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("activity.jsonl");
+        let store = brain::activity::ActivityStore::at(path.clone());
+        let mut source = source_event(ActivityKind::Decision);
+        source.decision_id = Some("review".into());
+        store.append(source).unwrap();
+
+        record_correction_at_path(
+            &path,
+            CorrectionInput {
+                activity_id: "activity-1".into(),
+                disposition: CorrectionDisposition::BrainWrong,
+                note: None,
+            },
+        )
+        .unwrap();
+
+        let events = store.read().unwrap();
+        let review = review_queue_from(vec![review_record()], events.events());
+        let scorecard = scorecard_from(
+            &[summary(
+                "review",
+                "approve",
+                Some("hook_proposal"),
+                Some("Bash"),
+                Some("rm -rf /tmp/build"),
+            )],
+            events.events(),
+        );
+
+        assert_eq!(review.len(), 1);
+        assert_eq!(review[0].decision.id, "review");
+        assert_eq!(scorecard.total_decisions, 1);
+        assert_eq!(scorecard.brain_decisions, 1);
+        assert_eq!(scorecard.correct_decisions, 0);
+        assert_eq!(scorecard.accuracy_pct, 0.0);
+    }
+
+    #[test]
     fn review_preserves_durable_decision_provider() {
         let mut record = review_record();
         record.provider = AgentProvider::Antigravity;

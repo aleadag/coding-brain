@@ -381,8 +381,8 @@ impl BrainApp {
     }
 
     pub fn begin_correction(&mut self) {
-        let Some(item) = self.selected_attention() else {
-            self.status = Some("Select a Needs Attention item first".into());
+        let Some(item) = self.selected_live_activity() else {
+            self.status = Some("Select a Live activity first".into());
             return;
         };
         if item.kind != coding_brain_core::brain_activity::ActivityKind::Decision {
@@ -397,15 +397,12 @@ impl BrainApp {
     }
 
     pub fn choose_correction(&mut self, disposition: CorrectionDisposition, note: Option<String>) {
-        let activity_id = match &self.input {
-            Some(BrainInput::Correction { activity_id, .. }) => activity_id.clone(),
-            _ => match self.selected_attention() {
-                Some(item) => item.activity_id.clone(),
-                None => return,
-            },
+        let Some(BrainInput::Correction { activity_id, .. }) = &self.input else {
+            self.status = Some("No correction in progress".into());
+            return;
         };
         let correction = CorrectionInput {
-            activity_id,
+            activity_id: activity_id.clone(),
             disposition,
             note: note.and_then(|note| bounded_note(&note)),
         };
@@ -1578,6 +1575,61 @@ mod tests {
             )
             .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn recent_decision_correction_records_exact_activity_for_every_disposition() {
+        for (key_code, disposition) in [
+            ('r', CorrectionDisposition::BrainRight),
+            ('w', CorrectionDisposition::BrainWrong),
+            ('e', CorrectionDisposition::Exception),
+        ] {
+            let (mut app, mock) = fixture_app(false);
+            let mut recent = activity();
+            recent.activity_id = "recent-decision".into();
+            app.snapshot.recent = vec![recent];
+            app.clamp_selection();
+
+            app.handle_key(key(KeyCode::Char('c')));
+            assert!(app.input_prompt().unwrap().starts_with("Correction:"));
+            app.handle_key(key(KeyCode::Char(key_code)));
+            app.handle_key(key(KeyCode::Enter));
+
+            assert_eq!(
+                non_poll_actions(&mock),
+                vec![MockBrainAction::RecordCorrection(CorrectionInput {
+                    activity_id: "recent-decision".into(),
+                    disposition,
+                    note: None,
+                })]
+            );
+        }
+    }
+
+    #[test]
+    fn correction_submission_without_prompt_fails_closed() {
+        let (mut app, mock) = fixture_app(true);
+
+        app.choose_correction(CorrectionDisposition::BrainWrong, None);
+
+        assert_eq!(app.status(), Some("No correction in progress"));
+        assert!(non_poll_actions(&mock).is_empty());
+    }
+
+    #[test]
+    fn diagnostic_recent_does_not_open_correction_input() {
+        let (mut app, mock) = fixture_app(false);
+        app.snapshot.recent = vec![diagnostic_activity("diagnostic-recent", 1)];
+        app.clamp_selection();
+
+        app.handle_key(key(KeyCode::Char('c')));
+
+        assert_eq!(app.input_prompt(), None);
+        assert_eq!(
+            app.status(),
+            Some("Corrections are only available for Decision activity")
+        );
+        assert!(non_poll_actions(&mock).is_empty());
     }
 
     #[test]

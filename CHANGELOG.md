@@ -31,6 +31,9 @@ All notable changes to codexctl are documented here.
 
 ### Fixed
 
+- Live corrections now target the selected Decision in either Needs Attention
+  or Recent. Selectable rows across Live, Review, and Diagnostics now share a
+  bold theme-aware highlight that makes the exact target clear.
 - Metadata-only correlation diagnostics no longer appear as Live errors;
   genuine decision failures remain visible in Needs Attention.
 - `coding-brain doctor` now warns when current Antigravity hooks are paired
