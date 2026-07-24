@@ -8,6 +8,9 @@ All notable changes to codexctl are documented here.
 
 ### Added
 
+- You can inspect metadata-only hook and correlation diagnostics plus
+  activity-store integrity in a read-only Diagnostics tab. Use `j`/`k` or the
+  arrow keys to select events and PageUp/PageDown to scroll Evidence.
 - You can configure Codex, Claude Code, and Antigravity CLI together with
   `coding-brain init codex|claude|antigravity|all`; bare interactive init
   detects providers and asks which managed hooks to install.
@@ -28,6 +31,8 @@ All notable changes to codexctl are documented here.
 
 ### Fixed
 
+- Metadata-only correlation diagnostics no longer appear as Live errors;
+  genuine decision failures remain visible in Needs Attention.
 - `coding-brain doctor` now warns when current Antigravity hooks are paired
   with `agy` 1.1.5, which may ignore valid `PreToolUse` decisions. Live reports
   successful hook writes as `response emitted` and reserves execution claims
@@ -58,9 +63,10 @@ All notable changes to codexctl are documented here.
 - **Breaking:** the installed executable is now `coding-brain`; the crates.io
   package and internal Rust crates use the `coding-brain` namespace. No compatibility
   executable is installed.
-- Coding Brain is now the only TUI. Its Live, Review, and Scorecard views focus
-  on immediate judgment, learning, and session navigation; the dashboard,
-  mailbox, and session-management commands have been removed.
+- Coding Brain is now the only TUI. Its Live, Review, Scorecard, and Diagnostics
+  views focus on immediate judgment, learning, session navigation, and
+  read-only diagnostic evidence; the dashboard, mailbox, and session-management
+  commands have been removed.
 - Config moved to `~/.config/coding-brain/config.toml`, state moved to
   `~/.local/state/coding-brain/`, project config is `.coding-brain.toml`, and
   stable project identity lives in `.coding-brain/project.toml`.

@@ -2,11 +2,12 @@
 
 Coding Brain is a local TUI for supervising Codex, Claude Code, and Antigravity CLI (`agy`) through judgment and learning. It observes hook, process, and transcript evidence, evaluates permission requests with deterministic rules and an optional local LLM, and learns from operator corrections. It does not schedule work or replace a task tracker.
 
-The default TUI has three views:
+The default TUI has four views:
 
 - **Live** shows current Brain activity, attention state, and provider-tagged decisions.
 - **Review** collects denials, corrections, and other decisions worth teaching from.
 - **Scorecard** tracks decision quality and whether the Brain is improving.
+- **Diagnostics** shows metadata-only hook/correlation diagnostics and activity-store integrity without treating them as failed commands.
 
 From Live, you can switch to the source session for the selected activity. Exact Claude background identities can use native attach; [Agent Deck](https://github.com/asheshgoplani/agent-deck) and terminal focus are optional fallbacks.
 
@@ -82,7 +83,7 @@ coding-brain -> coding-brain-tui -> coding-brain-core
 
 crates/
 ├── coding-brain-core/    # session evidence, paths, project identity, runtime contracts
-└── coding-brain-tui/     # Live, Review, and Scorecard terminal UI
+└── coding-brain-tui/     # Live, Review, Scorecard, and Diagnostics terminal UI
 src/                   # coding-brain binary wiring, local brain, config, init
 ```
 

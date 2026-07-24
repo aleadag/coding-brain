@@ -26,7 +26,7 @@ The workspace crates are `coding-brain-core` and `coding-brain-tui`; runtime int
 ```text
 crates/
 ├── coding-brain-core/    # session types, Codex transcript discovery, monitor, runtime traits
-└── coding-brain-tui/     # Live/Review/Scorecard UI, terminal suspend/restore
+└── coding-brain-tui/     # Live/Review/Scorecard/Diagnostics UI, terminal suspend/restore
 src/                   # coding-brain binary: brain, config, init, runtime
 ```
 

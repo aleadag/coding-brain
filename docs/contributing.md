@@ -7,7 +7,7 @@ coding-brain -> coding-brain-tui -> coding-brain-core
 ```
 
 - `coding-brain-core` owns session evidence, transcript discovery, health checks, Coding Brain paths, project identity, terminal backends, and runtime contracts.
-- `coding-brain-tui` owns the Live, Review, and Scorecard application and terminal suspend/restore behavior.
+- `coding-brain-tui` owns the Live, Review, Scorecard, and Diagnostics application and terminal suspend/restore behavior.
 - the root package owns local Brain evaluation, persistence, config parsing, onboarding, hooks, and the `coding-brain` CLI.
 
 Core must not import root-package modules. The TUI communicates with the binary through runtime traits in `coding-brain-core`; optional Agent Deck navigation is represented as a navigation plan rather than a direct dependency on binary internals.
@@ -32,6 +32,6 @@ When changing status inference, health checks, activity retention, hooks, paths,
 
 ## Product scope
 
-New work should strengthen immediate judgment, the hook-first activity record, preference learning, Live/Review/Scorecard, or reliable session navigation. Durable queues, dependency scheduling, distributed transport, and persistent worker coordination belong in external tools.
+New work should strengthen immediate judgment, the hook-first activity record, preference learning, Live/Review/Scorecard/Diagnostics, or reliable session navigation. Durable queues, dependency scheduling, distributed transport, and persistent worker coordination belong in external tools.
 
 Beads is the repository task tracker and an optional user companion. Agent Deck is an optional navigation companion. Neither belongs in Coding Brain's required runtime dependency graph.

@@ -2,11 +2,12 @@
 
 Coding Brain supervises Codex, Claude Code, and Antigravity CLI (`agy`) through local judgment and learning. Hook events make new activity visible immediately, provider evidence fills in context, and operator corrections become preference evidence for later decisions.
 
-The TUI is organized around three questions:
+The TUI is organized around four questions:
 
 - **Live:** Which current Brain activity needs attention?
 - **Review:** Which denials, corrections, or uncertain decisions should teach the Brain?
 - **Scorecard:** Is decision quality improving?
+- **Diagnostics:** What correlation or activity-store evidence needs inspection?
 
 Coding Brain can switch from selected Live activity to its exact source session. Claude background sessions can use native attach; [Agent Deck](https://github.com/asheshgoplani/agent-deck) and terminal focus are optional fallbacks.
 

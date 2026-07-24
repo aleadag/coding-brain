@@ -38,13 +38,13 @@ Init validates and stages every selected file before replacement. Unrelated and 
 
 ## Use the TUI
 
-Run `coding-brain` to open Live. Press the view keys shown in the footer to move between Live, Review, and Scorecard. Live presents provider-tagged Brain activity and attention; Review concentrates decisions worth correcting or retaining; Scorecard summarizes decision quality. These are Brain views, not a general session dashboard. Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view.
+Run `coding-brain` to open Live. Press the view keys shown in the footer to move between Live, Review, Scorecard, and Diagnostics. Live presents provider-tagged Brain activity and attention; Review concentrates decisions worth correcting or retaining; Scorecard summarizes decision quality. Diagnostics is the user-facing viewer for metadata-only hook/correlation diagnostics and activity-store integrity, not failed commands. These are Brain views, not a general session dashboard. Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view.
 
 Within Live, use `j`/`k` or the arrow keys to move inside the selected list. Press `J` for Recent or `K` for Needs Attention; each list restores its last valid selection.
 
 Press Enter in Live to switch to the selected activity's source session. Coding Brain can use exact provider-qualified Agent Deck navigation, native `claude attach` for a background identity, or exact terminal focus; cancellation returns directly to the Brain TUI.
 
-For an activity with exact current authority, press `x` to enter one-shot action mode, then `a` to allow, `d` to deny, `c` to continue, or `t` to enter bounded hidden literal text. Press Enter to send manual text and Escape to cancel. Outside action mode, Enter keeps its navigation behavior. Review and Scorecard remain read-only for session actions.
+For an activity with exact current authority, press `x` to enter one-shot action mode, then `a` to allow, `d` to deny, `c` to continue, or `t` to enter bounded hidden literal text. Press Enter to send manual text and Escape to cancel. Outside action mode, Enter keeps its navigation behavior. Review, Scorecard, and Diagnostics remain read-only for session actions.
 
 ## Add a local model
 

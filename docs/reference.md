@@ -11,13 +11,15 @@ coding-brain --headless
 coding-brain --headless --json
 ```
 
-The default command opens the Live, Review, and Scorecard TUI. `--headless` keeps evaluation and context-rot prevention active without taking over a terminal; activity remains visible to a Brain TUI running elsewhere.
+The default command opens the Live, Review, Scorecard, and Diagnostics tabs. `--headless` keeps evaluation and context-rot prevention active without taking over a terminal; activity remains visible to a Brain TUI running elsewhere.
 
 Live rows lead with a compact condition badge and bold project name, followed by the provider, action, and an occurrence count when needed. `j`/`k` and the arrow keys move within the selected Needs Attention or Recent list, while `J`/`K` switches lists and restores each list's last valid selection. Enter switches to the exact source of the selected activity. Coding Brain may use provider-qualified Agent Deck navigation, native `claude attach` for an exact background identity, or terminal focus. It does not expose a session list, terminate sessions, route work, or spawn workers.
 
 At 120 columns and wider, Live keeps the selected activity's Evidence beside the stacked lists. Narrower terminals keep all three panes vertical and bound Evidence to its content, up to 12 rows. Evidence presents status and outcome before action and context; use PageUp and PageDown when `↑ more` or `↓ more` appears in its title.
 
-Press `x` in Live to enter one-shot action mode. The next key is `a` (allow), `d` (deny), `c` (continue), or `t` (bounded hidden literal text, sent with Enter). Escape cancels. Semantic actions require recognized prompt evidence and exact current authority; manual text still requires an operator-selected exact live target. Outside action mode, `c` keeps correction behavior and Enter keeps navigation behavior. Review and Scorecard do not dispatch session actions.
+Press `x` in Live to enter one-shot action mode. The next key is `a` (allow), `d` (deny), `c` (continue), or `t` (bounded hidden literal text, sent with Enter). Escape cancels. Semantic actions require recognized prompt evidence and exact current authority; manual text still requires an operator-selected exact live target. Outside action mode, `c` keeps correction behavior and Enter keeps navigation behavior. Review, Scorecard, and Diagnostics do not dispatch session actions.
+
+Diagnostics is a read-only viewer for metadata-only hook and correlation diagnostics, not failed commands. Use `j`/`k` or the arrow keys to select recent diagnostic events. It displays Store integrity counters for malformed rows, duplicate terminal states, truncated tails, and discarded tail bytes, together with neutral `Diagnostic` status and Evidence for the selected event. Visible control characters are escaped before display. At 120 columns and wider, the event list and Evidence appear side by side; in narrower terminals they stack, and PageUp/PageDown scroll Evidence when its `↑ more` or `↓ more` title indicators appear. The raw audit rows remain in `$XDG_STATE_HOME/coding-brain/activity.jsonl`.
 
 ## Brain evaluation
 
@@ -44,7 +46,7 @@ coding-brain --brain-briefing --project <name>
 coding-brain --autopsy [--session <id>]
 ```
 
-Review and Scorecard in the TUI are the primary surfaces. These commands expose the same records for scripts, focused reports, or markdown output.
+The `Review` and `Scorecard` TUI tabs are the primary surfaces. These commands expose the same records for scripts, focused reports, or markdown output.
 
 ## Setup and health
 
