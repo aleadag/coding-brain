@@ -167,7 +167,7 @@ fn diagnostic_row(item: &ActivityItem, width: usize, app: &BrainApp) -> Line<'st
     let project = live::safe_row_text(live::project_label(item).as_ref());
     let tool = item.tool.as_deref().unwrap_or("unknown");
     let text = format!(
-        "Diagnostic  {}  {}  {}",
+        "{}  {}  {}",
         live::safe_row_text(provider),
         project,
         live::safe_row_text(tool),
@@ -241,9 +241,7 @@ fn evidence_lines(
     let tool = item.tool.as_deref().unwrap_or("unknown");
     let reason = item.reasoning.as_deref().unwrap_or("unavailable");
     let label_style = Style::default().fg(theme.text_muted);
-    let value_style = Style::default().fg(theme.header);
     [
-        ("Status", "Diagnostic".into()),
         ("Activity", bounded(&item.activity_id)),
         ("Recorded", item.recorded_at_ms.to_string()),
         ("Provider", bounded(provider)),
@@ -253,18 +251,10 @@ fn evidence_lines(
         ("Reason", bounded(reason)),
     ]
     .into_iter()
-    .enumerate()
-    .map(|(index, (label, value))| {
+    .map(|(label, value)| {
         Line::from(vec![
             Span::styled(format!("{label}: "), label_style),
-            Span::styled(
-                value,
-                if index == 0 {
-                    value_style
-                } else {
-                    Style::default().fg(theme.text_primary)
-                },
-            ),
+            Span::styled(value, Style::default().fg(theme.text_primary)),
         ])
     })
     .collect()

@@ -226,13 +226,22 @@ mod tests {
             "truncated tails: 1",
             "discarded bytes: 17",
             "Recent Diagnostics (2)",
-            "Diagnostic",
+            "Codex  project  Bash",
+            "Activity: diagnostic-1",
             "Provider: Codex",
+            "Project: project",
+            "Tool: Bash",
             "Reason: orphan outcome: Bash command is not losslessly correlatable",
         ] {
             assert!(text.contains(expected), "missing {expected}:\n{text}");
         }
-        for forbidden in ["Status: error", "failed command", "secret command"] {
+        for forbidden in [
+            "Diagnostic  Codex",
+            "Status: Diagnostic",
+            "Status: error",
+            "failed command",
+            "secret command",
+        ] {
             assert!(!text.contains(forbidden), "found {forbidden}:\n{text}");
         }
     }
@@ -288,7 +297,7 @@ mod tests {
 
         assert!(text.contains("\\u{1b}"), "missing escaped control:\n{text}");
         assert!(!text.contains('\u{1b}'), "raw control:\n{text}");
-        assert!(text.contains("Diagnostic"), "{text}");
+        assert!(text.contains("Codex  project  Bash"), "{text}");
         for expected in [
             "malformed rows: 2",
             "duplicate terminals: 1",
@@ -331,19 +340,41 @@ mod tests {
 
         for mode in [ThemeMode::Dark, ThemeMode::None] {
             let text = render_text_at(&populated_diagnostics_app(mode), 120, 38);
-            assert!(text.contains("Diagnostic"), "{text}");
+            assert!(text.contains("[ Diagnostics ]"), "{text}");
         }
         for width in [119, 120] {
             let text = render_text_at(&populated_diagnostics_app(ThemeMode::Dark), width, 38);
+            let normalized = text
+                .replace('│', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             for expected in [
-                "Diagnostics",
+                "[ Diagnostics ]",
                 "Recent Diagnostics (2)",
                 "Store integrity",
-                "Reason:",
+                "Codex  project  Bash",
+                "Activity: diagnostic-1",
+                "Recorded: 200",
+                "Provider: Codex",
+                "Session: session-1",
+                "Project: project",
+                "Tool: Bash",
+                "Reason: orphan outcome: Bash command is not losslessly correlatable",
             ] {
                 assert!(
-                    text.contains(expected),
+                    if expected.starts_with("Reason:") {
+                        normalized.contains(expected)
+                    } else {
+                        text.contains(expected)
+                    },
                     "missing {expected} at {width}:\n{text}"
+                );
+            }
+            for forbidden in ["Diagnostic  Codex", "Status: Diagnostic"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "found {forbidden} at {width}:\n{text}"
                 );
             }
         }
