@@ -698,10 +698,16 @@ fn project_snapshot(log: ActivityLog, limits: SnapshotLimits, now_ms: u64) -> Ac
     let mut unresolved_count = 0;
     let mut attention = HashMap::<String, AttentionItem>::new();
     let mut recent = Vec::new();
+    let mut diagnostic_events = Vec::new();
     for events in groups.into_values() {
         let item = project_activity(&events, limits.interrupted_after_ms, now_ms);
-        if item.kind == ActivityKind::Lifecycle {
-            continue;
+        match item.kind {
+            ActivityKind::Lifecycle => continue,
+            ActivityKind::Diagnostic => {
+                diagnostic_events.push(item);
+                continue;
+            }
+            ActivityKind::Decision => {}
         }
         let resolved = item.outcome.is_some()
             || item.correction.is_some()
@@ -773,9 +779,17 @@ fn project_snapshot(log: ActivityLog, limits: SnapshotLimits, now_ms: u64) -> Ac
             .then_with(|| left.activity_id.cmp(&right.activity_id))
     });
     recent.truncate(limits.recent);
+    diagnostic_events.sort_by(|left, right| {
+        right
+            .recorded_at_ms
+            .cmp(&left.recorded_at_ms)
+            .then_with(|| left.activity_id.cmp(&right.activity_id))
+    });
+    diagnostic_events.truncate(limits.diagnostic_events);
     ActivitySnapshot {
         attention,
         recent,
+        diagnostic_events,
         unresolved_count,
         diagnostics: log.diagnostics,
     }
@@ -1361,15 +1375,57 @@ mod tests {
 
         assert_eq!(store.read().unwrap().events().len(), 3);
         let snapshot = store.snapshot(SnapshotLimits::default()).unwrap();
-        assert_eq!(snapshot.attention.len(), 2);
-        assert_eq!(snapshot.unresolved_count, 2);
+        assert_eq!(snapshot.attention.len(), 1);
+        assert_eq!(snapshot.attention[0].activity_id, "decision-1");
+        assert_eq!(snapshot.unresolved_count, 1);
         assert!(snapshot.recent.is_empty());
-        assert!(
+        assert_eq!(snapshot.diagnostic_events.len(), 1);
+        assert_eq!(snapshot.diagnostic_events[0].activity_id, "orphan_1");
+    }
+
+    #[test]
+    fn diagnostic_events_are_stably_sorted_and_independently_bounded() {
+        let (_root, store) = fixture_store();
+        for (activity_id, recorded_at_ms) in [
+            ("diagnostic-b", 200),
+            ("diagnostic-a", 200),
+            ("diagnostic-old", 100),
+        ] {
+            let mut diagnostic = event_at(activity_id, ActivityState::Error, recorded_at_ms);
+            diagnostic.kind = ActivityKind::Diagnostic;
+            diagnostic.decision_id = None;
+            store.append(diagnostic).unwrap();
+        }
+
+        let snapshot = store
+            .snapshot(SnapshotLimits {
+                diagnostic_events: 2,
+                ..SnapshotLimits::default()
+            })
+            .unwrap();
+        assert_eq!(
             snapshot
-                .attention
+                .diagnostic_events
                 .iter()
-                .all(|item| item.kind != ActivityKind::Lifecycle)
+                .map(|item| item.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["diagnostic-a", "diagnostic-b"]
         );
+        assert!(snapshot.attention.is_empty());
+        assert_eq!(snapshot.unresolved_count, 0);
+    }
+
+    #[test]
+    fn decision_errors_remain_live_attention() {
+        let (_root, store) = fixture_store();
+        store
+            .append(event("decision-error", ActivityState::Error))
+            .unwrap();
+
+        let snapshot = store.snapshot(SnapshotLimits::default()).unwrap();
+        assert_eq!(snapshot.attention.len(), 1);
+        assert_eq!(snapshot.unresolved_count, 1);
+        assert!(snapshot.diagnostic_events.is_empty());
     }
 
     #[test]

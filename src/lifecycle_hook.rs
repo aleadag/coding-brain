@@ -794,7 +794,8 @@ mod tests {
 
     use coding_brain_core::brain_activity::{
         ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivityState,
-        MAX_ACTIVITY_FIELD_BYTES, ProjectEvidence, SessionTarget, bounded_redacted_activity_text,
+        MAX_ACTIVITY_FIELD_BYTES, ProjectEvidence, SessionTarget, SnapshotLimits,
+        bounded_redacted_activity_text,
     };
     use coding_brain_core::lifecycle::{LifecycleStore, StoreCondition};
     use coding_brain_core::project::ProjectId;
@@ -2271,6 +2272,16 @@ mod tests {
                     ActivityState::Allowed,
                 ))
                 .unwrap();
+            activity
+                .append(decision_event(
+                    temp.path(),
+                    "activity-1",
+                    3,
+                    None,
+                    &decision_command,
+                    ActivityState::Delivered,
+                ))
+                .unwrap();
             invoke_activity_hook(
                 &lifecycle,
                 &activity,
@@ -2287,6 +2298,15 @@ mod tests {
                 &activity,
                 &[post_command.as_str(), "alpha", "beta", "done"],
             );
+            let snapshot = activity.snapshot(SnapshotLimits::default()).unwrap();
+            assert!(snapshot.attention.is_empty());
+            assert_eq!(snapshot.diagnostic_events.len(), 1);
+            assert_eq!(
+                snapshot.diagnostic_events[0].reasoning.as_deref(),
+                Some("orphan outcome: Bash command is not losslessly correlatable")
+            );
+            assert_eq!(snapshot.recent.len(), 1);
+            assert_eq!(snapshot.recent[0].activity_id, "activity-1");
         }
     }
 
