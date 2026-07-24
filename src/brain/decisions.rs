@@ -116,11 +116,6 @@ pub fn gen_decision_id() -> String {
 pub enum DecisionOutcome {
     Success,
     Error(String),
-    /// A test-runner command failed within the attribution window after this
-    /// edit was approved (#238). Carries the failing command for diagnostics.
-    /// Weighted more strongly than `Error` in distillation because a broken
-    /// build is a stronger negative signal than a transient tool error.
-    TestFailed(String),
 }
 
 /// Snapshot of session state captured at decision time.
@@ -173,11 +168,9 @@ impl From<&DecisionRecord> for coding_brain_core::runtime::DecisionSummary {
             outcome_kind: r.outcome.as_ref().map(|o| match o {
                 DecisionOutcome::Success => "success".to_string(),
                 DecisionOutcome::Error(_) => "error".to_string(),
-                DecisionOutcome::TestFailed(_) => "test_failed".to_string(),
             }),
             outcome_detail: r.outcome.as_ref().and_then(|o| match o {
                 DecisionOutcome::Error(msg) => Some(msg.clone()),
-                DecisionOutcome::TestFailed(cmd) => Some(cmd.clone()),
                 _ => None,
             }),
             suggested_at: r.suggested_at,
@@ -1311,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_record_outcome_classification() {
+    fn decision_outcome_classification() {
         let accept = make_decision("Bash", "proj", "accept");
         assert!(accept.is_positive());
         assert!(!accept.is_negative());

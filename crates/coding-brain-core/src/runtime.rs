@@ -95,14 +95,12 @@ pub struct DecisionSummary {
     /// Model that produced the suggestion.
     #[serde(default)]
     pub model: Option<String>,
-    /// Resolved outcome category, when known. `"success" | "error" |
-    /// "test_failed" | "skipped"` etc. Mirrors the variants of the binary's
-    /// `brain::decisions::DecisionOutcome` enum, flattened to a string so
-    /// the contract doesn't pull the enum upward.
+    /// Resolved outcome category, when known. Mirrors the variants of the
+    /// binary's `brain::decisions::DecisionOutcome` enum, flattened to a
+    /// string so the contract doesn't pull the enum upward.
     #[serde(default)]
     pub outcome_kind: Option<String>,
-    /// Free-form detail for failure outcomes (the failing command for
-    /// `test_failed`, the error message for `error`).
+    /// Free-form detail for failure outcomes, such as the error message.
     #[serde(default)]
     pub outcome_detail: Option<String>,
     /// Epoch seconds when the brain suggestion was first surfaced. Used by

@@ -21,7 +21,6 @@ model = "gemma4:e4b"
 timeout_ms = 5000
 max_context_tokens = 4000
 few_shot_count = 5
-test_runners = ["cargo test", "npm test", "pytest", "go test", "bun test"]
 ```
 
 Brain mode is separate from TOML configuration. Set it with `coding-brain config set mode off|on|auto` and inspect it with `coding-brain config get mode`. The setting is global, persists under `$XDG_STATE_HOME/coding-brain/`, and takes effect after the settings command exits. New installs default to `off`; `on` enables advisory model evaluation, while `auto` permits high-confidence automatic decisions.

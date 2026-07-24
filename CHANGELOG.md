@@ -47,6 +47,18 @@ All notable changes to codexctl are documented here.
 
 ### Changed
 
+- **Breaking:** removed the unused legacy outcome pipeline and its public
+  `--record-outcome`, `--reap-outcomes`, `--brain-outcomes`,
+  `--brain-baseline`, `--exit-code`, `--duration-ms`, `--stderr-tail`,
+  `--session-id`, `--tool-use-id`, and `--top` flags. Managed provider
+  outcomes continue through `--lifecycle-hook` and the activity ledger.
+  Existing legacy outcome files are left untouched under the Coding Brain
+  state directory and may contain historical command or stderr data.
+  `coding-brain init --purge` remains the existing broad, explicit state
+  deletion mechanism.
+- Removed the dormant `[brain].test_runners` heuristic and
+  `DecisionOutcome::TestFailed`; configuration validation now tells users to
+  delete that setting.
 - Live rows now lead with a compact condition badge and project name before
   provider and action. Evidence groups status and outcome ahead of action and
   context; use PageUp and PageDown when its title shows more content.

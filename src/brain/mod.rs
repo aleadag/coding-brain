@@ -12,7 +12,6 @@ pub mod evals;
 pub mod garden;
 pub mod insights;
 pub mod metrics;
-pub mod outcomes;
 pub mod permission_hook;
 pub mod pref_store;
 pub mod preferences;

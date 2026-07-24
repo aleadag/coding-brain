@@ -2126,15 +2126,15 @@ pub struct Counterfactual {
     pub user_action: String,
     pub brain_confidence: f64,
     /// True when the *brain* was likely right — user overrode and the outcome
-    /// degraded (TestFailed or Error). These are the highest-value review
+    /// degraded (Error). These are the highest-value review
     /// candidates: marking them canonical teaches the few-shot store.
     pub brain_was_right: bool,
     pub outcome_summary: String,
 }
 
 /// Find counterfactual cases: where brain and user disagreed, and the
-/// subsequent outcome went badly. Heuristic: a `TestFailed` or `Error`
-/// outcome on a same-PID decision within `WINDOW` records after this one.
+/// subsequent outcome went badly. Heuristic: an `Error` outcome on a same-PID
+/// decision within `WINDOW` records after this one.
 pub fn compute_counterfactuals(decisions: &[DecisionSummary]) -> Vec<Counterfactual> {
     const WINDOW: usize = 5;
     let mut out = Vec::new();
@@ -2153,18 +2153,10 @@ pub fn compute_counterfactuals(decisions: &[DecisionSummary]) -> Vec<Counterfact
             if next.pid != d.pid {
                 continue;
             }
-            match next.outcome_kind.as_deref() {
-                Some("test_failed") => {
-                    let cmd = next.outcome_detail.as_deref().unwrap_or("");
-                    failing = Some(format!("TestFailed: {}", truncate(cmd, 60)));
-                    break;
-                }
-                Some("error") => {
-                    let msg = next.outcome_detail.as_deref().unwrap_or("");
-                    failing = Some(format!("Error: {}", truncate(msg, 60)));
-                    break;
-                }
-                _ => {}
+            if let Some("error") = next.outcome_kind.as_deref() {
+                let msg = next.outcome_detail.as_deref().unwrap_or("");
+                failing = Some(format!("Error: {}", truncate(msg, 60)));
+                break;
             }
         }
         if let Some(summary) = failing {
@@ -2571,6 +2563,21 @@ mod tests {
             cache_hit: None,
             canonical: None,
         }
+    }
+
+    #[test]
+    fn counterfactuals_ignore_removed_test_failed_kind() {
+        let mut disagreement =
+            coding_brain_core::runtime::DecisionSummary::from(&make_decision("reject"));
+        disagreement.action = "deny".into();
+        disagreement.pid = 7;
+        let mut stale_marker =
+            coding_brain_core::runtime::DecisionSummary::from(&make_decision("accept"));
+        stale_marker.pid = 7;
+        stale_marker.outcome_kind = Some("test_failed".into());
+        stale_marker.outcome_detail = Some("cargo test".into());
+
+        assert!(compute_counterfactuals(&[disagreement, stale_marker]).is_empty());
     }
 
     // ── Dispatch tests ───────────────────────────────────────────────

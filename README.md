@@ -58,7 +58,6 @@ Useful non-TUI commands include:
 ```bash
 coding-brain --brain-review list
 coding-brain --brain-stats scorecard
-coding-brain --brain-baseline
 coding-brain --brain-briefing --project my-project
 ```
 

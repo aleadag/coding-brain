@@ -38,8 +38,6 @@ The mode is global, persists after the settings command exits, and defaults to `
 coding-brain --brain-review [list]
 coding-brain --brain-mark-canonical <decision-id>
 coding-brain --brain-stats <report>
-coding-brain --brain-outcomes
-coding-brain --brain-baseline [--top N]
 coding-brain --insights [on|off|status]
 coding-brain --brain-garden [--apply]
 coding-brain --brain-briefing --project <name>

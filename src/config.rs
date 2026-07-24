@@ -18,7 +18,7 @@ pub struct Config {
 /// `BrainConfig` and friends live in `coding_brain_core::config` so the future
 /// TUI crate (#275) can hold them without depending on the binary. Re-exported
 /// here so existing `crate::config::BrainConfig` callers keep resolving.
-pub use coding_brain_core::config::{BrainConfig, default_test_runners};
+pub use coding_brain_core::config::BrainConfig;
 
 /// Raw TOML representation — all fields optional for partial overrides.
 #[derive(Debug, Default)]
@@ -36,7 +36,6 @@ struct RawBrainConfig {
     timeout_ms: Option<u64>,
     max_context_tokens: Option<u32>,
     few_shot_count: Option<usize>,
-    test_runners: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,9 +125,6 @@ impl Config {
             if let Some(value) = raw_brain.few_shot_count {
                 brain.few_shot_count = value;
             }
-            if let Some(value) = raw_brain.test_runners {
-                brain.test_runners = value;
-            }
         }
         warnings
     }
@@ -190,7 +186,6 @@ impl Config {
 # timeout_ms = 5000
 # max_context_tokens = 4000
 # few_shot_count = 5
-# test_runners = ["cargo test", "npm test", "pytest", "go test", "bun test"]
 "#
     }
 }
@@ -261,12 +256,6 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
                     "few_shot_count" => {
                         brain.few_shot_count = value.parse().ok();
                     }
-                    "test_runners" => {
-                        let parsed = parse_string_array(value);
-                        if !parsed.is_empty() {
-                            brain.test_runners = Some(parsed);
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -299,7 +288,6 @@ fn known_keys(section: &str) -> Option<&'static [&'static str]> {
             "timeout_ms",
             "max_context_tokens",
             "few_shot_count",
-            "test_runners",
         ]),
         _ => None,
     }
@@ -332,6 +320,9 @@ fn removed_key_message(section: &str, key: &str) -> Option<&'static str> {
             | "file_conflicts"
             | "auto_deny_file_conflicts",
         ) => Some("this dashboard or session-management setting is no longer supported"),
+        ("brain", "test_runners") => {
+            Some("legacy heuristic test-failure attribution was removed; delete this setting")
+        }
         (
             "brain",
             "terminal_auto_approve_fallback"
@@ -524,17 +515,28 @@ fn unquote(s: &str) -> String {
     s.trim_matches('"').trim_matches('\'').to_string()
 }
 
-fn parse_string_array(s: &str) -> Vec<String> {
-    let s = s.trim_start_matches('[').trim_end_matches(']');
-    s.split(',')
-        .map(|item| unquote(item.trim()))
-        .filter(|item| !item.is_empty())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_runners_is_explicitly_unsupported() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[brain]\ntest_runners = [\"cargo test\"]").unwrap();
+        file.flush().unwrap();
+
+        let (warnings, has_errors) = validate_config_file(&file.path().to_path_buf());
+
+        assert!(!has_errors);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].message,
+            "legacy heuristic test-failure attribution was removed; delete this setting"
+        );
+        assert!(!Config::template_string().contains("test_runners"));
+    }
 
     #[test]
     fn test_parse_bool() {
@@ -551,12 +553,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_string_array() {
-        let result = parse_string_array("[\"NeedsInput\", \"Finished\"]");
-        assert_eq!(result, vec!["NeedsInput", "Finished"]);
-    }
-
-    #[test]
     fn test_parse_config_file() {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -570,7 +566,6 @@ theme = "dark"
 [brain]
 enabled = true
 model = "local-model"
-test_runners = ["just test", "cargo test"]
 "#
         )
         .unwrap();
@@ -581,10 +576,6 @@ test_runners = ["just test", "cargo test"]
         let brain = raw.brain.expect("brain config");
         assert_eq!(brain.enabled, Some(true));
         assert_eq!(brain.model.as_deref(), Some("local-model"));
-        assert_eq!(
-            brain.test_runners,
-            Some(vec!["just test".into(), "cargo test".into()])
-        );
     }
 
     #[test]
@@ -606,7 +597,6 @@ test_runners = ["just test", "cargo test"]
         config.apply(RawConfig {
             brain: Some(RawBrainConfig {
                 timeout_ms: Some(7500),
-                test_runners: Some(vec!["just test".into()]),
                 ..RawBrainConfig::default()
             }),
             ..RawConfig::default()
@@ -616,7 +606,6 @@ test_runners = ["just test", "cargo test"]
         assert!(!brain.legacy_mode_configured);
         assert_eq!(brain.model, "user-model");
         assert_eq!(brain.timeout_ms, 7500);
-        assert_eq!(brain.test_runners, vec!["just test"]);
     }
 
     #[test]
@@ -701,7 +690,6 @@ model = "local-model"
 timeout_ms = 3210
 max_context_tokens = 7654
 few_shot_count = 7
-test_runners = ["just test", "cargo test"]
 "#
         )
         .unwrap();
@@ -720,7 +708,6 @@ test_runners = ["just test", "cargo test"]
         assert_eq!(brain.timeout_ms, 3210);
         assert_eq!(brain.max_context_tokens, 7654);
         assert_eq!(brain.few_shot_count, 7);
-        assert_eq!(brain.test_runners, vec!["just test", "cargo test"]);
     }
 
     #[test]

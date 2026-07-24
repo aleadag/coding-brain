@@ -269,54 +269,6 @@ pub(crate) struct Cli {
     #[arg(long, help_heading = "Brain (Local LLM)")]
     pub(crate) project: Option<String>,
 
-    /// Record a tool-call outcome to the pending-outcomes spool.
-    /// Used by the Codex PostToolUse hook for #220 baselining.
-    /// Reads pending-outcome JSON from stdin (preferred) or builds one from
-    /// --tool, --tool-input, --project, --exit-code, --duration-ms, --stderr-tail.
-    #[arg(long, help_heading = "Brain (Local LLM)")]
-    pub(crate) record_outcome: bool,
-
-    /// Tool exit code for --record-outcome (0 = success).
-    #[arg(long, help_heading = "Brain (Local LLM)")]
-    pub(crate) exit_code: Option<i32>,
-
-    /// Tool wall-clock duration in milliseconds for --record-outcome.
-    #[arg(long, help_heading = "Brain (Local LLM)")]
-    pub(crate) duration_ms: Option<u64>,
-
-    /// Tail of stderr / tool error output for --record-outcome
-    /// (truncated to MAX_STDERR_TAIL_BYTES).
-    #[arg(long, help_heading = "Brain (Local LLM)")]
-    pub(crate) stderr_tail: Option<String>,
-
-    /// Codex session id (passed through hook payload), optional.
-    #[arg(long, help_heading = "Brain (Local LLM)")]
-    pub(crate) session_id: Option<String>,
-
-    /// Codex tool call id (passed through hook payload), optional.
-    #[arg(long, help_heading = "Brain (Local LLM)")]
-    pub(crate) tool_use_id: Option<String>,
-
-    /// Reap pending outcomes: attribute each to a matching decision and
-    /// archive orphans older than 24h. Exits with the reap stats as JSON
-    /// when --json is set, otherwise human-readable.
-    #[arg(long, help_heading = "Brain (Local LLM)")]
-    pub(crate) reap_outcomes: bool,
-
-    /// List resolved tool-call outcomes attributed to brain decisions.
-    /// Filterable by --tool and --project. Honours --json.
-    #[arg(long, help_heading = "Brain (Local LLM)")]
-    pub(crate) brain_outcomes: bool,
-
-    /// Rank approaches by outcome data (success_rate * sample_count).
-    /// Filterable by --tool and --project. Honours --json.
-    #[arg(long, help_heading = "Brain (Local LLM)")]
-    pub(crate) brain_baseline: bool,
-
-    /// Limit baseline ranking output to top N rows.
-    #[arg(long, help_heading = "Brain (Local LLM)")]
-    pub(crate) top: Option<usize>,
-
     /// Show auto-generated insights, or set mode (on/off/status).
     /// Requires Brain mode on or auto.
     /// Without argument: show current insights.
@@ -733,22 +685,6 @@ fn run_main(cli: Cli) -> io::Result<()> {
         return commands::run_brain_query(&cfg, &cli);
     }
 
-    if cli.record_outcome {
-        return commands::run_record_outcome(&cli);
-    }
-
-    if cli.reap_outcomes {
-        return commands::run_reap_outcomes(&cli);
-    }
-
-    if cli.brain_outcomes {
-        return commands::run_brain_outcomes(&cli);
-    }
-
-    if cli.brain_baseline {
-        return commands::run_brain_baseline(&cli);
-    }
-
     if let Some(ref insights_arg) = cli.insights {
         return commands::run_insights(&cfg, insights_arg);
     }
@@ -766,7 +702,7 @@ fn run_main(cli: Cli) -> io::Result<()> {
     }
 
     if let RunMode::Headless { json } = select_mode(&cli) {
-        return commands::run_headless(Duration::from_secs(2), &cfg, json);
+        return commands::run_headless(Duration::from_secs(2), json);
     }
 
     catch_up_distillation();
@@ -997,6 +933,16 @@ mod brain_only_cli_tests {
         "--config-template",
         "--config-validate",
         "--config-init",
+        "--record-outcome",
+        "--exit-code",
+        "--duration-ms",
+        "--stderr-tail",
+        "--session-id",
+        "--tool-use-id",
+        "--reap-outcomes",
+        "--brain-outcomes",
+        "--brain-baseline",
+        "--top",
     ];
 
     const RETAINED_ARGS: &[&str] = &[
@@ -1014,16 +960,6 @@ mod brain_only_cli_tests {
         "--tool",
         "--tool-input",
         "--project",
-        "--record-outcome",
-        "--exit-code",
-        "--duration-ms",
-        "--stderr-tail",
-        "--session-id",
-        "--tool-use-id",
-        "--reap-outcomes",
-        "--brain-outcomes",
-        "--brain-baseline",
-        "--top",
         "--insights",
         "--brain-garden",
         "--apply",
@@ -1043,6 +979,24 @@ mod brain_only_cli_tests {
         }
         for arg in RETAINED_ARGS {
             assert!(help_has_long_flag(&help, arg), "{arg}");
+        }
+    }
+
+    #[test]
+    fn removed_outcome_pipeline_arguments_are_rejected_with_values() {
+        for args in [
+            vec!["coding-brain", "--record-outcome"],
+            vec!["coding-brain", "--exit-code", "0"],
+            vec!["coding-brain", "--duration-ms", "5"],
+            vec!["coding-brain", "--stderr-tail", "failure"],
+            vec!["coding-brain", "--session-id", "session-1"],
+            vec!["coding-brain", "--tool-use-id", "call-1"],
+            vec!["coding-brain", "--reap-outcomes"],
+            vec!["coding-brain", "--brain-outcomes"],
+            vec!["coding-brain", "--brain-baseline"],
+            vec!["coding-brain", "--top", "10"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
         }
     }
 
