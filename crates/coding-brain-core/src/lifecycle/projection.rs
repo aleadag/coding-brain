@@ -226,7 +226,9 @@ impl LifecycleSnapshot {
             self.next_sequence += 1;
             state.cwd = event.identity().cwd().to_path_buf();
             state.transcript_path = event.identity().transcript_path().map(PathBuf::from);
-            state.clear_transient_status();
+            if *source != SessionStartSource::Compact {
+                state.clear_transient_status();
+            }
             state.session_start_source = Some(*source);
             accept_event(state, &event, signature, sequence, received_at_ms);
             return ApplyOutcome::Applied;
@@ -414,6 +416,18 @@ mod tests {
             raw.insert("source".into(), json!("startup"));
         }
         LifecycleEvent::parse(Value::Object(raw).to_string().as_bytes()).unwrap()
+    }
+
+    fn session_start(
+        provider: AgentProvider,
+        session_id: &str,
+        cwd: &str,
+        source: SessionStartSource,
+    ) -> LifecycleEvent {
+        let identity =
+            LifecycleIdentity::try_new(provider, session_id.into(), None, None, cwd.into())
+                .unwrap();
+        LifecycleEvent::from_parts(identity, LifecycleEventKind::SessionStart { source }).unwrap()
     }
 
     fn session_key() -> String {
@@ -810,20 +824,213 @@ mod tests {
     }
 
     #[test]
-    fn session_start_clears_transient_state_but_keeps_recent_turns() {
+    fn compact_preserves_active_lifecycle_and_turn_guards() {
         let mut snapshot = LifecycleSnapshot::default();
         snapshot.apply(prompt("turn-1"), 1_000);
-        snapshot.apply(prompt("turn-2"), 2_000);
-        snapshot.apply(event(LifecycleEventName::SessionStart, None, None), 3_000);
+        snapshot.apply(
+            permission("turn-1", PermissionDisposition::NeedsInput),
+            2_000,
+        );
+        snapshot.apply(subagent_start("turn-1", "agent-1"), 3_000);
+
+        let before = snapshot.sessions[&session_key()].clone();
+        assert_eq!(
+            snapshot.apply(
+                session_start(
+                    AgentProvider::Codex,
+                    "session-1",
+                    "/work/after-compact",
+                    SessionStartSource::Compact,
+                ),
+                4_000,
+            ),
+            ApplyOutcome::Applied
+        );
+
         let state = &snapshot.sessions[&session_key()];
-        assert_eq!(state.current_turn, None);
-        assert!(!state.turn_open);
-        assert_eq!(state.projected_status, None);
-        assert!(state.recent_turns.iter().any(|turn| turn == "turn-1"));
+        assert_eq!(state.current_turn, before.current_turn);
+        assert_eq!(state.turn_open, before.turn_open);
+        assert_eq!(state.recent_turns, before.recent_turns);
+        assert_eq!(state.status_event, before.status_event);
+        assert_eq!(state.status_sequence, before.status_sequence);
+        assert_eq!(state.status_received_at_ms, before.status_received_at_ms);
+        assert_eq!(state.projected_status, before.projected_status);
+        assert_eq!(state.active_subagents, before.active_subagents);
         assert_eq!(
             state.session_start_source,
-            Some(SessionStartSource::Startup)
+            Some(SessionStartSource::Compact)
         );
+        assert_eq!(state.cwd, PathBuf::from("/work/after-compact"));
+        assert_eq!(state.latest_event, Some(LifecycleEventName::SessionStart));
+        assert_eq!(state.latest_received_at_ms, 4_000);
+
+        assert_eq!(
+            snapshot.apply(permission("turn-1", PermissionDisposition::Decided), 5_000,),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(pre_tool("turn-2"), 6_000),
+            ApplyOutcome::Ignored(IgnoreReason::AmbiguousTurn)
+        );
+    }
+
+    #[test]
+    fn compact_does_not_create_or_reopen_a_turn() {
+        let compact = || {
+            session_start(
+                AgentProvider::Codex,
+                "session-1",
+                "/work/codexctl",
+                SessionStartSource::Compact,
+            )
+        };
+
+        let mut empty = LifecycleSnapshot::default();
+        empty.apply(compact(), 1_000);
+        let empty_state = &empty.sessions[&session_key()];
+        assert_eq!(empty_state.current_turn, None);
+        assert!(!empty_state.turn_open);
+
+        let mut stopped = LifecycleSnapshot::default();
+        stopped.apply(prompt("turn-1"), 1_000);
+        stopped.apply(stop("turn-1"), 2_000);
+        stopped.apply(compact(), 3_000);
+        let stopped_state = &stopped.sessions[&session_key()];
+        assert_eq!(stopped_state.current_turn.as_deref(), Some("turn-1"));
+        assert!(!stopped_state.turn_open);
+        assert!(
+            stopped_state
+                .recent_turns
+                .iter()
+                .any(|turn| turn == "turn-1")
+        );
+        assert_eq!(
+            stopped.apply(pre_tool("turn-1"), 4_000),
+            ApplyOutcome::Ignored(IgnoreReason::RecentTurn)
+        );
+    }
+
+    #[test]
+    fn consecutive_compact_events_remain_duplicates() {
+        let mut snapshot = LifecycleSnapshot::default();
+        let compact = || {
+            session_start(
+                AgentProvider::Codex,
+                "session-1",
+                "/work/codexctl",
+                SessionStartSource::Compact,
+            )
+        };
+
+        assert_eq!(snapshot.apply(compact(), 1_000), ApplyOutcome::Applied);
+        let next_sequence = snapshot.next_sequence;
+        assert_eq!(
+            snapshot.apply(compact(), 2_000),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+        assert_eq!(snapshot.next_sequence, next_sequence);
+    }
+
+    #[test]
+    fn non_compact_session_starts_keep_full_reset_semantics() {
+        for source in [
+            SessionStartSource::Startup,
+            SessionStartSource::Resume,
+            SessionStartSource::Clear,
+        ] {
+            let mut snapshot = LifecycleSnapshot::default();
+            snapshot.apply(prompt("turn-1"), 1_000);
+            snapshot.apply(subagent_start("turn-1", "agent-1"), 2_000);
+            snapshot.apply(
+                session_start(AgentProvider::Codex, "session-1", "/work/codexctl", source),
+                3_000,
+            );
+
+            let state = &snapshot.sessions[&session_key()];
+            assert_eq!(state.current_turn, None);
+            assert!(!state.turn_open);
+            assert_eq!(state.projected_status, None);
+            assert!(state.active_subagents.is_empty());
+            assert!(state.recent_turns.iter().any(|turn| turn == "turn-1"));
+            assert_eq!(state.session_start_source, Some(source));
+        }
+    }
+
+    #[test]
+    fn compact_preserves_provider_specific_correlation_state() {
+        let mut snapshot = LifecycleSnapshot::default();
+        snapshot.apply(invocation("invocation-1", 5), 1);
+        snapshot.apply(
+            LifecycleEvent::permission(
+                antigravity_identity("step-5"),
+                PermissionDisposition::Decided,
+            )
+            .unwrap(),
+            2,
+        );
+        let key =
+            AgentSessionKey::native(AgentProvider::Antigravity, "agy-conversation-1").storage_key();
+        let before = snapshot.sessions[&key].clone();
+
+        snapshot.apply(
+            session_start(
+                AgentProvider::Antigravity,
+                "agy-conversation-1",
+                "/work/antigravity",
+                SessionStartSource::Compact,
+            ),
+            3,
+        );
+
+        let state = &snapshot.sessions[&key];
+        assert_eq!(state.current_turn, before.current_turn);
+        assert_eq!(state.turn_open, before.turn_open);
+        assert_eq!(
+            state.antigravity_initial_step,
+            before.antigravity_initial_step
+        );
+        assert_eq!(
+            state.antigravity_child_events,
+            before.antigravity_child_events
+        );
+    }
+
+    #[test]
+    fn compact_continuity_is_source_defined_across_providers() {
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let identity = LifecycleIdentity::try_new(
+                provider,
+                "provider-session".into(),
+                Some("turn-1".into()),
+                None,
+                "/work/provider".into(),
+            )
+            .unwrap();
+            let mut snapshot = LifecycleSnapshot::default();
+            snapshot.apply(
+                LifecycleEvent::from_parts(identity, LifecycleEventKind::UserPromptSubmit).unwrap(),
+                1,
+            );
+            snapshot.apply(
+                session_start(
+                    provider,
+                    "provider-session",
+                    "/work/provider",
+                    SessionStartSource::Compact,
+                ),
+                2,
+            );
+
+            let key = AgentSessionKey::native(provider, "provider-session").storage_key();
+            let state = &snapshot.sessions[&key];
+            assert_eq!(state.current_turn.as_deref(), Some("turn-1"));
+            assert!(state.turn_open);
+            assert_eq!(state.projected_status, Some(ProjectedStatus::Processing));
+        }
     }
 
     #[test]
