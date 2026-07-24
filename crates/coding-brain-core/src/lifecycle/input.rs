@@ -159,6 +159,8 @@ impl LifecycleIdentity {
 pub struct LifecycleEvent {
     identity: LifecycleIdentity,
     kind: LifecycleEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_initial_step: Option<u64>,
 }
 
 impl LifecycleEvent {
@@ -166,15 +168,30 @@ impl LifecycleEvent {
         identity: LifecycleIdentity,
         kind: LifecycleEventKind,
     ) -> Result<Self, LifecycleInputError> {
+        Self::from_parts_with_turn_initial_step(identity, kind, None)
+    }
+
+    pub fn from_parts_with_turn_initial_step(
+        identity: LifecycleIdentity,
+        kind: LifecycleEventKind,
+        turn_initial_step: Option<u64>,
+    ) -> Result<Self, LifecycleInputError> {
         if !matches!(kind, LifecycleEventKind::SessionStart { .. }) {
             require_turn(&identity)?;
+        }
+        if turn_initial_step.is_some() && !matches!(kind, LifecycleEventKind::UserPromptSubmit) {
+            return Err(LifecycleInputError::Invalid("turn_initial_step"));
         }
         if let LifecycleEventKind::SubagentStart { agent_id }
         | LifecycleEventKind::SubagentStop { agent_id } = &kind
         {
             validate_id("agent_id", agent_id)?;
         }
-        Ok(Self { identity, kind })
+        Ok(Self {
+            identity,
+            kind,
+            turn_initial_step,
+        })
     }
 
     pub fn parse(raw: &[u8]) -> Result<Self, LifecycleInputError> {
@@ -225,7 +242,11 @@ impl LifecycleEvent {
             }
             _ => return Err(LifecycleInputError::UnsupportedEvent),
         };
-        Ok(Self { identity, kind })
+        Ok(Self {
+            identity,
+            kind,
+            turn_initial_step: None,
+        })
     }
 
     pub fn permission(
@@ -236,6 +257,7 @@ impl LifecycleEvent {
         Ok(Self {
             identity,
             kind: LifecycleEventKind::PermissionRequest { disposition },
+            turn_initial_step: None,
         })
     }
 
@@ -245,6 +267,10 @@ impl LifecycleEvent {
 
     pub fn kind(&self) -> &LifecycleEventKind {
         &self.kind
+    }
+
+    pub fn turn_initial_step(&self) -> Option<u64> {
+        self.turn_initial_step
     }
 
     pub fn name(&self) -> LifecycleEventName {
@@ -406,6 +432,27 @@ mod tests {
                 LifecycleEventName::SubagentStop,
                 LifecycleEventName::Stop,
             ]
+        );
+    }
+
+    #[test]
+    fn turn_initial_step_is_only_valid_for_user_prompt_submit() {
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Antigravity,
+            "agy-conversation-1".into(),
+            Some("invocation-1".into()),
+            None,
+            "/work/antigravity".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            LifecycleEvent::from_parts_with_turn_initial_step(
+                identity,
+                LifecycleEventKind::Stop,
+                Some(5),
+            )
+            .unwrap_err(),
+            LifecycleInputError::Invalid("turn_initial_step")
         );
     }
 

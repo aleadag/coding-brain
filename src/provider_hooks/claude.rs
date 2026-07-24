@@ -134,6 +134,7 @@ pub(crate) fn parse_lifecycle(raw: &[u8]) -> Result<ParsedLifecycleHook, HookInp
     Ok(ParsedLifecycleHook {
         identity,
         event,
+        turn_initial_step: None,
         tool_use_id,
         tool_name,
         outcome,

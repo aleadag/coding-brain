@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::provider::AgentSessionKey;
+use crate::provider::{AgentProvider, AgentSessionKey};
 
 use super::input::{
     LifecycleEvent, LifecycleEventKind, LifecycleEventName, PermissionDisposition, ProjectedStatus,
@@ -13,6 +13,15 @@ use super::input::{
 pub const LIFECYCLE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_RECENT_TURNS: usize = 32;
 pub const MAX_ACTIVE_SUBAGENTS: usize = 64;
+pub const MAX_ANTIGRAVITY_INVOCATION_STEPS: usize = 256;
+const ANTIGRAVITY_PERMISSION_DECIDED_BIT: u8 = 1 << 0;
+const ANTIGRAVITY_PERMISSION_NEEDS_INPUT_BIT: u8 = 1 << 1;
+const ANTIGRAVITY_PRE_TOOL_BIT: u8 = 1 << 2;
+const ANTIGRAVITY_POST_TOOL_BIT: u8 = 1 << 3;
+pub(crate) const ANTIGRAVITY_CHILD_BITS: u8 = ANTIGRAVITY_PERMISSION_DECIDED_BIT
+    | ANTIGRAVITY_PERMISSION_NEEDS_INPUT_BIT
+    | ANTIGRAVITY_PRE_TOOL_BIT
+    | ANTIGRAVITY_POST_TOOL_BIT;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +67,10 @@ pub struct SessionLifecycleState {
     pub active_subagents: BTreeMap<String, ActiveSubagentState>,
     pub session_start_source: Option<SessionStartSource>,
     pub ignored_reason: Option<IgnoreReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_initial_step: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub antigravity_child_events: BTreeMap<u64, u8>,
     last_signature: Option<EventSignature>,
 }
 
@@ -79,6 +92,8 @@ impl SessionLifecycleState {
             active_subagents: BTreeMap::new(),
             session_start_source: None,
             ignored_reason: None,
+            antigravity_initial_step: None,
+            antigravity_child_events: BTreeMap::new(),
             last_signature: None,
         }
     }
@@ -121,7 +136,54 @@ impl SessionLifecycleState {
         self.status_received_at_ms = None;
         self.projected_status = None;
         self.active_subagents.clear();
+        self.antigravity_initial_step = None;
+        self.antigravity_child_events.clear();
     }
+}
+
+fn prefixed_index(value: &str, prefix: &str) -> Option<u64> {
+    value.strip_prefix(prefix)?.parse().ok()
+}
+
+fn antigravity_child_bit(kind: &LifecycleEventKind) -> Option<u8> {
+    match kind {
+        LifecycleEventKind::PermissionRequest {
+            disposition: PermissionDisposition::Decided,
+        } => Some(ANTIGRAVITY_PERMISSION_DECIDED_BIT),
+        LifecycleEventKind::PermissionRequest {
+            disposition: PermissionDisposition::NeedsInput,
+        } => Some(ANTIGRAVITY_PERMISSION_NEEDS_INPUT_BIT),
+        LifecycleEventKind::PreToolUse => Some(ANTIGRAVITY_PRE_TOOL_BIT),
+        LifecycleEventKind::PostToolUse => Some(ANTIGRAVITY_POST_TOOL_BIT),
+        _ => None,
+    }
+}
+
+fn antigravity_child(
+    state: &SessionLifecycleState,
+    event: &LifecycleEvent,
+    turn_id: &str,
+) -> Option<(u64, u8)> {
+    if event.identity().provider() != AgentProvider::Antigravity
+        || !state.turn_open
+        || state
+            .current_turn
+            .as_deref()
+            .and_then(|turn| prefixed_index(turn, "invocation-"))
+            .is_none()
+    {
+        return None;
+    }
+    let step = prefixed_index(turn_id, "step-")?;
+    let floor = state.antigravity_initial_step?;
+    let bit = antigravity_child_bit(event.kind())?;
+    (step >= floor).then_some((step, bit))
+}
+
+fn is_antigravity_child_candidate(event: &LifecycleEvent, turn_id: &str) -> bool {
+    event.identity().provider() == AgentProvider::Antigravity
+        && prefixed_index(turn_id, "step-").is_some()
+        && antigravity_child_bit(event.kind()).is_some()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -178,23 +240,44 @@ impl LifecycleSnapshot {
             return state.ignore(IgnoreReason::RecentTurn);
         }
 
-        match state.current_turn.as_deref() {
-            Some(current) if state.turn_open && current != turn_id => {
-                if !matches!(event.kind(), LifecycleEventKind::UserPromptSubmit) {
-                    return state.ignore(IgnoreReason::AmbiguousTurn);
+        if let Some((step, bit)) = antigravity_child(state, &event, turn_id) {
+            let previous = state
+                .antigravity_child_events
+                .get(&step)
+                .copied()
+                .unwrap_or(0);
+            let unsafe_permission_reversal = bit == ANTIGRAVITY_PERMISSION_DECIDED_BIT
+                && previous & ANTIGRAVITY_PERMISSION_NEEDS_INPUT_BIT != 0;
+            if previous & bit != 0 || unsafe_permission_reversal {
+                return state.ignore(IgnoreReason::Duplicate);
+            }
+            if previous == 0
+                && state.antigravity_child_events.len() >= MAX_ANTIGRAVITY_INVOCATION_STEPS
+            {
+                return state.ignore(IgnoreReason::AmbiguousTurn);
+            }
+            state.antigravity_child_events.insert(step, previous | bit);
+        } else if is_antigravity_child_candidate(&event, turn_id) {
+            return state.ignore(IgnoreReason::AmbiguousTurn);
+        } else {
+            match state.current_turn.as_deref() {
+                Some(current) if state.turn_open && current != turn_id => {
+                    if !matches!(event.kind(), LifecycleEventKind::UserPromptSubmit) {
+                        return state.ignore(IgnoreReason::AmbiguousTurn);
+                    }
+                    let current = current.to_owned();
+                    state.remember_turn(&current);
+                    state.current_turn = Some(turn_id.to_owned());
                 }
-                let current = current.to_owned();
-                state.remember_turn(&current);
-                state.current_turn = Some(turn_id.to_owned());
+                Some(current) if !state.turn_open && current == turn_id => {
+                    return state.ignore(IgnoreReason::RecentTurn);
+                }
+                Some(current) if current != turn_id => {
+                    state.current_turn = Some(turn_id.to_owned());
+                }
+                None => state.current_turn = Some(turn_id.to_owned()),
+                _ => {}
             }
-            Some(current) if !state.turn_open && current == turn_id => {
-                return state.ignore(IgnoreReason::RecentTurn);
-            }
-            Some(current) if current != turn_id => {
-                state.current_turn = Some(turn_id.to_owned());
-            }
-            None => state.current_turn = Some(turn_id.to_owned()),
-            _ => {}
         }
 
         match event.kind() {
@@ -224,9 +307,20 @@ impl LifecycleSnapshot {
         state.session_start_source = None;
 
         match event.kind() {
-            LifecycleEventKind::UserPromptSubmit
-            | LifecycleEventKind::PreToolUse
-            | LifecycleEventKind::PostToolUse => state.set_status(
+            LifecycleEventKind::UserPromptSubmit => {
+                state.antigravity_initial_step = (event.identity().provider()
+                    == AgentProvider::Antigravity)
+                    .then(|| event.turn_initial_step())
+                    .flatten();
+                state.antigravity_child_events.clear();
+                state.set_status(
+                    event.name(),
+                    ProjectedStatus::Processing,
+                    sequence,
+                    received_at_ms,
+                );
+            }
+            LifecycleEventKind::PreToolUse | LifecycleEventKind::PostToolUse => state.set_status(
                 event.name(),
                 ProjectedStatus::Processing,
                 sequence,
@@ -262,6 +356,8 @@ impl LifecycleSnapshot {
             LifecycleEventKind::Stop => {
                 state.turn_open = false;
                 state.active_subagents.clear();
+                state.antigravity_initial_step = None;
+                state.antigravity_child_events.clear();
                 state.remember_turn(turn_id);
                 state.set_status(
                     event.name(),
@@ -358,6 +454,207 @@ mod tests {
         )
         .unwrap();
         LifecycleEvent::permission(identity, disposition).unwrap()
+    }
+
+    fn antigravity_identity(turn: &str) -> LifecycleIdentity {
+        LifecycleIdentity::try_new(
+            AgentProvider::Antigravity,
+            "agy-conversation-1".into(),
+            Some(turn.into()),
+            None,
+            "/work/antigravity".into(),
+        )
+        .unwrap()
+    }
+
+    fn invocation(turn: &str, initial_step: u64) -> LifecycleEvent {
+        LifecycleEvent::from_parts_with_turn_initial_step(
+            antigravity_identity(turn),
+            LifecycleEventKind::UserPromptSubmit,
+            Some(initial_step),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn antigravity_steps_are_children_of_the_open_invocation() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(invocation("invocation-1", 5), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(
+                LifecycleEvent::permission(
+                    antigravity_identity("step-5"),
+                    PermissionDisposition::Decided,
+                )
+                .unwrap(),
+                2,
+            ),
+            ApplyOutcome::Applied
+        );
+        let key =
+            AgentSessionKey::native(AgentProvider::Antigravity, "agy-conversation-1").storage_key();
+        assert_eq!(
+            snapshot.sessions[&key].current_turn.as_deref(),
+            Some("invocation-1")
+        );
+        assert!(snapshot.sessions[&key].turn_open);
+
+        let stale = LifecycleEvent::permission(
+            antigravity_identity("step-4"),
+            PermissionDisposition::Decided,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.apply(stale, 3),
+            ApplyOutcome::Ignored(IgnoreReason::AmbiguousTurn)
+        );
+
+        let close = LifecycleEvent::from_parts(
+            antigravity_identity("invocation-1"),
+            LifecycleEventKind::Stop,
+        )
+        .unwrap();
+        assert_eq!(snapshot.apply(close, 4), ApplyOutcome::Applied);
+        assert!(!snapshot.sessions[&key].turn_open);
+    }
+
+    #[test]
+    fn antigravity_child_replay_and_permission_reversal_fail_safe() {
+        let mut snapshot = LifecycleSnapshot::default();
+        snapshot.apply(invocation("invocation-1", 5), 1);
+        let decided = || {
+            LifecycleEvent::permission(
+                antigravity_identity("step-5"),
+                PermissionDisposition::Decided,
+            )
+            .unwrap()
+        };
+        let needs_input = || {
+            LifecycleEvent::permission(
+                antigravity_identity("step-5"),
+                PermissionDisposition::NeedsInput,
+            )
+            .unwrap()
+        };
+        let post_tool = || {
+            LifecycleEvent::from_parts(
+                antigravity_identity("step-5"),
+                LifecycleEventKind::PostToolUse,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(snapshot.apply(decided(), 2), ApplyOutcome::Applied);
+        assert_eq!(snapshot.apply(post_tool(), 3), ApplyOutcome::Applied);
+        assert_eq!(
+            snapshot.apply(decided(), 4),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+        assert_eq!(snapshot.apply(needs_input(), 5), ApplyOutcome::Applied);
+        assert_eq!(
+            snapshot.apply(post_tool(), 6),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+        assert_eq!(
+            snapshot.apply(decided(), 7),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+    }
+
+    #[test]
+    fn antigravity_child_capacity_does_not_prevent_invocation_closure() {
+        let mut snapshot = LifecycleSnapshot::default();
+        snapshot.apply(invocation("invocation-1", 0), 1);
+        for step in 0..MAX_ANTIGRAVITY_INVOCATION_STEPS {
+            let permission = LifecycleEvent::permission(
+                antigravity_identity(&format!("step-{step}")),
+                PermissionDisposition::Decided,
+            )
+            .unwrap();
+            assert_eq!(
+                snapshot.apply(permission, step as u64 + 2),
+                ApplyOutcome::Applied
+            );
+        }
+        let overflow = LifecycleEvent::permission(
+            antigravity_identity(&format!("step-{MAX_ANTIGRAVITY_INVOCATION_STEPS}")),
+            PermissionDisposition::Decided,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.apply(overflow, 300),
+            ApplyOutcome::Ignored(IgnoreReason::AmbiguousTurn)
+        );
+
+        let close = LifecycleEvent::from_parts(
+            antigravity_identity("invocation-1"),
+            LifecycleEventKind::Stop,
+        )
+        .unwrap();
+        assert_eq!(snapshot.apply(close, 301), ApplyOutcome::Applied);
+        let key =
+            AgentSessionKey::native(AgentProvider::Antigravity, "agy-conversation-1").storage_key();
+        assert_eq!(snapshot.sessions[&key].antigravity_initial_step, None);
+        assert!(snapshot.sessions[&key].antigravity_child_events.is_empty());
+
+        let after_close = LifecycleEvent::permission(
+            antigravity_identity("step-300"),
+            PermissionDisposition::Decided,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.apply(after_close, 302),
+            ApplyOutcome::Ignored(IgnoreReason::AmbiguousTurn)
+        );
+    }
+
+    #[test]
+    fn unproven_antigravity_children_do_not_weaken_generic_turn_guards() {
+        let mut antigravity = LifecycleSnapshot::default();
+        let ordinary_turn = LifecycleEvent::from_parts_with_turn_initial_step(
+            antigravity_identity("turn-1"),
+            LifecycleEventKind::UserPromptSubmit,
+            Some(0),
+        )
+        .unwrap();
+        antigravity.apply(ordinary_turn, 1);
+        let step = LifecycleEvent::from_parts(
+            antigravity_identity("step-0"),
+            LifecycleEventKind::PreToolUse,
+        )
+        .unwrap();
+        assert_eq!(
+            antigravity.apply(step, 2),
+            ApplyOutcome::Ignored(IgnoreReason::AmbiguousTurn)
+        );
+
+        let claude_identity = |turn: &str| {
+            LifecycleIdentity::try_new(
+                AgentProvider::Claude,
+                "claude-session-1".into(),
+                Some(turn.into()),
+                None,
+                "/work/claude".into(),
+            )
+            .unwrap()
+        };
+        let prompt = LifecycleEvent::from_parts(
+            claude_identity("turn-1"),
+            LifecycleEventKind::UserPromptSubmit,
+        )
+        .unwrap();
+        let tool =
+            LifecycleEvent::from_parts(claude_identity("turn-2"), LifecycleEventKind::PreToolUse)
+                .unwrap();
+        let mut claude = LifecycleSnapshot::default();
+        claude.apply(prompt, 1);
+        assert_eq!(
+            claude.apply(tool, 2),
+            ApplyOutcome::Ignored(IgnoreReason::AmbiguousTurn)
+        );
     }
 
     #[test]

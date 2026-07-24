@@ -26,6 +26,13 @@ All notable changes to codexctl are documented here.
   mode. Claude background sessions can use native attach, while guarded tmux
   fallback covers exact live targets when structured delivery is unavailable.
 
+### Fixed
+
+- Antigravity automatic approvals now attach tool steps only to their open
+  invocation. Stale, replayed, or post-invocation permission requests fall back
+  to `ask`, and failed lifecycle persistence no longer appears as Allowed in
+  Live.
+
 ### Changed
 
 - Live now uses wide terminals for stacked Needs Attention and Recent lists

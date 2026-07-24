@@ -765,7 +765,9 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
     terminal.threshold = brain.threshold;
     terminal.reasoning = Some(bounded_redacted_activity_text(&brain.reasoning));
     terminal.decision_id = Some(decision_id.clone());
-    if let Err(error) = activity_store.unwrap().append(terminal) {
+    if behavior != Some(PermissionBehavior::Allow)
+        && let Err(error) = activity_store.unwrap().append(terminal.clone())
+    {
         write_diagnostic(
             &mut stderr,
             format!("could not persist terminal activity: {error}"),
@@ -787,14 +789,14 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
         }
         return;
     };
-    if let Err(error) = record_permission(
-        lifecycle_store,
-        &request.lifecycle,
-        PermissionDisposition::Decided,
-    ) {
-        let message = format!("could not persist executable permission state: {error}");
-        write_diagnostic(&mut stderr, &message);
-        if behavior == Some(PermissionBehavior::Allow) {
+    if behavior == Some(PermissionBehavior::Allow) {
+        if let Err(error) = record_permission(
+            lifecycle_store,
+            &request.lifecycle,
+            PermissionDisposition::Decided,
+        ) {
+            let message = format!("could not persist executable permission state: {error}");
+            write_diagnostic(&mut stderr, &message);
             if let (Ok(context), Some(activity_store)) = (&activity_context, activity_store) {
                 let mut event = context.event(ActivityState::Error);
                 event.decision_id = Some(decision_id);
@@ -812,6 +814,32 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
             }
             return;
         }
+        if let Err(error) = activity_store.unwrap().append(terminal) {
+            write_diagnostic(
+                &mut stderr,
+                format!("could not persist terminal activity: {error}"),
+            );
+            if let Err(error) = record_permission(
+                lifecycle_store,
+                &request.lifecycle,
+                PermissionDisposition::NeedsInput,
+            ) {
+                write_diagnostic(
+                    &mut stderr,
+                    format!("could not compensate executable permission state: {error}"),
+                );
+            }
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+    } else if let Err(error) = record_permission(
+        lifecycle_store,
+        &request.lifecycle,
+        PermissionDisposition::Decided,
+    ) {
+        write_diagnostic(&mut stderr, error);
     }
     let (delivery, failure) = match write_response(&mut stdout, &serialized) {
         Ok(()) => (ActivityState::Delivered, None),
@@ -966,7 +994,7 @@ mod tests {
     use coding_brain_core::brain_activity::{
         ActivityKind, ActivityState, MAX_ACTIVITY_FIELD_BYTES, bounded_redacted_activity_text,
     };
-    use coding_brain_core::lifecycle::{LifecycleStore, ProjectedStatus};
+    use coding_brain_core::lifecycle::{LifecycleEventKind, LifecycleStore, ProjectedStatus};
 
     struct FailingWriter;
 
@@ -1238,9 +1266,89 @@ mod tests {
             [
                 ActivityState::Observed,
                 ActivityState::Evaluating,
-                ActivityState::Allowed,
                 ActivityState::Error,
             ]
+        );
+    }
+
+    #[test]
+    fn terminal_activity_failure_compensates_antigravity_allow_to_needs_input() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let _restore_home = set_test_home(temp.path());
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity_path = temp.path().join("activity.jsonl");
+        let saved_activity_path = temp.path().join("activity-before-failure.jsonl");
+        let activity = ActivityStore::at(&activity_path);
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Antigravity,
+            "agy-conversation-1".into(),
+            Some("invocation-1".into()),
+            Some("/tmp/agy-conversation-1/transcript.jsonl".into()),
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        assert_eq!(
+            lifecycle
+                .record(
+                    LifecycleEvent::from_parts_with_turn_initial_step(
+                        identity,
+                        LifecycleEventKind::UserPromptSubmit,
+                        Some(5),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+        let mut payload: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/hooks/antigravity-pre-tool-use.json"
+        ))
+        .unwrap();
+        payload["workspacePaths"] = serde_json::json!([temp.path()]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_provider_with_gate_and_stores(
+            Cursor::new(serde_json::to_vec(&payload).unwrap()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            AgentProvider::Antigravity,
+            Some("PreToolUse"),
+            |_, _| {
+                std::fs::rename(&activity_path, &saved_activity_path).unwrap();
+                std::fs::create_dir(&activity_path).unwrap();
+                Ok(suggestion(RuleAction::Approve, 0.9))
+            },
+        );
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stdout).unwrap()["decision"],
+            "ask"
+        );
+        let key = coding_brain_core::provider::AgentSessionKey::native(
+            AgentProvider::Antigravity,
+            "agy-conversation-1",
+        )
+        .storage_key();
+        assert_eq!(
+            lifecycle.read().unwrap().snapshot.unwrap().sessions[&key].projected_status,
+            Some(ProjectedStatus::NeedsInput)
+        );
+        let saved = ActivityStore::at(&saved_activity_path).read().unwrap();
+        assert_eq!(
+            saved
+                .events()
+                .iter()
+                .map(|event| event.state)
+                .collect::<Vec<_>>(),
+            [ActivityState::Observed, ActivityState::Evaluating]
         );
     }
 

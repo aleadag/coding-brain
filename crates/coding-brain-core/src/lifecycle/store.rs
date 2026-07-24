@@ -11,8 +11,8 @@ use serde::Deserialize;
 use crate::provider::{AgentProvider, AgentSessionKey};
 
 use super::{
-    ApplyOutcome, LIFECYCLE_SCHEMA_VERSION, LifecycleEvent, LifecycleSnapshot,
-    MAX_ACTIVE_SUBAGENTS, MAX_RECENT_TURNS,
+    ANTIGRAVITY_CHILD_BITS, ApplyOutcome, LIFECYCLE_SCHEMA_VERSION, LifecycleEvent,
+    LifecycleSnapshot, MAX_ACTIVE_SUBAGENTS, MAX_ANTIGRAVITY_INVOCATION_STEPS, MAX_RECENT_TURNS,
 };
 
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
@@ -368,8 +368,31 @@ fn valid_snapshot_shape(snapshot: &LifecycleSnapshot) -> bool {
                 .max()
                 .unwrap_or(0)
         && snapshot.sessions.iter().all(|(storage_key, state)| {
-            AgentSessionKey::from_storage_key(storage_key)
-                .is_some_and(|key| valid_id(&key.session_id))
+            let Some(key) = AgentSessionKey::from_storage_key(storage_key) else {
+                return false;
+            };
+            let antigravity_state_valid = match (
+                key.provider,
+                state.antigravity_initial_step,
+                state.antigravity_child_events.is_empty(),
+            ) {
+                (_, None, true) => true,
+                (AgentProvider::Antigravity, Some(floor), _) => {
+                    state.turn_open
+                        && state
+                            .current_turn
+                            .as_deref()
+                            .and_then(|turn| turn.strip_prefix("invocation-"))
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .is_some()
+                        && state.antigravity_child_events.len() <= MAX_ANTIGRAVITY_INVOCATION_STEPS
+                        && state.antigravity_child_events.iter().all(|(step, bits)| {
+                            *step >= floor && *bits != 0 && *bits & !ANTIGRAVITY_CHILD_BITS == 0
+                        })
+                }
+                _ => false,
+            };
+            valid_id(&key.session_id)
                 && valid_path(&state.cwd)
                 && state.transcript_path.as_deref().is_none_or(valid_path)
                 && state.current_turn.as_deref().is_none_or(valid_id)
@@ -380,6 +403,7 @@ fn valid_snapshot_shape(snapshot: &LifecycleSnapshot) -> bool {
                     .active_subagents
                     .keys()
                     .all(|agent_id| valid_id(agent_id))
+                && antigravity_state_valid
         })
 }
 
@@ -479,6 +503,27 @@ mod tests {
 
     fn key(session_id: &str) -> String {
         AgentSessionKey::native(AgentProvider::Codex, session_id).storage_key()
+    }
+
+    fn antigravity_invocation() -> LifecycleEvent {
+        let identity = super::super::LifecycleIdentity::try_new(
+            AgentProvider::Antigravity,
+            "agy-conversation-1".into(),
+            Some("invocation-1".into()),
+            None,
+            "/work/antigravity".into(),
+        )
+        .unwrap();
+        LifecycleEvent::from_parts_with_turn_initial_step(
+            identity,
+            super::super::LifecycleEventKind::UserPromptSubmit,
+            Some(5),
+        )
+        .unwrap()
+    }
+
+    fn antigravity_key() -> String {
+        AgentSessionKey::native(AgentProvider::Antigravity, "agy-conversation-1").storage_key()
     }
 
     #[test]
@@ -672,6 +717,122 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.read().unwrap().condition, StoreCondition::Corrupt);
+    }
+
+    #[test]
+    fn schema_two_snapshot_defaults_absent_antigravity_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LifecycleStore::at(temp.path());
+        fs::create_dir_all(store.hooks_dir()).unwrap();
+        let mut snapshot = LifecycleSnapshot::default();
+        snapshot.apply(prompt("session-1", "turn-1"), 1_000);
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let state = &json["sessions"][key("session-1")];
+        assert!(state.get("antigravity_initial_step").is_none());
+        assert!(state.get("antigravity_child_events").is_none());
+        fs::write(store.snapshot_path(), bytes).unwrap();
+
+        let loaded = store.read().unwrap().snapshot.unwrap();
+        let state = &loaded.sessions[&key("session-1")];
+        assert_eq!(state.antigravity_initial_step, None);
+        assert!(state.antigravity_child_events.is_empty());
+    }
+
+    #[test]
+    fn malformed_antigravity_authority_state_is_rejected() {
+        let assert_corrupt = |mutate: &dyn Fn(&mut LifecycleSnapshot), label: &str| {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LifecycleStore::at(temp.path());
+            fs::create_dir_all(store.hooks_dir()).unwrap();
+            let mut snapshot = LifecycleSnapshot::default();
+            snapshot.apply(antigravity_invocation(), 1_000);
+            mutate(&mut snapshot);
+            fs::write(
+                store.snapshot_path(),
+                serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.read().unwrap().condition,
+                StoreCondition::Corrupt,
+                "{label}"
+            );
+        };
+
+        assert_corrupt(
+            &|snapshot| {
+                let state = snapshot.sessions.get_mut(&antigravity_key()).unwrap();
+                state.turn_open = false;
+            },
+            "closed invocation",
+        );
+        assert_corrupt(
+            &|snapshot| {
+                let state = snapshot.sessions.get_mut(&antigravity_key()).unwrap();
+                state.current_turn = Some("turn-1".into());
+            },
+            "non-invocation turn",
+        );
+        assert_corrupt(
+            &|snapshot| {
+                snapshot
+                    .sessions
+                    .get_mut(&antigravity_key())
+                    .unwrap()
+                    .antigravity_child_events
+                    .insert(4, 1);
+            },
+            "below-floor step",
+        );
+        assert_corrupt(
+            &|snapshot| {
+                snapshot
+                    .sessions
+                    .get_mut(&antigravity_key())
+                    .unwrap()
+                    .antigravity_child_events
+                    .insert(5, 0);
+            },
+            "zero event bits",
+        );
+        assert_corrupt(
+            &|snapshot| {
+                snapshot
+                    .sessions
+                    .get_mut(&antigravity_key())
+                    .unwrap()
+                    .antigravity_child_events
+                    .insert(5, 1 << 7);
+            },
+            "unknown event bits",
+        );
+        assert_corrupt(
+            &|snapshot| {
+                let state = snapshot.sessions.get_mut(&antigravity_key()).unwrap();
+                for step in 5..=5 + super::super::MAX_ANTIGRAVITY_INVOCATION_STEPS as u64 {
+                    state.antigravity_child_events.insert(step, 1);
+                }
+            },
+            "child capacity",
+        );
+        assert_corrupt(
+            &|snapshot| {
+                let state = snapshot.sessions.get_mut(&antigravity_key()).unwrap();
+                state.antigravity_initial_step = None;
+                state.antigravity_child_events.insert(5, 1);
+            },
+            "children without floor",
+        );
+        assert_corrupt(
+            &|snapshot| {
+                let state = snapshot.sessions.remove(&antigravity_key()).unwrap();
+                snapshot
+                    .sessions
+                    .insert(key("codex-session-with-ag-state"), state);
+            },
+            "non-Antigravity provider",
+        );
     }
 
     #[test]

@@ -6,7 +6,10 @@ use std::time::Instant;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use coding_brain_core::lifecycle::{LifecycleEventName, LifecycleStore, ProjectedStatus};
+use coding_brain_core::lifecycle::{
+    ApplyOutcome, LifecycleEvent, LifecycleEventKind, LifecycleEventName, LifecycleIdentity,
+    LifecycleStore, ProjectedStatus,
+};
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use sha2::{Digest, Sha256};
 
@@ -98,6 +101,29 @@ fn assert_antigravity_rejected(event: Option<&str>, payload: &serde_json::Value,
     }
 }
 
+fn seed_antigravity_invocation(home: &std::path::Path, initial_step: u64) {
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Antigravity,
+        "agy-conversation-1".into(),
+        Some("invocation-1".into()),
+        Some("/tmp/agy-conversation-1/transcript.jsonl".into()),
+        home.to_path_buf(),
+    )
+    .unwrap();
+    let event = LifecycleEvent::from_parts_with_turn_initial_step(
+        identity,
+        LifecycleEventKind::UserPromptSubmit,
+        Some(initial_step),
+    )
+    .unwrap();
+    assert_eq!(
+        LifecycleStore::at(home.join(".local/state/coding-brain"))
+            .record(event)
+            .unwrap(),
+        ApplyOutcome::Applied
+    );
+}
+
 #[test]
 fn claude_lifecycle_hook_records_provider_qualified_stop() {
     let home = tempfile::tempdir().unwrap();
@@ -137,6 +163,7 @@ fn claude_lifecycle_hook_records_provider_qualified_stop() {
 #[test]
 fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     let post_home = tempfile::tempdir().unwrap();
+    seed_antigravity_invocation(post_home.path(), 5);
     let post = run_provider_hook_with_event(
         post_home.path(),
         Some("antigravity"),
@@ -169,6 +196,7 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     assert_eq!(row["session"]["provider"], "antigravity");
 
     let adversarial_home = tempfile::tempdir().unwrap();
+    seed_antigravity_invocation(adversarial_home.path(), 5);
     let mut adversarial: serde_json::Value =
         serde_json::from_slice(ANTIGRAVITY_POST_TOOL_USE).unwrap();
     adversarial["hookEventName"] = serde_json::json!("Stop");
@@ -196,10 +224,11 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     );
     assert_eq!(
         snapshot.sessions[&key].current_turn.as_deref(),
-        Some("step-5")
+        Some("invocation-1")
     );
 
     let pre_home = tempfile::tempdir().unwrap();
+    seed_antigravity_invocation(pre_home.path(), 5);
     let mut pre_payload: serde_json::Value =
         serde_json::from_slice(ANTIGRAVITY_PRE_TOOL_USE).unwrap();
     pre_payload["hookEventName"] = serde_json::json!("Stop");
@@ -225,7 +254,7 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     );
     assert_eq!(
         snapshot.sessions[&key].current_turn.as_deref(),
-        Some("step-5")
+        Some("invocation-1")
     );
     let activity = fs::read_to_string(
         pre_home
@@ -275,14 +304,22 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
         "transcriptPath": "/tmp/agy-conversation-1/transcript.jsonl",
         "artifactDirectoryPath": "/tmp/agy-conversation-1/artifacts"
     });
-    let invocation = run_provider_hook_with_event(
+    let pre_invocation = run_provider_hook_with_event(
         invocation_home.path(),
         Some("antigravity"),
         Some("PreInvocation"),
         &serde_json::to_vec(&invocation).unwrap(),
     );
-    assert!(invocation.status.success());
-    assert!(invocation.stderr.is_empty());
+    assert!(pre_invocation.status.success());
+    assert!(pre_invocation.stderr.is_empty());
+    let post_invocation = run_provider_hook_with_event(
+        invocation_home.path(),
+        Some("antigravity"),
+        Some("PostInvocation"),
+        &serde_json::to_vec(&invocation).unwrap(),
+    );
+    assert!(post_invocation.status.success());
+    assert!(post_invocation.stderr.is_empty());
     let snapshot = LifecycleStore::at(invocation_home.path().join(".local/state/coding-brain"))
         .read()
         .unwrap()
@@ -290,8 +327,13 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
         .unwrap();
     assert_eq!(
         snapshot.sessions[&key].latest_event,
-        Some(LifecycleEventName::UserPromptSubmit)
+        Some(LifecycleEventName::Stop)
     );
+    assert_eq!(
+        snapshot.sessions[&key].current_turn.as_deref(),
+        Some("invocation-3")
+    );
+    assert!(!snapshot.sessions[&key].turn_open);
 }
 
 #[test]
@@ -300,6 +342,7 @@ fn antigravity_optional_error_is_typed_and_false_idle_is_rejected() {
         serde_json::from_slice(ANTIGRAVITY_POST_TOOL_USE).unwrap();
     post_without_error.as_object_mut().unwrap().remove("error");
     let home = tempfile::tempdir().unwrap();
+    seed_antigravity_invocation(home.path(), 5);
     let output = run_provider_hook_with_event(
         home.path(),
         Some("antigravity"),

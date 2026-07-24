@@ -157,7 +157,8 @@ enum TrustedAntigravityEvent {
     Stop,
     PreToolUse,
     PostToolUse,
-    Invocation,
+    PreInvocation,
+    PostInvocation,
 }
 
 impl TrustedAntigravityEvent {
@@ -166,7 +167,8 @@ impl TrustedAntigravityEvent {
             Some("Stop") => Ok(Self::Stop),
             Some("PreToolUse") => Ok(Self::PreToolUse),
             Some("PostToolUse") => Ok(Self::PostToolUse),
-            Some("PreInvocation" | "PostInvocation") => Ok(Self::Invocation),
+            Some("PreInvocation") => Ok(Self::PreInvocation),
+            Some("PostInvocation") => Ok(Self::PostInvocation),
             Some(_) => Err(HookInputError::Invalid("antigravity hook event")),
             None => Err(HookInputError::Missing("antigravity hook event")),
         }
@@ -186,7 +188,7 @@ pub(crate) fn parse_lifecycle(
         required_path(input.artifact_directory_path, "artifactDirectoryPath")?;
     let cwd = required_workspace(input.workspace_paths)?;
 
-    let (event, turn_id, tool_use_id, tool_name, outcome) = match trusted_event {
+    let (event, turn_id, turn_initial_step, tool_use_id, tool_name, outcome) = match trusted_event {
         TrustedAntigravityEvent::Stop => {
             let execution = input
                 .execution_num
@@ -204,9 +206,26 @@ pub(crate) fn parse_lifecycle(
                 None,
                 None,
                 None,
+                None,
             )
         }
-        TrustedAntigravityEvent::Invocation => {
+        TrustedAntigravityEvent::PreInvocation => {
+            let invocation = input
+                .invocation_num
+                .ok_or(HookInputError::Missing("invocationNum"))?;
+            let initial_num_steps = input
+                .initial_num_steps
+                .ok_or(HookInputError::Missing("initialNumSteps"))?;
+            (
+                LifecycleEventKind::UserPromptSubmit,
+                format!("invocation-{invocation}"),
+                Some(initial_num_steps),
+                None,
+                None,
+                None,
+            )
+        }
+        TrustedAntigravityEvent::PostInvocation => {
             let invocation = input
                 .invocation_num
                 .ok_or(HookInputError::Missing("invocationNum"))?;
@@ -214,8 +233,9 @@ pub(crate) fn parse_lifecycle(
                 .initial_num_steps
                 .ok_or(HookInputError::Missing("initialNumSteps"))?;
             (
-                LifecycleEventKind::UserPromptSubmit,
+                LifecycleEventKind::Stop,
                 format!("invocation-{invocation}"),
+                None,
                 None,
                 None,
                 None,
@@ -232,6 +252,7 @@ pub(crate) fn parse_lifecycle(
             (
                 LifecycleEventKind::PreToolUse,
                 format!("step-{step}"),
+                None,
                 Some(format!("step-{step}")),
                 Some(tool_name),
                 None,
@@ -242,6 +263,7 @@ pub(crate) fn parse_lifecycle(
             (
                 LifecycleEventKind::PostToolUse,
                 format!("step-{step}"),
+                None,
                 Some(format!("step-{step}")),
                 None,
                 Some(input.error.outcome()),
@@ -258,6 +280,7 @@ pub(crate) fn parse_lifecycle(
     Ok(ParsedLifecycleHook {
         identity,
         event,
+        turn_initial_step,
         tool_use_id,
         tool_name,
         outcome,
@@ -330,5 +353,28 @@ mod tests {
         assert_eq!(parsed.event, LifecycleEventKind::PostToolUse);
         assert_eq!(parsed.tool_use_id.as_deref(), Some("step-5"));
         assert_eq!(parsed.tool_name, None);
+    }
+
+    #[test]
+    fn invocation_events_open_and_close_the_same_trajectory() {
+        let payload = serde_json::json!({
+            "invocationNum": 3,
+            "initialNumSteps": 10,
+            "conversationId": "agy-conversation-1",
+            "workspacePaths": ["/work/antigravity"],
+            "transcriptPath": "/tmp/agy-conversation-1/transcript.jsonl",
+            "artifactDirectoryPath": "/tmp/agy-conversation-1/artifacts"
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+
+        let pre = parse_lifecycle(Some("PreInvocation"), &raw).unwrap();
+        assert_eq!(pre.event, LifecycleEventKind::UserPromptSubmit);
+        assert_eq!(pre.identity.turn_id(), Some("invocation-3"));
+        assert_eq!(pre.turn_initial_step, Some(10));
+
+        let post = parse_lifecycle(Some("PostInvocation"), &raw).unwrap();
+        assert_eq!(post.event, LifecycleEventKind::Stop);
+        assert_eq!(post.identity.turn_id(), Some("invocation-3"));
+        assert_eq!(post.turn_initial_step, None);
     }
 }

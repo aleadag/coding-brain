@@ -186,7 +186,11 @@ fn run_provider_with_activity<R: Read, E: Write>(
     };
     parsed.live_process = crate::provider_hooks::live_parent_process(provider);
     let activity_input = LifecycleActivityInput::from_parsed(&parsed, &input);
-    let event = match LifecycleEvent::from_parts(parsed.identity.clone(), parsed.event.clone()) {
+    let event = match LifecycleEvent::from_parts_with_turn_initial_step(
+        parsed.identity.clone(),
+        parsed.event.clone(),
+        parsed.turn_initial_step,
+    ) {
         Ok(event) => event,
         Err(error) => {
             write_diagnostic(&mut stderr, error);
@@ -264,7 +268,11 @@ pub(crate) fn persist_provider_hook(
     };
     parsed.live_process = crate::provider_hooks::live_parent_process(provider);
     let activity_input = LifecycleActivityInput::from_parsed(&parsed, input);
-    let event = match LifecycleEvent::from_parts(parsed.identity.clone(), parsed.event.clone()) {
+    let event = match LifecycleEvent::from_parts_with_turn_initial_step(
+        parsed.identity.clone(),
+        parsed.event.clone(),
+        parsed.turn_initial_step,
+    ) {
         Ok(event) => event,
         Err(error) => {
             return Err(error.to_string());

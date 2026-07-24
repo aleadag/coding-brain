@@ -85,6 +85,7 @@ pub(crate) fn parse_lifecycle(raw: &[u8]) -> Result<ParsedLifecycleHook, HookInp
     Ok(ParsedLifecycleHook {
         identity: lifecycle.identity().clone(),
         event: lifecycle.kind().clone(),
+        turn_initial_step: lifecycle.turn_initial_step(),
         tool_use_id: activity.tool_use_id,
         tool_name: activity.tool_name,
         outcome,

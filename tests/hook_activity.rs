@@ -280,6 +280,29 @@ fn activity(home: &Path) -> ActivityStore {
     ActivityStore::at(home.join(".local/state/coding-brain/activity.jsonl"))
 }
 
+fn seed_antigravity_invocation(home: &Path, initial_step: u64) {
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Antigravity,
+        "agy-conversation-1".into(),
+        Some("invocation-1".into()),
+        Some("/tmp/agy-conversation-1/transcript.jsonl".into()),
+        home.to_path_buf(),
+    )
+    .unwrap();
+    let event = LifecycleEvent::from_parts_with_turn_initial_step(
+        identity,
+        LifecycleEventKind::UserPromptSubmit,
+        Some(initial_step),
+    )
+    .unwrap();
+    assert_eq!(
+        LifecycleStore::at(home.join(".local/state/coding-brain"))
+            .record(event)
+            .unwrap(),
+        ApplyOutcome::Applied
+    );
+}
+
 fn seed_ignored_permission(home: &Path, provider: AgentProvider, ignored_reason: IgnoreReason) {
     let (session_id, turn_id) = match provider {
         AgentProvider::Claude => ("claude-session-1", "claude-session-1"),
@@ -299,9 +322,15 @@ fn seed_ignored_permission(home: &Path, provider: AgentProvider, ignored_reason:
     let lifecycle = LifecycleStore::at(home.join(".local/state/coding-brain"));
     let record = |event| assert_eq!(lifecycle.record(event).unwrap(), ApplyOutcome::Applied);
     match ignored_reason {
-        IgnoreReason::Duplicate => record(
-            LifecycleEvent::permission(identity(turn_id), PermissionDisposition::Decided).unwrap(),
-        ),
+        IgnoreReason::Duplicate => {
+            if provider == AgentProvider::Antigravity {
+                seed_antigravity_invocation(home, 5);
+            }
+            record(
+                LifecycleEvent::permission(identity(turn_id), PermissionDisposition::Decided)
+                    .unwrap(),
+            );
+        }
         IgnoreReason::RecentTurn => {
             record(
                 LifecycleEvent::from_parts(identity(turn_id), LifecycleEventKind::UserPromptSubmit)
@@ -584,6 +613,7 @@ fn antigravity_permission_uses_exact_decisions_without_forbidden_overrides() {
     for (action, decision) in [("approve", "allow"), ("deny", "deny")] {
         let home = tempfile::tempdir().unwrap();
         install_model_fixture(home.path(), action);
+        seed_antigravity_invocation(home.path(), 5);
 
         let output = run_provider_permission_hook(
             home.path(),
@@ -761,6 +791,12 @@ fn model_allow_requires_applied_lifecycle_decision() {
             assert!(
                 events
                     .iter()
+                    .all(|event| event.state != ActivityState::Allowed),
+                "{provider_name} {ignored_reason:?}: fail-safe response projected as allow"
+            );
+            assert!(
+                events
+                    .iter()
                     .all(|event| event.state != ActivityState::Delivered),
                 "{provider_name} {ignored_reason:?}"
             );
@@ -774,6 +810,36 @@ fn model_allow_requires_applied_lifecycle_decision() {
 }
 
 #[test]
+fn antigravity_open_invocation_allows_in_range_step() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    seed_antigravity_invocation(home.path(), 5);
+
+    let output = run_provider_permission_hook(
+        home.path(),
+        "antigravity",
+        Some("PreToolUse"),
+        &antigravity_permission_payload(home.path(), None),
+    );
+
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({"decision": "allow"})
+    );
+    let events = activity(home.path()).read().unwrap().events().to_vec();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state == ActivityState::Allowed)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state == ActivityState::Delivered)
+    );
+}
+
+#[test]
 fn provider_allow_responses_omit_model_message() {
     for provider in ["codex", "claude", "antigravity"] {
         let home = tempfile::tempdir().unwrap();
@@ -783,6 +849,9 @@ fn provider_allow_responses_omit_model_message() {
             0.9,
             Some("approval detail must not escape"),
         );
+        if provider == "antigravity" {
+            seed_antigravity_invocation(home.path(), 5);
+        }
 
         let (event, payload) = match provider {
             "codex" => (None, permission_payload(home.path(), "cargo test")),
@@ -875,6 +944,7 @@ fn repeated_claude_synthesized_turn_id_suppresses_second_allow() {
 fn repeated_antigravity_synthesized_turn_id_asks_after_model_allow() {
     let home = tempfile::tempdir().unwrap();
     install_model_fixture(home.path(), "approve");
+    seed_antigravity_invocation(home.path(), 5);
     let payload = antigravity_permission_payload(home.path(), None);
 
     let first =
@@ -996,6 +1066,9 @@ fn provider_permissions_accept_8k_commands_with_bounded_activity() {
     for provider in ["claude", "antigravity"] {
         let home = tempfile::tempdir().unwrap();
         install_model_fixture(home.path(), "approve");
+        if provider == "antigravity" {
+            seed_antigravity_invocation(home.path(), 5);
+        }
         let command = "x".repeat(8 * 1024);
         let (event, payload) = if provider == "claude" {
             let mut payload: serde_json::Value =
@@ -1188,6 +1261,7 @@ fn antigravity_reason_is_redacted_and_bounded() {
 fn unsupported_antigravity_post_tool_use_is_observation_only() {
     for (step, tool) in [(5, "view_file"), (6, "grep_search")] {
         let home = tempfile::tempdir().unwrap();
+        seed_antigravity_invocation(home.path(), step);
         let permission = run_provider_permission_hook(
             home.path(),
             "antigravity",
