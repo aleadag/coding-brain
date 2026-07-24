@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
@@ -116,6 +117,10 @@ pub struct BrainApp {
     live_list: LiveList,
     live_attention_selection: usize,
     live_recent_selection: usize,
+    live_evidence_activity_id: Option<String>,
+    live_evidence_scroll: Cell<u16>,
+    live_evidence_page_size: Cell<u16>,
+    live_evidence_max_scroll: Cell<u16>,
     input: Option<BrainInput>,
     session_action_worker: SessionActionWorker,
     pending_action_status: Option<String>,
@@ -138,6 +143,10 @@ impl BrainApp {
             live_list: LiveList::Attention,
             live_attention_selection: 0,
             live_recent_selection: 0,
+            live_evidence_activity_id: None,
+            live_evidence_scroll: Cell::new(0),
+            live_evidence_page_size: Cell::new(1),
+            live_evidence_max_scroll: Cell::new(0),
             input: None,
             session_action_worker: SessionActionWorker::new(),
             pending_action_status: None,
@@ -239,6 +248,24 @@ impl BrainApp {
             KeyCode::Tab => {
                 self.tab = self.tab.next();
                 self.selection = 0;
+                self.reset_live_evidence_scroll();
+                None
+            }
+            KeyCode::PageDown if self.tab == BrainTab::Live => {
+                let next = self
+                    .live_evidence_scroll
+                    .get()
+                    .saturating_add(self.live_evidence_page_size.get())
+                    .min(self.live_evidence_max_scroll.get());
+                self.live_evidence_scroll.set(next);
+                None
+            }
+            KeyCode::PageUp if self.tab == BrainTab::Live => {
+                self.live_evidence_scroll.set(
+                    self.live_evidence_scroll
+                        .get()
+                        .saturating_sub(self.live_evidence_page_size.get()),
+                );
                 None
             }
             KeyCode::Char('J') if self.tab == BrainTab::Live => {
@@ -605,12 +632,14 @@ impl BrainApp {
         if len > 0 {
             let next = (self.live_selection(self.live_list) + 1).min(len - 1);
             *self.live_selection_mut(self.live_list) = next;
+            self.reset_live_evidence_scroll_if_selection_changed();
         }
     }
 
     fn move_live_selection_up(&mut self) {
         let current = self.live_selection(self.live_list);
         *self.live_selection_mut(self.live_list) = current.saturating_sub(1);
+        self.reset_live_evidence_scroll_if_selection_changed();
     }
 
     fn jump_live_list(&mut self, target: LiveList) {
@@ -619,6 +648,7 @@ impl BrainApp {
             let clamped = self.live_selection(target).min(len - 1);
             *self.live_selection_mut(target) = clamped;
             self.live_list = target;
+            self.reset_live_evidence_scroll_if_selection_changed();
         }
     }
 
@@ -640,6 +670,21 @@ impl BrainApp {
     fn clamp_selection(&mut self) {
         self.clamp_live_selection();
         self.selection = self.selection.min(self.current_len().saturating_sub(1));
+        self.reset_live_evidence_scroll_if_selection_changed();
+    }
+
+    fn reset_live_evidence_scroll(&self) {
+        self.live_evidence_scroll.set(0);
+    }
+
+    fn reset_live_evidence_scroll_if_selection_changed(&mut self) {
+        let selected = self
+            .selected_live_activity()
+            .map(|item| item.activity_id.clone());
+        if selected != self.live_evidence_activity_id {
+            self.reset_live_evidence_scroll();
+            self.live_evidence_activity_id = selected;
+        }
     }
 
     pub fn selected_live_activity(&self) -> Option<&ActivityItem> {
@@ -663,6 +708,21 @@ impl BrainApp {
         (self.live_list == LiveList::Recent)
             .then_some(self.live_recent_selection)
             .filter(|index| *index < self.snapshot.recent.len())
+    }
+
+    pub(crate) fn selected_live_is_attention(&self) -> bool {
+        self.live_list == LiveList::Attention
+    }
+
+    pub(crate) fn live_evidence_scroll(&self) -> u16 {
+        self.live_evidence_scroll.get()
+    }
+
+    pub(crate) fn update_live_evidence_metrics(&self, page_size: u16, max_scroll: u16) {
+        self.live_evidence_page_size.set(page_size.max(1));
+        self.live_evidence_max_scroll.set(max_scroll);
+        self.live_evidence_scroll
+            .set(self.live_evidence_scroll.get().min(max_scroll));
     }
 
     pub fn tab(&self) -> BrainTab {
@@ -846,6 +906,58 @@ mod tests {
             app.selected_live_activity().unwrap().activity_id,
             "recent-2"
         );
+    }
+
+    #[test]
+    fn live_evidence_page_keys_use_viewport_and_clamp() {
+        let (mut app, _) = fixture_app(true);
+        app.update_live_evidence_metrics(5, 12);
+
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.live_evidence_scroll(), 5);
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.live_evidence_scroll(), 10);
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.live_evidence_scroll(), 12);
+
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.live_evidence_scroll(), 7);
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.live_evidence_scroll(), 2);
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.live_evidence_scroll(), 0);
+    }
+
+    #[test]
+    fn live_evidence_scroll_resets_when_selection_changes() {
+        let (mut app, _) = fixture_app(true);
+        let mut second_attention = activity();
+        second_attention.activity_id = "attention-2".into();
+        app.snapshot.attention.push(AttentionItem {
+            activity: second_attention,
+            occurrences: 1,
+            unresolved_occurrences: 1,
+        });
+        let mut recent = activity();
+        recent.activity_id = "recent-1".into();
+        app.snapshot.recent.push(recent);
+        app.clamp_selection();
+
+        app.update_live_evidence_metrics(5, 20);
+        app.handle_key(key(KeyCode::PageDown));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.live_evidence_scroll(), 0);
+
+        app.update_live_evidence_metrics(5, 20);
+        app.handle_key(key(KeyCode::PageDown));
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(app.live_evidence_scroll(), 0);
+
+        app.update_live_evidence_metrics(5, 20);
+        app.handle_key(key(KeyCode::PageDown));
+        app.snapshot.recent.clear();
+        app.clamp_selection();
+        assert_eq!(app.live_evidence_scroll(), 0);
     }
 
     #[test]

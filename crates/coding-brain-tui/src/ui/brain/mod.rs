@@ -103,7 +103,7 @@ fn render_footer(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &Brain
             .map(str::to_owned)
             .unwrap_or_else(|| match app.tab() {
                 BrainTab::Live => {
-                    "j/k select  J/K lists  Enter switch  x action  c correct  Tab tabs  r refresh  q quit"
+                    "j/k select  J/K lists  PgUp/PgDn evidence  Enter switch  x action  c correct  Tab tabs  r refresh  q quit"
                         .into()
                 }
                 BrainTab::Review => {
@@ -229,12 +229,12 @@ mod tests {
         let recent_focused = render_text(&app);
 
         assert_eq!(
-            content_column(&attention_focused, "attention-1", "denied"),
-            content_column(&recent_focused, "attention-1", "denied")
+            content_column(&attention_focused, "attention-1", "SEND ?"),
+            content_column(&recent_focused, "attention-1", "SEND ?")
         );
         assert_eq!(
-            content_column(&attention_focused, "recent-1", "allowed"),
-            content_column(&recent_focused, "recent-1", "allowed")
+            content_column(&attention_focused, "recent-1", "ALLOW"),
+            content_column(&recent_focused, "recent-1", "ALLOW")
         );
         assert_eq!(attention_focused.matches("> ").count(), 1);
         assert_eq!(recent_focused.matches("> ").count(), 1);
@@ -261,6 +261,18 @@ mod tests {
     }
 
     #[test]
+    fn live_extreme_narrow_width_keeps_condition_and_project_visible() {
+        let text = render_text_at(&populated_live_app(), 30, 38);
+        let row = text
+            .lines()
+            .find(|line| line.contains("SEND ?"))
+            .unwrap_or_else(|| panic!("missing condition row:\n{text}"));
+
+        assert!(row.contains("project"), "{row}");
+        assert!(!row.contains("Codex"), "{row}");
+    }
+
+    #[test]
     fn live_narrow_evidence_height_is_content_bounded() {
         let app = populated_live_app_with_note(Some("wrapped evidence ".repeat(200)));
 
@@ -276,6 +288,114 @@ mod tests {
     }
 
     #[test]
+    fn live_evidence_is_urgency_first_complete_and_control_safe() {
+        let mut item = activity("attention-1", DeliveryState::Unknown);
+        item.project.label = Some("coding-brain".into());
+        item.normalized_command = Some("cargo test\n--workspace\u{1b}".into());
+        item.reasoning = Some("unsafe\u{1b} reason".into());
+        item.correction = Some(CorrectionDisposition::BrainRight);
+        item.note = Some("operator note".into());
+        let app = fixture_app(MockBrainRuntime {
+            activity_snapshot: ActivitySnapshot {
+                attention: vec![AttentionItem {
+                    activity: item,
+                    occurrences: 1,
+                    unresolved_occurrences: 1,
+                }],
+                unresolved_count: 1,
+                ..ActivitySnapshot::default()
+            },
+            endpoint_health: online(),
+            ..MockBrainRuntime::default()
+        });
+
+        let text = render_text_at(&app, 150, 38);
+        let outcome = text.find("OUTCOME").expect("Outcome section");
+        let action = text.find("ACTION").expect("Action section");
+        let context = text.find("CONTEXT").expect("Context section");
+
+        assert!(outcome < action && action < context, "{text}");
+        for expected in [
+            "RESOLVED",
+            "Confidence",
+            "Reason",
+            "Resolved",
+            "Note",
+            "cargo test\\n--workspace\\u{1b}",
+            "Project",
+            "coding-brain",
+            "Provider",
+            "Codex",
+            "Activity",
+            "attention-1",
+        ] {
+            assert!(text.contains(expected), "missing {expected}:\n{text}");
+        }
+        assert!(!text.contains('\u{1b}'), "raw escape in Evidence:\n{text}");
+    }
+
+    #[test]
+    fn live_compact_evidence_keeps_outcome_before_action_and_omits_absent_fields() {
+        let mut item = activity("attention-1", DeliveryState::Unknown);
+        item.confidence = None;
+        item.reasoning = None;
+        item.correction = None;
+        item.note = None;
+        let app = fixture_app(MockBrainRuntime {
+            activity_snapshot: ActivitySnapshot {
+                attention: vec![AttentionItem {
+                    activity: item,
+                    occurrences: 1,
+                    unresolved_occurrences: 1,
+                }],
+                unresolved_count: 1,
+                ..ActivitySnapshot::default()
+            },
+            endpoint_health: online(),
+            ..MockBrainRuntime::default()
+        });
+
+        let text = render_text_at(&app, 70, 30);
+        let status = text.find("Status").expect("Status");
+        let outcome = text.find("Outcome").expect("Outcome");
+        let action = text.find("Action").expect("Action");
+        let context = text.find("Context").expect("Context");
+
+        assert!(
+            status < outcome && outcome < action && action < context,
+            "{text}"
+        );
+        for absent in ["Confidence", "Reason", "Resolved", "Note"] {
+            assert!(
+                !text.contains(absent),
+                "found absent field {absent}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_evidence_scroll_shows_overflow_indicators_and_moves_content() {
+        let mut app = populated_live_app_with_note(Some(
+            (1..=40)
+                .map(|number| format!("evidence-{number:02}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+
+        let initial = render_text_at(&app, 120, 24);
+        assert!(initial.contains("↓ more"), "{initial}");
+
+        app.handle_key(key(KeyCode::PageDown));
+        let scrolled = render_text_at(&app, 120, 24);
+        assert!(scrolled.contains("↑ more"), "{scrolled}");
+        assert_ne!(initial, scrolled);
+
+        app.handle_key(key(KeyCode::Char('J')));
+        let reset = render_text_at(&app, 120, 24);
+        assert!(!reset.contains("↑ more"), "{reset}");
+    }
+
+    #[test]
     fn live_list_jumps_keep_highlight_and_evidence_in_sync() {
         let mut app = populated_live_app();
 
@@ -287,18 +407,16 @@ mod tests {
                 .lines()
                 .any(|line| line.contains("> ") && line.contains("recent-1"))
         );
-        assert!(recent.contains("Activity: recent-1"));
+        assert!(recent.contains("Activity    recent-1"));
 
         app.handle_key(key(KeyCode::Char('K')));
         let attention = render_text_at(&app, 120, 38);
         assert_eq!(attention.matches("> ").count(), 1);
         assert!(
-            attention
-                .lines()
-                .any(|line| line.contains("> denied · delivery unknown")),
+            attention.lines().any(|line| line.contains("> SEND ?")),
             "{attention}"
         );
-        assert!(attention.contains("Activity: attention-1"));
+        assert!(attention.contains("Activity    attention-1"));
     }
 
     #[test]
@@ -306,6 +424,7 @@ mod tests {
         let text = render_text(&populated_live_app());
 
         assert!(text.contains("J/K lists"), "{text}");
+        assert!(text.contains("PgUp/PgDn evidence"), "{text}");
     }
 
     #[test]
