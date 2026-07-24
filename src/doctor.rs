@@ -1026,6 +1026,7 @@ mod tests {
             session: Some(SessionTarget {
                 provider: coding_brain_core::provider::AgentProvider::Codex,
                 session_id: "doctor-session".into(),
+                provider_session_id: None,
                 turn_id: Some("doctor-turn".into()),
                 tool_use_id: tool_use_id.map(str::to_owned),
                 project_id,

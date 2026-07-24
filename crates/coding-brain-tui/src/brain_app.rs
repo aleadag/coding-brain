@@ -1856,6 +1856,7 @@ mod tests {
             session: Some(SessionTarget {
                 provider: coding_brain_core::provider::AgentProvider::Codex,
                 session_id: "session-1".into(),
+                provider_session_id: None,
                 turn_id: Some("turn-1".into()),
                 tool_use_id: Some("tool-1".into()),
                 project_id,

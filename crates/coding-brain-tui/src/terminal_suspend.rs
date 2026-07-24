@@ -479,6 +479,7 @@ mod tests {
         SessionTarget {
             provider: coding_brain_core::provider::AgentProvider::Codex,
             session_id: "session-1".into(),
+            provider_session_id: None,
             turn_id: None,
             tool_use_id: None,
             project_id: ProjectId::Stable("project-1".into()),

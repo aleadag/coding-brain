@@ -1065,6 +1065,7 @@ mod tests {
         SessionTarget {
             provider,
             session_id: id.into(),
+            provider_session_id: None,
             turn_id: None,
             tool_use_id: None,
             project_id: ProjectId::Stable("project".into()),
