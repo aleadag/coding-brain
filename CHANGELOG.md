@@ -44,6 +44,10 @@ All notable changes to codexctl are documented here.
   invocation. Stale, replayed, or post-invocation permission requests fall back
   to `ask`, and failed lifecycle persistence no longer appears as Allowed in
   Live.
+- Concurrent Codex subagents now keep lifecycle status, permission decisions,
+  tool outcomes, recovery, and navigation attached to the exact child turn.
+  Replayed, mismatched, or stopped child hooks cannot reuse another agent's
+  authority.
 
 ### Changed
 
@@ -70,9 +74,10 @@ All notable changes to codexctl are documented here.
   current Codex Bash executions when PermissionRequest omits `tool_use_id`.
   Opaque unified-exec responses produce a neutral Completed outcome, not a
   success result, and `coding-brain doctor` advises when runtime or attribution
-  coverage remains zero. New activity rows use schema v2 while v1 reads remain
-  supported; the upgrade performs no backfill or destructive migration.
-  Downgrading after v2 rows are written is unsupported, so back up
+  coverage remains zero. New activity rows and lifecycle snapshots use schema
+  v3 while older supported schemas remain readable; the upgrade performs no
+  backfill or destructive migration. Downgrading after v3 state is written is
+  unsupported, so back up
   `~/.local/state/coding-brain/activity.jsonl` before upgrading if rollback
   matters.
 - **Breaking:** the installed executable is now `coding-brain`; the crates.io

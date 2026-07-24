@@ -66,11 +66,34 @@ Current OpenAI Codex source constructs PostToolUse with the originating tool-use
 - The public hook contract does not expose stable unified-exec exit status inside `tool_response`; this issue should preserve existing outcome rendering but should not claim that arbitrary string output proves process success or failure.
 - Non-Bash permission outcomes still lack a general cross-event correlation key. The proposed fallback deliberately leaves those unmatched rather than risk misattribution; explicit telemetry makes that limitation visible for a later, evidence-backed design.
 
+## Follow-up Audit: `--record-outcome` Deprecation (2026-07-24)
+
+> **Confidence:** high — independently verified against every managed provider
+> hook, the CLI dispatch, the pending/resolved stores, and their report
+> consumers.
+
+No managed Codex, Claude, or Antigravity hook invokes `--record-outcome`;
+current `PostToolUse` definitions invoke `--lifecycle-hook`. The flag remains a
+public manual ingestion surface, however, and its separate spool preserves
+exit code, duration, stderr tail, and command detail that structured lifecycle
+activity currently reduces to a categorical outcome.
+
+Deprecate and eventually remove `--record-outcome` in a dedicated migration,
+not as part of the subagent-identity fix. Removal is safe only after deciding
+which detailed telemetry remains supported, moving retained
+`--brain-outcomes`/`--brain-baseline` behavior to structured activity, preserving
+or explicitly retiring existing resolved files, and giving external
+hand-written hook users a compatibility window. The dormant test-failure
+marker producer and legacy marker reader should be resolved in the same
+cleanup.
+
 ## Sources
 
 - [Codex hooks](https://learn.chatgpt.com/docs/hooks.md) — Primary/Official — retrieved 2026-07-22 — event fields and unified-exec hook coverage.
 - [Codex advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced.md) — Primary/Official — retrieved 2026-07-22 — unified-exec feature status/default.
 - [Coding Brain hook and outcome implementation](https://github.com/aleadag/coding-brain) — Primary/Project — inspected 2026-07-22 — active hook command, correlation, rendering, Doctor, and tests.
+- [Coding Brain current source at audit revision](https://github.com/aleadag/coding-brain/tree/025c41222f4e09a4dca50bc8ced2b870a509e8f4) — Primary/Project — inspected 2026-07-24 — managed hook commands, public CLI surface, raw outcome telemetry, and report consumers.
+- [Codex-only migration](https://github.com/aleadag/coding-brain/commit/1cc010c97808cf6f1ee5d230ebad9bfbcf00d6dc) — Primary/Project history — inspected 2026-07-24 — removed the only repository-owned `outcome-record.sh` producer while retaining the CLI pipeline.
 - [Local activity store aggregates](file:///home/alexander/.local/state/coding-brain/activity.jsonl) — Primary/Runtime — inspected 2026-07-22 — ID and outcome coverage counts; content not copied.
 - [OpenAI Codex unified-exec handler](https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/unified_exec.rs) and [tool output contract](https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/context.rs) — Primary/Official source — inspected 2026-07-22 — original ID/input and string-shaped response.
 
