@@ -349,6 +349,7 @@ impl RecoveryReservationStore {
             session: Some(SessionTarget {
                 provider: session.provider,
                 session_id: session.session_id.clone(),
+                provider_session_id: None,
                 turn_id: target.turn_id.clone(),
                 tool_use_id: target.pending_tool_use_id.clone(),
                 project_id,
@@ -625,6 +626,7 @@ fn append_recovery_audit(
             session: Some(SessionTarget {
                 provider: session.provider,
                 session_id: session.session_id.clone(),
+                provider_session_id: None,
                 turn_id: target.turn_id.clone(),
                 tool_use_id: target.pending_tool_use_id.clone(),
                 project_id,
@@ -1131,6 +1133,7 @@ fn append_process_attention(
         session: Some(SessionTarget {
             provider: target.attempt.session.provider,
             session_id: target.attempt.session.session_id.clone(),
+            provider_session_id: None,
             turn_id: None,
             tool_use_id: None,
             project_id,

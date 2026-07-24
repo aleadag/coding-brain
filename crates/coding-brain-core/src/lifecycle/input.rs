@@ -104,6 +104,8 @@ impl LifecycleEventKind {
 pub struct LifecycleIdentity {
     provider: AgentProvider,
     session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_session_id: Option<String>,
     turn_id: Option<String>,
     transcript_path: Option<PathBuf>,
     cwd: PathBuf,
@@ -117,7 +119,31 @@ impl LifecycleIdentity {
         transcript_path: Option<PathBuf>,
         cwd: PathBuf,
     ) -> Result<Self, LifecycleInputError> {
+        Self::try_new_with_provider_session(
+            provider,
+            session_id,
+            None,
+            turn_id,
+            transcript_path,
+            cwd,
+        )
+    }
+
+    pub fn try_new_with_provider_session(
+        provider: AgentProvider,
+        session_id: String,
+        provider_session_id: Option<String>,
+        turn_id: Option<String>,
+        transcript_path: Option<PathBuf>,
+        cwd: PathBuf,
+    ) -> Result<Self, LifecycleInputError> {
         validate_id("session_id", &session_id)?;
+        if let Some(provider_session_id) = provider_session_id.as_deref() {
+            validate_id("provider_session_id", provider_session_id)?;
+            if provider_session_id == session_id {
+                return Err(LifecycleInputError::Invalid("provider_session_id"));
+            }
+        }
         if let Some(turn_id) = turn_id.as_deref() {
             validate_id("turn_id", turn_id)?;
         }
@@ -128,6 +154,7 @@ impl LifecycleIdentity {
         Ok(Self {
             provider,
             session_id,
+            provider_session_id,
             turn_id,
             transcript_path,
             cwd,
@@ -140,6 +167,10 @@ impl LifecycleIdentity {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub fn provider_session_id(&self) -> Option<&str> {
+        self.provider_session_id.as_deref()
     }
 
     pub fn turn_id(&self) -> Option<&str> {
@@ -432,6 +463,51 @@ mod tests {
                 LifecycleEventName::SubagentStop,
                 LifecycleEventName::Stop,
             ]
+        );
+    }
+
+    #[test]
+    fn linked_identity_preserves_effective_and_provider_sessions() {
+        let identity = LifecycleIdentity::try_new_with_provider_session(
+            AgentProvider::Codex,
+            "child-1".into(),
+            Some("provider-1".into()),
+            Some("turn-1".into()),
+            Some(PathBuf::from("/tmp/rollout.jsonl")),
+            PathBuf::from("/work/project"),
+        )
+        .unwrap();
+
+        assert_eq!(identity.session_id(), "child-1");
+        assert_eq!(identity.provider_session_id(), Some("provider-1"));
+    }
+
+    #[test]
+    fn linked_identity_rejects_unbounded_or_self_linked_provider_session() {
+        for provider_session in ["", "child-1"] {
+            assert!(
+                LifecycleIdentity::try_new_with_provider_session(
+                    AgentProvider::Codex,
+                    "child-1".into(),
+                    Some(provider_session.into()),
+                    Some("turn-1".into()),
+                    None,
+                    PathBuf::from("/work/project"),
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            LifecycleIdentity::try_new_with_provider_session(
+                AgentProvider::Codex,
+                "child-1".into(),
+                Some("x".repeat(MAX_ID_BYTES + 1)),
+                Some("turn-1".into()),
+                None,
+                PathBuf::from("/work/project"),
+            )
+            .unwrap_err(),
+            LifecycleInputError::TooLong("provider_session_id")
         );
     }
 

@@ -510,6 +510,7 @@ mod tests {
             target: SessionTarget {
                 provider: AgentProvider::Claude,
                 session_id: "session-42".into(),
+                provider_session_id: None,
                 turn_id: Some("turn-7".into()),
                 tool_use_id: None,
                 project_id: crate::project::ProjectId::Stable("project-1".into()),

@@ -564,6 +564,7 @@ mod tests {
             target: coding_brain_core::brain_activity::SessionTarget {
                 provider: AgentProvider::Codex,
                 session_id: "live:opaque-native".into(),
+                provider_session_id: None,
                 turn_id: None,
                 tool_use_id: None,
                 project_id: coding_brain_core::project::ProjectId::Temporary("project".into()),

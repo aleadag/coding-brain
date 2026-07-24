@@ -1059,14 +1059,17 @@ mod tests {
         });
         let mut v1 = event_at("v1", ActivityState::Allowed, 1);
         v1.schema_version = 1;
+        let mut v2 = event_at("v2", ActivityState::Allowed, 2);
+        v2.schema_version = 2;
         fs::write(
             temp.path().join("activity.jsonl"),
-            format!("{}\n", serde_json::to_string(&v1).unwrap()),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&v1).unwrap(),
+                serde_json::to_string(&v2).unwrap()
+            ),
         )
         .unwrap();
-        store
-            .append(event_at("v2", ActivityState::Allowed, 2))
-            .unwrap();
 
         let versions = store
             .read()
@@ -1085,6 +1088,86 @@ mod tests {
             .map(|event| event.schema_version)
             .collect::<Vec<_>>();
         assert_eq!(versions, [1, 2]);
+    }
+
+    #[test]
+    fn mixed_activity_schema_versions_remain_readable() {
+        let (temp, store) = fixture_store();
+        let session = |provider_session_id| coding_brain_core::brain_activity::SessionTarget {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
+            session_id: "child-1".into(),
+            provider_session_id,
+            turn_id: Some("turn-1".into()),
+            tool_use_id: None,
+            project_id: ProjectId::Stable("project-1".into()),
+            cwd: PathBuf::from("/work/project"),
+            provider_hints: Vec::new(),
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
+        };
+        let mut schema_1 = event_at("schema-1", ActivityState::Allowed, 1);
+        schema_1.schema_version = 1;
+        schema_1.session = Some(session(None));
+        let mut schema_2 = event_at("schema-2", ActivityState::Allowed, 2);
+        schema_2.schema_version = 2;
+        schema_2.session = Some(session(None));
+        let mut schema_3 = event_at("schema-3", ActivityState::Allowed, 3);
+        schema_3.schema_version = 3;
+        schema_3.session = Some(session(Some("provider-1".into())));
+
+        let mut rows = [schema_1, schema_2, schema_3]
+            .into_iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>();
+        for row in &mut rows[..2] {
+            row["session"]
+                .as_object_mut()
+                .unwrap()
+                .remove("provider_session_id");
+        }
+        fs::write(
+            temp.path().join("activity.jsonl"),
+            rows.into_iter()
+                .map(|row| serde_json::to_string(&row).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let log = store.read().unwrap();
+        assert_eq!(log.events().len(), 3);
+        assert_eq!(
+            log.events()
+                .iter()
+                .map(|event| event.schema_version)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            log.events()[0]
+                .session
+                .as_ref()
+                .unwrap()
+                .provider_session_id,
+            None
+        );
+        assert_eq!(
+            log.events()[1]
+                .session
+                .as_ref()
+                .unwrap()
+                .provider_session_id,
+            None
+        );
+        assert_eq!(
+            log.events()[2]
+                .session
+                .as_ref()
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("provider-1")
+        );
     }
 
     #[test]
@@ -1178,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn current_writer_rejects_v1_and_reader_diagnoses_v3() {
+    fn current_writer_rejects_v1_and_reader_diagnoses_v4() {
         let (temp, store) = fixture_store();
         let mut v1 = event_at("v1", ActivityState::Allowed, 1);
         v1.schema_version = 1;
@@ -1187,11 +1270,11 @@ mod tests {
             Err(ActivityStoreError::UnsupportedSchema(1))
         ));
 
-        let mut v3 = event_at("v3", ActivityState::Allowed, 3);
-        v3.schema_version = 3;
+        let mut v4 = event_at("v4", ActivityState::Allowed, 4);
+        v4.schema_version = 4;
         fs::write(
             temp.path().join("activity.jsonl"),
-            format!("{}\n", serde_json::to_string(&v3).unwrap()),
+            format!("{}\n", serde_json::to_string(&v4).unwrap()),
         )
         .unwrap();
         assert_eq!(store.read().unwrap().diagnostics().malformed_rows, 1);
@@ -1213,8 +1296,12 @@ mod tests {
         )
         .unwrap();
         let mut outcome = event_at("mixed", ActivityState::Outcome, 2);
+        outcome.schema_version = 2;
         outcome.outcome = Some(ActivityOutcome::Completed);
-        store.append(outcome).unwrap();
+        let mut contents = fs::read_to_string(temp.path().join("activity.jsonl")).unwrap();
+        contents.push_str(&serde_json::to_string(&outcome).unwrap());
+        contents.push('\n');
+        fs::write(temp.path().join("activity.jsonl"), contents).unwrap();
         assert_eq!(
             store.snapshot(SnapshotLimits::default()).unwrap().recent[0].outcome,
             Some(ActivityOutcome::Completed)
@@ -1675,6 +1762,7 @@ mod tests {
         large.session = Some(coding_brain_core::brain_activity::SessionTarget {
             provider: coding_brain_core::provider::AgentProvider::Codex,
             session_id: "session".into(),
+            provider_session_id: None,
             turn_id: None,
             tool_use_id: None,
             project_id: ProjectId::Temporary("project".into()),
@@ -1914,6 +2002,7 @@ mod tests {
         oversized.session = Some(coding_brain_core::brain_activity::SessionTarget {
             provider: coding_brain_core::provider::AgentProvider::Codex,
             session_id: "s".repeat(5_000),
+            provider_session_id: None,
             turn_id: None,
             tool_use_id: None,
             project_id: ProjectId::Temporary("p".repeat(5_000)),

@@ -6,7 +6,7 @@ use crate::project::ProjectId;
 use crate::provider::AgentProvider;
 
 pub const MIN_ACTIVITY_SCHEMA_VERSION: u32 = 1;
-pub const ACTIVITY_SCHEMA_VERSION: u32 = 2;
+pub const ACTIVITY_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_INTERRUPTED_AFTER_MS: u64 = 30_000;
 pub const MAX_ACTIVITY_EVENT_BYTES: usize = 64 * 1024;
 pub const MAX_ACTIVITY_FIELD_BYTES: usize = 4_096;
@@ -26,6 +26,8 @@ pub struct SessionTarget {
     #[serde(default)]
     pub provider: AgentProvider,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,6 +160,10 @@ impl ActivityEvent {
         self.project.label = self.project.label.map(|value| bounded(&value, true));
         if let Some(session) = &mut self.session {
             session.session_id = bounded(&session.session_id, false);
+            session.provider_session_id = session
+                .provider_session_id
+                .take()
+                .map(|value| bounded(&value, false));
             session.turn_id = session.turn_id.take().map(|value| bounded(&value, false));
             session.tool_use_id = session
                 .tool_use_id
@@ -523,13 +529,45 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_serializes_neutral_completed() {
+    fn schema_v3_serializes_neutral_completed() {
         let mut activity = event("cargo test", "safe", "note");
         activity.state = ActivityState::Outcome;
         activity.outcome = Some(ActivityOutcome::Completed);
         let value = serde_json::to_value(activity).unwrap();
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         assert_eq!(value["outcome"], "completed");
+    }
+
+    #[test]
+    fn session_target_round_trips_provider_session_identity() {
+        let target = SessionTarget {
+            provider: AgentProvider::Codex,
+            session_id: "child-1".into(),
+            provider_session_id: Some("provider-1".into()),
+            turn_id: Some("turn-1".into()),
+            tool_use_id: None,
+            project_id: ProjectId::Stable("project-1".into()),
+            cwd: PathBuf::from("/work/project"),
+            provider_hints: vec![],
+            provenance: SessionTargetProvenance::Structured,
+        };
+        let value = serde_json::to_value(&target).unwrap();
+        assert_eq!(value["provider_session_id"], "provider-1");
+        assert_eq!(
+            serde_json::from_value::<SessionTarget>(value).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn legacy_session_target_defaults_provider_session_to_none() {
+        let target: SessionTarget = serde_json::from_value(serde_json::json!({
+            "session_id": "root-1",
+            "project_id": {"kind": "stable", "value": "project-1"},
+            "cwd": "/work/project"
+        }))
+        .unwrap();
+        assert_eq!(target.provider_session_id, None);
     }
 
     #[test]
@@ -613,6 +651,7 @@ mod tests {
         activity.session = Some(SessionTarget {
             provider: AgentProvider::Codex,
             session_id: "s".repeat(5_000),
+            provider_session_id: None,
             turn_id: Some("t".repeat(5_000)),
             tool_use_id: Some("u".repeat(5_000)),
             project_id: ProjectId::Temporary("q".repeat(5_000)),
@@ -639,6 +678,7 @@ mod tests {
         activity.session = Some(SessionTarget {
             provider: AgentProvider::Antigravity,
             session_id: "process:7:9:4:pts0".into(),
+            provider_session_id: None,
             turn_id: None,
             tool_use_id: None,
             project_id: ProjectId::Temporary("project".into()),
@@ -701,6 +741,7 @@ mod tests {
         activity.session = Some(SessionTarget {
             provider: AgentProvider::Codex,
             session_id: "session".into(),
+            provider_session_id: None,
             turn_id: Some("turn".into()),
             tool_use_id: Some("tool-use".into()),
             project_id: ProjectId::Temporary("project".into()),

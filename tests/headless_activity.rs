@@ -29,6 +29,7 @@ fn headless_emits_activity_without_a_session_roster() {
         session: Some(SessionTarget {
             provider: AgentProvider::Antigravity,
             session_id: "conversation-1".into(),
+            provider_session_id: None,
             turn_id: Some("turn-1".into()),
             tool_use_id: None,
             project_id: ProjectId::Stable("project-1".into()),

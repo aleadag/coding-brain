@@ -398,6 +398,10 @@ fn observation_event(
         session: Some(SessionTarget {
             provider: lifecycle.identity().provider(),
             session_id: lifecycle.identity().session_id().to_string(),
+            provider_session_id: lifecycle
+                .identity()
+                .provider_session_id()
+                .map(str::to_string),
             turn_id: lifecycle.identity().turn_id().map(str::to_string),
             tool_use_id: input
                 .tool_use_id
@@ -722,6 +726,10 @@ fn diagnostic_event(
         session: Some(SessionTarget {
             provider: lifecycle.identity().provider(),
             session_id: lifecycle.identity().session_id().to_string(),
+            provider_session_id: lifecycle
+                .identity()
+                .provider_session_id()
+                .map(str::to_string),
             turn_id: lifecycle.identity().turn_id().map(str::to_string),
             tool_use_id: input.normalized_tool_use_id(),
             project_id,
@@ -829,6 +837,7 @@ mod tests {
             session: Some(SessionTarget {
                 provider: AgentProvider::Codex,
                 session_id: "session-1".into(),
+                provider_session_id: None,
                 turn_id: Some("turn-1".into()),
                 tool_use_id: tool_use_id.map(str::to_owned),
                 project_id,
@@ -1334,6 +1343,7 @@ mod tests {
                 session: Some(SessionTarget {
                     provider: coding_brain_core::provider::AgentProvider::Codex,
                     session_id: "session-1".into(),
+                    provider_session_id: None,
                     turn_id: Some("turn-1".into()),
                     tool_use_id: Some("call-1".into()),
                     project_id,
@@ -1507,6 +1517,7 @@ mod tests {
                 session: Some(SessionTarget {
                     provider: coding_brain_core::provider::AgentProvider::Claude,
                     session_id: "session-1".into(),
+                    provider_session_id: None,
                     turn_id: Some("turn-1".into()),
                     tool_use_id: Some("call-1".into()),
                     project_id,
@@ -1578,6 +1589,7 @@ mod tests {
                 session: Some(SessionTarget {
                     provider: coding_brain_core::provider::AgentProvider::Codex,
                     session_id: "session-1".into(),
+                    provider_session_id: None,
                     turn_id: Some("turn-1".into()),
                     tool_use_id: Some("call-1".into()),
                     project_id,
@@ -1787,6 +1799,7 @@ mod tests {
                 session: Some(SessionTarget {
                     provider: coding_brain_core::provider::AgentProvider::Codex,
                     session_id: "session-1".into(),
+                    provider_session_id: None,
                     turn_id: Some("turn-1".into()),
                     tool_use_id: Some("call-1".into()),
                     project_id,
@@ -1864,6 +1877,7 @@ mod tests {
                 session: Some(SessionTarget {
                     provider: coding_brain_core::provider::AgentProvider::Codex,
                     session_id: "session-1".into(),
+                    provider_session_id: None,
                     turn_id: Some("turn-1".into()),
                     tool_use_id: None,
                     project_id,

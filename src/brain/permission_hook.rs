@@ -144,6 +144,7 @@ impl HookActivity {
         let session = SessionTarget {
             provider: request.lifecycle.provider(),
             session_id: request.lifecycle.session_id().to_string(),
+            provider_session_id: request.lifecycle.provider_session_id().map(str::to_string),
             turn_id: request.lifecycle.turn_id().map(str::to_string),
             tool_use_id: request.tool_use_id.clone(),
             project_id: identity.id().clone(),
