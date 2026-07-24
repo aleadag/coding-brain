@@ -4,7 +4,7 @@ use coding_brain_core::runtime::{BrainRuntime, MockBrainRuntime};
 fn final_runtime_exposes_only_brain_source_actions_and_navigation() {
     let runtime: BrainRuntime = MockBrainRuntime::default().into_runtime();
 
-    assert!(runtime.source.snapshot(Default::default()).is_ok());
+    assert!(runtime.source.refresh(Default::default()).is_ok());
     assert_eq!(runtime.source.gate_mode().as_str(), "on");
 }
 
