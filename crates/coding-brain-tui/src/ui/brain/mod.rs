@@ -157,6 +157,7 @@ mod tests {
                 unresolved_occurrences: 3,
             }],
             recent: vec![recent],
+            diagnostic_events: Vec::new(),
             unresolved_count: 4,
             diagnostics: Default::default(),
         };
@@ -216,6 +217,7 @@ mod tests {
                     unresolved_occurrences: 1,
                 }],
                 recent: vec![recent],
+                diagnostic_events: Vec::new(),
                 unresolved_count: 1,
                 diagnostics: Default::default(),
             },
@@ -716,6 +718,7 @@ mod tests {
                     unresolved_occurrences: 1,
                 }],
                 recent: vec![recent],
+                diagnostic_events: Vec::new(),
                 unresolved_count: 1,
                 diagnostics: Default::default(),
             },

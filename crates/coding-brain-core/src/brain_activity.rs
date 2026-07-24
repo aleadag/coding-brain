@@ -368,6 +368,7 @@ pub struct ActivityDiagnostics {
 pub struct ActivitySnapshot {
     pub attention: Vec<AttentionItem>,
     pub recent: Vec<ActivityItem>,
+    pub diagnostic_events: Vec<ActivityItem>,
     pub unresolved_count: usize,
     pub diagnostics: ActivityDiagnostics,
 }
@@ -376,6 +377,7 @@ pub struct ActivitySnapshot {
 pub struct SnapshotLimits {
     pub attention: usize,
     pub recent: usize,
+    pub diagnostic_events: usize,
     pub interrupted_after_ms: u64,
 }
 
@@ -384,6 +386,7 @@ impl Default for SnapshotLimits {
         Self {
             attention: 100,
             recent: 100,
+            diagnostic_events: 100,
             interrupted_after_ms: DEFAULT_INTERRUPTED_AFTER_MS,
         }
     }
