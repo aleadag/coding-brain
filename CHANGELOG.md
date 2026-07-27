@@ -36,8 +36,10 @@ All notable changes to codexctl are documented here.
 - Live corrections now target the selected Decision in either Needs Attention
   or Recent. Selectable rows across Live, Review, and Diagnostics now share a
   bold theme-aware highlight that makes the exact target clear.
-- Metadata-only correlation diagnostics no longer appear as Live errors;
-  genuine decision failures remain visible in Needs Attention.
+- Metadata-only correlation diagnostics no longer appear as Live errors, and
+  concurrent Codex hooks with unpaired PreToolUse and PostToolUse IDs no longer
+  create false orphan alerts when no Brain decision belongs to the batch.
+  Genuine decision failures remain visible in Needs Attention.
 - `coding-brain doctor` now warns when current Antigravity hooks are paired
   with `agy` 1.1.5, which may ignore valid `PreToolUse` decisions. Live reports
   successful hook writes as `response emitted` and reserves execution claims

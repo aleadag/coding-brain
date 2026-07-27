@@ -618,6 +618,18 @@ fn correlate_outcome(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
+    if anchors.is_empty()
+        && let Some(open_batch) = open_codex_pre_batch(log, identity, &tool_use_id)
+        && !open_batch.iter().any(|event| {
+            event.kind == ActivityKind::Decision
+                && event
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| matches_lifecycle_identity(session, identity))
+        })
+    {
+        return Correlation::None;
+    }
     if anchors.len() != 1 {
         return diagnostic_correlation(
             lifecycle,
@@ -689,6 +701,52 @@ fn correlate_outcome(
         activity_ids,
         "orphan outcome: Decision correlation is ambiguous or ineligible",
     )
+}
+
+fn open_codex_pre_batch<'a>(
+    log: &'a ActivityLog,
+    identity: &coding_brain_core::lifecycle::LifecycleIdentity,
+    tool_use_id: &str,
+) -> Option<&'a [ActivityEvent]> {
+    if identity.provider() != AgentProvider::Codex {
+        return None;
+    }
+    let open_start = log
+        .events()
+        .iter()
+        .rposition(|event| {
+            event.kind == ActivityKind::Lifecycle
+                && event.tool.as_deref() == Some("PostToolUse")
+                && event
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| matches_lifecycle_identity(session, identity))
+        })
+        .map_or(0, |index| index + 1);
+    let open_batch = &log.events()[open_start..];
+    let first_pre = open_batch.iter().position(|event| {
+        event.kind == ActivityKind::Lifecycle
+            && event.tool.as_deref() == Some("PreToolUse")
+            && event
+                .session
+                .as_ref()
+                .is_some_and(|session| matches_lifecycle_identity(session, identity))
+    })?;
+    let batch = &open_batch[first_pre..];
+    if !batch.iter().any(|event| {
+        event.kind == ActivityKind::Lifecycle
+            && event.tool.as_deref() == Some("PreToolUse")
+            && event.session.as_ref().is_some_and(|session| {
+                matches_lifecycle_identity(session, identity)
+                    && session
+                        .tool_use_id
+                        .as_deref()
+                        .is_some_and(|pre_id| pre_id != tool_use_id)
+            })
+    }) {
+        return None;
+    }
+    Some(batch)
 }
 
 fn unique_activity_ids<'a>(events: impl Iterator<Item = &'a ActivityEvent>) -> Vec<String> {
@@ -2273,6 +2331,303 @@ mod tests {
         assert!(events[0].decision_id.is_none());
         assert_eq!(events[1].kind, ActivityKind::Lifecycle);
         assert_eq!(events[1].tool.as_deref(), Some("PostToolUse"));
+    }
+
+    #[test]
+    fn concurrent_codex_id_mismatch_without_in_batch_decision_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        activity
+            .append(decision_event(
+                temp.path(),
+                "prior-unrelated",
+                1,
+                None,
+                "cargo check",
+                ActivityState::Denied,
+            ))
+            .unwrap();
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(temp.path(), "PreToolUse", "exec-pre", "cargo test", None),
+        );
+
+        let stderr = invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(
+                temp.path(),
+                "PostToolUse",
+                "exec-post",
+                "cargo test",
+                Some(serde_json::json!({"exit_code": 0})),
+            ),
+        );
+
+        assert!(stderr.is_empty(), "{stderr}");
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 0));
+        assert_eq!(
+            activity
+                .read()
+                .unwrap()
+                .events()
+                .iter()
+                .filter(|event| event.kind == ActivityKind::Lifecycle)
+                .map(|event| event.tool.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["PreToolUse", "PostToolUse"]
+        );
+    }
+
+    #[test]
+    fn concurrent_codex_id_mismatch_with_in_batch_decision_is_diagnostic() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(temp.path(), "PreToolUse", "exec-pre", "cargo test", None),
+        );
+        activity
+            .append(decision_event(
+                temp.path(),
+                "in-batch",
+                2,
+                None,
+                "cargo check",
+                ActivityState::Observed,
+            ))
+            .unwrap();
+
+        let stderr = invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(
+                temp.path(),
+                "PostToolUse",
+                "exec-post",
+                "cargo test",
+                Some(serde_json::json!({"exit_code": 0})),
+            ),
+        );
+
+        assert!(stderr.contains("orphan outcome"), "{stderr}");
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 1));
+    }
+
+    #[test]
+    fn idless_pre_before_in_batch_decision_keeps_codex_mismatch_diagnostic() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let mut idless_pre = hook_payload(temp.path(), "PreToolUse", "ignored", "cargo test", None);
+        idless_pre.as_object_mut().unwrap().remove("tool_use_id");
+        invoke_activity_hook(&lifecycle, &activity, idless_pre);
+        activity
+            .append(decision_event(
+                temp.path(),
+                "in-batch",
+                2,
+                None,
+                "cargo check",
+                ActivityState::Observed,
+            ))
+            .unwrap();
+        let later_lifecycle = LifecycleStore::at(temp.path().join("later-lifecycle"));
+        invoke_activity_hook(
+            &later_lifecycle,
+            &activity,
+            hook_payload(temp.path(), "PreToolUse", "exec-pre", "cargo test", None),
+        );
+
+        let stderr = invoke_activity_hook(
+            &later_lifecycle,
+            &activity,
+            hook_payload(
+                temp.path(),
+                "PostToolUse",
+                "exec-post",
+                "cargo test",
+                Some(serde_json::json!({"exit_code": 0})),
+            ),
+        );
+
+        assert!(stderr.contains("orphan outcome"), "{stderr}");
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 1));
+    }
+
+    #[test]
+    fn foreign_decision_inside_concurrent_codex_batch_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        activity
+            .append(decision_event(
+                temp.path(),
+                "prior-unrelated",
+                1,
+                None,
+                "cargo check",
+                ActivityState::Denied,
+            ))
+            .unwrap();
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(temp.path(), "PreToolUse", "exec-pre", "cargo test", None),
+        );
+        let mut foreign = decision_event(
+            temp.path(),
+            "foreign",
+            3,
+            None,
+            "cargo check",
+            ActivityState::Denied,
+        );
+        foreign.session.as_mut().unwrap().session_id = "foreign-session".into();
+        activity.append(foreign).unwrap();
+
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(
+                temp.path(),
+                "PostToolUse",
+                "exec-post",
+                "cargo test",
+                Some(serde_json::json!({"exit_code": 0})),
+            ),
+        );
+
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 0));
+    }
+
+    #[test]
+    fn mismatched_codex_post_closes_the_open_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        activity
+            .append(decision_event(
+                temp.path(),
+                "prior-unrelated",
+                1,
+                None,
+                "cargo check",
+                ActivityState::Denied,
+            ))
+            .unwrap();
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(temp.path(), "PreToolUse", "exec-pre", "cargo test", None),
+        );
+        let first_stderr = invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(
+                temp.path(),
+                "PostToolUse",
+                "exec-post-a",
+                "cargo test",
+                Some(serde_json::json!({"exit_code": 0})),
+            ),
+        );
+        let second_lifecycle = LifecycleStore::at(temp.path().join("second-lifecycle"));
+        let second_stderr = invoke_activity_hook(
+            &second_lifecycle,
+            &activity,
+            hook_payload(
+                temp.path(),
+                "PostToolUse",
+                "exec-post-b",
+                "cargo test",
+                Some(serde_json::json!({"exit_code": 0})),
+            ),
+        );
+
+        assert!(first_stderr.is_empty(), "{first_stderr}");
+        assert!(second_stderr.contains("orphan outcome"), "{second_stderr}");
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 1));
+    }
+
+    #[test]
+    fn duplicate_exact_pre_anchors_remain_diagnostic() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(temp.path(), "PreToolUse", "call-1", "cargo test", None),
+        );
+        let mut duplicate = activity.read().unwrap().events()[0].clone();
+        duplicate.activity_id = "duplicate-pre".into();
+        duplicate.recorded_at_ms += 1;
+        activity.append(duplicate).unwrap();
+
+        invoke_activity_hook(
+            &lifecycle,
+            &activity,
+            hook_payload(
+                temp.path(),
+                "PostToolUse",
+                "call-1",
+                "cargo test",
+                Some(serde_json::json!({"exit_code": 0})),
+            ),
+        );
+
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 1));
+    }
+
+    #[test]
+    fn non_codex_id_mismatch_remains_diagnostic() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let payload = |event: &str, call: &str, response: Option<Value>| {
+            let mut value = serde_json::json!({
+                "session_id": "claude-session",
+                "turn_id": "claude-turn",
+                "cwd": temp.path(),
+                "hook_event_name": event,
+                "tool_name": "Bash",
+                "tool_use_id": call,
+                "tool_input": {"command": "cargo test"}
+            });
+            if let Some(response) = response {
+                value["tool_response"] = response;
+            }
+            serde_json::to_vec(&value).unwrap()
+        };
+        persist_provider_hook(
+            AgentProvider::Claude,
+            None,
+            &payload("PreToolUse", "exec-pre", None),
+            &lifecycle,
+            Some(&activity),
+            None,
+        )
+        .unwrap();
+        persist_provider_hook(
+            AgentProvider::Claude,
+            None,
+            &payload(
+                "PostToolUse",
+                "exec-post",
+                Some(serde_json::json!({"exit_code": 0})),
+            ),
+            &lifecycle,
+            Some(&activity),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome_and_diagnostic_counts(&activity), (0, 1));
     }
 
     #[test]
