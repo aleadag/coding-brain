@@ -1,7 +1,7 @@
 # Live Evidence Relative Age Design
 
-Date: 2026-07-27  
-Issue: `codexctl-zsyk`  
+Date: 2026-07-27
+Issue: `codexctl-zsyk`
 Brainstorm: `codexctl-kp54`
 
 ## Goal
