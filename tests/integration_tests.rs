@@ -413,6 +413,11 @@ fn replace_jsonl(file: &mut tempfile::NamedTempFile, content: &str) {
     file.flush().unwrap();
 }
 
+fn append_jsonl_line(file: &mut tempfile::NamedTempFile, line: &str) {
+    writeln!(file, "{line}").unwrap();
+    file.flush().unwrap();
+}
+
 fn assert_generic_replacement_rescanned(extra_bytes: usize) {
     let original = r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":129200,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1},"content":[]}}"#;
     let (mut session, mut file) = make_session_with_jsonl(original);
@@ -508,13 +513,10 @@ fn generic_monitor_does_not_rescan_an_ordinary_append() {
     monitor::update_tokens(&mut session);
     assert_eq!(session.tool_usage["Bash"].calls, 1);
 
-    writeln!(
-        file,
-        "{}",
-        r#"{"type":"user","message":{"role":"user","content":[]}}"#
-    )
-    .unwrap();
-    file.flush().unwrap();
+    append_jsonl_line(
+        &mut file,
+        r#"{"type":"user","message":{"role":"user","content":[]}}"#,
+    );
     monitor::update_tokens(&mut session);
 
     assert_eq!(session.tool_usage["Bash"].calls, 1);
@@ -529,13 +531,10 @@ fn codex_monitor_does_not_rescan_an_ordinary_append() {
     monitor::update_tokens(&mut session);
     assert_eq!(session.tool_usage["exec_command"].calls, 1);
 
-    writeln!(
-        file,
-        "{}",
-        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"continuing"}}"#
-    )
-    .unwrap();
-    file.flush().unwrap();
+    append_jsonl_line(
+        &mut file,
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"continuing"}}"#,
+    );
     monitor::update_tokens(&mut session);
 
     assert_eq!(session.tool_usage["exec_command"].calls, 1);
@@ -558,13 +557,10 @@ fn context_pressure_codex_monitor_uses_provider_then_fallback_and_resets() {
     monitor::update_tokens(&mut session);
     assert_eq!(session.context_pressure, Some(50));
 
-    writeln!(
-        file,
-        "{}",
-        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2}}}}"#
-    )
-    .unwrap();
-    file.flush().unwrap();
+    append_jsonl_line(
+        &mut file,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2}}}}"#,
+    );
     monitor::update_tokens(&mut session);
     assert_eq!(session.context_pressure, Some(50));
 
@@ -600,33 +596,24 @@ fn context_pressure_generic_monitor_retains_valid_value_until_truncation() {
     monitor::update_tokens(&mut session);
     assert_eq!(session.context_pressure, Some(50));
 
-    writeln!(
-        file,
-        "{}",
-        r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":"not-a-number","cache_read_input_tokens":7,"cache_creation_input_tokens":9,"output_tokens":2},"content":[]}}"#
-    )
-    .unwrap();
-    file.flush().unwrap();
+    append_jsonl_line(
+        &mut file,
+        r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":"not-a-number","cache_read_input_tokens":7,"cache_creation_input_tokens":9,"output_tokens":2},"content":[]}}"#,
+    );
     monitor::update_tokens(&mut session);
     assert_eq!(session.context_pressure, Some(50));
 
-    writeln!(
-        file,
-        "{}",
-        r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":1,"cache_read_input_tokens":"not-a-number","cache_creation_input_tokens":0,"output_tokens":0},"content":[]}}"#
-    )
-    .unwrap();
-    file.flush().unwrap();
+    append_jsonl_line(
+        &mut file,
+        r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":1,"cache_read_input_tokens":"not-a-number","cache_creation_input_tokens":0,"output_tokens":0},"content":[]}}"#,
+    );
     monitor::update_tokens(&mut session);
     assert_eq!(session.context_pressure, Some(50));
 
-    writeln!(
-        file,
-        "{}",
-        r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":"not-a-number","output_tokens":0},"content":[]}}"#
-    )
-    .unwrap();
-    file.flush().unwrap();
+    append_jsonl_line(
+        &mut file,
+        r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":"not-a-number","output_tokens":0},"content":[]}}"#,
+    );
     monitor::update_tokens(&mut session);
     assert_eq!(session.context_pressure, Some(50));
 
