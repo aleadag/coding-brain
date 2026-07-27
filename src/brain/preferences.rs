@@ -24,8 +24,6 @@ pub(super) fn is_work_hour(h: u8) -> bool {
 /// Condition for a conditional preference pattern.
 #[derive(Debug, Clone)]
 pub enum PreferenceCondition {
-    CostBelow(f64),
-    CostAbove(f64),
     ContextBelow(u8),
     ContextAbove(u8),
     NoErrors,
@@ -41,8 +39,6 @@ impl PreferenceCondition {
     /// Compact human-readable suffix for prompt rendering.
     pub fn label(&self) -> String {
         match self {
-            PreferenceCondition::CostBelow(v) => format!("cost<${v:.0}"),
-            PreferenceCondition::CostAbove(v) => format!("cost>${v:.0}"),
             PreferenceCondition::ContextBelow(v) => format!("ctx<{v}%"),
             PreferenceCondition::ContextAbove(v) => format!("ctx>{v}%"),
             PreferenceCondition::NoErrors => "no errors".to_string(),
@@ -56,12 +52,6 @@ impl PreferenceCondition {
     /// Serialize to JSON value.
     pub(super) fn to_json(&self) -> serde_json::Value {
         match self {
-            PreferenceCondition::CostBelow(v) => {
-                serde_json::json!({"type": "cost_below", "value": v})
-            }
-            PreferenceCondition::CostAbove(v) => {
-                serde_json::json!({"type": "cost_above", "value": v})
-            }
             PreferenceCondition::ContextBelow(v) => {
                 serde_json::json!({"type": "context_below", "value": v})
             }
@@ -84,8 +74,6 @@ impl PreferenceCondition {
     pub(super) fn from_json(v: &serde_json::Value) -> Option<Self> {
         let typ = v.get("type")?.as_str()?;
         match typ {
-            "cost_below" => Some(PreferenceCondition::CostBelow(v.get("value")?.as_f64()?)),
-            "cost_above" => Some(PreferenceCondition::CostAbove(v.get("value")?.as_f64()?)),
             "context_below" => Some(PreferenceCondition::ContextBelow(
                 v.get("value")?.as_u64()? as u8
             )),
@@ -135,6 +123,11 @@ pub struct TemporalPattern {
     pub strength: f64,
 }
 
+pub(super) fn is_legacy_cost_temporal(description: &str) -> bool {
+    let description = description.to_ascii_lowercase();
+    description.contains("burn rate") || description.contains("burn-rate")
+}
+
 /// Per-tool accuracy tracking for adaptive confidence thresholds.
 #[derive(Debug, Clone)]
 pub struct ToolAccuracy {
@@ -182,20 +175,15 @@ fn best_split(decisions: &[&DecisionRecord]) -> Option<(PreferenceCondition, Pre
         return None;
     }
 
-    let total_pos = enriched.iter().filter(|(d, _)| d.is_positive()).count() as u32;
-    let total_neg = enriched.iter().filter(|(d, _)| d.is_negative()).count() as u32;
-    let parent_gini = gini_impurity(total_pos, total_neg);
-
-    if parent_gini < 0.01 {
-        return None; // Already pure, no split needed
-    }
-
-    let total = enriched.len() as f64;
     let mut best_gain = 0.0f64;
     let mut best_result: Option<(PreferenceCondition, PreferenceCondition)> = None;
 
     // Helper: compute weighted gini for a boolean split
     let try_split = |left: &[bool], decisions: &[(&DecisionRecord, &DecisionContext)]| -> f64 {
+        let total_pos = decisions.iter().filter(|(d, _)| d.is_positive()).count() as u32;
+        let total_neg = decisions.iter().filter(|(d, _)| d.is_negative()).count() as u32;
+        let parent_gini = gini_impurity(total_pos, total_neg);
+        let total = decisions.len() as f64;
         let mut l_pos = 0u32;
         let mut l_neg = 0u32;
         let mut r_pos = 0u32;
@@ -224,39 +212,26 @@ fn best_split(decisions: &[&DecisionRecord]) -> Option<(PreferenceCondition, Pre
         parent_gini - weighted
     };
 
-    // Split on cost_usd median
-    {
-        let mut costs: Vec<f64> = enriched.iter().map(|(_, ctx)| ctx.cost_usd).collect();
-        costs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = costs[costs.len() / 2];
-        if median > 0.0 {
-            let left_mask: Vec<bool> = enriched
-                .iter()
-                .map(|(_, ctx)| ctx.cost_usd < median)
-                .collect();
-            let gain = try_split(&left_mask, &enriched);
-            if gain > best_gain {
-                best_gain = gain;
-                best_result = Some((
-                    PreferenceCondition::CostBelow(median),
-                    PreferenceCondition::CostAbove(median),
-                ));
-            }
-        }
-    }
-
     // Split on context_pct median
     {
-        let mut pcts: Vec<u8> = enriched.iter().map(|(_, ctx)| ctx.context_pct).collect();
+        let context_enriched = enriched
+            .iter()
+            .filter(|(_, ctx)| ctx.context_pct.is_some())
+            .copied()
+            .collect::<Vec<_>>();
+        let mut pcts: Vec<u8> = context_enriched
+            .iter()
+            .filter_map(|(_, ctx)| ctx.context_pct)
+            .collect();
         pcts.sort();
-        let median = pcts[pcts.len() / 2];
-        if median > 0 && median < 100 {
-            let left_mask: Vec<bool> = enriched
+        if pcts.len() >= 5 {
+            let median = pcts[pcts.len() / 2];
+            let left_mask: Vec<bool> = context_enriched
                 .iter()
-                .map(|(_, ctx)| ctx.context_pct < median)
+                .map(|(_, ctx)| ctx.context_pct.is_some_and(|pct| pct < median))
                 .collect();
-            let gain = try_split(&left_mask, &enriched);
-            if gain > best_gain {
+            let gain = try_split(&left_mask, &context_enriched);
+            if median > 0 && median < 100 && gain > best_gain {
                 best_gain = gain;
                 best_result = Some((
                     PreferenceCondition::ContextBelow(median),
@@ -401,50 +376,6 @@ fn detect_temporal_patterns(decisions: &[DecisionRecord]) -> Vec<TemporalPattern
         }
     }
 
-    // --- Cost pressure: rejection rate by burn rate quartile ---
-    {
-        let mut burn_rates: Vec<f64> = decisions
-            .iter()
-            .filter_map(|d| d.context.as_ref().map(|ctx| ctx.burn_rate_per_hr))
-            .filter(|r| *r > 0.0)
-            .collect();
-        burn_rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        if burn_rates.len() >= 8 {
-            let q3_idx = burn_rates.len() * 3 / 4;
-            let q3_threshold = burn_rates[q3_idx];
-            let high_burn: Vec<&DecisionRecord> = decisions
-                .iter()
-                .filter(|d| {
-                    d.context
-                        .as_ref()
-                        .map(|ctx| ctx.burn_rate_per_hr >= q3_threshold)
-                        .unwrap_or(false)
-                })
-                .collect();
-            let decided: Vec<&&DecisionRecord> = high_burn
-                .iter()
-                .filter(|d| d.is_positive() || d.is_negative())
-                .collect();
-            if decided.len() >= 3 {
-                let denied = decided.iter().filter(|d| d.is_negative()).count();
-                let rate = denied as f64 / decided.len() as f64;
-                if rate > 0.5 {
-                    patterns.push(TemporalPattern {
-                        description: format!(
-                            "High burn rate (>${:.1}/hr): rejection rate {:.0}% (n={})",
-                            q3_threshold,
-                            rate * 100.0,
-                            decided.len()
-                        ),
-                        sample_count: decided.len() as u32,
-                        strength: rate,
-                    });
-                }
-            }
-        }
-    }
-
     // --- Context pressure: approval rate drop when context >80% ---
     {
         let high_ctx: Vec<&DecisionRecord> = decisions
@@ -452,8 +383,8 @@ fn detect_temporal_patterns(decisions: &[DecisionRecord]) -> Vec<TemporalPattern
             .filter(|d| {
                 d.context
                     .as_ref()
-                    .map(|ctx| ctx.context_pct > 80)
-                    .unwrap_or(false)
+                    .and_then(|ctx| ctx.context_pct)
+                    .is_some_and(|pct| pct > 80)
             })
             .collect();
         let low_ctx: Vec<&DecisionRecord> = decisions
@@ -461,8 +392,8 @@ fn detect_temporal_patterns(decisions: &[DecisionRecord]) -> Vec<TemporalPattern
             .filter(|d| {
                 d.context
                     .as_ref()
-                    .map(|ctx| ctx.context_pct <= 80)
-                    .unwrap_or(false)
+                    .and_then(|ctx| ctx.context_pct)
+                    .is_some_and(|pct| pct <= 80)
             })
             .collect();
 
@@ -647,10 +578,12 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
                         .iter()
                         .filter(|d| {
                             d.context.as_ref().is_some_and(|ctx| match &cond {
-                                PreferenceCondition::CostBelow(v) => ctx.cost_usd < *v,
-                                PreferenceCondition::CostAbove(v) => ctx.cost_usd >= *v,
-                                PreferenceCondition::ContextBelow(v) => ctx.context_pct < *v,
-                                PreferenceCondition::ContextAbove(v) => ctx.context_pct >= *v,
+                                PreferenceCondition::ContextBelow(v) => {
+                                    ctx.context_pct.is_some_and(|pct| pct < *v)
+                                }
+                                PreferenceCondition::ContextAbove(v) => {
+                                    ctx.context_pct.is_some_and(|pct| pct >= *v)
+                                }
                                 PreferenceCondition::NoErrors => !ctx.last_tool_error,
                                 PreferenceCondition::HasErrors => ctx.last_tool_error,
                                 PreferenceCondition::NoFileConflict => !ctx.has_file_conflict,
@@ -816,7 +749,12 @@ pub(super) fn extract_command_keyword(command: Option<&str>) -> Option<String> {
 /// Format distilled preferences as a compact prompt section.
 /// This replaces verbose few-shot examples for small context windows.
 pub fn format_preference_summary(prefs: &DistilledPreferences) -> String {
-    if prefs.patterns.is_empty() && prefs.tool_accuracy.is_empty() && prefs.temporal.is_empty() {
+    let temporal = prefs
+        .temporal
+        .iter()
+        .filter(|pattern| !is_legacy_cost_temporal(&pattern.description))
+        .collect::<Vec<_>>();
+    if prefs.patterns.is_empty() && prefs.tool_accuracy.is_empty() && temporal.is_empty() {
         return String::new();
     }
 
@@ -882,9 +820,9 @@ pub fn format_preference_summary(prefs: &DistilledPreferences) -> String {
     }
 
     // Temporal patterns (situational rules)
-    if !prefs.temporal.is_empty() {
+    if !temporal.is_empty() {
         lines.push("Situational rules:".to_string());
-        for tp in &prefs.temporal {
+        for tp in temporal {
             lines.push(format!("- {}", tp.description));
         }
     }
@@ -962,10 +900,9 @@ mod tests {
         }
     }
 
-    fn make_context(cost_usd: f64, context_pct: u8, last_tool_error: bool) -> DecisionContext {
+    fn make_context(context_pct: u8, last_tool_error: bool) -> DecisionContext {
         DecisionContext {
-            cost_usd,
-            context_pct,
+            context_pct: Some(context_pct),
             last_tool_error,
             error_message: if last_tool_error {
                 Some("test error".to_string())
@@ -978,22 +915,16 @@ mod tests {
             total_tool_calls: 10,
             has_file_conflict: false,
             status: "Working".into(),
-            burn_rate_per_hr: 1.0,
             recent_error_count: if last_tool_error { 1 } else { 0 },
             subagent_count: 0,
             hour: None,
         }
     }
 
-    fn make_context_with_hour(
-        cost_usd: f64,
-        context_pct: u8,
-        last_tool_error: bool,
-        hour: u8,
-    ) -> DecisionContext {
+    fn make_context_with_hour(context_pct: u8, last_tool_error: bool, hour: u8) -> DecisionContext {
         DecisionContext {
             hour: Some(hour),
-            ..make_context(cost_usd, context_pct, last_tool_error)
+            ..make_context(context_pct, last_tool_error)
         }
     }
 
@@ -1204,38 +1135,6 @@ mod tests {
     // ── Multi-level learning tests ───────────────────────────────────
 
     #[test]
-    fn test_conditional_split_on_cost() {
-        // Low-cost decisions: all accepted. High-cost decisions: all rejected.
-        // Should produce a cost-based split.
-        let mut decisions = Vec::new();
-        for _ in 0..5 {
-            decisions.push(make_decision_with_context(
-                "Bash",
-                "proj",
-                "accept",
-                make_context(1.0, 50, false),
-            ));
-        }
-        for _ in 0..5 {
-            decisions.push(make_decision_with_context(
-                "Bash",
-                "proj",
-                "reject",
-                make_context(10.0, 50, false),
-            ));
-        }
-
-        let prefs = distill_preferences(&decisions);
-        // Should have conditional patterns (split on cost)
-        let conditional = prefs.patterns.iter().any(|p| !p.conditions.is_empty());
-        assert!(
-            conditional,
-            "Expected conditional patterns from cost split, got: {:?}",
-            prefs.patterns
-        );
-    }
-
-    #[test]
     fn test_conditional_split_on_error() {
         // No-error decisions: all accepted. Error decisions: all rejected.
         let mut decisions = Vec::new();
@@ -1244,7 +1143,7 @@ mod tests {
                 "Bash",
                 "proj",
                 "accept",
-                make_context(5.0, 50, false),
+                make_context(50, false),
             ));
         }
         for _ in 0..5 {
@@ -1252,7 +1151,7 @@ mod tests {
                 "Bash",
                 "proj",
                 "reject",
-                make_context(5.0, 50, true),
+                make_context(50, true),
             ));
         }
 
@@ -1267,16 +1166,15 @@ mod tests {
 
     #[test]
     fn test_no_split_when_ambiguous() {
-        // Even mix of accept/reject at all cost levels — no meaningful split
+        // Even mix of accept/reject with identical context — no meaningful split
         let mut decisions = Vec::new();
         for i in 0..10 {
             let action = if i % 2 == 0 { "accept" } else { "reject" };
-            let cost = (i as f64) + 1.0; // Different costs but same 50/50 split
             decisions.push(make_decision_with_context(
                 "Bash",
                 "proj",
                 action,
-                make_context(cost, 50, false),
+                make_context(50, false),
             ));
         }
 
@@ -1287,6 +1185,44 @@ mod tests {
             !conditional,
             "Expected no conditional patterns for ambiguous data"
         );
+    }
+
+    #[test]
+    fn unavailable_context_pressure_is_not_matched_or_split_as_low() {
+        let mut decisions = Vec::new();
+        for _ in 0..5 {
+            decisions.push(make_decision_with_context(
+                "Bash",
+                "proj",
+                "accept",
+                make_context(30, false),
+            ));
+        }
+        for _ in 0..5 {
+            let mut context = make_context(90, false);
+            context.context_pct = None;
+            decisions.push(make_decision_with_context(
+                "Bash", "proj", "accept", context,
+            ));
+        }
+        for _ in 0..5 {
+            decisions.push(make_decision_with_context(
+                "Bash",
+                "proj",
+                "reject",
+                make_context(90, false),
+            ));
+        }
+
+        let preferences = distill_preferences(&decisions);
+        let conditional = preferences
+            .patterns
+            .iter()
+            .filter(|pattern| !pattern.conditions.is_empty())
+            .collect::<Vec<_>>();
+
+        assert_eq!(conditional.len(), 2);
+        assert!(conditional.iter().all(|pattern| pattern.sample_count == 5));
     }
 
     #[test]
@@ -1304,7 +1240,7 @@ mod tests {
                 brain_confidence: 0.9,
                 brain_reasoning: "safe".into(),
                 user_action: "accept".into(),
-                context: Some(make_context(1.0, 50, false)),
+                context: Some(make_context(50, false)),
                 outcome: None,
                 decision_type: DecisionType::Session,
                 suggested_at: None,
@@ -1326,7 +1262,7 @@ mod tests {
                 brain_confidence: 0.9,
                 brain_reasoning: "safe".into(),
                 user_action: "accept".into(),
-                context: Some(make_context(1.5, 55, true)),
+                context: Some(make_context(55, true)),
                 outcome: None,
                 decision_type: DecisionType::Session,
                 suggested_at: None,
@@ -1367,7 +1303,7 @@ mod tests {
                 brain_confidence: 0.9,
                 brain_reasoning: "test".into(),
                 user_action: "accept".into(),
-                context: Some(make_context(1.0, 50, true)),
+                context: Some(make_context(50, true)),
                 outcome: None,
                 decision_type: DecisionType::Session,
                 suggested_at: None,
@@ -1391,7 +1327,7 @@ mod tests {
             brain_confidence: 0.9,
             brain_reasoning: "test".into(),
             user_action: "reject".into(),
-            context: Some(make_context(1.0, 50, false)),
+            context: Some(make_context(50, false)),
             outcome: None,
             decision_type: DecisionType::Session,
             suggested_at: None,
@@ -1415,7 +1351,7 @@ mod tests {
                 brain_confidence: 0.9,
                 brain_reasoning: "test".into(),
                 user_action: "accept".into(),
-                context: Some(make_context(1.0, 50, true)),
+                context: Some(make_context(50, true)),
                 outcome: None,
                 decision_type: DecisionType::Session,
                 suggested_at: None,
@@ -1438,7 +1374,7 @@ mod tests {
             brain_confidence: 0.9,
             brain_reasoning: "test".into(),
             user_action: "reject".into(),
-            context: Some(make_context(1.0, 50, false)),
+            context: Some(make_context(50, false)),
             outcome: None,
             decision_type: DecisionType::Session,
             suggested_at: None,
@@ -1469,7 +1405,7 @@ mod tests {
                 "Bash",
                 "proj",
                 "accept",
-                make_context(1.0, 30, false),
+                make_context(30, false),
             ));
         }
         // 5 high-context rejects
@@ -1478,7 +1414,7 @@ mod tests {
                 "Bash",
                 "proj",
                 "reject",
-                make_context(1.0, 90, false),
+                make_context(90, false),
             ));
         }
 
@@ -1515,8 +1451,6 @@ mod tests {
 
     #[test]
     fn test_preference_condition_label() {
-        assert_eq!(PreferenceCondition::CostBelow(5.0).label(), "cost<$5");
-        assert_eq!(PreferenceCondition::CostAbove(10.0).label(), "cost>$10");
         assert_eq!(PreferenceCondition::ContextBelow(80).label(), "ctx<80%");
         assert_eq!(PreferenceCondition::ContextAbove(80).label(), "ctx>80%");
         assert_eq!(PreferenceCondition::NoErrors.label(), "no errors");
@@ -1530,8 +1464,6 @@ mod tests {
     #[test]
     fn test_preference_condition_roundtrip() {
         let conditions = vec![
-            PreferenceCondition::CostBelow(5.0),
-            PreferenceCondition::CostAbove(10.0),
             PreferenceCondition::ContextBelow(80),
             PreferenceCondition::ContextAbove(80),
             PreferenceCondition::NoErrors,
@@ -1557,7 +1489,7 @@ mod tests {
                 preferred_action: "approve".into(),
                 sample_count: 8,
                 accept_rate: 0.9,
-                conditions: vec![PreferenceCondition::CostBelow(5.0)],
+                conditions: vec![PreferenceCondition::ContextBelow(80)],
                 confidence: 0.8,
             }],
             tool_accuracy: Vec::new(),
@@ -1566,7 +1498,7 @@ mod tests {
             temporal: Vec::new(),
         };
         let summary = format_preference_summary(&prefs);
-        assert!(summary.contains("when cost<$5"));
+        assert!(summary.contains("when ctx<80%"));
         assert!(summary.contains("[Bash]"));
         assert!(summary.contains("git push"));
     }
@@ -1649,7 +1581,7 @@ mod tests {
                 "Bash",
                 "proj",
                 "accept",
-                make_context_with_hour(5.0, 50, false, 10), // 10:00 = work hours
+                make_context_with_hour(50, false, 10), // 10:00 = work hours
             ));
         }
         for _ in 0..5 {
@@ -1657,7 +1589,7 @@ mod tests {
                 "Bash",
                 "proj",
                 "reject",
-                make_context_with_hour(5.0, 50, false, 22), // 22:00 = off hours
+                make_context_with_hour(50, false, 22), // 22:00 = off hours
             ));
         }
 
@@ -1683,7 +1615,7 @@ mod tests {
                 "Bash",
                 "proj",
                 "accept",
-                make_context_with_hour(1.0, 50, false, 10),
+                make_context_with_hour(50, false, 10),
             ));
         }
         for _ in 0..5 {
@@ -1691,7 +1623,7 @@ mod tests {
                 "Bash",
                 "proj",
                 "reject",
-                make_context_with_hour(1.0, 50, false, 22),
+                make_context_with_hour(50, false, 22),
             ));
         }
 

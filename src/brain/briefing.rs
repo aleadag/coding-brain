@@ -310,7 +310,6 @@ mod tests {
                 total_occurrences: 5,
                 bad_terminals: 4,
                 last_seen: 1000,
-                avg_downstream_cost: 0.0,
             },
             AntiPattern {
                 steps: vec![SeqStep {
@@ -321,7 +320,6 @@ mod tests {
                 total_occurrences: 5,
                 bad_terminals: 4,
                 last_seen: 1000,
-                avg_downstream_cost: 0.0,
             },
         ];
         let kept = filter_antipatterns_for_project(&library, &recent_refs);

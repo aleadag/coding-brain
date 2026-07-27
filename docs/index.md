@@ -40,7 +40,9 @@ Mode is global and persistent. New installs start in `off`; choose `on` for advi
 
 ## Boundaries and privacy
 
-Coding Brain records immediate activity, decisions, outcomes, corrections, and learned preferences. It is not a general session dashboard. Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view. Coding Brain also does not own durable tasks, dependencies, claims, or handoffs; use Beads or another external tracker when work must survive a session. Beads is optional.
+Coding Brain records immediate activity, decisions, outcomes, corrections, and learned preferences. It is not a general session dashboard. Coding Brain does not collect or display token usage or cost. Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it. Only that bounded percentage is retained. The percentage uses provider-supplied context capacity when available and otherwise a known-model fallback; it is not raw usage or cost accounting.
+
+Coding Brain also does not own durable tasks, dependencies, claims, or handoffs; use Beads or another external tracker when work must survive a session. Beads is optional.
 
 State lives under `$XDG_STATE_HOME/coding-brain/`, normally `~/.local/state/coding-brain/`. User config lives at `$XDG_CONFIG_HOME/coding-brain/config.toml`. Remote endpoints produce a privacy advisory, with a stronger warning for plaintext HTTP.
 

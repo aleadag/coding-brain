@@ -250,8 +250,9 @@ fn print_full_details(d: &DecisionRecord) {
         println!("  cache_hit:        {hit}");
     }
     if let Some(ctx) = &d.context {
-        println!("  cost_usd:         ${:.4}", ctx.cost_usd);
-        println!("  context_pct:      {}%", ctx.context_pct);
+        if let Some(context_pct) = ctx.context_pct {
+            println!("  context_pct:      {context_pct}%");
+        }
         println!("  model:            {}", ctx.model);
     }
     println!();

@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -152,44 +152,22 @@ pub struct AgentSession {
     pub cpu_percent: f32,
     pub cpu_history: Vec<f32>, // Last N CPU readings for smoothing
     pub mem_mb: f64,
-    pub own_input_tokens: u64,
-    pub own_output_tokens: u64,
-    pub own_cache_read_tokens: u64,
-    pub own_cache_write_tokens: u64,
-    pub subagent_input_tokens: u64,
-    pub subagent_output_tokens: u64,
-    pub subagent_cache_read_tokens: u64,
-    pub subagent_cache_write_tokens: u64,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
     pub model: String,
     pub command_args: String,
     pub session_name: String,
     pub jsonl_path: Option<PathBuf>,
     pub jsonl_offset: u64,
+    pub(crate) jsonl_prefix_digest: Option<[u8; 32]>,
     pub last_message_ts: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub cost_usd: f64,
-    pub own_cost_usd: f64,
-    pub priced_total_tokens: u64,
-    pub cost_ledger_frozen: bool,
-    pub context_tokens: u64,
-    pub context_max: u64,
-    pub prev_cost_usd: f64,
-    pub burn_rate_per_hr: f64,
+    pub context_pressure: Option<u8>,
     pub subagent_count: usize,
     pub active_subagent_count: usize,
     pub active_subagent_jsonl_paths: Vec<PathBuf>,
-    pub subagent_rollups: HashMap<PathBuf, SubagentRollup>,
     pub activity_history: Vec<u8>, // Ring buffer of status levels (0-7) for sparkline, one per tick
     pub files_modified: HashMap<String, u32>, // file path -> edit count
-    pub tool_usage: HashMap<String, ToolStats>, // tool name -> call count & tokens
+    pub tool_usage: HashMap<String, ToolStats>, // tool name -> call count
     pub worktree_id: Option<String>, // Resolved git toplevel + git-dir, for conflict detection
     pub telemetry_status: TelemetryStatus,
-    pub usage_metrics_available: bool,
-    pub cost_estimate_unverified: bool,
-    pub model_profile_source: String,
     /// Persisted across ticks so status inference works when no new JSONL arrives.
     pub last_msg_type: String,
     pub last_stop_reason: String,
@@ -211,12 +189,6 @@ pub struct AgentSession {
     pub last_error_message: Option<String>,
     pub recent_errors: Vec<ErrorEntry>, // Last 5 errors (ring buffer)
     // ── Cognitive health tracking ────────────────────────────────────
-    /// Cumulative tokens at each Edit/Write event (for efficiency trending).
-    pub total_tokens_at_edit_count: u64,
-    /// Number of Edit/Write events (for averaging tokens-per-edit).
-    pub edit_event_count: u32,
-    /// Baseline tokens-per-edit, frozen after first 5 edits.
-    pub baseline_tokens_per_edit: Option<f64>,
     /// Error count ring buffer: one entry per window (~10s each).
     pub error_counts_per_window: Vec<u32>, // max 10 entries
     /// Accumulator for current error window.
@@ -249,103 +221,6 @@ pub struct ToolStats {
     pub calls: u32,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct SubagentRollup {
-    pub jsonl_offset: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub cost_usd: f64,
-    pub cost_ledger_frozen: bool,
-    pub model: String,
-    pub cost_estimate_unverified: bool,
-    pub usage_metrics_available: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubagentState {
-    Active,
-    Completed,
-}
-
-#[derive(Debug, Clone)]
-pub struct SubagentBreakdown {
-    pub label: String,
-    pub state: SubagentState,
-    pub count: usize,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub cost_usd: f64,
-    pub usage_metrics_available: bool,
-    pub cost_estimate_unverified: bool,
-}
-
-impl SubagentBreakdown {
-    pub fn total_input_tokens(&self) -> u64 {
-        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
-    }
-
-    pub fn state_label(&self) -> String {
-        match self.state {
-            SubagentState::Active => "Active".to_string(),
-            SubagentState::Completed if self.count > 1 => format!("Completed ({})", self.count),
-            SubagentState::Completed => "Completed".to_string(),
-        }
-    }
-
-    pub fn display_label(&self) -> String {
-        if self.state == SubagentState::Completed && self.label == "completed" && self.count > 1 {
-            format!("completed ({})", self.count)
-        } else {
-            self.label.clone()
-        }
-    }
-
-    pub fn format_tokens(&self) -> String {
-        if !self.usage_metrics_available {
-            return "n/a".to_string();
-        }
-        let total = self.total_input_tokens() + self.output_tokens;
-        if total == 0 {
-            return "-".to_string();
-        }
-        format_count(self.total_input_tokens()) + "/" + &format_count(self.output_tokens)
-    }
-
-    pub fn format_cost(&self) -> String {
-        if !self.usage_metrics_available {
-            return "n/a".to_string();
-        }
-        if self.cost_usd < 0.01 {
-            return "-".to_string();
-        }
-        if self.cost_usd < 1.0 {
-            format!(
-                "${:.2}{}",
-                self.cost_usd,
-                if self.cost_estimate_unverified {
-                    "?"
-                } else {
-                    ""
-                }
-            )
-        } else {
-            format!(
-                "${:.1}{}",
-                self.cost_usd,
-                if self.cost_estimate_unverified {
-                    "?"
-                } else {
-                    ""
-                }
-            )
-        }
-    }
-}
-
 impl AgentSession {
     pub fn from_raw(raw: RawAgentSession) -> Self {
         let project_name = raw.cwd.rsplit('/').next().unwrap_or("unknown").to_string();
@@ -374,44 +249,22 @@ impl AgentSession {
             cpu_percent: 0.0,
             cpu_history: Vec::new(),
             mem_mb: 0.0,
-            own_input_tokens: 0,
-            own_output_tokens: 0,
-            own_cache_read_tokens: 0,
-            own_cache_write_tokens: 0,
-            subagent_input_tokens: 0,
-            subagent_output_tokens: 0,
-            subagent_cache_read_tokens: 0,
-            subagent_cache_write_tokens: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
             model: String::new(),
             command_args: String::new(),
             session_name: String::new(),
             jsonl_path: None,
             jsonl_offset: 0,
+            jsonl_prefix_digest: None,
             last_message_ts: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            cost_usd: 0.0,
-            own_cost_usd: 0.0,
-            priced_total_tokens: 0,
-            cost_ledger_frozen: false,
-            context_tokens: 0,
-            context_max: 0,
-            prev_cost_usd: 0.0,
-            burn_rate_per_hr: 0.0,
+            context_pressure: None,
             subagent_count: 0,
             active_subagent_count: 0,
             active_subagent_jsonl_paths: Vec::new(),
-            subagent_rollups: HashMap::new(),
             activity_history: Vec::new(),
             files_modified: HashMap::new(),
             tool_usage: HashMap::new(),
             worktree_id: None,
             telemetry_status: TelemetryStatus::Pending,
-            usage_metrics_available: false,
-            cost_estimate_unverified: false,
-            model_profile_source: "built-in".into(),
             last_msg_type: String::new(),
             last_stop_reason: String::new(),
             is_waiting_for_task: false,
@@ -430,9 +283,6 @@ impl AgentSession {
             last_tool_error: false,
             last_error_message: None,
             recent_errors: Vec::new(),
-            total_tokens_at_edit_count: 0,
-            edit_event_count: 0,
-            baseline_tokens_per_edit: None,
             error_counts_per_window: Vec::new(),
             current_window_errors: 0,
             window_tick_counter: 0,
@@ -589,7 +439,6 @@ impl AgentSession {
         session.identity_provenance = SessionIdentityProvenance::Structured;
         session.jsonl_path = Some(jsonl_path);
         session.telemetry_status = TelemetryStatus::Pending;
-        session.model_profile_source = "codex-transcript".into();
         session
     }
 
@@ -695,26 +544,11 @@ impl AgentSession {
         session.worker_origin = Some(worker_id.to_string());
         session.project_name = format!("[{worker_id}] {project}");
 
-        // Populate metrics from JSON when available
-        if let Some(cost) = json.get("cost_usd").and_then(|v| v.as_f64()) {
-            session.cost_usd = cost;
-            session.usage_metrics_available = true;
-        }
-        if let Some(burn) = json.get("burn_rate_per_hr").and_then(|v| v.as_f64()) {
-            session.burn_rate_per_hr = burn;
-        }
-        if let Some(ctx) = json.get("context_pct").and_then(|v| v.as_f64()) {
-            // Reverse-engineer context_tokens/context_max from percentage
-            session.context_max = 200_000; // reasonable default
-            session.context_tokens = ((ctx / 100.0) * session.context_max as f64) as u64;
-        }
-        if let Some(t_in) = json.get("tokens_in").and_then(|v| v.as_u64()) {
-            session.total_input_tokens = t_in;
-            session.usage_metrics_available = true;
-        }
-        if let Some(t_out) = json.get("tokens_out").and_then(|v| v.as_u64()) {
-            session.total_output_tokens = t_out;
-        }
+        session.context_pressure = json
+            .get("context_pct")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u8::try_from(value).ok())
+            .filter(|value| *value <= 100);
         if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
             session.model = model.to_string();
         }
@@ -741,74 +575,6 @@ impl AgentSession {
         )
     }
 
-    pub fn subagent_breakdown(&self) -> Vec<SubagentBreakdown> {
-        if self.subagent_rollups.is_empty() {
-            return Vec::new();
-        }
-
-        let active_paths: HashSet<&PathBuf> = self.active_subagent_jsonl_paths.iter().collect();
-        let mut active_rows = Vec::new();
-        let mut completed_rows = Vec::new();
-
-        for (path, rollup) in &self.subagent_rollups {
-            let row = SubagentBreakdown {
-                label: subagent_label(path),
-                state: if active_paths.contains(path) {
-                    SubagentState::Active
-                } else {
-                    SubagentState::Completed
-                },
-                count: 1,
-                input_tokens: rollup.input_tokens,
-                output_tokens: rollup.output_tokens,
-                cache_read_tokens: rollup.cache_read_tokens,
-                cache_write_tokens: rollup.cache_write_tokens,
-                cost_usd: rollup.cost_usd,
-                usage_metrics_available: rollup.usage_metrics_available,
-                cost_estimate_unverified: rollup.cost_estimate_unverified,
-            };
-
-            if row.state == SubagentState::Active {
-                active_rows.push(row);
-            } else {
-                completed_rows.push(row);
-            }
-        }
-
-        active_rows.sort_by(|a, b| a.label.cmp(&b.label));
-
-        let mut rows = Vec::new();
-        if !completed_rows.is_empty() {
-            let mut aggregate = SubagentBreakdown {
-                label: "completed".to_string(),
-                state: SubagentState::Completed,
-                count: completed_rows.len(),
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                cost_usd: 0.0,
-                usage_metrics_available: false,
-                cost_estimate_unverified: false,
-            };
-
-            for row in completed_rows {
-                aggregate.input_tokens += row.input_tokens;
-                aggregate.output_tokens += row.output_tokens;
-                aggregate.cache_read_tokens += row.cache_read_tokens;
-                aggregate.cache_write_tokens += row.cache_write_tokens;
-                aggregate.cost_usd += row.cost_usd;
-                aggregate.usage_metrics_available |= row.usage_metrics_available;
-                aggregate.cost_estimate_unverified |= row.cost_estimate_unverified;
-            }
-
-            rows.push(aggregate);
-        }
-
-        rows.extend(active_rows);
-        rows
-    }
-
     pub fn format_elapsed(&self) -> String {
         let secs = self.elapsed.as_secs();
         let h = secs / 3600;
@@ -821,17 +587,6 @@ impl AgentSession {
         }
     }
 
-    pub fn format_tokens(&self) -> String {
-        if !self.usage_metrics_available {
-            return "n/a".to_string();
-        }
-        let total = self.total_input_tokens + self.total_output_tokens;
-        if total == 0 {
-            return String::from("-");
-        }
-        format_count(self.total_input_tokens) + "/" + &format_count(self.total_output_tokens)
-    }
-
     pub fn format_mem(&self) -> String {
         if self.mem_mb < 1.0 {
             return String::from("-");
@@ -839,151 +594,48 @@ impl AgentSession {
         format!("{:.0}M", self.mem_mb)
     }
 
-    pub fn format_cost(&self) -> String {
-        if !self.usage_metrics_available {
-            return "n/a".to_string();
-        }
-        if self.cost_usd < 0.01 {
-            return String::from("-");
-        }
-        if self.cost_usd < 1.0 {
-            format!(
-                "${:.2}{}",
-                self.cost_usd,
-                if self.cost_estimate_unverified {
-                    "?"
-                } else {
-                    ""
-                }
-            )
-        } else {
-            format!(
-                "${:.1}{}",
-                self.cost_usd,
-                if self.cost_estimate_unverified {
-                    "?"
-                } else {
-                    ""
-                }
-            )
-        }
+    pub fn context_percent(&self) -> Option<u8> {
+        self.context_pressure
     }
 
-    pub fn context_percent(&self) -> f64 {
-        if !self.usage_metrics_available {
-            return 0.0;
-        }
-        if self.context_max == 0 || self.context_tokens == 0 {
-            return 0.0;
-        }
-        (self.context_tokens as f64 / self.context_max as f64) * 100.0
-    }
-
-    /// Format context as "450k/1M 45%" or a visual bar
     pub fn format_context(&self) -> String {
-        if !self.usage_metrics_available {
-            return "n/a".to_string();
-        }
-        if self.context_tokens == 0 {
-            return String::from("-");
-        }
-        let pct = self.context_percent();
-        format!("{}%", pct as u32)
+        self.context_percent()
+            .map(|pct| format!("{pct}%"))
+            .unwrap_or_else(|| "n/a".to_string())
     }
 
     /// Visual bar for context usage: ████░░ 62%
     pub fn format_context_bar(&self, width: usize) -> String {
-        if !self.usage_metrics_available {
+        let Some(pct) = self.context_percent() else {
             return "n/a".to_string();
-        }
-        let pct = self.context_percent();
-        if pct == 0.0 {
+        };
+        if pct == 0 {
             return String::from("-");
         }
-        let filled = ((pct / 100.0) * width as f64).round() as usize;
+        let filled = ((f64::from(pct) / 100.0) * width as f64).round() as usize;
         let empty = width.saturating_sub(filled);
-        format!(
-            "{}{} {}%",
-            "█".repeat(filled),
-            "░".repeat(empty),
-            pct as u32
-        )
+        format!("{}{} {pct}%", "█".repeat(filled), "░".repeat(empty))
     }
 
     /// Produce a JSON-serializable value for --json export.
     pub fn to_json_value(&self) -> serde_json::Value {
-        let cost_usd = if self.usage_metrics_available {
-            serde_json::json!((self.cost_usd * 100.0).round() / 100.0)
-        } else {
-            serde_json::Value::Null
-        };
-        let burn_rate = if self.usage_metrics_available {
-            serde_json::json!((self.burn_rate_per_hr * 100.0).round() / 100.0)
-        } else {
-            serde_json::Value::Null
-        };
-        let context_pct = if self.usage_metrics_available {
-            serde_json::json!((self.context_percent() * 100.0).round() / 100.0)
-        } else {
-            serde_json::Value::Null
-        };
-        let tokens_in = if self.usage_metrics_available {
-            serde_json::json!(self.total_input_tokens)
-        } else {
-            serde_json::Value::Null
-        };
-        let tokens_out = if self.usage_metrics_available {
-            serde_json::json!(self.total_output_tokens)
-        } else {
-            serde_json::Value::Null
-        };
         let lifecycle = &self.lifecycle_diagnostic;
 
         serde_json::json!({
             "pid": self.pid,
             "project": self.display_name(),
             "status": self.status.to_string(),
+            "model": self.model,
             "telemetry": {
                 "state": self.telemetry_status.label(),
-                "usage_metrics_available": self.usage_metrics_available,
             },
-            "estimate": {
-                "verified": !self.cost_estimate_unverified,
-                "profile_source": self.model_profile_source,
-            },
-            "context_pct": context_pct,
-            "cost_usd": cost_usd,
-            "burn_rate_per_hr": burn_rate,
+            "context_pct": self.context_percent(),
             "elapsed_secs": self.elapsed.as_secs(),
             "cpu": self.cpu_percent,
             "mem_mb": (self.mem_mb * 100.0).round() / 100.0,
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
             "subagents": self.subagent_count,
             "active_subagents": self.active_subagent_count,
-            "subagent_breakdown": self.subagent_breakdown().into_iter().map(|row| {
-                serde_json::json!({
-                    "label": row.display_label(),
-                    "state": row.state_label(),
-                    "count": row.count,
-                    "tokens_in": if row.usage_metrics_available {
-                        serde_json::json!(row.total_input_tokens())
-                    } else {
-                        serde_json::Value::Null
-                    },
-                    "tokens_out": if row.usage_metrics_available {
-                        serde_json::json!(row.output_tokens)
-                    } else {
-                        serde_json::Value::Null
-                    },
-                    "cost_usd": if row.usage_metrics_available {
-                        serde_json::json!((row.cost_usd * 100.0).round() / 100.0)
-                    } else {
-                        serde_json::Value::Null
-                    },
-                })
-            }).collect::<Vec<_>>(),
-            "decay_score": if self.usage_metrics_available { serde_json::json!(self.decay_score) } else { serde_json::Value::Null },
+            "decay_score": self.decay_score,
             "last_error": self.last_error_message,
             "recent_errors": self.recent_errors.iter().map(|e| {
                 serde_json::json!({
@@ -1007,42 +659,8 @@ impl AgentSession {
         })
     }
 
-    pub fn format_burn_rate(&self) -> String {
-        if !self.usage_metrics_available {
-            return "n/a".to_string();
-        }
-        if self.burn_rate_per_hr < 0.01 {
-            return String::from("-");
-        }
-        if self.burn_rate_per_hr < 1.0 {
-            format!(
-                "${:.2}/h{}",
-                self.burn_rate_per_hr,
-                if self.cost_estimate_unverified {
-                    "?"
-                } else {
-                    ""
-                }
-            )
-        } else {
-            format!(
-                "${:.1}/h{}",
-                self.burn_rate_per_hr,
-                if self.cost_estimate_unverified {
-                    "?"
-                } else {
-                    ""
-                }
-            )
-        }
-    }
-
     pub fn telemetry_label(&self) -> &'static str {
         self.telemetry_status.label()
-    }
-
-    pub fn has_usage_metrics(&self) -> bool {
-        self.usage_metrics_available
     }
 }
 
@@ -1067,39 +685,6 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
-}
-
-fn format_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-fn subagent_label(path: &Path) -> String {
-    let components: Vec<String> = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
-        .collect();
-
-    if let Some(tasks_idx) = components.iter().position(|component| component == "tasks") {
-        let relative = &components[tasks_idx + 1..];
-        if !relative.is_empty() {
-            let mut label = relative.join("/");
-            if let Some(stripped) = label.strip_suffix(".jsonl") {
-                label = stripped.to_string();
-            }
-            return label;
-        }
-    }
-
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("subagent")
-        .to_string()
 }
 
 #[cfg(test)]
@@ -1286,71 +871,6 @@ mod tests {
         assert!(!session.is_shell_permission_request());
     }
 
-    #[test]
-    fn subagent_breakdown_groups_completed_and_lists_active_rows() {
-        let mut session = make_session();
-        let completed = PathBuf::from("/tmp/codex-1/-tmp-project/session-1/tasks/agent-1.jsonl");
-        let active =
-            PathBuf::from("/tmp/codex-1/-tmp-project/session-1/tasks/nested/agent-2.jsonl");
-
-        session.active_subagent_jsonl_paths = vec![active.clone()];
-        session.subagent_rollups.insert(
-            completed,
-            SubagentRollup {
-                input_tokens: 10_000,
-                output_tokens: 2_000,
-                cost_usd: 0.25,
-                usage_metrics_available: true,
-                ..SubagentRollup::default()
-            },
-        );
-        session.subagent_rollups.insert(
-            active,
-            SubagentRollup {
-                input_tokens: 40_000,
-                output_tokens: 8_000,
-                cost_usd: 1.5,
-                usage_metrics_available: true,
-                ..SubagentRollup::default()
-            },
-        );
-
-        let rows = session.subagent_breakdown();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].display_label(), "completed");
-        assert_eq!(rows[0].state, SubagentState::Completed);
-        assert_eq!(rows[0].count, 1);
-        assert_eq!(rows[0].format_tokens(), "10.0k/2.0k");
-        assert_eq!(rows[1].display_label(), "nested/agent-2");
-        assert_eq!(rows[1].state, SubagentState::Active);
-        assert_eq!(rows[1].format_cost(), "$1.5");
-    }
-
-    #[test]
-    fn subagent_breakdown_collapses_multiple_completed_rows() {
-        let mut session = make_session();
-
-        for name in ["agent-1.jsonl", "agent-2.jsonl"] {
-            let path = PathBuf::from(format!("/tmp/codex-1/-tmp-project/session-1/tasks/{name}"));
-            session.subagent_rollups.insert(
-                path,
-                SubagentRollup {
-                    input_tokens: 10_000,
-                    output_tokens: 1_000,
-                    cost_usd: 0.2,
-                    usage_metrics_available: true,
-                    ..SubagentRollup::default()
-                },
-            );
-        }
-
-        let rows = session.subagent_breakdown();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].display_label(), "completed (2)");
-        assert_eq!(rows[0].count, 2);
-        assert_eq!(rows[0].format_tokens(), "20.0k/2.0k");
-    }
-
     // ── Cognitive health tracking tests ──────────────────────────────
 
     #[test]
@@ -1405,10 +925,8 @@ mod tests {
             "pid": 42,
             "project": "backend",
             "status": "Processing",
-            "cost_usd": 1.23,
             "elapsed_secs": 600,
-            "tokens_in": 50000,
-            "tokens_out": 10000,
+            "context_pct": 42,
         });
         let session = AgentSession::from_remote_json("macbook-02", &json).unwrap();
         assert!(session.is_remote());
@@ -1416,10 +934,7 @@ mod tests {
         assert_eq!(session.pid, 42);
         assert_eq!(session.project_name, "[macbook-02] backend");
         assert_eq!(session.status, SessionStatus::Processing);
-        assert!((session.cost_usd - 1.23).abs() < 0.01);
-        assert_eq!(session.total_input_tokens, 50000);
-        assert_eq!(session.total_output_tokens, 10000);
-        assert!(session.usage_metrics_available);
+        assert_eq!(session.context_pressure, Some(42));
     }
 
     #[test]
@@ -1465,6 +980,27 @@ mod tests {
             output.get("worker_origin").and_then(|v| v.as_str()),
             Some("remote-w")
         );
+    }
+
+    #[test]
+    fn session_json_retains_context_and_omits_legacy_telemetry() {
+        let mut session = make_session();
+        session.context_pressure = Some(42);
+
+        let output = session.to_json_value();
+        let encoded = serde_json::to_string(&output).unwrap();
+        let forbidden: Vec<String> = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/legacy-forbidden-output-keys.json"
+        ))
+        .unwrap();
+
+        assert_eq!(output["context_pct"], 42);
+        for key in forbidden {
+            assert!(
+                !encoded.contains(&key),
+                "session JSON retained forbidden output key {key}"
+            );
+        }
     }
 
     #[test]

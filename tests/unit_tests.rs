@@ -77,52 +77,6 @@ fn test_format_elapsed() {
 }
 
 #[test]
-fn test_format_tokens() {
-    use coding_brain::session::{AgentSession, RawAgentSession, TelemetryStatus};
-    let raw = RawAgentSession {
-        provider: AgentProvider::Codex,
-        pid: 1,
-        process_start_identity: None,
-        session_id: "x".to_string(),
-        cwd: "/tmp".to_string(),
-        started_at: 0,
-    };
-    let mut session = AgentSession::from_raw(raw);
-
-    assert_eq!(session.format_tokens(), "n/a");
-
-    session.telemetry_status = TelemetryStatus::Available;
-    session.usage_metrics_available = true;
-    session.total_input_tokens = 1_500_000;
-    session.total_output_tokens = 42_000;
-    assert_eq!(session.format_tokens(), "1.5M/42.0k");
-}
-
-#[test]
-fn test_format_cost() {
-    use coding_brain::session::{AgentSession, RawAgentSession, TelemetryStatus};
-    let raw = RawAgentSession {
-        provider: AgentProvider::Codex,
-        pid: 1,
-        process_start_identity: None,
-        session_id: "x".to_string(),
-        cwd: "/tmp".to_string(),
-        started_at: 0,
-    };
-    let mut session = AgentSession::from_raw(raw);
-
-    assert_eq!(session.format_cost(), "n/a");
-
-    session.telemetry_status = TelemetryStatus::Available;
-    session.usage_metrics_available = true;
-    session.cost_usd = 0.42;
-    assert_eq!(session.format_cost(), "$0.42");
-
-    session.cost_usd = 12.5;
-    assert_eq!(session.format_cost(), "$12.5");
-}
-
-#[test]
 fn test_cwd_to_project_name() {
     use coding_brain::session::{AgentSession, RawAgentSession};
     let cases = vec![

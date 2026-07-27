@@ -1,0 +1,19 @@
+[
+  "cost_usd",
+  "burn_rate_per_hr",
+  "priced_total_tokens",
+  "tokens_in",
+  "tokens_out",
+  "usage_metrics_available",
+  "cost_estimate_unverified",
+  "input_per_m",
+  "output_per_m",
+  "cache_read_per_m",
+  "cache_write_per_m",
+  "CostBelow",
+  "CostAbove",
+  "median_cost_usd",
+  "avg_downstream_cost",
+  "estimate_verified",
+  "profile_source"
+]

@@ -1,0 +1,54 @@
+{
+  "patterns": [
+    {
+      "tool": "Bash",
+      "command_pattern": "cargo test",
+      "preferred_action": "approve",
+      "sample_count": 8,
+      "accept_rate": 0.875,
+      "conditions": [
+        {
+          "type": "cost_above",
+          "value": 2.0
+        },
+        {
+          "type": "no_errors"
+        }
+      ],
+      "confidence": 0.75
+    },
+    {
+      "tool": "Read",
+      "command_pattern": null,
+      "preferred_action": "approve",
+      "sample_count": 12,
+      "accept_rate": 1.0,
+      "conditions": [
+        {
+          "type": "no_errors"
+        }
+      ],
+      "confidence": 1.0
+    }
+  ],
+  "tool_accuracy": [],
+  "total_decisions": 20,
+  "overall_accuracy": 0.95,
+  "temporal": [
+    {
+      "description": "High burn rate (>$3.00/hr): rejection rate 75% (n=4)",
+      "sample_count": 4,
+      "strength": 0.75
+    },
+    {
+      "description": "After 3+ errors: user usually denies (n=5)",
+      "sample_count": 5,
+      "strength": 0.6
+    },
+    {
+      "description": "After costume file edits: user usually approves (n=6)",
+      "sample_count": 6,
+      "strength": 0.7
+    }
+  ]
+}

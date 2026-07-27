@@ -18,7 +18,6 @@ pub enum InsightCategory {
     MissingRule,
     AccuracyGap,
     TemporalFriction,
-    CostPattern,
     AntiPattern,
     CodificationSuggestion,
 }
@@ -32,7 +31,6 @@ impl InsightCategory {
             InsightCategory::MissingRule => "missing_rule",
             InsightCategory::AccuracyGap => "accuracy_gap",
             InsightCategory::TemporalFriction => "temporal_friction",
-            InsightCategory::CostPattern => "cost_pattern",
             InsightCategory::AntiPattern => "antipattern",
             InsightCategory::CodificationSuggestion => "codification_suggestion",
         }
@@ -46,7 +44,6 @@ impl InsightCategory {
             "missing_rule" => Some(InsightCategory::MissingRule),
             "accuracy_gap" => Some(InsightCategory::AccuracyGap),
             "temporal_friction" => Some(InsightCategory::TemporalFriction),
-            "cost_pattern" => Some(InsightCategory::CostPattern),
             "antipattern" => Some(InsightCategory::AntiPattern),
             "codification_suggestion" => Some(InsightCategory::CodificationSuggestion),
             _ => None,
@@ -61,7 +58,6 @@ impl InsightCategory {
             InsightCategory::MissingRule => "Recommended Rules",
             InsightCategory::AccuracyGap => "Accuracy Gaps",
             InsightCategory::TemporalFriction => "Temporal Patterns",
-            InsightCategory::CostPattern => "Cost Patterns",
             InsightCategory::AntiPattern => "Anti-Pattern Sequences",
             InsightCategory::CodificationSuggestion => "AGENTS.md Suggestions",
         }
@@ -182,6 +178,10 @@ pub fn load_state() -> InsightState {
         }
     };
 
+    parse_state_json(&json)
+}
+
+fn parse_state_json(json: &serde_json::Value) -> InsightState {
     let seen = json
         .get("seen_fingerprints")
         .and_then(|v| v.as_array())
@@ -291,8 +291,8 @@ pub fn merge_insights(generated: Vec<Insight>, state: &mut InsightState) -> Vec<
 
 // Import detectors for use by generate_insights()
 use super::detectors::{
-    detect_accuracy_gaps, detect_context_blowouts, detect_cost_patterns, detect_error_loops,
-    detect_friction_patterns, detect_missing_rules, detect_temporal_friction,
+    detect_accuracy_gaps, detect_context_blowouts, detect_error_loops, detect_friction_patterns,
+    detect_missing_rules, detect_temporal_friction,
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -312,7 +312,6 @@ pub fn generate_insights(
     insights.extend(detect_missing_rules(decisions, prefs));
     insights.extend(detect_accuracy_gaps(prefs));
     insights.extend(detect_temporal_friction(prefs));
-    insights.extend(detect_cost_patterns(decisions));
     insights.extend(super::sequences::detect_antipattern_sequences(decisions));
 
     // Sort by severity descending, then by evidence count descending
@@ -354,7 +353,6 @@ fn format_insights(insights: &[Insight], header: &str) -> String {
         InsightCategory::CodificationSuggestion,
         InsightCategory::AccuracyGap,
         InsightCategory::TemporalFriction,
-        InsightCategory::CostPattern,
     ];
 
     for i in insights {
@@ -445,7 +443,7 @@ pub fn print_insights() {
 mod tests {
     use super::*;
     use crate::brain::decisions::{
-        DecisionContext, DecisionType, DistilledPreferences, PreferencePattern, ToolAccuracy,
+        DecisionType, DistilledPreferences, PreferencePattern, ToolAccuracy,
     };
 
     fn make_decision(tool: &str, command: &str, user_action: &str, pid: u32) -> DecisionRecord {
@@ -471,37 +469,6 @@ mod tests {
             cache_hit: None,
             canonical: None,
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn make_decision_with_context(
-        tool: &str,
-        command: &str,
-        user_action: &str,
-        pid: u32,
-        context_pct: u8,
-        last_error: bool,
-        burn_rate: f64,
-        cost: f64,
-    ) -> DecisionRecord {
-        let mut d = make_decision(tool, command, user_action, pid);
-        d.context = Some(DecisionContext {
-            cost_usd: cost,
-            context_pct,
-            last_tool_error: last_error,
-            error_message: None,
-            model: "test".to_string(),
-            elapsed_secs: 100,
-            files_modified_count: 0,
-            total_tool_calls: 10,
-            has_file_conflict: false,
-            status: "Processing".to_string(),
-            burn_rate_per_hr: burn_rate,
-            recent_error_count: 0,
-            subagent_count: 0,
-            hour: Some(10),
-        });
-        d
     }
 
     fn empty_prefs() -> DistilledPreferences {
@@ -625,6 +592,24 @@ mod tests {
     fn test_empty_decisions_no_insights() {
         let insights = generate_insights(&[], &empty_prefs());
         assert!(insights.is_empty());
+    }
+
+    #[test]
+    fn legacy_cost_insight_is_discarded_while_neighbor_survives() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-cost-insights.json"
+        ))
+        .unwrap();
+
+        let state = parse_state_json(&value);
+
+        assert_eq!(state.last_generated, 1_710_000_000);
+        assert_eq!(state.current_insights.len(), 1);
+        assert_eq!(state.current_insights[0].fingerprint, "error-loop:Bash");
+        assert_eq!(
+            state.current_insights[0].category,
+            InsightCategory::ErrorLoop
+        );
     }
 
     #[test]

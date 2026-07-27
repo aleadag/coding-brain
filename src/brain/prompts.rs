@@ -95,9 +95,6 @@ const AUTOPSY_PROMPT: &str = r#"You are analyzing a completed Codex session post
 ## Detected Issues
 {{findings}}
 
-## Cost Breakdown
-{{cost_breakdown}}
-
 Provide 3-5 concise, actionable suggestions for what the session should have done differently. Focus on strategy, not syntax. Each suggestion should be one sentence.
 
 Respond with JSON: {"suggestions": ["...", "..."]}"#;
@@ -126,6 +123,7 @@ mod tests {
         assert!(prompt.contains("post-mortem"));
         assert!(prompt.contains("{{session_summary}}"));
         assert!(prompt.contains("{{findings}}"));
+        assert!(!prompt.to_ascii_lowercase().contains("cost"));
     }
 
     #[test]

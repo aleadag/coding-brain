@@ -63,6 +63,14 @@ All notable changes to codexctl are documented here.
 - Removed the dormant `[brain].test_runners` heuristic and
   `DecisionOutcome::TestFailed`; configuration validation now tells users to
   delete that setting.
+- **Breaking (pre-1.0):** Coding Brain no longer exposes token-usage, cost,
+  pricing, budget, session-history, or generic session-dashboard APIs.
+  Coding Brain does not collect or display token usage or cost.
+  Context-rot prevention retains only a bounded context-window percentage
+  derived from provider-supplied capacity or a known-model fallback, not the
+  provider counts used to calculate it. Legacy serialized fields are ignored
+  during compatibility reads; older binaries may still write them during
+  rollback.
 - Live rows now lead with a compact condition badge and project name before
   provider and action. Evidence groups status and outcome ahead of action and
   context; use PageUp and PageDown when its title shows more content.

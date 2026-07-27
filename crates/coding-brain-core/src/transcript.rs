@@ -1,17 +1,11 @@
 use serde_json::Value;
 
+use crate::models;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptRole {
     Assistant,
     User,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranscriptUsage {
-    pub input_tokens: u64,
-    pub cache_read_input_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub output_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -26,7 +20,7 @@ pub struct TranscriptMessage {
     pub role: TranscriptRole,
     pub model: Option<String>,
     pub stop_reason: Option<String>,
-    pub usage: Option<TranscriptUsage>,
+    pub context_pressure: Option<u8>,
     pub content: Vec<TranscriptBlock>,
 }
 
@@ -52,17 +46,22 @@ pub fn parse_line(line: &str) -> Option<TranscriptEvent> {
         .map(|blocks| blocks.iter().filter_map(parse_block).collect())
         .unwrap_or_default();
 
+    let model = msg
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let raw_usage = msg.get("usage");
+    let context_pressure =
+        raw_usage.and_then(|usage| derive_context_pressure(model.as_deref(), usage));
+
     Some(TranscriptEvent::Message(TranscriptMessage {
         role,
-        model: msg
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        model,
         stop_reason: msg
             .get("stop_reason")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        usage: msg.get("usage").and_then(parse_usage),
+        context_pressure,
         content,
     }))
 }
@@ -96,22 +95,22 @@ fn message_role(entry: &Value, msg: &Value) -> Option<TranscriptRole> {
     }
 }
 
-fn parse_usage(value: &Value) -> Option<TranscriptUsage> {
-    Some(TranscriptUsage {
-        input_tokens: value.get("input_tokens")?.as_u64().unwrap_or(0),
-        cache_read_input_tokens: value
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        cache_creation_input_tokens: value
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        output_tokens: value
-            .get("output_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-    })
+fn derive_context_pressure(model: Option<&str>, usage: &Value) -> Option<u8> {
+    let capacity = model.and_then(models::context_window)?;
+    let input_tokens = usage.get("input_tokens")?.as_u64()?;
+    let cache_read_input_tokens = optional_usage_counter(usage, "cache_read_input_tokens")?;
+    let cache_creation_input_tokens = optional_usage_counter(usage, "cache_creation_input_tokens")?;
+    let used = input_tokens
+        .saturating_add(cache_read_input_tokens)
+        .saturating_add(cache_creation_input_tokens);
+    crate::context_pressure::percent(used, capacity)
+}
+
+fn optional_usage_counter(usage: &Value, field: &str) -> Option<u64> {
+    match usage.get(field) {
+        Some(value) => value.as_u64(),
+        None => Some(0),
+    }
 }
 
 fn parse_block(block: &Value) -> Option<TranscriptBlock> {
@@ -186,7 +185,27 @@ mod tests {
         };
         assert_eq!(msg.role, TranscriptRole::Assistant);
         assert_eq!(msg.stop_reason.as_deref(), Some("end_turn"));
-        assert!(msg.usage.is_some());
+    }
+
+    #[test]
+    fn message_context_pressure_uses_known_model_capacity() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":100000,"cache_read_input_tokens":20000,"cache_creation_input_tokens":10000,"output_tokens":1},"content":[]}}"#;
+        let Some(TranscriptEvent::Message(message)) = parse_line(line) else {
+            panic!("expected message");
+        };
+        assert_eq!(message.context_pressure, Some(50));
+
+        let unknown = line.replace("gpt-5.5", "custom-model");
+        let Some(TranscriptEvent::Message(message)) = parse_line(&unknown) else {
+            panic!("expected message");
+        };
+        assert_eq!(message.context_pressure, None);
+
+        let without_caches = r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":129200},"content":[]}}"#;
+        let Some(TranscriptEvent::Message(message)) = parse_line(without_caches) else {
+            panic!("expected message");
+        };
+        assert_eq!(message.context_pressure, Some(50));
     }
 
     #[test]

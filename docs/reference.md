@@ -96,7 +96,7 @@ Multi-provider init parses, validates, and stages the complete selected set befo
 | Terminal focus | Exact supported terminal target; optional Agent Deck | Exact supported terminal target; optional Agent Deck | Exact supported terminal target; optional Agent Deck |
 | Guarded input | Semantic allow/deny/continue and manual literal text through an exact tmux binding | Semantic allow/deny/continue and manual literal text through an exact tmux binding | Structured hooks first; guarded tmux for process-only, manual, or uncovered prompts |
 | Transcript context | Codex rollout JSONL | Unavailable: the hook transcript path is retained as lifecycle identity/status evidence, but records are not parsed into `AgentSession` context | Unavailable: the hook transcript path is retained as lifecycle identity/status evidence, but records are not parsed into `AgentSession` context; SQLite is not read |
-| Usage/cost surface | Unsupported; this provider feature adds no ingestion or dashboard/view | Unsupported; this provider feature adds no ingestion or dashboard/view | Unsupported; this provider feature adds no ingestion or dashboard/view |
+| Context pressure | Bounded percentage from provider capacity or a known-model fallback | Unavailable | Unavailable |
 
 Automatic terminal input revalidates provider process identity, a unique pane, a versioned prompt fingerprint, and pending request evidence immediately before input, then verifies that the prompt cleared or advanced. A mismatch leaves the activity for manual attention. Terminal focus alone never grants input authority.
 
@@ -116,4 +116,6 @@ Current config uses `.coding-brain.toml` and `$XDG_CONFIG_HOME/coding-brain/conf
 
 ## Product boundary
 
-Coding Brain keeps immediate judgment, learning evidence, review, recovery, and navigation local. It is Brain activity rather than a general session dashboard. Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view. Coding Brain has no durable task queue, dependency executor, distributed peer transport, or embedded project tracker. Beads and Agent Deck are optional companion tools for different jobs.
+Coding Brain keeps immediate judgment, learning evidence, review, recovery, and navigation local. It is Brain activity rather than a general session dashboard. Coding Brain does not collect or display token usage or cost. Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it. Only that bounded percentage is retained. The percentage uses provider-supplied context capacity when available and otherwise a known-model fallback; it is not raw usage or cost accounting.
+
+Coding Brain has no durable task queue, dependency executor, distributed peer transport, or embedded project tracker. Beads and Agent Deck are optional companion tools for different jobs.

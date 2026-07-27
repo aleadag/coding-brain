@@ -15,8 +15,6 @@ pub enum FindingCategory {
     ErrorCascade,
     WastedReads,
     UndoRedoLoop,
-    ContextBloat,
-    CostEfficiency,
 }
 
 impl FindingCategory {
@@ -25,8 +23,6 @@ impl FindingCategory {
             FindingCategory::ErrorCascade => "Error Cascade",
             FindingCategory::WastedReads => "Wasted Reads",
             FindingCategory::UndoRedoLoop => "Undo-Redo Loop",
-            FindingCategory::ContextBloat => "Context Bloat",
-            FindingCategory::CostEfficiency => "Cost Efficiency",
         }
     }
 }
@@ -54,18 +50,7 @@ pub struct AutopsyFinding {
     pub severity: FindingSeverity,
     pub summary: String,
     pub detail: Option<String>,
-    pub tokens_wasted: u64,
     pub message_range: (usize, usize),
-}
-
-#[derive(Debug, Clone)]
-pub struct CostBreakdown {
-    pub total_tokens: u64,
-    pub productive_tokens: u64,
-    pub wasted_retry_tokens: u64,
-    pub wasted_read_tokens: u64,
-    pub wasted_undo_tokens: u64,
-    pub efficiency_pct: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +72,6 @@ pub struct AutopsyReport {
     pub total_tool_calls: u32,
     pub total_errors: u32,
     pub quality: QualityScore,
-    pub cost: CostBreakdown,
     pub findings: Vec<AutopsyFinding>,
     pub generated_at: u64,
 }
@@ -103,23 +87,16 @@ pub(crate) struct ToolCall {
     pub input: serde_json::Value,
     pub is_error: bool,
     pub result_content: Option<String>,
-    pub tokens_at_call: u64,
 }
 
 #[derive(Debug)]
 pub(crate) struct TranscriptWalker {
     pub tool_calls: Vec<ToolCall>,
     pub message_count: usize,
-    /// file_path -> list of (message_idx, tokens_at_call) for each read
-    pub read_history: HashMap<String, Vec<(usize, u64)>>,
-    /// file_path -> list of (message_idx, tokens_at_call) for each edit
-    pub edit_history: HashMap<String, Vec<(usize, u64)>>,
-    /// Cumulative tokens after each message
-    pub token_curve: Vec<u64>,
-    /// Number of edit operations per message
-    pub edits_per_message: Vec<u32>,
-    /// Total tokens across the session
-    pub total_tokens: u64,
+    /// file_path -> message indices for each read
+    pub read_history: HashMap<String, Vec<usize>>,
+    /// file_path -> message indices for each edit
+    pub edit_history: HashMap<String, Vec<usize>>,
     /// Model seen in transcript
     pub model: String,
     /// Duration: last message timestamp - first message timestamp (approximate via message count)
@@ -137,11 +114,8 @@ impl TranscriptWalker {
     /// Build a walker from an iterator of JSONL lines.
     pub fn from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Self, String> {
         let mut tool_calls = Vec::new();
-        let mut read_history: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
-        let mut edit_history: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
-        let mut token_curve = Vec::new();
-        let mut edits_per_message = Vec::new();
-        let mut cumulative_tokens: u64 = 0;
+        let mut read_history: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut edit_history: HashMap<String, Vec<usize>> = HashMap::new();
         let mut message_idx: usize = 0;
         let mut model = String::new();
 
@@ -149,7 +123,7 @@ impl TranscriptWalker {
         // them with the ToolResult blocks that follow in the same message
         // (user messages contain interleaved ToolResult blocks) or match
         // them across assistant→user message boundaries.
-        let mut pending_tools: Vec<(String, serde_json::Value, usize, u64)> = Vec::new();
+        let mut pending_tools: Vec<(String, serde_json::Value, usize)> = Vec::new();
 
         for line in lines {
             let line = line.trim();
@@ -162,31 +136,14 @@ impl TranscriptWalker {
             match event {
                 TranscriptEvent::WaitingForTask => {}
                 TranscriptEvent::Message(msg) => {
-                    // Track usage
-                    if let Some(ref usage) = msg.usage {
-                        let delta = usage.input_tokens
-                            + usage.cache_read_input_tokens
-                            + usage.cache_creation_input_tokens
-                            + usage.output_tokens;
-                        cumulative_tokens += delta;
-                    }
-                    token_curve.push(cumulative_tokens);
-
                     if let Some(ref m) = msg.model {
                         model = m.clone();
                     }
 
-                    let mut msg_edits: u32 = 0;
-
                     for block in &msg.content {
                         match block {
                             TranscriptBlock::ToolUse { name, input } => {
-                                pending_tools.push((
-                                    name.clone(),
-                                    input.clone(),
-                                    message_idx,
-                                    cumulative_tokens,
-                                ));
+                                pending_tools.push((name.clone(), input.clone(), message_idx));
 
                                 // Track reads
                                 if matches!(name.as_str(), "Read" | "Grep" | "Glob") {
@@ -196,7 +153,7 @@ impl TranscriptWalker {
                                         read_history
                                             .entry(fp.to_string())
                                             .or_default()
-                                            .push((message_idx, cumulative_tokens));
+                                            .push(message_idx);
                                     }
                                 }
 
@@ -208,14 +165,13 @@ impl TranscriptWalker {
                                         edit_history
                                             .entry(fp.to_string())
                                             .or_default()
-                                            .push((message_idx, cumulative_tokens));
+                                            .push(message_idx);
                                     }
-                                    msg_edits += 1;
                                 }
                             }
                             TranscriptBlock::ToolResult { is_error, content } => {
                                 // Match with the oldest pending tool
-                                if let Some((name, input, call_idx, tokens_at)) =
+                                if let Some((name, input, call_idx)) =
                                     pending_tools.first().cloned()
                                 {
                                     pending_tools.remove(0);
@@ -225,7 +181,6 @@ impl TranscriptWalker {
                                         input,
                                         is_error: *is_error,
                                         result_content: Some(content.clone()),
-                                        tokens_at_call: tokens_at,
                                     });
                                 }
                             }
@@ -233,21 +188,19 @@ impl TranscriptWalker {
                         }
                     }
 
-                    edits_per_message.push(msg_edits);
                     message_idx += 1;
                 }
             }
         }
 
         // Flush any remaining pending tools (no result received — session may have been interrupted)
-        for (name, input, call_idx, tokens_at) in pending_tools {
+        for (name, input, call_idx) in pending_tools {
             tool_calls.push(ToolCall {
                 message_idx: call_idx,
                 tool_name: name,
                 input,
                 is_error: false,
                 result_content: None,
-                tokens_at_call: tokens_at,
             });
         }
 
@@ -256,9 +209,6 @@ impl TranscriptWalker {
             message_count: message_idx,
             read_history,
             edit_history,
-            token_curve,
-            edits_per_message,
-            total_tokens: cumulative_tokens,
             model,
             duration_secs: 0, // Filled by caller if needed
         })
@@ -284,7 +234,6 @@ pub(crate) fn detect_error_cascades(walker: &TranscriptWalker) -> Vec<AutopsyFin
         let chain_start = i;
         let tool_name = &calls[i].tool_name;
         let mut chain_len = 1;
-        let tokens_start = calls[i].tokens_at_call;
 
         while i + chain_len < calls.len()
             && calls[i + chain_len].is_error
@@ -295,8 +244,6 @@ pub(crate) fn detect_error_cascades(walker: &TranscriptWalker) -> Vec<AutopsyFin
 
         if chain_len >= 2 {
             let last = &calls[chain_start + chain_len - 1];
-            let tokens_end = last.tokens_at_call;
-            let wasted = tokens_end.saturating_sub(tokens_start);
 
             let severity = if chain_len >= 5 {
                 FindingSeverity::Critical
@@ -324,7 +271,6 @@ pub(crate) fn detect_error_cascades(walker: &TranscriptWalker) -> Vec<AutopsyFin
                     calls[chain_start].message_idx
                 ),
                 detail: Some(format!("First error: {truncated}")),
-                tokens_wasted: wasted,
                 message_range: (calls[chain_start].message_idx, last.message_idx),
             });
         }
@@ -346,16 +292,13 @@ pub(crate) fn detect_wasted_reads(walker: &TranscriptWalker) -> Vec<AutopsyFindi
 
         // Check if there are edits interspersed
         let edits = walker.edit_history.get(file_path.as_str());
-        let edit_indices: Vec<usize> = edits
-            .map(|e| e.iter().map(|(idx, _)| *idx).collect())
-            .unwrap_or_default();
+        let edit_indices = edits.cloned().unwrap_or_default();
 
         // Count reads with no edit between them
         let mut consecutive_reads = 0u32;
-        let mut wasted_tokens: u64 = 0;
         let mut prev_read_idx: Option<usize> = None;
 
-        for &(read_idx, tokens) in reads {
+        for &read_idx in reads {
             let had_edit = if let Some(prev) = prev_read_idx {
                 edit_indices.iter().any(|&e| e > prev && e < read_idx)
             } else {
@@ -366,17 +309,6 @@ pub(crate) fn detect_wasted_reads(walker: &TranscriptWalker) -> Vec<AutopsyFindi
                 consecutive_reads = 1;
             } else {
                 consecutive_reads += 1;
-                if consecutive_reads >= 3 {
-                    // Approximate token cost: delta from previous read
-                    if let Some(prev) = prev_read_idx {
-                        let prev_tokens = reads
-                            .iter()
-                            .find(|(idx, _)| *idx == prev)
-                            .map(|(_, t)| *t)
-                            .unwrap_or(0);
-                        wasted_tokens += tokens.saturating_sub(prev_tokens);
-                    }
-                }
             }
             prev_read_idx = Some(read_idx);
         }
@@ -394,10 +326,9 @@ pub(crate) fn detect_wasted_reads(walker: &TranscriptWalker) -> Vec<AutopsyFindi
                     "{short_path} read {consecutive_reads} times without an intervening edit"
                 ),
                 detail: None,
-                tokens_wasted: wasted_tokens,
                 message_range: (
-                    reads.first().map(|(i, _)| *i).unwrap_or(0),
-                    reads.last().map(|(i, _)| *i).unwrap_or(0),
+                    reads.first().copied().unwrap_or(0),
+                    reads.last().copied().unwrap_or(0),
                 ),
             });
         }
@@ -418,8 +349,8 @@ pub(crate) fn detect_undo_redo_loops(walker: &TranscriptWalker) -> Vec<AutopsyFi
         // Check if edits to this file are interspersed with errors
         let mut edit_error_edit_count = 0u32;
         for window in edits.windows(2) {
-            let (idx_a, _) = window[0];
-            let (idx_b, _) = window[1];
+            let idx_a = window[0];
+            let idx_b = window[1];
 
             // Look for error tool calls between these two edits
             let has_error_between = walker
@@ -433,15 +364,6 @@ pub(crate) fn detect_undo_redo_loops(walker: &TranscriptWalker) -> Vec<AutopsyFi
         }
 
         if edit_error_edit_count >= 2 {
-            let total_edit_tokens: u64 = if edits.len() >= 2 {
-                edits
-                    .last()
-                    .unwrap()
-                    .1
-                    .saturating_sub(edits.first().unwrap().1)
-            } else {
-                0
-            };
             let short_path = shorten_path(file_path);
 
             findings.push(AutopsyFinding {
@@ -458,131 +380,15 @@ pub(crate) fn detect_undo_redo_loops(walker: &TranscriptWalker) -> Vec<AutopsyFi
                 detail: Some(
                     "Session repeatedly edited this file, hit errors, and re-edited".to_string(),
                 ),
-                tokens_wasted: total_edit_tokens / 2, // Rough estimate: half was wasted
                 message_range: (
-                    edits.first().map(|(i, _)| *i).unwrap_or(0),
-                    edits.last().map(|(i, _)| *i).unwrap_or(0),
+                    edits.first().copied().unwrap_or(0),
+                    edits.last().copied().unwrap_or(0),
                 ),
             });
         }
     }
 
     findings
-}
-
-/// Detect stretches of high token consumption with no file edits (spinning).
-pub(crate) fn detect_context_bloat(walker: &TranscriptWalker) -> Vec<AutopsyFinding> {
-    let mut findings = Vec::new();
-    let window_size = 8; // Look at 8-message windows
-
-    if walker.token_curve.len() < window_size || walker.edits_per_message.len() < window_size {
-        return findings;
-    }
-
-    let total = walker.total_tokens.max(1) as f64;
-
-    let mut i = 0;
-    while i + window_size <= walker.token_curve.len() {
-        let tokens_start = if i == 0 { 0 } else { walker.token_curve[i - 1] };
-        let tokens_end = walker.token_curve[i + window_size - 1];
-        let window_tokens = tokens_end.saturating_sub(tokens_start);
-        let window_pct = (window_tokens as f64 / total) * 100.0;
-
-        let edits_in_window: u32 = walker.edits_per_message[i..i + window_size].iter().sum();
-
-        // >15% of total tokens consumed in 8 messages with zero edits
-        if window_pct > 15.0 && edits_in_window == 0 {
-            findings.push(AutopsyFinding {
-                category: FindingCategory::ContextBloat,
-                severity: if window_pct > 30.0 {
-                    FindingSeverity::Critical
-                } else {
-                    FindingSeverity::Warning
-                },
-                summary: format!(
-                    "Messages {}-{}: {window_pct:.0}% of tokens consumed with zero file edits",
-                    i,
-                    i + window_size - 1,
-                ),
-                detail: Some(format!("{window_tokens} tokens spent without progress")),
-                tokens_wasted: window_tokens,
-                message_range: (i, i + window_size - 1),
-            });
-
-            // Skip past this window to avoid overlapping findings
-            i += window_size;
-        } else {
-            i += 1;
-        }
-    }
-
-    findings
-}
-
-/// Compute cost efficiency: productive tokens vs wasted tokens.
-pub(crate) fn compute_cost_breakdown(walker: &TranscriptWalker) -> CostBreakdown {
-    let mut productive: u64 = 0;
-    let mut wasted_retry: u64 = 0;
-
-    // Classify each tool call
-    let calls = &walker.tool_calls;
-    for (i, call) in calls.iter().enumerate() {
-        let next_tokens = if i + 1 < calls.len() {
-            calls[i + 1].tokens_at_call
-        } else {
-            walker.total_tokens
-        };
-        let call_tokens = next_tokens.saturating_sub(call.tokens_at_call);
-
-        if call.is_error {
-            wasted_retry += call_tokens;
-        } else {
-            productive += call_tokens;
-        }
-    }
-
-    // Wasted reads: reads of files that were never edited
-    let mut wasted_reads: u64 = 0;
-    for (file_path, reads) in &walker.read_history {
-        if !walker.edit_history.contains_key(file_path) && reads.len() >= 2 {
-            // Only the first read is productive (orientation); subsequent reads are waste
-            for &(_, tokens) in reads.iter().skip(1) {
-                // Approximate per-read token cost
-                wasted_reads += 500; // Conservative estimate per redundant read
-                let _ = tokens; // tokens_at_call is cumulative, not per-call
-            }
-        }
-    }
-
-    // Undo tokens: edits to files with many edit-error cycles
-    let mut wasted_undo: u64 = 0;
-    for edits in walker.edit_history.values() {
-        if edits.len() >= 4 {
-            // Rough: half the edit tokens on heavily-churned files were wasted
-            let span = edits
-                .last()
-                .unwrap()
-                .1
-                .saturating_sub(edits.first().unwrap().1);
-            wasted_undo += span / 4;
-        }
-    }
-
-    let total = walker.total_tokens.max(1);
-    let efficiency = if total > 0 {
-        (productive as f64 / total as f64) * 100.0
-    } else {
-        100.0
-    };
-
-    CostBreakdown {
-        total_tokens: walker.total_tokens,
-        productive_tokens: productive,
-        wasted_retry_tokens: wasted_retry,
-        wasted_read_tokens: wasted_reads,
-        wasted_undo_tokens: wasted_undo,
-        efficiency_pct: efficiency.clamp(0.0, 100.0),
-    }
 }
 
 /// Compute a quality score by examining what happened at the end of the session.
@@ -684,12 +490,10 @@ pub fn run_autopsy(jsonl_path: &Path) -> Result<AutopsyReport, String> {
     findings.extend(detect_error_cascades(&walker));
     findings.extend(detect_wasted_reads(&walker));
     findings.extend(detect_undo_redo_loops(&walker));
-    findings.extend(detect_context_bloat(&walker));
 
     // Sort by severity descending
     findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
-    let cost = compute_cost_breakdown(&walker);
     let quality = compute_quality_score(&walker);
     let total_errors = walker.tool_calls.iter().filter(|c| c.is_error).count() as u32;
 
@@ -714,7 +518,6 @@ pub fn run_autopsy(jsonl_path: &Path) -> Result<AutopsyReport, String> {
         total_tool_calls: walker.tool_calls.len() as u32,
         total_errors,
         quality,
-        cost,
         findings,
         generated_at,
     })
@@ -757,34 +560,6 @@ pub fn format_report(report: &AutopsyReport) -> String {
     ));
     out.push(String::new());
 
-    // Cost breakdown
-    let c = &report.cost;
-    out.push(format!("  Cost Efficiency: {:.0}%", c.efficiency_pct));
-    out.push(format!(
-        "    Total tokens: {}  |  Productive: {}",
-        format_tokens(c.total_tokens),
-        format_tokens(c.productive_tokens),
-    ));
-    if c.wasted_retry_tokens > 0 {
-        out.push(format!(
-            "    Wasted on retries: {}",
-            format_tokens(c.wasted_retry_tokens)
-        ));
-    }
-    if c.wasted_read_tokens > 0 {
-        out.push(format!(
-            "    Wasted on redundant reads: {}",
-            format_tokens(c.wasted_read_tokens)
-        ));
-    }
-    if c.wasted_undo_tokens > 0 {
-        out.push(format!(
-            "    Wasted on undo-redo: {}",
-            format_tokens(c.wasted_undo_tokens)
-        ));
-    }
-    out.push(String::new());
-
     // Findings
     if report.findings.is_empty() {
         out.push("  No issues detected.".to_string());
@@ -805,12 +580,6 @@ pub fn format_report(report: &AutopsyReport) -> String {
             ));
             if let Some(ref detail) = f.detail {
                 out.push(format!("       {detail}"));
-            }
-            if f.tokens_wasted > 0 {
-                out.push(format!(
-                    "       ~{} tokens wasted",
-                    format_tokens(f.tokens_wasted)
-                ));
             }
         }
     }
@@ -835,21 +604,12 @@ pub fn report_to_json(report: &AutopsyReport) -> serde_json::Value {
             "ran_lint": report.quality.ran_lint,
             "edit_efficiency": report.quality.edit_efficiency,
         },
-        "cost": {
-            "total_tokens": report.cost.total_tokens,
-            "productive_tokens": report.cost.productive_tokens,
-            "wasted_retry_tokens": report.cost.wasted_retry_tokens,
-            "wasted_read_tokens": report.cost.wasted_read_tokens,
-            "wasted_undo_tokens": report.cost.wasted_undo_tokens,
-            "efficiency_pct": report.cost.efficiency_pct,
-        },
         "findings": report.findings.iter().map(|f| {
             serde_json::json!({
                 "category": f.category.label(),
                 "severity": f.severity.label(),
                 "summary": f.summary,
                 "detail": f.detail,
-                "tokens_wasted": f.tokens_wasted,
                 "message_range": [f.message_range.0, f.message_range.1],
             })
         }).collect::<Vec<_>>(),
@@ -879,16 +639,6 @@ pub fn save_report(report: &AutopsyReport) -> Result<PathBuf, String> {
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
 fn shorten_path(path: &str) -> &str {
     // Show just the filename or last two components
     let parts: Vec<&str> = path.rsplitn(3, '/').collect();
@@ -911,7 +661,7 @@ mod tests {
 
     fn make_assistant_with_tool_use(tool: &str, input_json: &str) -> String {
         format!(
-            r#"{{"type":"assistant","message":{{"role":"assistant","model":"gpt-5.4","stop_reason":"tool_use","usage":{{"input_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":200}},"content":[{{"type":"tool_use","name":"{tool}","input":{input_json}}}]}}}}"#
+            r#"{{"type":"assistant","message":{{"role":"assistant","model":"gpt-5.4","stop_reason":"tool_use","content":[{{"type":"tool_use","name":"{tool}","input":{input_json}}}]}}}}"#
         )
     }
 
@@ -1061,44 +811,6 @@ mod tests {
     }
 
     #[test]
-    fn cost_efficiency_all_success() {
-        let lines = [
-            make_assistant_with_tool_use("Bash", r#"{"command":"ls"}"#),
-            make_user_with_result(false, "ok"),
-            make_assistant_with_tool_use(
-                "Edit",
-                r#"{"file_path":"/a.rs","old_string":"x","new_string":"y"}"#,
-            ),
-            make_user_with_result(false, "ok"),
-        ];
-        let joined = lines.join("\n");
-        let walker = TranscriptWalker::from_lines(joined.lines()).unwrap();
-        let breakdown = compute_cost_breakdown(&walker);
-
-        assert_eq!(breakdown.wasted_retry_tokens, 0);
-        // Efficiency may not be 100% due to token attribution granularity
-        // (last call gets 0 tokens since its tokens_at_call == total_tokens)
-        // but the key property is zero wasted tokens
-        assert!(breakdown.productive_tokens > 0);
-    }
-
-    #[test]
-    fn cost_efficiency_half_errors() {
-        let lines = [
-            make_assistant_with_tool_use("Bash", r#"{"command":"cargo build"}"#),
-            make_user_with_result(true, "error"),
-            make_assistant_with_tool_use("Bash", r#"{"command":"cargo build"}"#),
-            make_user_with_result(false, "ok"),
-        ];
-        let joined = lines.join("\n");
-        let walker = TranscriptWalker::from_lines(joined.lines()).unwrap();
-        let breakdown = compute_cost_breakdown(&walker);
-
-        assert!(breakdown.wasted_retry_tokens > 0);
-        assert!(breakdown.efficiency_pct < 100.0);
-    }
-
-    #[test]
     fn quality_score_with_passing_tests() {
         let lines = [
             make_assistant_with_tool_use("Bash", r#"{"command":"cargo test"}"#),
@@ -1151,20 +863,11 @@ mod tests {
                 ran_lint: false,
                 edit_efficiency: 80,
             },
-            cost: CostBreakdown {
-                total_tokens: 50000,
-                productive_tokens: 35000,
-                wasted_retry_tokens: 10000,
-                wasted_read_tokens: 3000,
-                wasted_undo_tokens: 2000,
-                efficiency_pct: 70.0,
-            },
             findings: vec![AutopsyFinding {
                 category: FindingCategory::ErrorCascade,
                 severity: FindingSeverity::Warning,
                 summary: "3 consecutive Bash errors".into(),
                 detail: Some("first error: compilation failed".into()),
-                tokens_wasted: 5000,
                 message_range: (2, 7),
             }],
             generated_at: 0,
@@ -1173,9 +876,20 @@ mod tests {
         let output = format_report(&report);
         assert!(output.contains("Session Autopsy: test-session"));
         assert!(output.contains("Quality Score: 65/100"));
-        assert!(output.contains("Cost Efficiency: 70%"));
         assert!(output.contains("Error Cascade"));
         assert!(output.contains("3 consecutive Bash errors"));
+        let forbidden: Vec<String> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-forbidden-output-keys.json"
+        ))
+        .unwrap();
+        for key in forbidden {
+            assert!(
+                !output.contains(&key),
+                "autopsy text retained forbidden output key {key}"
+            );
+        }
+        assert!(!output.contains("Cost Efficiency"));
+        assert!(!output.contains("tokens wasted"));
     }
 
     #[test]
@@ -1195,14 +909,6 @@ mod tests {
                 ran_lint: false,
                 edit_efficiency: 100,
             },
-            cost: CostBreakdown {
-                total_tokens: 10000,
-                productive_tokens: 8000,
-                wasted_retry_tokens: 2000,
-                wasted_read_tokens: 0,
-                wasted_undo_tokens: 0,
-                efficiency_pct: 80.0,
-            },
             findings: vec![],
             generated_at: 1234567890,
         };
@@ -1211,31 +917,21 @@ mod tests {
         assert_eq!(json["session_id"].as_str().unwrap(), "test");
         assert_eq!(json["total_messages"].as_u64().unwrap(), 5);
         assert_eq!(json["quality"]["overall"].as_u64().unwrap(), 50);
-        assert_eq!(json["cost"]["efficiency_pct"].as_f64().unwrap(), 80.0);
-        assert!(json["findings"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn context_bloat_detected() {
-        // Build a transcript with many messages consuming tokens but no edits
-        let mut lines = Vec::new();
-        for _ in 0..12 {
-            lines.push(make_assistant_with_tool_use(
-                "Read",
-                r#"{"file_path":"/a.rs"}"#,
-            ));
-            lines.push(make_user_with_result(false, "contents"));
+        assert!(json.get("cost").is_none());
+        let encoded = serde_json::to_string(&json).unwrap();
+        let forbidden: Vec<String> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-forbidden-output-keys.json"
+        ))
+        .unwrap();
+        for key in forbidden {
+            assert!(
+                !encoded.contains(&key),
+                "autopsy JSON retained forbidden output key {key}"
+            );
         }
-        let joined = lines.join("\n");
-        let walker = TranscriptWalker::from_lines(joined.lines()).unwrap();
-        let findings = detect_context_bloat(&walker);
-
-        // May or may not detect depending on token distribution — at least verify it runs
-        // (with uniform token distribution, each 8-msg window is ~33% of total → should trigger)
-        assert!(
-            !findings.is_empty(),
-            "Expected context bloat finding for 12 read-only messages"
-        );
+        assert!(!encoded.contains("tokens_wasted"));
+        assert!(!encoded.contains("total_tokens"));
+        assert!(json["findings"].as_array().unwrap().is_empty());
     }
 
     #[test]

@@ -9,7 +9,10 @@ Current product boundary:
 - Structured lifecycle, permission, and recovery hooks record bounded activity before richer provider evidence catches up.
 - Session switching uses exact provider-qualified Agent Deck navigation, native Claude background attach, or supported terminal focus.
 - Guarded tmux actions require current process identity, a unique pane, and prompt revalidation; manual text also requires explicit Live selection.
-- Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view.
+- Coding Brain does not collect or display token usage or cost.
+- Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it.
+- Only that bounded percentage is retained.
+- The percentage uses provider-supplied context capacity when available and otherwise a known-model fallback; it is not raw usage or cost accounting.
 - Coding Brain does not provide a mailbox, scheduler, durable task queue, dependency engine, or distributed coordinator.
 
 Current paths:

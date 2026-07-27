@@ -85,7 +85,6 @@ fn decision() -> DecisionSummary {
         brain_decision_ms: None,
         canonical: None,
         cache_hit: None,
-        cost_usd: None,
         model: None,
         outcome_kind: None,
         outcome_detail: None,

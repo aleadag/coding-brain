@@ -1,50 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModelProfile {
-    pub input_per_m: f64,
-    pub output_per_m: f64,
-    pub cache_read_per_m: f64,
-    pub cache_write_per_m: f64,
-    pub context_max: u64,
-    pub long_context_threshold: Option<u64>,
-    pub long_context_input_multiplier: f64,
-    pub long_context_output_multiplier: f64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ModelOverride {
-    pub name: String,
-    pub profile: ModelProfile,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelProfileSource {
-    BuiltIn,
-    Override,
-    Fallback,
-}
-
-impl ModelProfileSource {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::BuiltIn => "built-in",
-            Self::Override => "override",
-            Self::Fallback => "fallback",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedModelProfile {
-    pub key: String,
-    pub profile: ModelProfile,
-    pub source: ModelProfileSource,
-}
-
-static MODEL_OVERRIDES: OnceLock<Mutex<HashMap<String, ModelProfile>>> = OnceLock::new();
-
 pub fn shorten_model(model: &str) -> String {
     let key = model.trim().to_lowercase();
     if key.contains("gpt-5.6-terra") {
@@ -64,146 +17,11 @@ pub fn shorten_model(model: &str) -> String {
     }
 }
 
-pub fn set_overrides(overrides: Vec<ModelOverride>) {
-    let store = MODEL_OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut guard) = store.lock() else {
-        return;
-    };
-    guard.clear();
-    for override_ in overrides {
-        let raw = override_.name.trim().to_lowercase();
-        let shortened = shorten_model(&override_.name).to_lowercase();
-        guard.insert(raw, override_.profile);
-        guard.insert(shortened, override_.profile);
-    }
-}
-
-pub fn resolve(model: &str) -> ResolvedModelProfile {
-    let empty = HashMap::new();
-    let store = MODEL_OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()));
-    let guard = store.lock().ok();
-    let overrides = guard.as_deref().unwrap_or(&empty);
-    resolve_with_overrides(model, overrides)
-}
-
-pub(crate) fn resolve_with_overrides(
-    model: &str,
-    overrides: &HashMap<String, ModelProfile>,
-) -> ResolvedModelProfile {
-    let raw_key = model.trim().to_lowercase();
-    let short_key = shorten_model(model).to_lowercase();
-
-    if let Some(profile) = overrides
-        .get(&raw_key)
-        .or_else(|| overrides.get(&short_key))
-        .copied()
-    {
-        return ResolvedModelProfile {
-            key: if raw_key.is_empty() {
-                short_key
-            } else {
-                raw_key
-            },
-            profile,
-            source: ModelProfileSource::Override,
-        };
-    }
-
-    if let Some(profile) = built_in_profile(&short_key) {
-        return ResolvedModelProfile {
-            key: short_key,
-            profile,
-            source: ModelProfileSource::BuiltIn,
-        };
-    }
-
-    ResolvedModelProfile {
-        key: if short_key.is_empty() {
-            "unknown".into()
-        } else {
-            short_key
-        },
-        profile: fallback_profile(),
-        source: ModelProfileSource::Fallback,
-    }
-}
-
-fn built_in_profile(key: &str) -> Option<ModelProfile> {
-    match key {
-        "gpt-5.6-sol" => Some(ModelProfile {
-            input_per_m: 5.0,
-            output_per_m: 30.0,
-            cache_read_per_m: 0.5,
-            cache_write_per_m: 6.25,
-            context_max: 1_050_000,
-            long_context_threshold: Some(272_000),
-            long_context_input_multiplier: 2.0,
-            long_context_output_multiplier: 1.5,
-        }),
-        "gpt-5.6-terra" => Some(ModelProfile {
-            input_per_m: 2.5,
-            output_per_m: 15.0,
-            cache_read_per_m: 0.25,
-            cache_write_per_m: 3.125,
-            context_max: 1_050_000,
-            long_context_threshold: Some(272_000),
-            long_context_input_multiplier: 2.0,
-            long_context_output_multiplier: 1.5,
-        }),
-        "gpt-5.6-luna" => Some(ModelProfile {
-            input_per_m: 1.0,
-            output_per_m: 6.0,
-            cache_read_per_m: 0.1,
-            cache_write_per_m: 1.25,
-            context_max: 1_050_000,
-            long_context_threshold: Some(272_000),
-            long_context_input_multiplier: 2.0,
-            long_context_output_multiplier: 1.5,
-        }),
-        "gpt-5.5" => Some(ModelProfile {
-            input_per_m: 5.0,
-            output_per_m: 30.0,
-            cache_read_per_m: 0.5,
-            cache_write_per_m: 5.0,
-            context_max: 258_400,
-            long_context_threshold: None,
-            long_context_input_multiplier: 1.0,
-            long_context_output_multiplier: 1.0,
-        }),
-        "gpt-5.4" => Some(ModelProfile {
-            input_per_m: 2.5,
-            output_per_m: 15.0,
-            cache_read_per_m: 0.25,
-            cache_write_per_m: 2.5,
-            context_max: 258_400,
-            long_context_threshold: None,
-            long_context_input_multiplier: 1.0,
-            long_context_output_multiplier: 1.0,
-        }),
-        "gpt-5.4-mini" => Some(ModelProfile {
-            input_per_m: 0.75,
-            output_per_m: 4.5,
-            cache_read_per_m: 0.075,
-            cache_write_per_m: 0.75,
-            context_max: 258_400,
-            long_context_threshold: None,
-            long_context_input_multiplier: 1.0,
-            long_context_output_multiplier: 1.0,
-        }),
+pub fn context_window(model: &str) -> Option<u64> {
+    match shorten_model(model).as_str() {
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => Some(1_050_000),
+        "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" => Some(258_400),
         _ => None,
-    }
-}
-
-fn fallback_profile() -> ModelProfile {
-    ModelProfile {
-        input_per_m: 5.0,
-        output_per_m: 30.0,
-        cache_read_per_m: 0.5,
-        cache_write_per_m: 5.0,
-        context_max: 258_400,
-        long_context_threshold: None,
-        long_context_input_multiplier: 1.0,
-        long_context_output_multiplier: 1.0,
     }
 }
 
@@ -212,84 +30,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_builtin_profile() {
-        let resolved = resolve_with_overrides("gpt-5.5", &HashMap::new());
-        assert_eq!(resolved.source, ModelProfileSource::BuiltIn);
-        assert_eq!(resolved.profile.input_per_m, 5.0);
-        assert_eq!(resolved.profile.cache_read_per_m, 0.5);
-        assert_eq!(resolved.profile.output_per_m, 30.0);
-        assert_eq!(resolved.profile.context_max, 258_400);
-    }
-
-    #[test]
-    fn resolve_gpt_family_profiles() {
-        let large = resolve_with_overrides("gpt-5.4", &HashMap::new());
-        assert_eq!(large.source, ModelProfileSource::BuiltIn);
-        assert_eq!(large.profile.input_per_m, 2.5);
-        assert_eq!(large.profile.cache_read_per_m, 0.25);
-        assert_eq!(large.profile.output_per_m, 15.0);
-
-        let mini = resolve_with_overrides("gpt-5.4-mini", &HashMap::new());
-        assert_eq!(mini.source, ModelProfileSource::BuiltIn);
-        assert_eq!(mini.profile.input_per_m, 0.75);
-        assert_eq!(mini.profile.cache_read_per_m, 0.075);
-        assert_eq!(mini.profile.output_per_m, 4.5);
-    }
-
-    #[test]
-    fn resolves_gpt_56_family_profiles() {
-        let sol = resolve_with_overrides("gpt-5.6", &HashMap::new()).profile;
-        assert_eq!(sol.input_per_m, 5.0);
-        assert_eq!(sol.cache_read_per_m, 0.5);
-        assert_eq!(sol.output_per_m, 30.0);
-        assert_eq!(sol.cache_write_per_m, 6.25);
-        assert_eq!(sol.context_max, 1_050_000);
-        assert_eq!(sol.long_context_threshold, Some(272_000));
-        assert_eq!(sol.long_context_input_multiplier, 2.0);
-        assert_eq!(sol.long_context_output_multiplier, 1.5);
-
-        let terra = resolve_with_overrides("gpt-5.6-terra", &HashMap::new()).profile;
-        assert_eq!(
-            (
-                terra.input_per_m,
-                terra.cache_read_per_m,
-                terra.output_per_m
-            ),
-            (2.5, 0.25, 15.0)
-        );
-
-        let luna = resolve_with_overrides("gpt-5.6-luna", &HashMap::new()).profile;
-        assert_eq!(
-            (luna.input_per_m, luna.cache_read_per_m, luna.output_per_m),
-            (1.0, 0.1, 6.0)
-        );
-    }
-
-    #[test]
-    fn resolve_override_profile() {
-        let mut overrides = HashMap::new();
-        overrides.insert(
-            "custom-model".into(),
-            ModelProfile {
-                input_per_m: 1.0,
-                output_per_m: 2.0,
-                cache_read_per_m: 0.5,
-                cache_write_per_m: 1.5,
-                context_max: 128_000,
-                long_context_threshold: None,
-                long_context_input_multiplier: 1.0,
-                long_context_output_multiplier: 1.0,
-            },
-        );
-        let resolved = resolve_with_overrides("custom-model", &overrides);
-        assert_eq!(resolved.source, ModelProfileSource::Override);
-        assert_eq!(resolved.profile.context_max, 128_000);
-    }
-
-    #[test]
-    fn resolve_fallback_profile() {
-        let resolved = resolve_with_overrides("mystery-model", &HashMap::new());
-        assert_eq!(resolved.source, ModelProfileSource::Fallback);
-        assert_eq!(resolved.profile.context_max, 258_400);
+    fn context_window_is_known_only_for_supported_models() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(context_window(model), Some(1_050_000));
+        }
+        for model in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] {
+            assert_eq!(context_window(model), Some(258_400));
+        }
+        assert_eq!(context_window("custom-model"), None);
     }
 }

@@ -10,8 +10,6 @@ pub enum HookEvent {
     StatusChange,
     NeedsInput,
     Finished,
-    BudgetWarning,
-    BudgetExceeded,
     Idle,
     ContextHigh,
     ConflictDetected,
@@ -24,8 +22,6 @@ impl HookEvent {
             "hooks.on_status_change" => Some(Self::StatusChange),
             "hooks.on_needs_input" => Some(Self::NeedsInput),
             "hooks.on_finished" => Some(Self::Finished),
-            "hooks.on_budget_warning" => Some(Self::BudgetWarning),
-            "hooks.on_budget_exceeded" => Some(Self::BudgetExceeded),
             "hooks.on_idle" => Some(Self::Idle),
             "hooks.on_context_high" => Some(Self::ContextHigh),
             "hooks.on_conflict_detected" => Some(Self::ConflictDetected),
@@ -39,8 +35,6 @@ impl HookEvent {
             Self::StatusChange => "on_status_change",
             Self::NeedsInput => "on_needs_input",
             Self::Finished => "on_finished",
-            Self::BudgetWarning => "on_budget_warning",
-            Self::BudgetExceeded => "on_budget_exceeded",
             Self::Idle => "on_idle",
             Self::ContextHigh => "on_context_high",
             Self::ConflictDetected => "on_conflict_detected",
@@ -150,16 +144,16 @@ fn expand_template(template: &str, session: &AgentSession) -> String {
         .replace("{pid}", &session.pid.to_string())
         .replace("{project}", session.display_name())
         .replace("{status}", &session.status.to_string())
-        .replace("{cost}", &format!("{:.2}", session.cost_usd))
         .replace("{model}", &session.model)
         .replace("{cwd}", &session.cwd)
-        .replace("{tokens_in}", &session.total_input_tokens.to_string())
-        .replace("{tokens_out}", &session.total_output_tokens.to_string())
         .replace("{elapsed}", &session.format_elapsed())
         .replace("{session_id}", &session.session_id)
         .replace(
             "{context_pct}",
-            &format!("{:.0}", session.context_percent()),
+            &session
+                .context_pressure
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
         )
 }
 
@@ -179,34 +173,34 @@ mod tests {
         };
         let mut s = AgentSession::from_raw(raw);
         s.model = "gpt-5.5".into();
-        s.cost_usd = 3.45;
-        s.total_input_tokens = 500_000;
-        s.total_output_tokens = 50_000;
         s.telemetry_status = TelemetryStatus::Available;
-        s.usage_metrics_available = true;
         s
     }
 
     #[test]
-    fn test_expand_template() {
+    fn legacy_removed_placeholders_remain_literal() {
         let s = make_session();
-        let result = expand_template("echo {pid} {project} ${cost}", &s);
-        assert_eq!(result, "echo 12345 my-app $3.45");
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/legacy-hook-template.json"
+        ))
+        .unwrap();
+        let template = fixture["template"].as_str().unwrap();
+        let expected = fixture["expected"].as_str().unwrap();
+
+        assert_eq!(expand_template(template, &s), expected);
     }
 
     #[test]
-    fn test_expand_all_vars() {
+    fn retained_template_variables_expand() {
         let s = make_session();
         let result = expand_template(
-            "{pid}|{project}|{status}|{cost}|{model}|{cwd}|{tokens_in}|{tokens_out}|{session_id}",
+            "{pid}|{project}|{status}|{model}|{cwd}|{elapsed}|{session_id}",
             &s,
         );
         assert!(result.contains("12345"));
         assert!(result.contains("my-app"));
         assert!(result.contains("gpt-5.5"));
         assert!(result.contains("/Users/test/projects/my-app"));
-        assert!(result.contains("500000"));
-        assert!(result.contains("50000"));
         assert!(result.contains("abc-def-123"));
     }
 
@@ -239,9 +233,16 @@ mod tests {
     #[test]
     fn test_expand_context_pct() {
         let mut s = make_session();
-        s.context_tokens = 150_000;
-        s.context_max = 200_000;
+        s.context_pressure = Some(75);
         let result = expand_template("context at {context_pct}%", &s);
         assert_eq!(result, "context at 75%");
+    }
+
+    #[test]
+    fn unavailable_context_pressure_expands_to_empty() {
+        let mut s = make_session();
+        s.context_pressure = None;
+        let result = expand_template("context at {context_pct}%", &s);
+        assert_eq!(result, "context at %");
     }
 }
