@@ -1,0 +1,4 @@
+{
+  "template": "{pid}|{project}|{cost}|{tokens_in}|{tokens_out}",
+  "expected": "12345|my-app|{cost}|{tokens_in}|{tokens_out}"
+}

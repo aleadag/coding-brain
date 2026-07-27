@@ -159,15 +159,15 @@ pub(crate) fn detect_error_loops(decisions: &[DecisionRecord]) -> Vec<Insight> {
         .collect()
 }
 
-/// Detect sessions frequently hitting high context usage.
+/// Detect sessions frequently reaching high context pressure.
 pub(crate) fn detect_context_blowouts(decisions: &[DecisionRecord]) -> Vec<Insight> {
-    // Group by PID, check if any decision in session had context > 80%
+    // Group by PID, check if any decision in session reached at least 80%.
     let mut pid_max_context: HashMap<u32, u8> = HashMap::new();
     for d in decisions {
-        if let Some(ref ctx) = d.context {
+        if let Some(context_pct) = d.context.as_ref().and_then(|ctx| ctx.context_pct) {
             let entry = pid_max_context.entry(d.pid).or_insert(0);
-            if ctx.context_pct > *entry {
-                *entry = ctx.context_pct;
+            if context_pct > *entry {
+                *entry = context_pct;
             }
         }
     }
@@ -186,7 +186,7 @@ pub(crate) fn detect_context_blowouts(decisions: &[DecisionRecord]) -> Vec<Insig
         .take(20)
         .collect();
 
-    let blowout_count = recent.iter().filter(|&&pct| pct > 80).count();
+    let blowout_count = recent.iter().filter(|&&pct| pct >= 80).count();
     let total = recent.len();
     let blowout_rate = blowout_count as f64 / total as f64;
 
@@ -204,7 +204,7 @@ pub(crate) fn detect_context_blowouts(decisions: &[DecisionRecord]) -> Vec<Insig
             InsightSeverity::Suggestion
         },
         summary: format!(
-            "Context >80% in {blowout_count}/{total} recent sessions ({:.0}%)",
+            "Context at least 80% in {blowout_count}/{total} recent sessions ({:.0}%)",
             blowout_rate * 100.0
         ),
         suggestion: Some("consider earlier /compact when context approaches 70%".to_string()),
@@ -358,90 +358,6 @@ pub(crate) fn detect_temporal_friction(prefs: &DistilledPreferences) -> Vec<Insi
         .collect()
 }
 
-/// Detect increasing burn rate trends and cost outliers.
-pub(crate) fn detect_cost_patterns(decisions: &[DecisionRecord]) -> Vec<Insight> {
-    let burn_rates: Vec<f64> = decisions
-        .iter()
-        .filter_map(|d| d.context.as_ref().map(|c| c.burn_rate_per_hr))
-        .filter(|r| *r > 0.0)
-        .collect();
-
-    if burn_rates.len() < 10 {
-        return Vec::new();
-    }
-
-    let mut insights = Vec::new();
-    let now = epoch_now();
-
-    // Compare first half vs second half burn rates
-    let mid = burn_rates.len() / 2;
-    let first_avg: f64 = burn_rates[..mid].iter().sum::<f64>() / mid as f64;
-    let second_avg: f64 = burn_rates[mid..].iter().sum::<f64>() / (burn_rates.len() - mid) as f64;
-
-    if first_avg > 0.0 {
-        let increase = (second_avg - first_avg) / first_avg;
-        if increase > 0.5 {
-            insights.push(Insight {
-                fingerprint: "cost_trend:increasing".to_string(),
-                generated_at: now,
-                category: InsightCategory::CostPattern,
-                severity: if increase > 1.0 {
-                    InsightSeverity::Warning
-                } else {
-                    InsightSeverity::Suggestion
-                },
-                summary: format!(
-                    "Burn rate trending up: ${:.2}/hr -> ${:.2}/hr ({:+.0}%)",
-                    first_avg,
-                    second_avg,
-                    increase * 100.0,
-                ),
-                suggestion: Some(
-                    "consider setting a budget with --budget or reviewing costly operations"
-                        .to_string(),
-                ),
-                evidence_count: burn_rates.len() as u32,
-            });
-        }
-    }
-
-    // Detect cost outlier sessions
-    let mut per_session_cost: HashMap<u32, f64> = HashMap::new();
-    for d in decisions {
-        if let Some(ref ctx) = d.context {
-            let entry = per_session_cost.entry(d.pid).or_insert(0.0);
-            if ctx.cost_usd > *entry {
-                *entry = ctx.cost_usd;
-            }
-        }
-    }
-
-    if per_session_cost.len() >= 3 {
-        let costs: Vec<f64> = per_session_cost.values().copied().collect();
-        let avg: f64 = costs.iter().sum::<f64>() / costs.len() as f64;
-        let outlier_count = costs.iter().filter(|&&c| c > avg * 2.0 && c > 1.0).count();
-
-        if outlier_count >= 2 {
-            insights.push(Insight {
-                fingerprint: "cost_trend:outliers".to_string(),
-                generated_at: now,
-                category: InsightCategory::CostPattern,
-                severity: InsightSeverity::Info,
-                summary: format!(
-                    "{outlier_count} sessions cost >2x average (avg ${avg:.2})"
-                ),
-                suggestion: Some(
-                    "review high-cost sessions — consider budget limits or earlier session restarts"
-                        .to_string(),
-                ),
-                evidence_count: outlier_count as u32,
-            });
-        }
-    }
-
-    insights
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
@@ -479,7 +395,6 @@ mod tests {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn make_decision_with_context(
         tool: &str,
         command: &str,
@@ -487,13 +402,10 @@ mod tests {
         pid: u32,
         context_pct: u8,
         last_error: bool,
-        burn_rate: f64,
-        cost: f64,
     ) -> DecisionRecord {
         let mut d = make_decision(tool, command, user_action, pid);
         d.context = Some(DecisionContext {
-            cost_usd: cost,
-            context_pct,
+            context_pct: Some(context_pct),
             last_tool_error: last_error,
             error_message: None,
             model: "test".to_string(),
@@ -502,7 +414,6 @@ mod tests {
             total_tool_calls: 10,
             has_file_conflict: false,
             status: "Processing".to_string(),
-            burn_rate_per_hr: burn_rate,
             recent_error_count: 0,
             subagent_count: 0,
             hour: Some(10),
@@ -542,18 +453,7 @@ mod tests {
     fn test_error_loops_detected() {
         // 4 consecutive errors for same tool in one session
         let decisions: Vec<DecisionRecord> = (0..4)
-            .map(|_| {
-                make_decision_with_context(
-                    "Write",
-                    "src/main.rs",
-                    "accept",
-                    100,
-                    50,
-                    true,
-                    1.0,
-                    0.5,
-                )
-            })
+            .map(|_| make_decision_with_context("Write", "src/main.rs", "accept", 100, 50, true))
             .collect();
 
         let insights = detect_error_loops(&decisions);
@@ -565,14 +465,33 @@ mod tests {
     fn test_context_blowouts_detected() {
         // 5 sessions all hitting >80% context
         let decisions: Vec<DecisionRecord> = (0..5)
-            .map(|pid| {
-                make_decision_with_context("Read", "file.rs", "accept", pid, 85, false, 1.0, 0.5)
-            })
+            .map(|pid| make_decision_with_context("Read", "file.rs", "accept", pid, 85, false))
             .collect();
 
         let insights = detect_context_blowouts(&decisions);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].category, InsightCategory::ContextBlowout);
+    }
+
+    #[test]
+    fn context_pressure_at_eighty_percent_counts_as_a_blowout() {
+        let decisions: Vec<DecisionRecord> = (0..5)
+            .map(|pid| make_decision_with_context("Read", "file.rs", "accept", pid, 80, false))
+            .collect();
+
+        assert_eq!(detect_context_blowouts(&decisions).len(), 1);
+    }
+
+    #[test]
+    fn unavailable_context_pressure_does_not_count_as_a_blowout() {
+        let mut decisions: Vec<DecisionRecord> = (0..5)
+            .map(|pid| make_decision_with_context("Read", "file.rs", "accept", pid, 85, false))
+            .collect();
+        for decision in &mut decisions {
+            decision.context.as_mut().unwrap().context_pct = None;
+        }
+
+        assert!(detect_context_blowouts(&decisions).is_empty());
     }
 
     #[test]
@@ -629,30 +548,6 @@ mod tests {
         assert_eq!(insights.len(), 1);
         assert!(insights[0].summary.contains("Edit"));
         assert!(insights[0].summary.contains("40%"));
-    }
-
-    #[test]
-    fn test_cost_trend_detected() {
-        let mut decisions = Vec::new();
-        // First 10: low burn rate
-        for i in 0..10 {
-            decisions.push(make_decision_with_context(
-                "Bash", "cmd", "accept", i, 50, false, 1.0, 0.5,
-            ));
-        }
-        // Next 10: high burn rate (3x increase)
-        for i in 10..20 {
-            decisions.push(make_decision_with_context(
-                "Bash", "cmd", "accept", i, 50, false, 3.0, 1.5,
-            ));
-        }
-
-        let insights = detect_cost_patterns(&decisions);
-        assert!(
-            insights
-                .iter()
-                .any(|i| i.fingerprint == "cost_trend:increasing")
-        );
     }
 
     #[test]

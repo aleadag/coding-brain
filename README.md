@@ -63,7 +63,9 @@ coding-brain --brain-briefing --project my-project
 
 ## Product boundary
 
-Coding Brain owns immediate judgment, learning evidence, review, recovery, and source-session navigation. It is Brain activity, not a general session dashboard. Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view. Durable tasks, dependency graphs, claims, blockers, and cross-session handoffs belong in an external tool such as [Beads](https://github.com/steveyegge/beads). Beads and Agent Deck are both optional; neither is a runtime dependency.
+Coding Brain owns immediate judgment, learning evidence, review, recovery, and source-session navigation. It is Brain activity, not a general session dashboard. Coding Brain does not collect or display token usage or cost. Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it. Only that bounded percentage is retained. The percentage uses provider-supplied context capacity when available and otherwise a known-model fallback; it is not raw usage or cost accounting.
+
+Durable tasks, dependency graphs, claims, blockers, and cross-session handoffs belong in an external tool such as [Beads](https://github.com/steveyegge/beads). Beads and Agent Deck are both optional; neither is a runtime dependency.
 
 ## Breaking cutover from codexctl
 

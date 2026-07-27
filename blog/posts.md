@@ -1,4 +1,14 @@
-# codexctl Social Posts
+# Archived codexctl Social Post Drafts
+
+These pre-1.0 launch drafts describe removed codexctl capabilities and are
+retained as historical material, not as current Coding Brain product claims.
+Coding Brain does not collect or display token usage or cost.
+Coding Brain may derive a bounded context-window percentage for context-rot
+prevention, but it does not retain the provider token counts used to derive it.
+Only that bounded percentage is retained.
+The percentage uses provider-supplied context capacity when available and
+otherwise a known-model fallback; it is not raw usage or cost accounting. See
+the [README](../README.md) for the current product surface.
 
 ---
 

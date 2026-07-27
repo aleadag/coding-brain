@@ -89,9 +89,6 @@ pub struct DecisionSummary {
     /// `None` before instrumentation.
     #[serde(default)]
     pub cache_hit: Option<bool>,
-    /// Cost in USD when this decision was made (context snapshot).
-    #[serde(default)]
-    pub cost_usd: Option<f64>,
     /// Model that produced the suggestion.
     #[serde(default)]
     pub model: Option<String>,

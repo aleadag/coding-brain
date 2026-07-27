@@ -78,9 +78,6 @@ pub struct AntiPattern {
     pub bad_terminals: u32,
     /// Last epoch second the sequence was observed.
     pub last_seen: u64,
-    /// Avg cost (USD) of the step immediately after the sequence ended in a
-    /// bad terminal — proxy for downstream waste.
-    pub avg_downstream_cost: f64,
 }
 
 impl AntiPattern {
@@ -145,6 +142,10 @@ pub fn load_library() -> Vec<AntiPattern> {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
+    parse_library_json(&json)
+}
+
+fn parse_library_json(json: &serde_json::Value) -> Vec<AntiPattern> {
     json.get("antipatterns")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(antipattern_from_json).collect())
@@ -161,7 +162,6 @@ fn antipattern_to_json(ap: &AntiPattern) -> serde_json::Value {
         "total_occurrences": ap.total_occurrences,
         "bad_terminals": ap.bad_terminals,
         "last_seen": ap.last_seen,
-        "avg_downstream_cost": ap.avg_downstream_cost,
     })
 }
 
@@ -189,10 +189,6 @@ fn antipattern_from_json(v: &serde_json::Value) -> Option<AntiPattern> {
         total_occurrences: v.get("total_occurrences")?.as_u64()? as u32,
         bad_terminals: v.get("bad_terminals")?.as_u64()? as u32,
         last_seen: v.get("last_seen").and_then(|c| c.as_u64()).unwrap_or(0),
-        avg_downstream_cost: v
-            .get("avg_downstream_cost")
-            .and_then(|c| c.as_f64())
-            .unwrap_or(0.0),
     })
 }
 
@@ -206,7 +202,7 @@ fn antipattern_from_json(v: &serde_json::Value) -> Option<AntiPattern> {
 ///
 /// - User rejected the brain's approve
 /// - Auto-approved decision was followed by an error-heavy context
-/// - High context (>80%) right after the sequence (blowout)
+/// - High context (>=80%) right after the sequence (blowout)
 fn is_bad_terminal(d: &DecisionRecord) -> bool {
     if d.is_negative() {
         return true;
@@ -218,7 +214,7 @@ fn is_bad_terminal(d: &DecisionRecord) -> bool {
         // We approved into an error
         return true;
     }
-    if ctx.context_pct >= 80 {
+    if ctx.context_pct.is_some_and(|pct| pct >= 80) {
         return true;
     }
     false
@@ -264,8 +260,6 @@ pub fn mine_antipatterns(decisions: &[DecisionRecord]) -> Vec<AntiPattern> {
         total: u32,
         bad: u32,
         last_seen: u64,
-        cost_acc: f64,
-        cost_n: u32,
     }
     let mut agg: HashMap<Vec<SeqStep>, Stats> = HashMap::new();
 
@@ -286,10 +280,6 @@ pub fn mine_antipatterns(decisions: &[DecisionRecord]) -> Vec<AntiPattern> {
                 entry.total += 1;
                 if is_bad_terminal(next) {
                     entry.bad += 1;
-                    if let Some(ctx) = next.context.as_ref() {
-                        entry.cost_acc += ctx.cost_usd;
-                        entry.cost_n += 1;
-                    }
                 }
                 let ts = next.resolved_at.unwrap_or(0);
                 if ts > entry.last_seen {
@@ -309,17 +299,11 @@ pub fn mine_antipatterns(decisions: &[DecisionRecord]) -> Vec<AntiPattern> {
             if rate < MIN_BAD_RATE {
                 return None;
             }
-            let avg_cost = if s.cost_n > 0 {
-                s.cost_acc / s.cost_n as f64
-            } else {
-                0.0
-            };
             Some(AntiPattern {
                 steps,
                 total_occurrences: s.total,
                 bad_terminals: s.bad,
                 last_seen: s.last_seen,
-                avg_downstream_cost: avg_cost,
             })
         })
         .filter(|ap| ap.steps.len() <= MAX_LIBRARY_N)
@@ -399,23 +383,17 @@ pub(crate) fn detect_antipattern_sequences(decisions: &[DecisionRecord]) -> Vec<
             } else {
                 InsightSeverity::Suggestion
             };
-            let cost_part = if ap.avg_downstream_cost > 0.0 {
-                format!(", avg ${:.2} downstream", ap.avg_downstream_cost)
-            } else {
-                String::new()
-            };
             Insight {
                 fingerprint: ap.fingerprint(),
                 generated_at: now,
                 category: InsightCategory::AntiPattern,
                 severity,
                 summary: format!(
-                    "{} → bad outcome {}/{} ({:.0}%{})",
+                    "{} → bad outcome {}/{} ({:.0}%)",
                     ap.display(),
                     ap.bad_terminals,
                     ap.total_occurrences,
                     bad_rate * 100.0,
-                    cost_part,
                 ),
                 suggestion: Some(format!(
                     "watch for this prefix in live sessions; n={}",
@@ -449,8 +427,7 @@ mod tests {
             brain_reasoning: String::new(),
             user_action: user_action.into(),
             context: Some(DecisionContext {
-                cost_usd: 0.5,
-                context_pct: if error { 50 } else { 40 },
+                context_pct: Some(if error { 50 } else { 40 }),
                 last_tool_error: error,
                 error_message: None,
                 model: "test".into(),
@@ -459,7 +436,6 @@ mod tests {
                 total_tool_calls: 1,
                 has_file_conflict: false,
                 status: "Processing".into(),
-                burn_rate_per_hr: 1.0,
                 recent_error_count: 0,
                 subagent_count: 0,
                 hour: None,
@@ -549,7 +525,6 @@ mod tests {
             total_occurrences: 7,
             bad_terminals: 6,
             last_seen: 12345,
-            avg_downstream_cost: 0.42,
         }];
         let _guard = crate::config::HOME_ENV_LOCK
             .lock()
@@ -570,5 +545,32 @@ mod tests {
         assert_eq!(loaded[0].steps.len(), 2);
         assert_eq!(loaded[0].total_occurrences, 7);
         assert_eq!(loaded[0].bad_terminals, 6);
+    }
+
+    #[test]
+    fn legacy_cost_field_is_ignored_while_neighboring_sequences_survive() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-cost-sequences.json"
+        ))
+        .unwrap();
+
+        let library = parse_library_json(&value);
+
+        assert_eq!(library.len(), 2);
+        assert_eq!(library[0].total_occurrences, 7);
+        assert_eq!(library[1].steps[0].tool, "Read");
+        let encoded =
+            serde_json::to_string(&library.iter().map(antipattern_to_json).collect::<Vec<_>>())
+                .unwrap();
+        let forbidden: Vec<String> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-forbidden-output-keys.json"
+        ))
+        .unwrap();
+        for key in forbidden {
+            assert!(
+                !encoded.contains(&key),
+                "sequence JSON retained forbidden output key {key}"
+            );
+        }
     }
 }

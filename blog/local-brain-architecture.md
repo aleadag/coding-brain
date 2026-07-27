@@ -2,6 +2,17 @@
 
 *How codexctl uses a local LLM to supervise, teach, and coordinate AI coding agents — without your reasoning traces ever leaving your machine.*
 
+> **Archive notice:** This pre-1.0 article describes removed codexctl
+> capabilities and is retained as historical material, not as a current Coding
+> Brain product description.
+> Coding Brain does not collect or display token usage or cost.
+> Coding Brain may derive a bounded context-window percentage for context-rot
+> prevention, but it does not retain the provider token counts used to derive
+> it. Only that bounded percentage is retained. The percentage uses
+> provider-supplied context capacity when available and otherwise a known-model
+> fallback; it is not raw usage or cost accounting. See the
+> [README](../README.md) for the current product surface.
+
 ---
 
 ## The Problem With Babysitting Agents

@@ -1,0 +1,40 @@
+{
+  "generated_at": 1710000000,
+  "antipatterns": [
+    {
+      "steps": [
+        {
+          "tool": "Edit",
+          "cmd": "src/main.rs",
+          "had_error": false
+        },
+        {
+          "tool": "Bash",
+          "cmd": "cargo test",
+          "had_error": true
+        }
+      ],
+      "total_occurrences": 7,
+      "bad_terminals": 6,
+      "avg_downstream_cost": 0.42,
+      "last_seen": 1709999999
+    },
+    {
+      "steps": [
+        {
+          "tool": "Read",
+          "cmd": "src/lib.rs",
+          "had_error": false
+        },
+        {
+          "tool": "Read",
+          "cmd": "src/lib.rs",
+          "had_error": false
+        }
+      ],
+      "total_occurrences": 5,
+      "bad_terminals": 4,
+      "last_seen": 1710000000
+    }
+  ]
+}

@@ -31,7 +31,6 @@ pub struct AutoRule {
     pub match_tool: Vec<String>,
     pub match_command: Vec<String>,
     pub match_project: Vec<String>,
-    pub match_cost_above: Option<f64>,
     pub match_last_error: Option<bool>,
     pub match_file_conflict: Option<bool>,
     pub action: RuleAction,
@@ -46,7 +45,6 @@ impl AutoRule {
             match_tool: Vec::new(),
             match_command: Vec::new(),
             match_project: Vec::new(),
-            match_cost_above: None,
             match_last_error: None,
             match_file_conflict: None,
             action,
@@ -146,12 +144,6 @@ fn matches_rule(rule: &AutoRule, session: &AgentSession) -> bool {
         }
     }
 
-    if let Some(threshold) = rule.match_cost_above {
-        if session.cost_usd <= threshold {
-            return false;
-        }
-    }
-
     if let Some(expected) = rule.match_last_error {
         if session.last_tool_error != expected {
             return false;
@@ -190,7 +182,6 @@ mod tests {
         s.telemetry_status = TelemetryStatus::Available;
         s.pending_tool_name = Some("Bash".into());
         s.pending_tool_input = Some("cargo test".into());
-        s.cost_usd = 5.0;
         s
     }
 
@@ -308,16 +299,17 @@ mod tests {
     }
 
     #[test]
-    fn match_cost_above() {
-        let s = make_session(); // cost = 5.0
+    fn deny_precedence_survives_matching_permission_conditions() {
+        let s = make_session();
 
-        let mut rule = approve_rule("cheap");
-        rule.match_cost_above = Some(10.0);
-        assert!(evaluate(&[rule], &s).is_none());
+        let mut approve = approve_rule("approve-bash");
+        approve.match_tool = vec!["Bash".into()];
+        let mut deny = deny_rule("deny-cargo");
+        deny.match_command = vec!["cargo".into()];
 
-        let mut rule2 = approve_rule("expensive");
-        rule2.match_cost_above = Some(3.0);
-        assert!(evaluate(&[rule2], &s).is_some());
+        let matched = evaluate(&[approve, deny], &s).unwrap();
+        assert_eq!(matched.rule_name, "deny-cargo");
+        assert_eq!(matched.action, RuleAction::Deny);
     }
 
     #[test]
@@ -372,13 +364,12 @@ mod tests {
 
     #[test]
     fn multiple_conditions_are_and() {
-        let s = make_session(); // Bash + "cargo test" + cost 5.0
+        let s = make_session(); // Bash + "cargo test"
 
-        let mut rule = approve_rule("bash_cargo_cheap");
+        let mut rule = approve_rule("bash_cargo");
         rule.match_tool = vec!["Bash".into()];
         rule.match_command = vec!["cargo".into()];
-        rule.match_cost_above = Some(10.0); // cost 5.0 does NOT exceed 10.0
-        assert!(evaluate(&[rule], &s).is_none());
+        assert!(evaluate(&[rule], &s).is_some());
     }
 
     #[test]

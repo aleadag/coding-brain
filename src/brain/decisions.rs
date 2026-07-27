@@ -122,8 +122,7 @@ pub enum DecisionOutcome {
 /// Stored in JSONL for rich distillation. NOT sent to LLM directly.
 #[derive(Debug, Clone)]
 pub struct DecisionContext {
-    pub cost_usd: f64,
-    pub context_pct: u8,
+    pub context_pct: Option<u8>,
     pub last_tool_error: bool,
     pub error_message: Option<String>,
     pub model: String,
@@ -132,7 +131,6 @@ pub struct DecisionContext {
     pub total_tool_calls: u32,
     pub has_file_conflict: bool,
     pub status: String,
-    pub burn_rate_per_hr: f64,
     pub recent_error_count: u8,
     pub subagent_count: u8,
     /// Hour of day (0-23) when this decision was made. Used for time-of-day
@@ -163,7 +161,6 @@ impl From<&DecisionRecord> for coding_brain_core::runtime::DecisionSummary {
             brain_decision_ms: r.brain_decision_ms,
             canonical: r.canonical,
             cache_hit: r.cache_hit,
-            cost_usd: r.context.as_ref().map(|c| c.cost_usd),
             model: r.context.as_ref().map(|c| c.model.clone()),
             outcome_kind: r.outcome.as_ref().map(|o| match o {
                 DecisionOutcome::Success => "success".to_string(),
@@ -462,14 +459,8 @@ pub(super) fn local_hour_from_epoch(epoch_secs: i64) -> u8 {
 
 /// Build a JSON snapshot of session state for embedding in a JSONL record.
 fn snapshot_context(session: &crate::session::AgentSession) -> serde_json::Value {
-    let context_pct = if session.context_max > 0 {
-        ((session.context_tokens as f64 / session.context_max as f64) * 100.0) as u8
-    } else {
-        0
-    };
     serde_json::json!({
-        "cost_usd": session.cost_usd,
-        "context_pct": context_pct,
+        "context_pct": session.context_pressure,
         "last_tool_error": session.last_tool_error,
         "error_message": session.last_error_message.as_deref().map(|m| crate::session::truncate_str(m, 100)),
         "model": session.model,
@@ -478,7 +469,6 @@ fn snapshot_context(session: &crate::session::AgentSession) -> serde_json::Value
         "total_tool_calls": session.tool_usage.values().map(|t| t.calls).sum::<u32>(),
         "has_file_conflict": session.has_file_conflict,
         "status": session.status.to_string(),
-        "burn_rate_per_hr": session.burn_rate_per_hr,
         "recent_error_count": session.recent_errors.len() as u8,
         "subagent_count": session.subagent_count as u8,
         "hour": current_hour(),
@@ -771,96 +761,137 @@ pub fn read_all_decisions() -> Vec<DecisionRecord> {
         .lines()
         .filter_map(|line| {
             let json: serde_json::Value = serde_json::from_str(line).ok()?;
-            let context = json.get("context").and_then(|ctx| {
-                Some(DecisionContext {
-                    cost_usd: ctx.get("cost_usd")?.as_f64()?,
-                    context_pct: ctx.get("context_pct")?.as_u64()? as u8,
-                    last_tool_error: ctx.get("last_tool_error")?.as_bool()?,
-                    error_message: ctx
-                        .get("error_message")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    model: ctx.get("model")?.as_str()?.to_string(),
-                    elapsed_secs: ctx.get("elapsed_secs")?.as_u64()?,
-                    files_modified_count: ctx.get("files_modified_count")?.as_u64()? as u32,
-                    total_tool_calls: ctx.get("total_tool_calls")?.as_u64()? as u32,
-                    has_file_conflict: ctx.get("has_file_conflict")?.as_bool()?,
-                    status: ctx.get("status")?.as_str()?.to_string(),
-                    burn_rate_per_hr: ctx.get("burn_rate_per_hr")?.as_f64()?,
-                    recent_error_count: ctx.get("recent_error_count")?.as_u64()? as u8,
-                    subagent_count: ctx.get("subagent_count")?.as_u64()? as u8,
-                    // Backwards-compatible: old records won't have "hour" field
-                    hour: ctx.get("hour").and_then(|v| v.as_u64()).map(|v| v as u8),
-                })
-            });
-            // Backwards-compatible: old records won't have "decision_type" field
-            let decision_type = json
-                .get("decision_type")
-                .and_then(|v| v.as_str())
-                .map(DecisionType::from_label)
-                .unwrap_or(DecisionType::Session);
-            let provider = match json.get("provider") {
-                None => AgentProvider::Codex,
-                Some(value) => serde_json::from_value(value.clone()).ok()?,
-            };
-            Some(DecisionRecord {
-                provider,
-                timestamp: json.get("ts")?.to_string(),
-                pid: json.get("pid")?.as_u64()? as u32,
-                project: json.get("project")?.as_str()?.to_string(),
-                tool: json
-                    .get("tool")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                command: json
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                // Handle null brain_action (observations log it as null)
-                brain_action: json
-                    .get("brain_action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                brain_confidence: json
-                    .get("brain_confidence")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0),
-                brain_reasoning: json
-                    .get("brain_reasoning")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                user_action: json.get("user_action")?.as_str()?.to_string(),
-                context,
-                outcome: None, // Backfilled during distillation
-                decision_type,
-                // Backwards-compatible: old records won't have these fields
-                suggested_at: json.get("suggested_at").and_then(|v| v.as_u64()),
-                resolved_at: json.get("resolved_at").and_then(|v| v.as_u64()),
-                override_reason: json
-                    .get("override_reason")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                decision_id: json
-                    .get("decision_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                brain_decision_ms: json.get("brain_decision_ms").and_then(|v| v.as_u64()),
-                cache_hit: json.get("cache_hit").and_then(|v| v.as_bool()),
-                canonical: {
-                    // Inline canonical flag wins; otherwise check the side store.
-                    let inline = json.get("canonical").and_then(|v| v.as_bool());
-                    let dec_id = json.get("decision_id").and_then(|v| v.as_str());
-                    match (inline, dec_id) {
-                        (Some(b), _) => Some(b),
-                        (None, Some(id)) if canonical_set.contains(id) => Some(true),
-                        _ => None,
-                    }
-                },
-            })
+            parse_decision_value(&json, &canonical_set)
         })
         .collect()
+}
+
+fn parse_decision_value(
+    json: &serde_json::Value,
+    canonical_set: &std::collections::HashSet<String>,
+) -> Option<DecisionRecord> {
+    let context = json
+        .get("context")
+        .filter(|ctx| ctx.is_object())
+        .map(|ctx| DecisionContext {
+            context_pct: ctx
+                .get("context_pct")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u8::try_from(value).ok())
+                .filter(|value| *value <= 100),
+            last_tool_error: ctx
+                .get("last_tool_error")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            error_message: ctx
+                .get("error_message")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            model: ctx
+                .get("model")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            elapsed_secs: ctx
+                .get("elapsed_secs")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default(),
+            files_modified_count: ctx
+                .get("files_modified_count")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default(),
+            total_tool_calls: ctx
+                .get("total_tool_calls")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default(),
+            has_file_conflict: ctx
+                .get("has_file_conflict")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            status: ctx
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            recent_error_count: ctx
+                .get("recent_error_count")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u8::try_from(value).ok())
+                .unwrap_or_default(),
+            subagent_count: ctx
+                .get("subagent_count")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u8::try_from(value).ok())
+                .unwrap_or_default(),
+            hour: ctx
+                .get("hour")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u8::try_from(value).ok()),
+        });
+    let decision_type = json
+        .get("decision_type")
+        .and_then(|v| v.as_str())
+        .map(DecisionType::from_label)
+        .unwrap_or(DecisionType::Session);
+    let provider = match json.get("provider") {
+        None => AgentProvider::Codex,
+        Some(value) => serde_json::from_value(value.clone()).ok()?,
+    };
+    Some(DecisionRecord {
+        provider,
+        timestamp: json.get("ts")?.to_string(),
+        pid: json.get("pid")?.as_u64()? as u32,
+        project: json.get("project")?.as_str()?.to_string(),
+        tool: json
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        command: json
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        brain_action: json
+            .get("brain_action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        brain_confidence: json
+            .get("brain_confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        brain_reasoning: json
+            .get("brain_reasoning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        user_action: json.get("user_action")?.as_str()?.to_string(),
+        context,
+        outcome: None,
+        decision_type,
+        suggested_at: json.get("suggested_at").and_then(|v| v.as_u64()),
+        resolved_at: json.get("resolved_at").and_then(|v| v.as_u64()),
+        override_reason: json
+            .get("override_reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        decision_id: json
+            .get("decision_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        brain_decision_ms: json.get("brain_decision_ms").and_then(|v| v.as_u64()),
+        cache_hit: json.get("cache_hit").and_then(|v| v.as_bool()),
+        canonical: {
+            let inline = json.get("canonical").and_then(|v| v.as_bool());
+            let dec_id = json.get("decision_id").and_then(|v| v.as_str());
+            match (inline, dec_id) {
+                (Some(b), _) => Some(b),
+                (None, Some(id)) if canonical_set.contains(id) => Some(true),
+                _ => None,
+            }
+        },
+    })
 }
 
 pub(crate) fn read_learning_decisions() -> Vec<DecisionRecord> {
@@ -1064,10 +1095,9 @@ mod tests {
         }
     }
 
-    fn make_context(cost_usd: f64, context_pct: u8, last_tool_error: bool) -> DecisionContext {
+    fn make_context(context_pct: u8, last_tool_error: bool) -> DecisionContext {
         DecisionContext {
-            cost_usd,
-            context_pct,
+            context_pct: Some(context_pct),
             last_tool_error,
             error_message: if last_tool_error {
                 Some("test error".to_string())
@@ -1080,22 +1110,16 @@ mod tests {
             total_tool_calls: 10,
             has_file_conflict: false,
             status: "Working".into(),
-            burn_rate_per_hr: 1.0,
             recent_error_count: if last_tool_error { 1 } else { 0 },
             subagent_count: 0,
             hour: None,
         }
     }
 
-    fn make_context_with_hour(
-        cost_usd: f64,
-        context_pct: u8,
-        last_tool_error: bool,
-        hour: u8,
-    ) -> DecisionContext {
+    fn make_context_with_hour(context_pct: u8, last_tool_error: bool, hour: u8) -> DecisionContext {
         DecisionContext {
             hour: Some(hour),
-            ..make_context(cost_usd, context_pct, last_tool_error)
+            ..make_context(context_pct, last_tool_error)
         }
     }
 
@@ -1374,7 +1398,7 @@ mod tests {
     // ── Snapshot context tests ────────────────────────────────────────
 
     #[test]
-    fn test_snapshot_context_fields() {
+    fn telemetry_free_snapshot_context_fields() {
         use crate::session::{AgentSession, SessionStatus};
         use std::collections::HashMap;
         use std::time::Duration;
@@ -1386,99 +1410,43 @@ mod tests {
         let mut files = HashMap::new();
         files.insert("src/main.rs".to_string(), 2u32);
 
-        let session = AgentSession {
+        let mut session = AgentSession::from_raw(crate::session::RawAgentSession {
             provider: coding_brain_core::provider::AgentProvider::Codex,
             pid: 42,
             process_start_identity: None,
-            process_backed: true,
-            identity_provenance: coding_brain_core::session::SessionIdentityProvenance::Unknown,
             session_id: "test-session".into(),
-            native_attach_id: None,
             cwd: "/tmp".into(),
-            project_name: "test-proj".into(),
             started_at: 0,
-            elapsed: Duration::from_secs(120),
-            tty: "/dev/pts/0".into(),
-            status: SessionStatus::Processing,
-            cpu_percent: 50.0,
-            cpu_history: vec![],
-            mem_mb: 100.0,
-            own_input_tokens: 1000,
-            own_output_tokens: 500,
-            own_cache_read_tokens: 0,
-            own_cache_write_tokens: 0,
-            subagent_input_tokens: 0,
-            subagent_output_tokens: 0,
-            subagent_cache_read_tokens: 0,
-            subagent_cache_write_tokens: 0,
-            total_input_tokens: 1000,
-            total_output_tokens: 500,
-            model: "gpt-5.4".into(),
-            command_args: "".into(),
-            session_name: "test".into(),
-            jsonl_path: None,
-            jsonl_offset: 0,
-            last_message_ts: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            cost_usd: 3.50,
-            own_cost_usd: 3.50,
-            priced_total_tokens: 0,
-            cost_ledger_frozen: false,
-            context_tokens: 80000,
-            context_max: 100000,
-            prev_cost_usd: 3.0,
-            burn_rate_per_hr: 2.5,
-            subagent_count: 1,
-            active_subagent_count: 0,
-            active_subagent_jsonl_paths: vec![],
-            subagent_rollups: HashMap::new(),
-            activity_history: vec![],
-            files_modified: files,
-            tool_usage,
-            worktree_id: None,
-            telemetry_status: crate::session::TelemetryStatus::Available,
-            usage_metrics_available: true,
-            cost_estimate_unverified: false,
-            model_profile_source: "builtin".into(),
-            last_msg_type: "".into(),
-            last_stop_reason: "".into(),
-            is_waiting_for_task: false,
-            task_state: crate::session::CodexTaskState::Unknown,
-            transcript_evidence: None,
-            lifecycle_evidence: None,
-            lifecycle_diagnostic: coding_brain_core::lifecycle::LifecycleDiagnostic::default(),
-            explicit_input_required: false,
-            approval: crate::session::ApprovalObservation::NotChecked,
-            approval_checked_at_ms: 0,
-            pending_tool_name: None,
-            pending_tool_call_id: None,
-            pending_tool_input: None,
-            pending_file_path: None,
-            has_file_conflict: false,
-            last_tool_error: true,
-            last_error_message: Some("command failed".into()),
-            recent_errors: vec![crate::session::ErrorEntry {
-                tool_name: "Bash".into(),
-                message: "exit code 1".into(),
-            }],
-            total_tokens_at_edit_count: 0,
-            edit_event_count: 0,
-            baseline_tokens_per_edit: None,
-            error_counts_per_window: vec![],
-            current_window_errors: 0,
-            window_tick_counter: 0,
-            baseline_error_rate: None,
-            file_reads_since_edit: HashMap::new(),
-            total_error_count: 0,
-            decay_score: 0,
-            worker_origin: None,
-        };
+        });
+        session.project_name = "test-proj".into();
+        session.elapsed = Duration::from_secs(120);
+        session.tty = "/dev/pts/0".into();
+        session.status = SessionStatus::Processing;
+        session.cpu_percent = 50.0;
+        session.mem_mb = 100.0;
+        session.model = "gpt-5.4".into();
+        session.session_name = "test".into();
+        session.context_pressure = Some(80);
+        session.subagent_count = 1;
+        session.files_modified = files;
+        session.tool_usage = tool_usage;
+        session.telemetry_status = crate::session::TelemetryStatus::Available;
+        session.last_tool_error = true;
+        session.last_error_message = Some("command failed".into());
+        session.recent_errors = vec![crate::session::ErrorEntry {
+            tool_name: "Bash".into(),
+            message: "exit code 1".into(),
+        }];
 
         let ctx = snapshot_context(&session);
+        let forbidden: Vec<String> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-forbidden-output-keys.json"
+        ))
+        .unwrap();
 
-        // Verify all 13 original fields + hour
-        assert_eq!(ctx["cost_usd"].as_f64().unwrap(), 3.5);
+        for key in forbidden {
+            assert!(ctx.get(&key).is_none(), "decision context exposed {key}");
+        }
         assert_eq!(ctx["context_pct"].as_u64().unwrap(), 80);
         assert!(ctx["last_tool_error"].as_bool().unwrap());
         assert_eq!(ctx["error_message"].as_str().unwrap(), "command failed");
@@ -1488,7 +1456,6 @@ mod tests {
         assert_eq!(ctx["total_tool_calls"].as_u64().unwrap(), 8); // 5+3
         assert!(!ctx["has_file_conflict"].as_bool().unwrap());
         assert_eq!(ctx["status"].as_str().unwrap(), "Processing");
-        assert_eq!(ctx["burn_rate_per_hr"].as_f64().unwrap(), 2.5);
         assert_eq!(ctx["recent_error_count"].as_u64().unwrap(), 1);
         assert_eq!(ctx["subagent_count"].as_u64().unwrap(), 1);
         // Hour should be present (0-23)
@@ -1497,31 +1464,96 @@ mod tests {
     }
 
     #[test]
+    fn legacy_context_ignores_removed_telemetry() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-decision-context-telemetry.json"
+        ))
+        .unwrap();
+
+        let decision = parse_decision_value(&value, &std::collections::HashSet::new()).unwrap();
+
+        assert_eq!(decision.project, "legacy-project");
+        assert_eq!(decision.tool.as_deref(), Some("Bash"));
+        assert_eq!(decision.provider, AgentProvider::Codex);
+        let context = decision.context.as_ref().unwrap();
+        assert_eq!(context.context_pct, Some(80));
+        assert!(!context.last_tool_error);
+        assert!(context.error_message.is_none());
+        assert_eq!(context.model, "gpt-5.4");
+        assert_eq!(context.status, "Processing");
+        assert_eq!(context.elapsed_secs, 120);
+        assert_eq!(context.files_modified_count, 1);
+        assert_eq!(context.total_tool_calls, 8);
+        assert!(!context.has_file_conflict);
+        assert_eq!(context.recent_error_count, 0);
+        assert_eq!(context.subagent_count, 1);
+        assert_eq!(context.hour, Some(14));
+    }
+
+    #[test]
+    fn legacy_context_pressure_is_bounded_without_dropping_neighboring_fields() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-decision-context-telemetry.json"
+        ))
+        .unwrap();
+
+        for (context_pct, expected) in [
+            (Some(serde_json::json!(0)), Some(0)),
+            (Some(serde_json::json!(100)), Some(100)),
+            (Some(serde_json::json!(101)), None),
+            (Some(serde_json::json!(255)), None),
+            (Some(serde_json::json!(u64::MAX)), None),
+            (Some(serde_json::json!(-1)), None),
+            (Some(serde_json::json!(50.5)), None),
+            (Some(serde_json::json!("50")), None),
+            (Some(serde_json::Value::Null), None),
+            (None, None),
+        ] {
+            let mut value = fixture.clone();
+            let context = value["context"].as_object_mut().unwrap();
+            match context_pct {
+                Some(value) => {
+                    context.insert("context_pct".into(), value);
+                }
+                None => {
+                    context.remove("context_pct");
+                }
+            }
+
+            let decision = parse_decision_value(&value, &std::collections::HashSet::new()).unwrap();
+            let context = decision.context.unwrap();
+            assert_eq!(context.context_pct, expected);
+            assert_eq!(context.model, "gpt-5.4");
+            assert_eq!(context.status, "Processing");
+            assert_eq!(context.total_tool_calls, 8);
+        }
+    }
+
+    #[test]
+    fn telemetry_free_runtime_decision_summary() {
+        let forbidden: Vec<String> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-forbidden-output-keys.json"
+        ))
+        .unwrap();
+        let mut decision = make_decision("Bash", "project", "accept");
+        decision.context = Some(make_context(80, false));
+        let summary =
+            serde_json::to_value(coding_brain_core::runtime::DecisionSummary::from(&decision))
+                .unwrap();
+
+        for key in forbidden {
+            assert!(summary.get(&key).is_none(), "runtime summary exposed {key}");
+        }
+    }
+
+    #[test]
     fn test_backward_compat_no_context() {
         // Simulate a JSONL record without the "context" field (old format)
         let json_str = r#"{"ts":"123","pid":1,"project":"proj","tool":"Bash","command":"ls","brain_action":"approve","brain_confidence":0.9,"brain_reasoning":"safe","user_action":"accept"}"#;
         let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
 
-        // Parse context — should be None
-        let context = json.get("context").and_then(|ctx| {
-            Some(DecisionContext {
-                cost_usd: ctx.get("cost_usd")?.as_f64()?,
-                context_pct: ctx.get("context_pct")?.as_u64()? as u8,
-                last_tool_error: ctx.get("last_tool_error")?.as_bool()?,
-                error_message: None,
-                model: ctx.get("model")?.as_str()?.to_string(),
-                elapsed_secs: ctx.get("elapsed_secs")?.as_u64()?,
-                files_modified_count: ctx.get("files_modified_count")?.as_u64()? as u32,
-                total_tool_calls: ctx.get("total_tool_calls")?.as_u64()? as u32,
-                has_file_conflict: ctx.get("has_file_conflict")?.as_bool()?,
-                status: ctx.get("status")?.as_str()?.to_string(),
-                burn_rate_per_hr: ctx.get("burn_rate_per_hr")?.as_f64()?,
-                recent_error_count: ctx.get("recent_error_count")?.as_u64()? as u8,
-                subagent_count: ctx.get("subagent_count")?.as_u64()? as u8,
-                hour: ctx.get("hour").and_then(|v| v.as_u64()).map(|v| v as u8),
-            })
-        });
-        assert!(context.is_none());
+        let decision = parse_decision_value(&json, &std::collections::HashSet::new()).unwrap();
+        assert!(decision.context.is_none());
 
         // Also verify the record still parses with null brain_action (observation)
         let obs_str = r#"{"ts":"124","pid":1,"project":"proj","tool":"Bash","command":"ls","brain_action":null,"brain_confidence":0.0,"brain_reasoning":"","user_action":"user_approve"}"#;
@@ -1583,8 +1615,7 @@ mod tests {
     #[test]
     fn test_backward_compat_no_hour_in_context() {
         // Old context records without hour field → hour should be None
-        let json_str = r#"{"cost_usd":1.0,"context_pct":50,"last_tool_error":false,"model":"gpt-5.4","elapsed_secs":60,"files_modified_count":2,"total_tool_calls":10,"has_file_conflict":false,"status":"Working","burn_rate_per_hr":1.0,"recent_error_count":0,"subagent_count":0}"#;
-        let ctx: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let ctx = serde_json::json!({"context_pct": 50});
         let hour: Option<u8> = ctx.get("hour").and_then(|v| v.as_u64()).map(|v| v as u8);
         assert!(hour.is_none());
     }
@@ -1598,7 +1629,7 @@ mod tests {
     #[test]
     fn test_hour_captured_in_context() {
         // The make_context_with_hour helper sets the hour field
-        let ctx = make_context_with_hour(1.0, 50, false, 14);
+        let ctx = make_context_with_hour(50, false, 14);
         assert_eq!(ctx.hour, Some(14));
     }
 }

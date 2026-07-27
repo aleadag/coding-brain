@@ -2,7 +2,6 @@ use std::io::{Seek, SeekFrom, Write};
 use std::time::Duration;
 
 use coding_brain::discovery;
-use coding_brain::models;
 use coding_brain::monitor;
 use coding_brain::process;
 use coding_brain::session::{
@@ -112,7 +111,6 @@ fn make_session(cpu: f32, last_message_age_secs: u64) -> AgentSession {
     let mut s = AgentSession::from_raw(raw);
     s.cpu_percent = cpu;
     s.telemetry_status = TelemetryStatus::Available;
-    s.usage_metrics_available = true;
 
     // Set last_message_ts relative to now
     let now_ms = std::time::SystemTime::now()
@@ -315,118 +313,6 @@ fn status_null_stop_reason_with_tool_use_stays_processing() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Cost Estimation Tests
-// ────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn cost_gpt_55_tokens() {
-    let mut s = make_session(0.0, 0);
-    s.model = "gpt-5.5".into();
-    s.total_input_tokens = 1_000_000;
-    s.total_output_tokens = 100_000;
-    s.cache_read_tokens = 500_000;
-    s.cache_write_tokens = 200_000;
-
-    let cost = monitor::estimate_cost(&s);
-    // plain_input = 1M - 500k - 200k = 300k
-    // cost = 300k/1M * 5 + 100k/1M * 30 + 500k/1M * 0.5 + 200k/1M * 5
-    //      = 0.3 * 5 + 0.1 * 30 + 0.5 * 0.5 + 0.2 * 5
-    //      = 1.5 + 3 + 0.25 + 1 = 5.75
-    let expected = 5.75;
-    assert!(
-        (cost - expected).abs() < 0.001,
-        "gpt-5.5 cost={cost}, expected={expected}"
-    );
-}
-
-#[test]
-fn cost_gpt_54_tokens() {
-    let mut s = make_session(0.0, 0);
-    s.model = "gpt-5.4".into();
-    s.total_input_tokens = 100_000;
-    s.total_output_tokens = 50_000;
-    s.cache_read_tokens = 0;
-    s.cache_write_tokens = 0;
-
-    let cost = monitor::estimate_cost(&s);
-    // plain_input = 100k
-    // cost = 100k/1M * 2.5 + 50k/1M * 15 = 0.25 + 0.75 = 1.0
-    let expected = 1.0;
-    assert!(
-        (cost - expected).abs() < 0.001,
-        "gpt-5.4 cost={cost}, expected={expected}"
-    );
-}
-
-#[test]
-fn cost_gpt_54_mini_tokens() {
-    let mut s = make_session(0.0, 0);
-    s.model = "gpt-5.4-mini".into();
-    s.total_input_tokens = 100_000;
-    s.total_output_tokens = 50_000;
-    s.cache_read_tokens = 0;
-    s.cache_write_tokens = 0;
-
-    let cost = monitor::estimate_cost(&s);
-    // plain_input = 100k
-    // cost = 100k/1M * 0.75 + 50k/1M * 4.5 = 0.075 + 0.225 = 0.3
-    let expected = 0.3;
-    assert!(
-        (cost - expected).abs() < 0.001,
-        "gpt-5.4-mini cost={cost}, expected={expected}"
-    );
-}
-
-#[test]
-fn cost_unknown_model_uses_gpt_55_fallback() {
-    let mut s = make_session(0.0, 0);
-    s.model = "some-future-model".into();
-    s.total_input_tokens = 1_000_000;
-    s.total_output_tokens = 0;
-    s.cache_read_tokens = 0;
-    s.cache_write_tokens = 0;
-
-    let cost = monitor::estimate_cost(&s);
-    // Should use GPT-5.5 fallback pricing: 1M/1M * 5 = 5.0
-    let expected = 5.0;
-    assert!(
-        (cost - expected).abs() < 0.001,
-        "unknown model cost={cost}, expected={expected}"
-    );
-}
-
-#[test]
-fn cost_zero_tokens() {
-    let s = make_session(0.0, 0);
-    let cost = monitor::estimate_cost(&s);
-    assert_eq!(cost, 0.0);
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Model Context Max Tests
-// ────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn context_max_gpt_55() {
-    assert_eq!(monitor::model_context_max("gpt-5.5"), 258_400);
-}
-
-#[test]
-fn context_max_gpt_54() {
-    assert_eq!(monitor::model_context_max("gpt-5.4"), 258_400);
-}
-
-#[test]
-fn context_max_gpt_54_mini() {
-    assert_eq!(monitor::model_context_max("gpt-5.4-mini"), 258_400);
-}
-
-#[test]
-fn context_max_unknown() {
-    assert_eq!(monitor::model_context_max("unknown-model"), 258_400);
-}
-
-// ────────────────────────────────────────────────────────────────────────────
 // Model Shortening Tests
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -504,58 +390,252 @@ fn make_codex_session_with_jsonl(content: &str) -> (AgentSession, tempfile::Name
     (session, file)
 }
 
-fn codex_session_file(model: &str) -> (AgentSession, tempfile::NamedTempFile) {
-    make_codex_session_with_jsonl(&format!(
-        "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"{model}\"}}}}\n"
-    ))
+fn padded_jsonl(mut value: serde_json::Value, target_len: usize) -> String {
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("padding".into(), serde_json::Value::String(String::new()));
+    let minimum_len = serde_json::to_vec(&value).unwrap().len() + 1;
+    assert!(target_len >= minimum_len);
+    value.as_object_mut().unwrap().insert(
+        "padding".into(),
+        serde_json::Value::String("x".repeat(target_len - minimum_len)),
+    );
+    let content = format!("{}\n", serde_json::to_string(&value).unwrap());
+    assert_eq!(content.len(), target_len);
+    content
 }
 
-fn codex_token_count_line(
-    total_input: u64,
-    total_cached: u64,
-    total_output: u64,
-    last_input: u64,
-    last_cached: u64,
-    last_output: u64,
-) -> String {
-    format!(
-        concat!(
-            r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{},"cached_input_tokens":{},"output_tokens":{},"reasoning_output_tokens":0,"total_tokens":{}}},"last_token_usage":{{"input_tokens":{},"cached_input_tokens":{},"output_tokens":{},"reasoning_output_tokens":0,"total_tokens":{}}},"model_context_window":1050000}}}}}}"#
-        ),
-        total_input,
-        total_cached,
-        total_output,
-        total_input + total_output,
-        last_input,
-        last_cached,
-        last_output,
-        last_input + last_output,
-    )
+fn replace_jsonl(file: &mut tempfile::NamedTempFile, content: &str) {
+    file.as_file_mut().set_len(0).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(content.as_bytes()).unwrap();
+    file.flush().unwrap();
 }
 
-fn append_codex_token_count(
-    file: &mut tempfile::NamedTempFile,
-    total_input: u64,
-    total_cached: u64,
-    total_output: u64,
-    last_input: u64,
-    last_cached: u64,
-    last_output: u64,
-) {
+fn assert_generic_replacement_rescanned(extra_bytes: usize) {
+    let original = r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":129200,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1},"content":[]}}"#;
+    let (mut session, mut file) = make_session_with_jsonl(original);
+
+    monitor::update_tokens(&mut session);
+    let original_len = session.jsonl_offset;
+    assert_eq!(session.context_pressure, Some(50));
+    assert_eq!(session.last_msg_type, "assistant");
+    assert_eq!(session.status, SessionStatus::WaitingInput);
+
+    let replacement = padded_jsonl(
+        serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "model": "gpt-5.4",
+                "content": []
+            }
+        }),
+        usize::try_from(original_len).unwrap() + extra_bytes,
+    );
+    replace_jsonl(&mut file, &replacement);
+
+    monitor::update_tokens(&mut session);
+
+    assert_eq!(session.jsonl_offset, replacement.len() as u64);
+    assert_eq!(session.context_pressure, None);
+    assert_eq!(session.last_msg_type, "user");
+    assert_eq!(session.last_stop_reason, "");
+    assert_eq!(session.status, SessionStatus::Processing);
+}
+
+fn assert_codex_replacement_rescanned(extra_bytes: usize) {
+    let original = concat!(
+        r#"{"type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1},"last_token_usage":{"input_tokens":50},"model_context_window":100}}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        "\n",
+    );
+    let (mut session, mut file) = make_codex_session_with_jsonl(original);
+
+    monitor::update_tokens(&mut session);
+    let original_len = session.jsonl_offset;
+    assert_eq!(session.context_pressure, Some(50));
+    assert_eq!(session.task_state, CodexTaskState::WaitingInput);
+    assert_eq!(session.last_stop_reason, "end_turn");
+
+    let replacement = padded_jsonl(
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "task_started"}
+        }),
+        usize::try_from(original_len).unwrap() + extra_bytes,
+    );
+    replace_jsonl(&mut file, &replacement);
+
+    monitor::update_tokens(&mut session);
+
+    assert_eq!(session.jsonl_offset, replacement.len() as u64);
+    assert_eq!(session.context_pressure, None);
+    assert_eq!(session.task_state, CodexTaskState::Processing);
+    assert_eq!(session.last_stop_reason, "");
+    assert_eq!(session.status, SessionStatus::Processing);
+}
+
+#[test]
+fn generic_monitor_rescans_same_size_replacement() {
+    assert_generic_replacement_rescanned(0);
+}
+
+#[test]
+fn generic_monitor_rescans_larger_replacement() {
+    assert_generic_replacement_rescanned(64);
+}
+
+#[test]
+fn codex_monitor_rescans_same_size_replacement() {
+    assert_codex_replacement_rescanned(0);
+}
+
+#[test]
+fn codex_monitor_rescans_larger_replacement() {
+    assert_codex_replacement_rescanned(64);
+}
+
+#[test]
+fn generic_monitor_does_not_rescan_an_ordinary_append() {
+    let original = r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+    let (mut session, mut file) = make_session_with_jsonl(original);
+
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.tool_usage["Bash"].calls, 1);
+
     writeln!(
         file,
         "{}",
-        codex_token_count_line(
-            total_input,
-            total_cached,
-            total_output,
-            last_input,
-            last_cached,
-            last_output,
-        )
+        r#"{"type":"user","message":{"role":"user","content":[]}}"#
     )
     .unwrap();
     file.flush().unwrap();
+    monitor::update_tokens(&mut session);
+
+    assert_eq!(session.tool_usage["Bash"].calls, 1);
+    assert_eq!(session.last_msg_type, "user");
+}
+
+#[test]
+fn codex_monitor_does_not_rescan_an_ordinary_append() {
+    let original = r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"call-1"}}"#;
+    let (mut session, mut file) = make_codex_session_with_jsonl(original);
+
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.tool_usage["exec_command"].calls, 1);
+
+    writeln!(
+        file,
+        "{}",
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"continuing"}}"#
+    )
+    .unwrap();
+    file.flush().unwrap();
+    monitor::update_tokens(&mut session);
+
+    assert_eq!(session.tool_usage["exec_command"].calls, 1);
+    assert_eq!(session.last_msg_type, "assistant");
+}
+
+#[test]
+fn context_pressure_codex_monitor_uses_provider_then_fallback_and_resets() {
+    let jsonl = concat!(
+        r#"{"type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1},"last_token_usage":{"input_tokens":50},"model_context_window":100}}}"#,
+        "\n",
+    );
+    let (mut session, mut file) = make_codex_session_with_jsonl(jsonl);
+
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_pressure, Some(50));
+
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_pressure, Some(50));
+
+    writeln!(
+        file,
+        "{}",
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2}}}}"#
+    )
+    .unwrap();
+    file.flush().unwrap();
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_pressure, Some(50));
+
+    file.as_file_mut().set_len(0).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_pressure, None);
+    assert_eq!(session.jsonl_offset, 0);
+    assert_eq!(session.telemetry_status, TelemetryStatus::Pending);
+
+    let fallback_jsonl = concat!(
+        r#"{"type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1},"last_token_usage":{"input_tokens":129200}}}}"#,
+        "\n",
+    );
+    let (mut fallback, _fallback_file) = make_codex_session_with_jsonl(fallback_jsonl);
+    monitor::update_tokens(&mut fallback);
+    assert_eq!(fallback.model, "gpt-5.5");
+    assert_eq!(fallback.context_pressure, Some(50));
+
+    let unknown_jsonl = fallback_jsonl.replace("gpt-5.5", "custom-model");
+    let (mut unknown, _unknown_file) = make_codex_session_with_jsonl(&unknown_jsonl);
+    monitor::update_tokens(&mut unknown);
+    assert_eq!(unknown.context_pressure, None);
+}
+
+#[test]
+fn context_pressure_generic_monitor_retains_valid_value_until_truncation() {
+    let line = r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":129200,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1},"content":[]}}"#;
+    let (mut session, mut file) = make_session_with_jsonl(line);
+
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_pressure, Some(50));
+
+    writeln!(
+        file,
+        "{}",
+        r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":"not-a-number","cache_read_input_tokens":7,"cache_creation_input_tokens":9,"output_tokens":2},"content":[]}}"#
+    )
+    .unwrap();
+    file.flush().unwrap();
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_pressure, Some(50));
+
+    writeln!(
+        file,
+        "{}",
+        r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":1,"cache_read_input_tokens":"not-a-number","cache_creation_input_tokens":0,"output_tokens":0},"content":[]}}"#
+    )
+    .unwrap();
+    file.flush().unwrap();
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_pressure, Some(50));
+
+    writeln!(
+        file,
+        "{}",
+        r#"{"type":"assistant","message":{"role":"assistant","model":"gpt-5.5","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":"not-a-number","output_tokens":0},"content":[]}}"#
+    )
+    .unwrap();
+    file.flush().unwrap();
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_pressure, Some(50));
+
+    file.as_file_mut().set_len(0).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    monitor::update_tokens(&mut session);
+    assert_eq!(session.context_pressure, None);
+    assert_eq!(session.jsonl_offset, 0);
+    assert_eq!(session.telemetry_status, TelemetryStatus::Pending);
 }
 
 fn make_session_with_paths(
@@ -584,127 +664,26 @@ fn write_jsonl(path: &std::path::Path, content: &str) {
 }
 
 #[test]
-fn codex_cost_prices_each_request_once_and_never_decreases() {
-    let (mut session, mut file) = codex_session_file("gpt-5.6-sol");
-    append_codex_token_count(&mut file, 100_000, 20_000, 1_000, 100_000, 20_000, 1_000);
-    monitor::update_tokens(&mut session);
-    let first = session.cost_usd;
-    assert!(first > 0.0);
-
-    monitor::update_tokens(&mut session);
-    assert_eq!(session.cost_usd, first);
-
-    append_codex_token_count(&mut file, 220_000, 60_000, 3_000, 120_000, 40_000, 2_000);
-    monitor::update_tokens(&mut session);
-    assert!(session.cost_usd > first);
-}
-
-#[test]
-fn counter_reset_freezes_cost_as_unverified() {
-    let (mut session, mut file) = codex_session_file("gpt-5.6-sol");
-    append_codex_token_count(&mut file, 250_000, 40_000, 2_000, 250_000, 40_000, 2_000);
-    monitor::update_tokens(&mut session);
-    let before = session.cost_usd;
-
-    append_codex_token_count(&mut file, 10_000, 2_000, 100, 10_000, 2_000, 100);
-    monitor::update_tokens(&mut session);
-
-    assert_eq!(session.cost_usd, before);
-    assert!(session.cost_estimate_unverified);
-    assert!(session.cost_ledger_frozen);
-}
-
-#[test]
-fn transcript_truncation_freezes_cost_instead_of_lowering_it() {
-    let (mut session, mut file) = codex_session_file("gpt-5.6-sol");
-    append_codex_token_count(&mut file, 250_000, 40_000, 2_000, 250_000, 40_000, 2_000);
-    monitor::update_tokens(&mut session);
-    let before = session.cost_usd;
-
-    file.as_file_mut().set_len(0).unwrap();
-    file.seek(SeekFrom::Start(0)).unwrap();
-    writeln!(
-        file,
-        r#"{{"type":"turn_context","payload":{{"model":"gpt-5.6-sol"}}}}"#
-    )
-    .unwrap();
-    append_codex_token_count(&mut file, 10_000, 2_000, 100, 10_000, 2_000, 100);
-    monitor::update_tokens(&mut session);
-
-    assert_eq!(session.cost_usd, before);
-    assert!(session.cost_estimate_unverified);
-    assert!(session.cost_ledger_frozen);
-}
-
-#[test]
-fn mixed_model_requests_keep_original_prices() {
-    let (mut session, mut file) = codex_session_file("gpt-5.6-sol");
-    append_codex_token_count(&mut file, 100_000, 0, 1_000, 100_000, 0, 1_000);
-    monitor::update_tokens(&mut session);
-    let sol_cost = session.cost_usd;
-    assert!((sol_cost - 0.53).abs() < 0.000_001);
-
-    writeln!(
-        file,
-        r#"{{"type":"turn_context","payload":{{"model":"gpt-5.6-terra"}}}}"#
-    )
-    .unwrap();
-    append_codex_token_count(&mut file, 200_000, 0, 2_000, 100_000, 0, 1_000);
-    monitor::update_tokens(&mut session);
-
-    assert!((session.cost_usd - 0.795).abs() < 0.000_001);
-}
-
-#[test]
-fn long_context_multiplier_uses_request_input_not_session_total() {
-    let (mut long_session, mut long_file) = codex_session_file("gpt-5.6-sol");
-    append_codex_token_count(&mut long_file, 300_000, 0, 10_000, 300_000, 0, 10_000);
-    monitor::update_tokens(&mut long_session);
-    assert!((long_session.cost_usd - 3.45).abs() < 0.000_001);
-
-    let (mut cumulative_session, mut cumulative_file) = codex_session_file("gpt-5.6-sol");
-    append_codex_token_count(&mut cumulative_file, 200_000, 0, 1_000, 200_000, 0, 1_000);
-    monitor::update_tokens(&mut cumulative_session);
-    append_codex_token_count(&mut cumulative_file, 300_000, 0, 2_000, 100_000, 0, 1_000);
-    monitor::update_tokens(&mut cumulative_session);
-    assert!((cumulative_session.cost_usd - 1.56).abs() < 0.000_001);
-}
-
-#[test]
 fn partial_jsonl_line_is_retried_after_newline() {
-    let (mut session, mut file) = codex_session_file("gpt-5.6-sol");
+    let (mut session, mut file) = make_codex_session_with_jsonl("");
     monitor::update_tokens(&mut session);
     let complete_offset = session.jsonl_offset;
     write!(
         file,
-        "{}",
-        codex_token_count_line(100_000, 20_000, 1_000, 100_000, 20_000, 1_000)
+        r#"{{"type":"event_msg","payload":{{"type":"task_started"}}}}"#
     )
     .unwrap();
     file.flush().unwrap();
 
     monitor::update_tokens(&mut session);
-    assert_eq!(session.cost_usd, 0.0);
+    assert_eq!(session.task_state, CodexTaskState::Unknown);
     assert_eq!(session.jsonl_offset, complete_offset);
 
     writeln!(file).unwrap();
     file.flush().unwrap();
     monitor::update_tokens(&mut session);
-    assert!(session.cost_usd > 0.0);
+    assert_eq!(session.task_state, CodexTaskState::Processing);
     assert!(session.jsonl_offset > complete_offset);
-}
-
-#[test]
-fn unknown_model_cost_is_monotonic_and_unverified() {
-    let (mut session, mut file) = codex_session_file("future-model");
-    append_codex_token_count(&mut file, 100_000, 0, 1_000, 100_000, 0, 1_000);
-    monitor::update_tokens(&mut session);
-    let first = session.cost_usd;
-    assert!(first > 0.0);
-    assert!(session.cost_estimate_unverified);
-
-    monitor::update_tokens(&mut session);
-    assert_eq!(session.cost_usd, first);
 }
 
 #[test]
@@ -915,7 +894,7 @@ fn unknown_modern_event_does_not_end_active_task() {
 }
 
 #[test]
-fn process_backed_codex_monitor_records_usage_metrics() {
+fn process_backed_codex_monitor_records_derived_context_pressure() {
     let jsonl = concat!(
         r#"{"timestamp":"2026-06-11T12:33:54.694Z","type":"session_meta","payload":{"id":"019eb6ac-6d30-7301-885d-ff4d354c0116","timestamp":"2026-06-11T12:33:34.003Z","cwd":"/home/alexander/hacking/aleadag/codexctl","model_provider":"openai"}}"#,
         "\n",
@@ -942,25 +921,16 @@ fn process_backed_codex_monitor_records_usage_metrics() {
     };
     let mut session = AgentSession::from_raw(raw);
     session.jsonl_path = Some(file.path().to_path_buf());
-    session.model_profile_source = "codex-transcript".into();
 
     monitor::update_tokens(&mut session);
 
     assert_eq!(session.telemetry_status, TelemetryStatus::Available);
-    assert!(session.usage_metrics_available);
-    assert_eq!(session.total_input_tokens, 100000);
-    assert_eq!(session.cache_read_tokens, 25000);
-    assert_eq!(session.total_output_tokens, 12000);
-    assert_eq!(session.context_tokens, 42000);
-    assert_eq!(session.context_max, 258400);
-    assert!(session.cost_usd > 0.0);
-    assert_ne!(session.format_tokens(), "n/a");
-    assert_ne!(session.format_cost(), "n/a");
+    assert_eq!(session.context_pressure, Some(16));
     assert_eq!(session.format_context(), "16%");
 }
 
 #[test]
-fn process_backed_codex_monitor_preserves_transcript_context_window_on_idle_tick() {
+fn process_backed_codex_monitor_preserves_context_pressure_on_idle_tick() {
     let jsonl = concat!(
         r#"{"timestamp":"2026-06-12T09:13:44.723Z","type":"session_meta","payload":{"id":"019ebb14-fa82-70b0-afc7-6daab97998ec","timestamp":"2026-06-12T09:06:14.788Z","cwd":"/home/alexander/hacking/aleadag/codexctl","model_provider":"openai"}}"#,
         "\n",
@@ -987,16 +957,13 @@ fn process_backed_codex_monitor_preserves_transcript_context_window_on_idle_tick
     };
     let mut session = AgentSession::from_raw(raw);
     session.jsonl_path = Some(file.path().to_path_buf());
-    session.model_profile_source = "codex-transcript".into();
 
     monitor::update_tokens(&mut session);
-    assert_eq!(session.context_tokens, 125980);
-    assert_eq!(session.context_max, 258400);
+    assert_eq!(session.context_pressure, Some(48));
     assert_eq!(session.format_context(), "48%");
 
     monitor::update_tokens(&mut session);
-    assert_eq!(session.context_tokens, 125980);
-    assert_eq!(session.context_max, 258400);
+    assert_eq!(session.context_pressure, Some(48));
     assert_eq!(session.format_context(), "48%");
 }
 
@@ -1020,25 +987,17 @@ fn transcript_backed_sessions_are_not_marked_finished_by_ps() {
     assert!(!sessions[0].process_backed);
 }
 
-fn expected_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
-    let profile = models::resolve(model).profile;
-    (input_tokens as f64 / 1_000_000.0) * profile.input_per_m
-        + (output_tokens as f64 / 1_000_000.0) * profile.output_per_m
-}
-
 #[test]
-fn jsonl_parse_token_usage() {
+fn jsonl_parses_model_status_and_context_pressure() {
     let jsonl = r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":50000,"output_tokens":10000,"cache_read_input_tokens":20000,"cache_creation_input_tokens":5000}}}"#;
 
     let (mut s, _file) = make_session_with_jsonl(jsonl);
     monitor::update_tokens(&mut s);
 
-    assert_eq!(s.total_input_tokens, 75000); // 50000 + 20000 + 5000
-    assert_eq!(s.total_output_tokens, 10000);
-    assert_eq!(s.cache_read_tokens, 20000);
-    assert_eq!(s.cache_write_tokens, 5000);
     assert_eq!(s.model, "gpt-5.5");
-    assert_eq!(s.context_max, 258_400);
+    assert_eq!(s.context_pressure, Some(29));
+    assert_eq!(s.status, SessionStatus::WaitingInput);
+    assert_eq!(s.telemetry_status, TelemetryStatus::Available);
 }
 
 #[test]
@@ -1054,9 +1013,9 @@ fn jsonl_parse_multiple_entries() {
     let (mut s, _file) = make_session_with_jsonl(jsonl);
     monitor::update_tokens(&mut s);
 
-    assert_eq!(s.total_input_tokens, 3000); // 1000 + 2000
-    assert_eq!(s.total_output_tokens, 1500); // 500 + 1000
     assert_eq!(s.model, "gpt-5.4");
+    assert_eq!(s.context_pressure, Some(0));
+    assert_eq!(s.last_stop_reason, "end_turn");
 }
 
 #[test]
@@ -1077,33 +1036,29 @@ fn jsonl_incremental_reads() {
     let mut s = AgentSession::from_raw(raw);
     s.jsonl_path = Some(file.path().to_path_buf());
 
-    // First read
     monitor::update_tokens(&mut s);
-    assert_eq!(s.total_input_tokens, 1000);
-    assert_eq!(s.total_output_tokens, 500);
+    let first_offset = s.jsonl_offset;
+    assert!(first_offset > 0);
+    assert_eq!(s.model, "gpt-5.5");
 
-    // Second read with no new data — should not double-count
     monitor::update_tokens(&mut s);
-    assert_eq!(s.total_input_tokens, 1000);
-    assert_eq!(s.total_output_tokens, 500);
+    assert_eq!(s.jsonl_offset, first_offset);
 
-    // Append more data
     let line2 = r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":2000,"output_tokens":800,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
     writeln!(file, "{line2}").unwrap();
     file.flush().unwrap();
 
-    // Third read — should pick up new data only
     monitor::update_tokens(&mut s);
-    assert_eq!(s.total_input_tokens, 3000);
-    assert_eq!(s.total_output_tokens, 1300);
+    assert!(s.jsonl_offset > first_offset);
+    assert_eq!(s.last_stop_reason, "end_turn");
 }
 
 #[test]
 fn jsonl_empty_file() {
     let (mut s, _file) = make_session_with_jsonl("");
     monitor::update_tokens(&mut s);
-    assert_eq!(s.total_input_tokens, 0);
-    assert_eq!(s.total_output_tokens, 0);
+    assert_eq!(s.telemetry_status, TelemetryStatus::Pending);
+    assert_eq!(s.context_pressure, None);
 }
 
 #[test]
@@ -1117,9 +1072,9 @@ fn jsonl_corrupted_lines_skipped() {
     let (mut s, _file) = make_session_with_jsonl(jsonl);
     monitor::update_tokens(&mut s);
 
-    // Should still parse the valid line
-    assert_eq!(s.total_input_tokens, 5000);
-    assert_eq!(s.total_output_tokens, 1000);
+    assert_eq!(s.telemetry_status, TelemetryStatus::Available);
+    assert_eq!(s.model, "gpt-5.5");
+    assert_eq!(s.context_pressure, Some(1));
 }
 
 #[test]
@@ -1151,9 +1106,9 @@ fn jsonl_missing_file() {
     let mut s = AgentSession::from_raw(raw);
     s.jsonl_path = Some(std::path::PathBuf::from("/nonexistent/path.jsonl"));
 
-    // Should not panic
     monitor::update_tokens(&mut s);
-    assert_eq!(s.total_input_tokens, 0);
+    assert_eq!(s.telemetry_status, TelemetryStatus::UnreadableTranscript);
+    assert_eq!(s.context_pressure, None);
 }
 
 #[test]
@@ -1170,16 +1125,17 @@ fn jsonl_no_path() {
     // jsonl_path is None
 
     monitor::update_tokens(&mut s);
-    assert_eq!(s.total_input_tokens, 0);
+    assert_eq!(s.telemetry_status, TelemetryStatus::MissingTranscript);
+    assert_eq!(s.context_pressure, None);
 }
 
 #[test]
-fn jsonl_rolls_up_subagent_tokens_and_cost() {
+fn subagent_count_tracks_active_transcript_paths() {
     let temp = tempfile::tempdir().unwrap();
     let parent_jsonl = temp.path().join("parent.jsonl");
     write_jsonl(
         &parent_jsonl,
-        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"end_turn","usage":{"input_tokens":100000,"output_tokens":50000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"end_turn"}}"#,
     );
 
     let session_id = format!("subagent-rollup-{}", std::process::id());
@@ -1192,11 +1148,11 @@ fn jsonl_rolls_up_subagent_tokens_and_cost() {
         .join("tasks");
     write_jsonl(
         &tasks_dir.join("agent-1.jsonl"),
-        r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn","usage":{"input_tokens":200000,"output_tokens":50000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.5","stop_reason":"end_turn"}}"#,
     );
     write_jsonl(
         &tasks_dir.join("nested/agent-2.jsonl"),
-        r#"{"type":"assistant","message":{"model":"gpt-5.4-mini","stop_reason":"end_turn","usage":{"input_tokens":50000,"output_tokens":10000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.4-mini","stop_reason":"end_turn"}}"#,
     );
 
     let mut s = make_session_with_paths(cwd, session_id, parent_jsonl);
@@ -1205,14 +1161,6 @@ fn jsonl_rolls_up_subagent_tokens_and_cost() {
 
     assert_eq!(s.active_subagent_count, 2);
     assert_eq!(s.subagent_count, 2);
-    assert_eq!(s.total_input_tokens, 350_000);
-    assert_eq!(s.total_output_tokens, 110_000);
-
-    let expected = expected_cost("gpt-5.4", 100_000, 50_000)
-        + expected_cost("gpt-5.5", 200_000, 50_000)
-        + expected_cost("gpt-5.4-mini", 50_000, 10_000);
-    assert!((s.cost_usd - expected).abs() < 0.0001);
-    assert!(!s.cost_estimate_unverified);
 
     let _ = std::fs::remove_dir_all(
         std::path::PathBuf::from(format!("/tmp/codex-{uid}"))
@@ -1222,12 +1170,12 @@ fn jsonl_rolls_up_subagent_tokens_and_cost() {
 }
 
 #[test]
-fn subagent_rollup_persists_after_task_file_disappears() {
+fn subagent_count_clears_after_task_files_disappear() {
     let temp = tempfile::tempdir().unwrap();
     let parent_jsonl = temp.path().join("parent.jsonl");
     write_jsonl(
         &parent_jsonl,
-        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"end_turn","usage":{"input_tokens":100000,"output_tokens":10000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"end_turn"}}"#,
     );
 
     let session_id = format!("subagent-persist-{}", std::process::id());
@@ -1240,7 +1188,7 @@ fn subagent_rollup_persists_after_task_file_disappears() {
     let tasks_dir = subagent_root.join("tasks");
     write_jsonl(
         &tasks_dir.join("agent-1.jsonl"),
-        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"end_turn","usage":{"input_tokens":200000,"output_tokens":20000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        r#"{"type":"assistant","message":{"model":"gpt-5.4","stop_reason":"end_turn"}}"#,
     );
 
     let mut s = make_session_with_paths(cwd, session_id, parent_jsonl);
@@ -1249,8 +1197,6 @@ fn subagent_rollup_persists_after_task_file_disappears() {
 
     assert_eq!(s.active_subagent_count, 1);
     assert_eq!(s.subagent_count, 1);
-    assert_eq!(s.total_input_tokens, 300_000);
-    assert_eq!(s.total_output_tokens, 30_000);
 
     std::fs::remove_dir_all(&subagent_root).unwrap();
 
@@ -1258,9 +1204,7 @@ fn subagent_rollup_persists_after_task_file_disappears() {
     monitor::update_tokens(&mut s);
 
     assert_eq!(s.active_subagent_count, 0);
-    assert_eq!(s.subagent_count, 1);
-    assert_eq!(s.total_input_tokens, 300_000);
-    assert_eq!(s.total_output_tokens, 30_000);
+    assert_eq!(s.subagent_count, 0);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1268,27 +1212,23 @@ fn subagent_rollup_persists_after_task_file_disappears() {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn context_percent_zero_max() {
-    let mut s = make_session(0.0, 0);
-    s.context_max = 0;
-    s.context_tokens = 1000;
-    assert_eq!(s.context_percent(), 0.0);
+fn context_percent_is_optional() {
+    let s = make_session(0.0, 0);
+    assert_eq!(s.context_percent(), None);
 }
 
 #[test]
-fn context_percent_zero_tokens() {
+fn context_percent_preserves_zero_pressure() {
     let mut s = make_session(0.0, 0);
-    s.context_max = 200_000;
-    s.context_tokens = 0;
-    assert_eq!(s.context_percent(), 0.0);
+    s.context_pressure = Some(0);
+    assert_eq!(s.context_percent(), Some(0));
 }
 
 #[test]
 fn context_percent_calculation() {
     let mut s = make_session(0.0, 0);
-    s.context_max = 200_000;
-    s.context_tokens = 100_000;
-    assert!((s.context_percent() - 50.0).abs() < 0.01);
+    s.context_pressure = Some(50);
+    assert_eq!(s.context_percent(), Some(50));
 }
 
 #[test]
@@ -1324,72 +1264,25 @@ fn sparkline_ring_buffer_limit() {
 fn json_export_format() {
     let mut s = make_session(0.0, 0);
     s.model = "gpt-5.5".into();
-    s.cost_usd = 1.234;
-    s.total_input_tokens = 50000;
-    s.total_output_tokens = 10000;
+    s.context_pressure = Some(42);
     s.elapsed = Duration::from_secs(300);
 
     let json = s.to_json_value();
+    let encoded = serde_json::to_string(&json).unwrap();
+    let forbidden: Vec<String> =
+        serde_json::from_str(include_str!("fixtures/legacy-forbidden-output-keys.json")).unwrap();
+
     assert_eq!(json["pid"], 1);
     assert_eq!(json["status"], "Idle");
+    assert_eq!(json["model"], "gpt-5.5");
+    assert_eq!(json["context_pct"], 42);
     assert_eq!(json["elapsed_secs"], 300);
-    assert_eq!(json["tokens_in"], 50000);
-    assert_eq!(json["tokens_out"], 10000);
-    assert_eq!(json["cost_usd"], 1.23);
-    assert!(json["estimate"]["verified"].is_boolean());
-    assert!(json["estimate"]["profile_source"].is_string());
-    assert!(json["subagent_breakdown"].as_array().unwrap().is_empty());
-}
-
-#[test]
-fn json_export_includes_subagent_breakdown() {
-    let mut s = make_session(0.0, 0);
-    s.active_subagent_jsonl_paths = vec![std::path::PathBuf::from(
-        "/tmp/codex-1/-tmp-project/session-1/tasks/agent-2.jsonl",
-    )];
-    s.subagent_rollups.insert(
-        std::path::PathBuf::from("/tmp/codex-1/-tmp-project/session-1/tasks/agent-1.jsonl"),
-        coding_brain::session::SubagentRollup {
-            input_tokens: 20_000,
-            output_tokens: 2_000,
-            cost_usd: 0.4,
-            usage_metrics_available: true,
-            ..coding_brain::session::SubagentRollup::default()
-        },
-    );
-    s.subagent_rollups.insert(
-        std::path::PathBuf::from("/tmp/codex-1/-tmp-project/session-1/tasks/agent-2.jsonl"),
-        coding_brain::session::SubagentRollup {
-            input_tokens: 10_000,
-            output_tokens: 1_000,
-            cost_usd: 0.2,
-            usage_metrics_available: true,
-            ..coding_brain::session::SubagentRollup::default()
-        },
-    );
-    s.subagent_count = 2;
-    s.active_subagent_count = 1;
-
-    let json = s.to_json_value();
-    let breakdown = json["subagent_breakdown"].as_array().unwrap();
-    assert_eq!(breakdown.len(), 2);
-    assert_eq!(breakdown[0]["label"], "completed");
-    assert_eq!(breakdown[0]["state"], "Completed");
-    assert_eq!(breakdown[0]["tokens_in"], 20000);
-    assert_eq!(breakdown[1]["label"], "agent-2");
-    assert_eq!(breakdown[1]["state"], "Active");
-}
-
-#[test]
-fn burn_rate_formatting() {
-    let mut s = make_session(0.0, 0);
-    assert_eq!(s.format_burn_rate(), "-");
-
-    s.burn_rate_per_hr = 0.50;
-    assert_eq!(s.format_burn_rate(), "$0.50/h");
-
-    s.burn_rate_per_hr = 3.5;
-    assert_eq!(s.format_burn_rate(), "$3.5/h");
+    for key in forbidden {
+        assert!(
+            !encoded.contains(&key),
+            "session JSON retained forbidden output key {key}"
+        );
+    }
 }
 
 #[test]
@@ -1404,10 +1297,9 @@ fn mem_formatting() {
 #[test]
 fn context_bar_formatting() {
     let mut s = make_session(0.0, 0);
-    assert_eq!(s.format_context_bar(10), "-");
+    assert_eq!(s.format_context_bar(10), "n/a");
 
-    s.context_max = 200_000;
-    s.context_tokens = 100_000; // 50%
+    s.context_pressure = Some(50);
     let bar = s.format_context_bar(10);
     assert!(bar.contains("50%"));
     assert!(bar.contains("█████"));
@@ -1609,6 +1501,5 @@ fn resolve_jsonl_telemetry_available_after_resolution() {
         "telemetry should be Available after parsing JSONL, not {:?}",
         s.telemetry_status
     );
-    assert!(s.usage_metrics_available);
-    assert!(s.own_output_tokens > 0, "should have parsed output tokens");
+    assert_eq!(s.context_pressure, Some(30));
 }

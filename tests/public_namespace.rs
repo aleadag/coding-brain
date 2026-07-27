@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn isolated_command(temp: &tempfile::TempDir) -> Command {
@@ -111,7 +112,10 @@ fn provider_documentation_scopes_usage_and_transcript_context() {
     let llms = include_str!("../docs/llms.txt");
     let quickstart = include_str!("../docs/quickstart.md");
     let reference = include_str!("../docs/reference.md");
-    let boundary = "Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view.";
+    let boundary = "Coding Brain does not collect or display token usage or cost.";
+    let retained = "Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it.";
+    let only = "Only that bounded percentage is retained.";
+    let capacity = "The percentage uses provider-supplied context capacity when available and otherwise a known-model fallback; it is not raw usage or cost accounting.";
 
     for (name, documentation) in [
         ("README", readme),
@@ -121,10 +125,9 @@ fn provider_documentation_scopes_usage_and_transcript_context() {
         ("reference", reference),
     ] {
         assert!(documentation.contains(boundary), "{name}");
-        assert!(
-            !documentation.contains("does not collect or display token usage"),
-            "{name}"
-        );
+        assert!(documentation.contains(retained), "{name}");
+        assert!(documentation.contains(only), "{name}");
+        assert!(documentation.contains(capacity), "{name}");
         assert!(
             !documentation.contains("Intentionally not collected or displayed"),
             "{name}"
@@ -134,6 +137,62 @@ fn provider_documentation_scopes_usage_and_transcript_context() {
     assert!(reference.contains("not parsed into `AgentSession` context"));
     assert!(reference.contains("retained as lifecycle identity/status evidence"));
     assert!(reference.contains("SQLite is not read"));
+}
+
+#[test]
+fn production_source_has_no_usage_or_cost_surfaces() {
+    const FORBIDDEN: &[&str] = &[
+        "cost_usd",
+        "burn_rate_per_hr",
+        "priced_total_tokens",
+        "usage_metrics_available",
+        "cost_estimate_unverified",
+        "input_per_m",
+        "output_per_m",
+        "cache_read_per_m",
+        "cache_write_per_m",
+        "CostBelow",
+        "CostAbove",
+        "median_cost_usd",
+        "avg_downstream_cost",
+    ];
+
+    fn scan_rust(root: &Path, violations: &mut Vec<String>) {
+        let mut paths = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        for path in paths {
+            if path.is_dir() {
+                scan_rust(&path, violations);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                for forbidden in FORBIDDEN {
+                    if source.contains(forbidden) {
+                        violations.push(format!("{}: {forbidden}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut violations = Vec::new();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for root in [
+        "src",
+        "crates/coding-brain-core/src",
+        "crates/coding-brain-tui/src",
+    ] {
+        scan_rust(&manifest_dir.join(root), &mut violations);
+    }
+
+    assert!(
+        violations.is_empty(),
+        "forbidden production identifiers:\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]

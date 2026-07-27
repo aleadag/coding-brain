@@ -13,7 +13,7 @@ use crate::transcript::{self, TranscriptBlock, TranscriptEvent};
 /// Compact context for the brain LLM, built from session state + recent transcript.
 #[derive(Debug, Clone)]
 pub struct BrainContext {
-    /// One-line session summary (status, cost, context%, pending tool).
+    /// One-line session summary (status, context pressure, pending tool).
     pub session_summary: String,
     /// Recent conversation messages, compacted to fit within token budget.
     pub recent_transcript: String,
@@ -45,20 +45,15 @@ pub fn build_context(session: &AgentSession, max_tokens: u32) -> BrainContext {
 }
 
 fn format_session_summary(session: &AgentSession) -> String {
-    let context_pct = if session.context_max > 0 {
-        (session.context_tokens as f64 / session.context_max as f64 * 100.0) as u32
-    } else {
-        0
-    };
-
     let mut summary = format!(
-        "Project: {} | Status: {} | Model: {} | Cost: ${:.2} | Context: {}%",
+        "Project: {} | Status: {} | Model: {}",
         session.display_name(),
         session.status,
         session.model,
-        session.cost_usd,
-        context_pct,
     );
+    if let Some(context_pct) = session.context_pressure {
+        summary.push_str(&format!(" | Context: {context_pct}%"));
+    }
 
     if let Some(tool) = session.actionable_tool_name() {
         summary.push_str(&format!(" | Pending tool: {tool}"));
@@ -435,9 +430,7 @@ mod tests {
         s.status = SessionStatus::NeedsInput;
         s.telemetry_status = TelemetryStatus::Available;
         s.model = "gpt-5.5".into();
-        s.cost_usd = 12.50;
-        s.context_tokens = 50000;
-        s.context_max = 200000;
+        s.context_pressure = Some(25);
         s.pending_tool_name = Some("Bash".into());
         s.pending_tool_input = Some("cargo test --release".into());
         s
@@ -488,16 +481,49 @@ mod tests {
     }
 
     #[test]
-    fn session_summary_includes_key_fields() {
+    fn telemetry_free_session_summary_includes_key_fields() {
         let s = make_session();
         let summary = format_session_summary(&s);
         assert!(summary.contains("my-project"));
         assert!(summary.contains("Needs Input"));
         assert!(summary.contains("gpt-5.5"));
-        assert!(summary.contains("$12.50"));
+        assert!(!summary.contains("Cost"));
         assert!(summary.contains("25%"));
         assert!(summary.contains("Bash"));
         assert!(summary.contains("cargo test --release"));
+    }
+
+    #[test]
+    fn unavailable_context_pressure_is_omitted_from_summary() {
+        let mut session = make_session();
+        session.context_pressure = None;
+
+        let summary = format_session_summary(&session);
+
+        assert!(!summary.contains("Context:"));
+        assert!(!summary.contains("0%"));
+    }
+
+    #[test]
+    fn legacy_burn_temporal_pattern_is_absent_from_brain_prompt() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-preferences-cost-condition.json"
+        ))
+        .unwrap();
+        let preferences = crate::brain::pref_store::parse_preferences_json(&value).unwrap();
+        let preference_summary = crate::brain::preferences::format_preference_summary(&preferences);
+        let prompt = format_brain_prompt(&BrainContext {
+            session_summary: "summary".into(),
+            recent_transcript: "transcript".into(),
+            decision_prompt: "decide".into(),
+            few_shot_examples: String::new(),
+            preference_summary,
+            git_context: String::new(),
+        });
+
+        assert!(prompt.contains("After 3+ errors"));
+        assert!(prompt.contains("After costume file edits"));
+        assert!(!prompt.to_ascii_lowercase().contains("burn rate"));
     }
 
     #[test]

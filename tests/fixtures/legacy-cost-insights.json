@@ -1,0 +1,27 @@
+{
+  "seen_fingerprints": [
+    "legacy-cost-pattern",
+    "error-loop:Bash"
+  ],
+  "last_generated": 1710000000,
+  "current_insights": [
+    {
+      "fingerprint": "legacy-cost-pattern",
+      "generated_at": 1709999999,
+      "category": "cost_pattern",
+      "severity": "warning",
+      "summary": "Burn rate increased across recent sessions",
+      "suggestion": "Review costly operations",
+      "evidence_count": 12
+    },
+    {
+      "fingerprint": "error-loop:Bash",
+      "generated_at": 1710000000,
+      "category": "error_loop",
+      "severity": "warning",
+      "summary": "Bash failed repeatedly in one session",
+      "suggestion": "Inspect the first failure before retrying",
+      "evidence_count": 4
+    }
+  ]
+}

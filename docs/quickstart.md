@@ -38,7 +38,9 @@ Init validates and stages every selected file before replacement. Unrelated and 
 
 ## Use the TUI
 
-Run `coding-brain` to open Live. Press the view keys shown in the footer to move between Live, Review, Scorecard, and Diagnostics. Live presents provider-tagged Brain activity and attention; Review concentrates decisions worth correcting or retaining; Scorecard summarizes decision quality. Diagnostics is the user-facing viewer for metadata-only hook/correlation diagnostics and activity-store integrity, not failed commands. These are Brain views, not a general session dashboard. Usage/cost tracking is outside the supported product surface; this provider feature adds no usage/cost ingestion or dashboard/view.
+Run `coding-brain` to open Live. Press the view keys shown in the footer to move between Live, Review, Scorecard, and Diagnostics. Live presents provider-tagged Brain activity and attention; Review concentrates decisions worth correcting or retaining; Scorecard summarizes decision quality. Diagnostics is the user-facing viewer for metadata-only hook/correlation diagnostics and activity-store integrity, not failed commands. These are Brain views, not a general session dashboard.
+
+Coding Brain does not collect or display token usage or cost. Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it. Only that bounded percentage is retained. The percentage uses provider-supplied context capacity when available and otherwise a known-model fallback; it is not raw usage or cost accounting.
 
 Within Live, use `j`/`k` or the arrow keys to move inside the selected list. Press `J` for Recent or `K` for Needs Attention; each list restores its last valid selection.
 

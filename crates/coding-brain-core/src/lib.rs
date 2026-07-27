@@ -16,10 +16,10 @@
 pub mod brain_activity;
 pub mod codex_transcript;
 pub mod config;
+pub mod context_pressure;
 pub mod discovery;
 pub mod health;
 pub mod helpers;
-pub mod history;
 pub mod hooks;
 pub mod lifecycle;
 pub mod logger;

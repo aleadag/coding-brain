@@ -210,6 +210,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "time",
  "toml",
@@ -225,6 +226,7 @@ dependencies = [
  "ctrlc",
  "libc",
  "ratatui",
+ "serde_json",
  "unicode-width 0.2.0",
 ]
 

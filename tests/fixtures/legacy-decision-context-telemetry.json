@@ -1,0 +1,27 @@
+{
+  "ts": "1710000000",
+  "pid": 4242,
+  "project": "legacy-project",
+  "tool": "Bash",
+  "command": "cargo test",
+  "brain_action": "approve",
+  "brain_confidence": 0.91,
+  "brain_reasoning": "Known local verification command",
+  "user_action": "accept",
+  "context": {
+    "cost_usd": 3.5,
+    "burn_rate_per_hr": 2.5,
+    "context_pct": 80,
+    "last_tool_error": false,
+    "error_message": null,
+    "model": "gpt-5.4",
+    "elapsed_secs": 120,
+    "files_modified_count": 1,
+    "total_tool_calls": 8,
+    "has_file_conflict": false,
+    "status": "Processing",
+    "recent_error_count": 0,
+    "subagent_count": 1,
+    "hour": 14
+  }
+}

@@ -4,6 +4,7 @@ use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 
 use super::preferences::{
     DistilledPreferences, PreferenceCondition, PreferencePattern, TemporalPattern, ToolAccuracy,
+    is_legacy_cost_temporal,
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -51,15 +52,23 @@ pub(crate) fn parse_preferences_json(json: &serde_json::Value) -> Option<Distill
         .as_array()?
         .iter()
         .filter_map(|p| {
-            let conditions = p
+            let raw_conditions = p
                 .get("conditions")
                 .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(PreferenceCondition::from_json)
-                        .collect::<Vec<_>>()
-                })
+                .map(Vec::as_slice)
                 .unwrap_or_default();
+            if raw_conditions.iter().any(|condition| {
+                matches!(
+                    condition.get("type").and_then(serde_json::Value::as_str),
+                    Some("cost_below" | "cost_above")
+                )
+            }) {
+                return None;
+            }
+            let conditions = raw_conditions
+                .iter()
+                .filter_map(PreferenceCondition::from_json)
+                .collect::<Vec<_>>();
             let confidence = p.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
             Some(PreferencePattern {
                 tool: p.get("tool")?.as_str()?.to_string(),
@@ -96,8 +105,12 @@ pub(crate) fn parse_preferences_json(json: &serde_json::Value) -> Option<Distill
         .map(|arr| {
             arr.iter()
                 .filter_map(|tp| {
+                    let description = tp.get("description")?.as_str()?;
+                    if is_legacy_cost_temporal(description) {
+                        return None;
+                    }
                     Some(TemporalPattern {
-                        description: tp.get("description")?.as_str()?.to_string(),
+                        description: description.to_string(),
                         sample_count: tp.get("sample_count")?.as_u64()? as u32,
                         strength: tp.get("strength")?.as_f64()?,
                     })
@@ -223,6 +236,30 @@ mod tests {
         assert_eq!(parsed.total_decisions, 10);
         assert!((parsed.overall_accuracy - 0.9).abs() < f64::EPSILON);
         assert_eq!(parsed.temporal.len(), 1);
+    }
+
+    #[test]
+    fn legacy_cost_condition_discards_whole_pattern() {
+        let json: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-preferences-cost-condition.json"
+        ))
+        .unwrap();
+
+        let parsed = parse_preferences_json(&json).unwrap();
+
+        assert_eq!(parsed.patterns.len(), 1);
+        assert_eq!(parsed.patterns[0].tool, "Read");
+        assert!(matches!(
+            parsed.patterns[0].conditions.as_slice(),
+            [PreferenceCondition::NoErrors]
+        ));
+        assert_eq!(parsed.temporal.len(), 2);
+        assert!(parsed.temporal.iter().any(|pattern| {
+            pattern.description == "After 3+ errors: user usually denies (n=5)"
+        }));
+        assert!(parsed.temporal.iter().any(|pattern| {
+            pattern.description == "After costume file edits: user usually approves (n=6)"
+        }));
     }
 
     #[test]

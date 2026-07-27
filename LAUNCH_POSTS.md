@@ -4,6 +4,8 @@
 
 Coding Brain is a local TUI for the judgment and learning loop around Codex, Claude Code, and Antigravity CLI. Live shows what needs attention, Review turns corrections into teaching evidence, Scorecard makes decision quality visible, and Diagnostics exposes metadata-only correlation and activity-store evidence. It can switch to an exact source session through native Claude attach, terminal support, or optional Agent Deck navigation.
 
+Coding Brain does not collect or display token usage or cost. Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it. Only that bounded percentage is retained. The percentage uses provider-supplied context capacity when available and otherwise a known-model fallback; it is not raw usage or cost accounting.
+
 It does not schedule work or replace a durable tracker. Beads and Agent Deck are optional companions for different jobs.
 
 ## GitHub Discussion

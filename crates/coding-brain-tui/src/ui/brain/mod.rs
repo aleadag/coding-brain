@@ -193,8 +193,12 @@ mod tests {
         for forbidden in ["PID", "send", "terminate", "route", "spawn"] {
             assert!(!text.contains(forbidden), "found {forbidden}:\n{text}");
         }
-        for forbidden in ["Usage", "Cost", "Quota", "Burn rate", "Token"] {
-            assert!(!text.contains(forbidden), "found {forbidden}:\n{text}");
+        let removed_labels = serde_json::from_str::<Vec<String>>(include_str!(
+            "../../../../../tests/fixtures/legacy-ui-labels.json"
+        ))
+        .unwrap();
+        for forbidden in removed_labels {
+            assert!(!text.contains(&forbidden), "found {forbidden}:\n{text}");
         }
     }
 
@@ -1230,7 +1234,6 @@ mod tests {
             brain_decision_ms: Some(30),
             canonical: None,
             cache_hit: Some(false),
-            cost_usd: None,
             model: Some("qwen-local".into()),
             outcome_kind: None,
             outcome_detail: None,

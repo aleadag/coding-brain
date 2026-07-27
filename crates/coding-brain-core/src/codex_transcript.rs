@@ -38,19 +38,8 @@ pub struct CodexTurnContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CodexTokenUsage {
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
-    pub reasoning_output_tokens: u64,
-    pub total_tokens: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CodexTokenCount {
-    pub total: CodexTokenUsage,
-    pub last: CodexTokenUsage,
-    pub model_context_window: Option<u64>,
+    pub context_pressure: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +75,13 @@ pub fn parse_line(line: &str) -> Option<CodexEvent> {
 }
 
 pub fn parse_timed_line(line: &str) -> Option<TimedCodexEvent> {
+    parse_timed_line_with_capacity(line, None)
+}
+
+pub fn parse_timed_line_with_capacity(
+    line: &str,
+    fallback_capacity: Option<u64>,
+) -> Option<TimedCodexEvent> {
     let entry: Value = serde_json::from_str(line).ok()?;
     let timestamp_ms = entry
         .get("timestamp")
@@ -97,7 +93,7 @@ pub fn parse_timed_line(line: &str) -> Option<TimedCodexEvent> {
         "turn_context" => Some(CodexEvent::TurnContext(parse_turn_context(
             entry.get("payload")?,
         ))),
-        "event_msg" => parse_event_msg(entry.get("payload")?),
+        "event_msg" => parse_event_msg(entry.get("payload")?, fallback_capacity),
         "response_item" => parse_response_item(entry.get("payload")?).map(CodexEvent::ResponseItem),
         _ => None,
     }?;
@@ -148,10 +144,10 @@ fn parse_turn_context(payload: &Value) -> CodexTurnContext {
     }
 }
 
-fn parse_event_msg(payload: &Value) -> Option<CodexEvent> {
+fn parse_event_msg(payload: &Value, fallback_capacity: Option<u64>) -> Option<CodexEvent> {
     let event_type = payload.get("type").and_then(|v| v.as_str())?;
     if event_type == "token_count" {
-        return parse_token_count(payload).map(CodexEvent::TokenCount);
+        return parse_token_count(payload, fallback_capacity).map(CodexEvent::TokenCount);
     }
 
     let event = match event_type {
@@ -165,41 +161,21 @@ fn parse_event_msg(payload: &Value) -> Option<CodexEvent> {
     Some(CodexEvent::Lifecycle(event))
 }
 
-fn parse_token_count(payload: &Value) -> Option<CodexTokenCount> {
+fn parse_token_count(payload: &Value, fallback_capacity: Option<u64>) -> Option<CodexTokenCount> {
     let info = payload.get("info")?;
+    let capacity = info
+        .get("model_context_window")
+        .and_then(Value::as_u64)
+        .or(fallback_capacity);
+    let used = info
+        .get("last_token_usage")
+        .and_then(|value| value.get("input_tokens"))
+        .and_then(Value::as_u64);
     Some(CodexTokenCount {
-        total: parse_token_usage(info.get("total_token_usage")?),
-        last: info
-            .get("last_token_usage")
-            .map(parse_token_usage)
-            .unwrap_or_default(),
-        model_context_window: info.get("model_context_window").and_then(|v| v.as_u64()),
+        context_pressure: used
+            .zip(capacity)
+            .and_then(|(used, capacity)| crate::context_pressure::percent(used, capacity)),
     })
-}
-
-fn parse_token_usage(value: &Value) -> CodexTokenUsage {
-    CodexTokenUsage {
-        input_tokens: value
-            .get("input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        cached_input_tokens: value
-            .get("cached_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        output_tokens: value
-            .get("output_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        reasoning_output_tokens: value
-            .get("reasoning_output_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        total_tokens: value
-            .get("total_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-    }
 }
 
 fn parse_response_item(payload: &Value) -> Option<CodexResponseItem> {
@@ -301,11 +277,26 @@ mod tests {
         let Some(CodexEvent::TokenCount(count)) = parse_line(line) else {
             panic!("expected token count");
         };
-        assert_eq!(count.total.input_tokens, 100000);
-        assert_eq!(count.total.cached_input_tokens, 25000);
-        assert_eq!(count.total.output_tokens, 12000);
-        assert_eq!(count.last.input_tokens, 42000);
-        assert_eq!(count.model_context_window, Some(258400));
+        assert_eq!(count.context_pressure, Some(16));
+    }
+
+    #[test]
+    fn token_count_pressure_prefers_provider_capacity_over_fallback() {
+        let provider_capacity = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1},"last_token_usage":{"input_tokens":50},"model_context_window":100}}}"#;
+        let Some(CodexEvent::TokenCount(count)) =
+            parse_timed_line_with_capacity(provider_capacity, Some(200)).map(|timed| timed.event)
+        else {
+            panic!("expected token count");
+        };
+        assert_eq!(count.context_pressure, Some(50));
+
+        let fallback_capacity = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1},"last_token_usage":{"input_tokens":50}}}}"#;
+        let Some(CodexEvent::TokenCount(count)) =
+            parse_timed_line_with_capacity(fallback_capacity, Some(200)).map(|timed| timed.event)
+        else {
+            panic!("expected token count");
+        };
+        assert_eq!(count.context_pressure, Some(25));
     }
 
     #[test]

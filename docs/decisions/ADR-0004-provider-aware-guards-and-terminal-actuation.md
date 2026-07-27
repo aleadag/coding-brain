@@ -103,6 +103,14 @@ provider-tagged Brain activity with source-session navigation; they do not add
 a session dashboard. Usage, token, quota, and cost tracking remain outside the
 product.
 
+The current boundary is stricter after the pre-1.0 cleanup:
+Coding Brain does not collect or display token usage or cost.
+Coding Brain may derive a bounded context-window percentage for context-rot
+prevention, but it does not retain the provider token counts used to derive it.
+Only that bounded percentage is retained.
+The percentage uses provider-supplied context capacity when available and
+otherwise a known-model fallback; it is not raw usage or cost accounting.
+
 ## Rationale
 
 Structured permission and continuation hooks avoid terminal races on the

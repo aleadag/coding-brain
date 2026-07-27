@@ -2,37 +2,20 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::codex_transcript::{
-    CodexEvent, CodexLifecycleEvent, CodexResponseItem, CodexResponseKind, CodexTokenCount,
-    CodexTokenUsage, parse_timed_line as parse_codex_line,
+    CodexEvent, CodexLifecycleEvent, CodexResponseItem, CodexResponseKind,
+    parse_timed_line_with_capacity as parse_codex_line,
 };
 use crate::lifecycle::{TranscriptEvidence, contributing_status};
 use crate::models;
 use crate::session::{
-    AgentSession, ApprovalObservation, CodexTaskState, SessionStatus, SubagentRollup,
-    TelemetryStatus,
+    AgentSession, ApprovalObservation, CodexTaskState, SessionStatus, TelemetryStatus,
 };
 use crate::transcript::{TranscriptBlock, TranscriptEvent, TranscriptRole, parse_line};
 
-#[derive(Default)]
-struct UsageRollup {
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    cost_usd: f64,
-    usage_metrics_available: bool,
-    cost_estimate_unverified: bool,
-}
-
-impl UsageRollup {
-    fn total_input_tokens(&self) -> u64 {
-        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
-    }
-}
-
-/// Read new JSONL entries since last offset, accumulate token stats.
+/// Read new JSONL entries since last offset and update session state.
 pub fn update_tokens(session: &mut AgentSession) {
     if should_use_codex_parser(session) {
         update_codex_tokens(session);
@@ -45,7 +28,6 @@ pub fn update_tokens(session: &mut AgentSession) {
     let mut is_waiting_for_task = session.is_waiting_for_task;
     let mut saw_non_empty_line = false;
     let mut recognized_events = 0usize;
-    let mut saw_parent_usage = false;
     let jsonl_path = session.jsonl_path.clone();
 
     match jsonl_path.as_ref() {
@@ -54,47 +36,54 @@ pub fn update_tokens(session: &mut AgentSession) {
                 Ok(f) => f,
                 Err(_) => {
                     session.telemetry_status = TelemetryStatus::UnreadableTranscript;
-                    finalize_usage(
-                        session,
-                        &last_type,
-                        &last_stop_reason,
-                        is_waiting_for_task,
-                        false,
-                    );
+                    finalize_session(session, &last_type, &last_stop_reason, is_waiting_for_task);
                     return;
                 }
             };
 
             let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut prefix_hasher = match hash_prefix(&mut file, session.jsonl_offset, file_len) {
+                Ok(hasher) => hasher,
+                Err(_) => {
+                    finalize_session(session, &last_type, &last_stop_reason, is_waiting_for_task);
+                    return;
+                }
+            };
+            let prefix_changed = session
+                .jsonl_prefix_digest
+                .is_some_and(|expected| prefix_hasher.clone().finalize()[..] != expected);
+
+            if session.jsonl_offset > file_len || prefix_changed {
+                session.context_pressure = None;
+                session.jsonl_offset = 0;
+                session.jsonl_prefix_digest = None;
+                prefix_hasher = Sha256::new();
+                // Reset persisted inference state on file truncation
+                last_type.clear();
+                last_stop_reason.clear();
+                is_waiting_for_task = false;
+            }
 
             if file_len == 0 {
                 session.telemetry_status = TelemetryStatus::Pending;
             } else {
-                if session.jsonl_offset > file_len {
-                    session.jsonl_offset = 0;
-                    session.cost_ledger_frozen = true;
-                    session.cost_estimate_unverified = true;
-                    // Reset persisted inference state on file truncation
-                    last_type.clear();
-                    last_stop_reason.clear();
-                    is_waiting_for_task = false;
-                }
-
                 if session.jsonl_offset < file_len {
-                    let (lines, complete_offset) =
-                        match read_complete_lines(&mut file, session.jsonl_offset) {
-                            Ok(result) => result,
-                            Err(_) => {
-                                finalize_usage(
-                                    session,
-                                    &last_type,
-                                    &last_stop_reason,
-                                    is_waiting_for_task,
-                                    false,
-                                );
-                                return;
-                            }
-                        };
+                    let (lines, complete_offset) = match read_complete_lines(
+                        &mut file,
+                        session.jsonl_offset,
+                        &mut prefix_hasher,
+                    ) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            finalize_session(
+                                session,
+                                &last_type,
+                                &last_stop_reason,
+                                is_waiting_for_task,
+                            );
+                            return;
+                        }
+                    };
 
                     for line in lines {
                         if line.trim().is_empty() {
@@ -139,44 +128,8 @@ pub fn update_tokens(session: &mut AgentSession) {
                                     session.model = shorten_model(&model);
                                 }
 
-                                if let Some(usage) = message.usage {
-                                    let input = usage.input_tokens;
-                                    let cache_read = usage.cache_read_input_tokens;
-                                    let cache_create = usage.cache_creation_input_tokens;
-                                    let output = usage.output_tokens;
-
-                                    if !session.cost_ledger_frozen {
-                                        session.own_input_tokens +=
-                                            input + cache_read + cache_create;
-                                        session.own_output_tokens += output;
-                                        session.own_cache_read_tokens += cache_read;
-                                        session.own_cache_write_tokens += cache_create;
-                                        let request_usage = CodexTokenUsage {
-                                            input_tokens: input + cache_read + cache_create,
-                                            cached_input_tokens: cache_read,
-                                            output_tokens: output,
-                                            reasoning_output_tokens: 0,
-                                            total_tokens: input
-                                                + cache_read
-                                                + cache_create
-                                                + output,
-                                        };
-                                        let (cost, unverified) = price_request(
-                                            &session.model,
-                                            &request_usage,
-                                            Some(cache_create),
-                                        );
-                                        session.own_cost_usd += cost;
-                                        session.cost_estimate_unverified |= unverified;
-                                    }
-                                    saw_parent_usage = true;
-
-                                    // Track context window: the input_tokens of the LAST API call
-                                    // represents the current prompt/context size
-                                    let context_size = input + cache_read + cache_create;
-                                    if context_size > 0 {
-                                        session.context_tokens = context_size;
-                                    }
+                                if let Some(pressure) = message.context_pressure {
+                                    session.context_pressure = Some(pressure);
                                 }
 
                                 for block in message.content {
@@ -248,6 +201,8 @@ pub fn update_tokens(session: &mut AgentSession) {
                     }
                     session.jsonl_offset = complete_offset;
                 }
+                session.jsonl_prefix_digest =
+                    (session.jsonl_offset > 0).then(|| prefix_hasher.finalize().into());
 
                 if recognized_events > 0 || session.telemetry_status.is_available() {
                     session.telemetry_status = TelemetryStatus::Available;
@@ -273,18 +228,11 @@ pub fn update_tokens(session: &mut AgentSession) {
         }
     }
 
-    finalize_usage(
-        session,
-        &last_type,
-        &last_stop_reason,
-        is_waiting_for_task,
-        saw_parent_usage,
-    );
+    finalize_session(session, &last_type, &last_stop_reason, is_waiting_for_task);
 }
 
 fn should_use_codex_parser(session: &AgentSession) -> bool {
     !session.process_backed
-        || session.model_profile_source == "codex-transcript"
         || session
             .jsonl_path
             .as_ref()
@@ -298,9 +246,6 @@ fn update_codex_tokens(session: &mut AgentSession) {
     let mut last_stop_reason = session.last_stop_reason.clone();
     let mut saw_non_empty_line = false;
     let mut recognized_events = 0usize;
-    let mut saw_parent_usage = false;
-    let mut codex_context_max = None;
-    let previous_context_max = session.context_max;
     let jsonl_path = session.jsonl_path.clone();
 
     match jsonl_path.as_ref() {
@@ -309,49 +254,59 @@ fn update_codex_tokens(session: &mut AgentSession) {
                 Ok(file) => file,
                 Err(_) => {
                     session.telemetry_status = TelemetryStatus::UnreadableTranscript;
-                    finalize_usage(session, &last_type, &last_stop_reason, false, false);
+                    finalize_session(session, &last_type, &last_stop_reason, false);
                     return;
                 }
             };
 
             let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut prefix_hasher = match hash_prefix(&mut file, session.jsonl_offset, file_len) {
+                Ok(hasher) => hasher,
+                Err(_) => {
+                    finalize_session(session, &last_type, &last_stop_reason, false);
+                    return;
+                }
+            };
+            let prefix_changed = session
+                .jsonl_prefix_digest
+                .is_some_and(|expected| prefix_hasher.clone().finalize()[..] != expected);
+            if session.jsonl_offset > file_len || prefix_changed {
+                session.context_pressure = None;
+                session.jsonl_offset = 0;
+                session.jsonl_prefix_digest = None;
+                prefix_hasher = Sha256::new();
+                last_type.clear();
+                last_stop_reason.clear();
+                session.task_state = CodexTaskState::Unknown;
+                session.transcript_evidence = None;
+                session.explicit_input_required = false;
+                clear_pending_tool(session);
+            }
+
             if file_len == 0 {
                 session.telemetry_status = TelemetryStatus::Pending;
             } else {
-                if session.jsonl_offset > file_len {
-                    session.jsonl_offset = 0;
-                    session.cost_ledger_frozen = true;
-                    session.cost_estimate_unverified = true;
-                    last_type.clear();
-                    last_stop_reason.clear();
-                    session.task_state = CodexTaskState::Unknown;
-                    session.transcript_evidence = None;
-                    session.explicit_input_required = false;
-                    clear_pending_tool(session);
-                }
-
                 if session.jsonl_offset < file_len {
-                    let (lines, complete_offset) =
-                        match read_complete_lines(&mut file, session.jsonl_offset) {
-                            Ok(result) => result,
-                            Err(_) => {
-                                finalize_usage(
-                                    session,
-                                    &last_type,
-                                    &last_stop_reason,
-                                    false,
-                                    false,
-                                );
-                                return;
-                            }
-                        };
+                    let (lines, complete_offset) = match read_complete_lines(
+                        &mut file,
+                        session.jsonl_offset,
+                        &mut prefix_hasher,
+                    ) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            finalize_session(session, &last_type, &last_stop_reason, false);
+                            return;
+                        }
+                    };
                     for line in lines {
                         if line.trim().is_empty() {
                             continue;
                         }
                         saw_non_empty_line = true;
 
-                        let Some(timed) = parse_codex_line(&line) else {
+                        let Some(timed) =
+                            parse_codex_line(&line, models::context_window(&session.model))
+                        else {
                             continue;
                         };
                         recognized_events += 1;
@@ -369,9 +324,9 @@ fn update_codex_tokens(session: &mut AgentSession) {
                                 }
                             }
                             CodexEvent::TokenCount(count) => {
-                                codex_context_max = count.model_context_window;
-                                apply_token_count(count, session);
-                                saw_parent_usage = true;
+                                if let Some(pressure) = count.context_pressure {
+                                    session.context_pressure = Some(pressure);
+                                }
                             }
                             CodexEvent::Lifecycle(event) => {
                                 match &event {
@@ -445,6 +400,8 @@ fn update_codex_tokens(session: &mut AgentSession) {
                     }
                     session.jsonl_offset = complete_offset;
                 }
+                session.jsonl_prefix_digest =
+                    (session.jsonl_offset > 0).then(|| prefix_hasher.finalize().into());
 
                 if recognized_events > 0 || session.telemetry_status.is_available() {
                     session.telemetry_status = TelemetryStatus::Available;
@@ -469,18 +426,7 @@ fn update_codex_tokens(session: &mut AgentSession) {
         }
     }
 
-    finalize_usage(
-        session,
-        &last_type,
-        &last_stop_reason,
-        false,
-        saw_parent_usage,
-    );
-    if let Some(max) = codex_context_max {
-        session.context_max = max;
-    } else if previous_context_max > 0 && session.context_tokens > 0 {
-        session.context_max = previous_context_max;
-    }
+    finalize_session(session, &last_type, &last_stop_reason, false);
 }
 
 fn update_transcript_evidence(
@@ -525,28 +471,22 @@ fn update_transcript_evidence(
     }
 }
 
-fn apply_token_count(count: CodexTokenCount, session: &mut AgentSession) {
-    let watermark = count.total.total_tokens;
-    if watermark < session.priced_total_tokens {
-        session.cost_ledger_frozen = true;
-        session.cost_estimate_unverified = true;
-    } else if watermark > session.priced_total_tokens && !session.cost_ledger_frozen {
-        let (cost, unverified) = price_request(&session.model, &count.last, None);
-        session.own_cost_usd += cost;
-        session.cost_estimate_unverified |= unverified;
-        session.priced_total_tokens = watermark;
+fn hash_prefix(file: &mut File, offset: u64, file_len: u64) -> std::io::Result<Sha256> {
+    let mut hasher = Sha256::new();
+    if offset == 0 || offset > file_len {
+        return Ok(hasher);
     }
-
-    if !session.cost_ledger_frozen && watermark >= session.priced_total_tokens {
-        session.own_input_tokens = count.total.input_tokens;
-        session.own_output_tokens = count.total.output_tokens;
-        session.own_cache_read_tokens = count.total.cached_input_tokens;
-        session.own_cache_write_tokens = 0;
-        session.context_tokens = count.last.input_tokens;
-    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut prefix = file.take(offset);
+    std::io::copy(&mut prefix, &mut hasher)?;
+    Ok(hasher)
 }
 
-fn read_complete_lines(file: &mut File, offset: u64) -> std::io::Result<(Vec<String>, u64)> {
+fn read_complete_lines(
+    file: &mut File,
+    offset: u64,
+    prefix_hasher: &mut Sha256,
+) -> std::io::Result<(Vec<String>, u64)> {
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -554,6 +494,7 @@ fn read_complete_lines(file: &mut File, offset: u64) -> std::io::Result<(Vec<Str
         return Ok((Vec::new(), offset));
     };
     let complete = &bytes[..=last_newline];
+    prefix_hasher.update(complete);
     let lines = String::from_utf8_lossy(complete)
         .lines()
         .map(str::to_owned)
@@ -642,39 +583,13 @@ fn clear_pending_tool(session: &mut AgentSession) {
     session.approval_checked_at_ms = 0;
 }
 
-fn finalize_usage(
+fn finalize_session(
     session: &mut AgentSession,
     last_type: &str,
     last_stop_reason: &str,
     is_waiting_for_task: bool,
-    saw_parent_usage: bool,
 ) {
-    let resolved_profile = models::resolve(&session.model);
-    session.context_max = resolved_profile.profile.context_max;
-    session.model_profile_source = resolved_profile.source.label().to_string();
-
-    let subagent_rollup = refresh_subagent_rollups(session);
-    session.subagent_input_tokens = subagent_rollup.total_input_tokens();
-    session.subagent_output_tokens = subagent_rollup.output_tokens;
-    session.subagent_cache_read_tokens = subagent_rollup.cache_read_tokens;
-    session.subagent_cache_write_tokens = subagent_rollup.cache_write_tokens;
-    session.subagent_count = session.subagent_rollups.len();
-
-    session.total_input_tokens = session.own_input_tokens + session.subagent_input_tokens;
-    session.total_output_tokens = session.own_output_tokens + session.subagent_output_tokens;
-    session.cache_read_tokens = session.own_cache_read_tokens + session.subagent_cache_read_tokens;
-    session.cache_write_tokens =
-        session.own_cache_write_tokens + session.subagent_cache_write_tokens;
-
-    let own_usage_metrics_available = saw_parent_usage
-        || session.own_input_tokens > 0
-        || session.own_output_tokens > 0
-        || session.own_cache_read_tokens > 0
-        || session.own_cache_write_tokens > 0;
-    session.cost_usd = session.own_cost_usd + subagent_rollup.cost_usd;
-    session.usage_metrics_available =
-        own_usage_metrics_available || subagent_rollup.usage_metrics_available;
-    session.cost_estimate_unverified |= subagent_rollup.cost_estimate_unverified;
+    session.subagent_count = session.active_subagent_jsonl_paths.len();
 
     // Persist for next tick (so status inference works when no new JSONL arrives).
     session.last_msg_type = last_type.to_string();
@@ -803,24 +718,6 @@ fn recent_waiting_or_idle(last_message_ts: u64) -> SessionStatus {
     }
 }
 
-/// Estimate USD cost based on token usage and model.
-#[allow(dead_code)]
-pub fn estimate_cost(session: &AgentSession) -> f64 {
-    estimate_cost_components(
-        &session.model,
-        session.total_input_tokens,
-        session.total_output_tokens,
-        session.cache_read_tokens,
-        session.cache_write_tokens,
-    )
-    .0
-}
-
-/// Max context window tokens by model.
-pub fn model_context_max(model: &str) -> u64 {
-    models::resolve(model).profile.context_max
-}
-
 /// Extract tool usage stats and file paths from tool_use content blocks.
 fn record_tool_usage(tool_name: &str, input: &Value, session: &mut AgentSession) {
     if tool_name.is_empty() {
@@ -839,15 +736,6 @@ fn record_tool_usage(tool_name: &str, input: &Value, session: &mut AgentSession)
             // Reset file-read tracker for this path (it was just edited)
             session.file_reads_since_edit.remove(path);
         }
-        // Track token efficiency: cumulative tokens at each edit event
-        let total_tokens = session.total_input_tokens + session.total_output_tokens;
-        session.total_tokens_at_edit_count += total_tokens;
-        session.edit_event_count += 1;
-        // Freeze baseline tokens-per-edit after first 5 edits
-        if session.baseline_tokens_per_edit.is_none() && session.edit_event_count >= 5 {
-            session.baseline_tokens_per_edit =
-                Some(session.total_tokens_at_edit_count as f64 / session.edit_event_count as f64);
-        }
     }
 
     // Track file reads for repetition detection
@@ -865,174 +753,11 @@ pub fn shorten_model(model: &str) -> String {
     models::shorten_model(model)
 }
 
-fn refresh_subagent_rollups(session: &mut AgentSession) -> UsageRollup {
-    for path in session.active_subagent_jsonl_paths.clone() {
-        let rollup = session.subagent_rollups.entry(path.clone()).or_default();
-        update_subagent_rollup(&path, rollup, &session.model);
-    }
-
-    let mut totals = UsageRollup::default();
-    for rollup in session.subagent_rollups.values() {
-        totals.input_tokens += rollup.input_tokens;
-        totals.output_tokens += rollup.output_tokens;
-        totals.cache_read_tokens += rollup.cache_read_tokens;
-        totals.cache_write_tokens += rollup.cache_write_tokens;
-        totals.cost_usd += rollup.cost_usd;
-        totals.usage_metrics_available |= rollup.usage_metrics_available;
-        totals.cost_estimate_unverified |= rollup.cost_estimate_unverified;
-    }
-    totals
-}
-
-fn update_subagent_rollup(
-    path: &std::path::Path,
-    rollup: &mut SubagentRollup,
-    default_model: &str,
-) {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return,
-    };
-
-    let file_len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
-    if rollup.jsonl_offset > file_len {
-        rollup.jsonl_offset = 0;
-        rollup.cost_ledger_frozen = true;
-        rollup.cost_estimate_unverified = true;
-    }
-
-    if rollup.jsonl_offset >= file_len {
-        rollup.jsonl_offset = file_len;
-        return;
-    }
-
-    let mut current_model = if rollup.model.is_empty() {
-        default_model.to_string()
-    } else {
-        rollup.model.clone()
-    };
-
-    let (lines, complete_offset) = match read_complete_lines(&mut file, rollup.jsonl_offset) {
-        Ok(result) => result,
-        Err(_) => return,
-    };
-    for line in lines {
-        let Some(TranscriptEvent::Message(message)) = parse_line(&line) else {
-            continue;
-        };
-
-        if let Some(model) = message.model {
-            current_model = shorten_model(&model);
-            rollup.model = current_model.clone();
-        }
-
-        let Some(usage) = message.usage else {
-            continue;
-        };
-
-        if !rollup.cost_ledger_frozen {
-            rollup.input_tokens += usage.input_tokens;
-            rollup.output_tokens += usage.output_tokens;
-            rollup.cache_read_tokens += usage.cache_read_input_tokens;
-            rollup.cache_write_tokens += usage.cache_creation_input_tokens;
-            rollup.usage_metrics_available = true;
-
-            let model_for_cost = if current_model.is_empty() {
-                default_model
-            } else {
-                current_model.as_str()
-            };
-            let request_usage = CodexTokenUsage {
-                input_tokens: usage.input_tokens
-                    + usage.cache_read_input_tokens
-                    + usage.cache_creation_input_tokens,
-                cached_input_tokens: usage.cache_read_input_tokens,
-                output_tokens: usage.output_tokens,
-                reasoning_output_tokens: 0,
-                total_tokens: usage.input_tokens
-                    + usage.cache_read_input_tokens
-                    + usage.cache_creation_input_tokens
-                    + usage.output_tokens,
-            };
-            let (delta_cost, unverified) = price_request(
-                model_for_cost,
-                &request_usage,
-                Some(usage.cache_creation_input_tokens),
-            );
-            rollup.cost_usd += delta_cost;
-            rollup.cost_estimate_unverified |= unverified;
-        }
-    }
-
-    rollup.jsonl_offset = complete_offset;
-}
-
-fn price_request(
-    model: &str,
-    usage: &CodexTokenUsage,
-    cache_write_tokens: Option<u64>,
-) -> (f64, bool) {
-    let resolved = models::resolve(model);
-    let cache_write = cache_write_tokens.unwrap_or(0);
-    let plain_input = usage
-        .input_tokens
-        .saturating_sub(usage.cached_input_tokens)
-        .saturating_sub(cache_write);
-    let long = resolved
-        .profile
-        .long_context_threshold
-        .is_some_and(|threshold| usage.input_tokens > threshold);
-    let input_multiplier = if long {
-        resolved.profile.long_context_input_multiplier
-    } else {
-        1.0
-    };
-    let output_multiplier = if long {
-        resolved.profile.long_context_output_multiplier
-    } else {
-        1.0
-    };
-    let cost = input_multiplier
-        * ((plain_input as f64 / 1_000_000.0) * resolved.profile.input_per_m
-            + (usage.cached_input_tokens as f64 / 1_000_000.0) * resolved.profile.cache_read_per_m
-            + (cache_write as f64 / 1_000_000.0) * resolved.profile.cache_write_per_m)
-        + output_multiplier
-            * (usage.output_tokens as f64 / 1_000_000.0)
-            * resolved.profile.output_per_m;
-    let unverified =
-        resolved.source == models::ModelProfileSource::Fallback || cache_write_tokens.is_none();
-    (cost, unverified)
-}
-
-fn estimate_cost_components(
-    model: &str,
-    total_input_tokens: u64,
-    total_output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-) -> (f64, bool) {
-    let plain_input = total_input_tokens
-        .saturating_sub(cache_read_tokens)
-        .saturating_sub(cache_write_tokens);
-    let resolved = models::resolve(model);
-
-    let cost = (plain_input as f64 / 1_000_000.0) * resolved.profile.input_per_m
-        + (total_output_tokens as f64 / 1_000_000.0) * resolved.profile.output_per_m
-        + (cache_read_tokens as f64 / 1_000_000.0) * resolved.profile.cache_read_per_m
-        + (cache_write_tokens as f64 / 1_000_000.0) * resolved.profile.cache_write_per_m;
-
-    (
-        cost,
-        resolved.source == models::ModelProfileSource::Fallback,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::{ApprovalEvidence, ApprovalObservation, RawAgentSession};
     use crate::terminals::Terminal;
-    use std::io::{Seek, SeekFrom, Write};
 
     fn session() -> AgentSession {
         let mut session = AgentSession::from_raw(RawAgentSession {
@@ -1063,56 +788,6 @@ mod tests {
             prompt_pattern_version: 1,
             prompt_fingerprint: 42,
         }
-    }
-
-    #[test]
-    fn subagent_cost_keeps_each_messages_model() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"{{"type":"assistant","message":{{"model":"gpt-5.6-sol","usage":{{"input_tokens":100000,"output_tokens":1000}}}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            file,
-            r#"{{"type":"assistant","message":{{"model":"gpt-5.6-terra","usage":{{"input_tokens":100000,"output_tokens":1000}}}}}}"#
-        )
-        .unwrap();
-        file.flush().unwrap();
-        let mut rollup = SubagentRollup::default();
-
-        update_subagent_rollup(file.path(), &mut rollup, "gpt-5.6-sol");
-
-        assert!((rollup.cost_usd - 0.795).abs() < 0.000_001);
-        assert_eq!(rollup.model, "gpt-5.6-terra");
-    }
-
-    #[test]
-    fn subagent_truncation_freezes_existing_cost() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"{{"type":"assistant","message":{{"model":"gpt-5.6-sol","usage":{{"input_tokens":250000,"output_tokens":2000}}}}}}"#
-        )
-        .unwrap();
-        file.flush().unwrap();
-        let mut rollup = SubagentRollup::default();
-        update_subagent_rollup(file.path(), &mut rollup, "gpt-5.6-sol");
-        let before = rollup.cost_usd;
-
-        file.as_file_mut().set_len(0).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        writeln!(
-            file,
-            r#"{{"type":"assistant","message":{{"model":"gpt-5.6-sol","usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
-        )
-        .unwrap();
-        file.flush().unwrap();
-        update_subagent_rollup(file.path(), &mut rollup, "gpt-5.6-sol");
-
-        assert_eq!(rollup.cost_usd, before);
-        assert!(rollup.cost_ledger_frozen);
-        assert!(rollup.cost_estimate_unverified);
     }
 
     #[test]

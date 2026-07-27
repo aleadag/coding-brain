@@ -378,7 +378,6 @@ fn session_from_live_process(
     if let Some(transcript) = transcript {
         session.jsonl_path = Some(transcript.path.clone());
         session.last_message_ts = transcript.mtime_ms;
-        session.model_profile_source = "codex-transcript".into();
     }
 
     session
