@@ -216,7 +216,21 @@ impl BrainApp {
         let mut busy_status = None;
         match self.runtime.source.refresh(SnapshotLimits::default()) {
             Ok(refresh) => {
+                let selected_recent_activity_id = self
+                    .snapshot
+                    .recent
+                    .get(self.live_recent_selection)
+                    .map(|item| item.activity_id.clone());
                 self.snapshot = refresh.snapshot;
+                if let Some(selected_recent_activity_id) = selected_recent_activity_id
+                    && let Some(index) = self
+                        .snapshot
+                        .recent
+                        .iter()
+                        .position(|item| item.activity_id == selected_recent_activity_id)
+                {
+                    self.live_recent_selection = index;
+                }
                 self.review_queue = refresh.review_queue;
                 self.scorecard = refresh.scorecard;
                 self.has_successful_refresh = true;
@@ -1477,6 +1491,43 @@ mod tests {
     }
 
     #[test]
+    fn refresh_preserves_recent_selection_by_activity_id() {
+        let mut app = scripted_app([
+            Ok(refresh_with_recent(&["recent-2", "recent-1"])),
+            Ok(refresh_with_recent(&["recent-3", "recent-2", "recent-1"])),
+        ]);
+        app.handle_key(key(KeyCode::Char('j')));
+        app.update_live_evidence_metrics(5, 20);
+        app.handle_key(key(KeyCode::PageDown));
+
+        app.refresh();
+
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "recent-1"
+        );
+        assert_eq!(app.selected_recent_index(), Some(2));
+        assert_eq!(app.live_evidence_scroll(), 5);
+    }
+
+    #[test]
+    fn refresh_removing_selected_recent_activity_uses_clamped_fallback() {
+        let mut app = scripted_app([
+            Ok(refresh_with_recent(&["recent-2", "recent-1"])),
+            Ok(refresh_with_recent(&["recent-3"])),
+        ]);
+        app.handle_key(key(KeyCode::Char('j')));
+
+        app.refresh();
+
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "recent-3"
+        );
+        assert_eq!(app.selected_recent_index(), Some(0));
+    }
+
+    #[test]
     fn busy_refresh_does_not_overwrite_higher_priority_status() {
         let mut app = scripted_app([
             Ok(refresh_fixture("old", 1, 1)),
@@ -1947,6 +1998,23 @@ mod tests {
                 total_decisions: total,
                 ..ScorecardSummary::default()
             },
+        }
+    }
+
+    fn refresh_with_recent(activity_ids: &[&str]) -> BrainRefresh {
+        BrainRefresh {
+            snapshot: ActivitySnapshot {
+                recent: activity_ids
+                    .iter()
+                    .map(|activity_id| {
+                        let mut item = activity();
+                        item.activity_id = (*activity_id).into();
+                        item
+                    })
+                    .collect(),
+                ..ActivitySnapshot::default()
+            },
+            ..BrainRefresh::default()
         }
     }
 

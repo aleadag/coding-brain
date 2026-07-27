@@ -31,6 +31,8 @@ All notable changes to codexctl are documented here.
 
 ### Fixed
 
+- New Recent activity no longer moves the selected Live row or its Evidence
+  pane while the selected activity is still present.
 - Live corrections now target the selected Decision in either Needs Attention
   or Recent. Selectable rows across Live, Review, and Diagnostics now share a
   bold theme-aware highlight that makes the exact target clear.
