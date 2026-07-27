@@ -161,8 +161,55 @@ pub fn infer_recovery(
     parse_recovery_suggestion_json(&complete(config, prompt)?)
 }
 
+fn api_error(provider: &str, message: &str) -> String {
+    format!("{provider} API error: {message}")
+}
+
+fn extract_ollama_content(json: &serde_json::Value) -> Result<&str, String> {
+    if let Some(error) = json.get("error") {
+        let message = error
+            .as_str()
+            .ok_or_else(|| "invalid Ollama response: 'error' must be a string".to_string())?;
+        return Err(api_error("Ollama", message));
+    }
+
+    json.get("response")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "invalid Ollama response: missing string 'response' field".to_string())
+}
+
+fn extract_openai_content(json: &serde_json::Value) -> Result<&str, String> {
+    if let Some(error) = json.get("error") {
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                "invalid OpenAI response: missing string 'error.message' field".to_string()
+            })?;
+        return Err(api_error("OpenAI", message));
+    }
+
+    json.get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            "invalid OpenAI response: missing string 'choices[0].message.content' field".to_string()
+        })
+}
+
 /// Make an LLM API call, auto-detecting ollama vs OpenAI format from the endpoint URL.
 fn call_llm(config: &BrainConfig, prompt: &str) -> Result<String, String> {
+    call_llm_with_program(config, prompt, Path::new("curl"))
+}
+
+fn call_llm_with_program(
+    config: &BrainConfig,
+    prompt: &str,
+    program: &Path,
+) -> Result<String, String> {
     let is_openai = is_openai_compatible(&config.endpoint);
 
     let payload = if is_openai {
@@ -180,30 +227,17 @@ fn call_llm(config: &BrainConfig, prompt: &str) -> Result<String, String> {
     };
 
     let body = serde_json::to_string(&payload).map_err(|e| format!("json error: {e}"))?;
-    let stdout = curl_post(Path::new("curl"), config, &body)?;
+    let stdout = curl_post(program, config, &body)?;
     let stdout = String::from_utf8_lossy(&stdout);
     let json: serde_json::Value =
         serde_json::from_str(&stdout).map_err(|e| format!("invalid response: {e}"))?;
 
-    if is_openai {
-        // OpenAI: choices[0].message.content
-        Ok(json
-            .get("choices")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|choice| choice.get("message"))
-            .and_then(|msg| msg.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(&stdout)
-            .to_string())
+    let content = if is_openai {
+        extract_openai_content(&json)?
     } else {
-        // Ollama: response field
-        Ok(json
-            .get("response")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&stdout)
-            .to_string())
-    }
+        extract_ollama_content(&json)?
+    };
+    Ok(content.to_string())
 }
 
 /// Parse the ollama `/api/generate` response format.
@@ -211,12 +245,7 @@ fn parse_ollama_response(response: &str) -> Result<BrainSuggestion, String> {
     let json: serde_json::Value =
         serde_json::from_str(response).map_err(|e| format!("invalid JSON response: {e}"))?;
 
-    // Ollama wraps the generated text in a "response" field
-    let generated = json
-        .get("response")
-        .and_then(|v| v.as_str())
-        .unwrap_or(response);
-
+    let generated = extract_ollama_content(&json)?;
     parse_suggestion_json(generated)
 }
 
@@ -225,16 +254,7 @@ fn parse_openai_response(response: &str) -> Result<BrainSuggestion, String> {
     let json: serde_json::Value =
         serde_json::from_str(response).map_err(|e| format!("invalid JSON response: {e}"))?;
 
-    // OpenAI format: choices[0].message.content
-    let content = json
-        .get("choices")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|msg| msg.get("content"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(response);
-
+    let content = extract_openai_content(&json)?;
     parse_suggestion_json(content)
 }
 
@@ -419,6 +439,120 @@ printf '%s' '{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confi
         let ollama_response = r#"{"model":"gemma4","response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confidence\":0.9}","done":true}"#;
         let s = parse_ollama_response(ollama_response).unwrap();
         assert_eq!(s.action, RuleAction::Approve);
+    }
+
+    #[test]
+    fn parse_ollama_api_error_is_not_a_suggestion_error() {
+        let error = parse_ollama_response(r#"{"error":"unable to load model"}"#).unwrap_err();
+        assert_eq!(error, "Ollama API error: unable to load model");
+    }
+
+    #[test]
+    fn parse_openai_api_error_is_not_a_suggestion_error() {
+        let error = parse_openai_response(
+            r#"{"error":{"message":"model unavailable","type":"server_error"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error, "OpenAI API error: model unavailable");
+    }
+
+    #[test]
+    fn provider_errors_take_precedence_over_generated_content() {
+        let ollama = r#"{
+            "error":"generation failed",
+            "response":"{\"action\":\"approve\"}"
+        }"#;
+        assert_eq!(
+            parse_ollama_response(ollama).unwrap_err(),
+            "Ollama API error: generation failed"
+        );
+
+        let openai = r#"{
+            "error":{"message":"generation failed"},
+            "choices":[{"message":{"content":"{\"action\":\"approve\"}"}}]
+        }"#;
+        assert_eq!(
+            parse_openai_response(openai).unwrap_err(),
+            "OpenAI API error: generation failed"
+        );
+    }
+
+    #[test]
+    fn malformed_provider_envelopes_do_not_reach_suggestion_parser() {
+        let ollama =
+            parse_ollama_response(r#"{"error":{"message":"wrong native shape"}}"#).unwrap_err();
+        assert_eq!(ollama, "invalid Ollama response: 'error' must be a string");
+
+        let openai = parse_openai_response(r#"{"error":"wrong OpenAI shape"}"#).unwrap_err();
+        assert_eq!(
+            openai,
+            "invalid OpenAI response: missing string 'error.message' field"
+        );
+    }
+
+    #[test]
+    fn malformed_generated_decisions_remain_suggestion_errors() {
+        let ollama =
+            parse_ollama_response(r#"{"response":"{\"reasoning\":\"no decision\"}"}"#).unwrap_err();
+        assert_eq!(ollama, "missing 'action' field");
+
+        let openai = parse_openai_response(
+            r#"{"choices":[{"message":{"content":"{\"reasoning\":\"no decision\"}"}}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(openai, "missing 'action' field");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_extracts_generated_recovery_content_for_both_formats() {
+        let recovery = r#"{"action":"continue","confidence":0.9}"#;
+        let (_ollama_temp, ollama_curl) = fake_curl(
+            r#"dd of=/dev/null 2>/dev/null
+printf '%s' '{"response":"{\"action\":\"continue\",\"confidence\":0.9}"}'"#,
+        );
+        let ollama =
+            call_llm_with_program(&BrainConfig::default(), "prompt", &ollama_curl).unwrap();
+        assert_eq!(ollama, recovery);
+        assert!(parse_recovery_suggestion_json(&ollama).is_ok());
+
+        let (_openai_temp, openai_curl) = fake_curl(
+            r#"dd of=/dev/null 2>/dev/null
+printf '%s' '{"choices":[{"message":{"content":"{\"action\":\"continue\",\"confidence\":0.9}"}}]}'"#,
+        );
+        let openai_config = BrainConfig {
+            endpoint: "http://brain.example.test/v1/chat/completions".into(),
+            ..BrainConfig::default()
+        };
+        let openai = call_llm_with_program(&openai_config, "prompt", &openai_curl).unwrap();
+        assert_eq!(openai, recovery);
+        assert!(parse_recovery_suggestion_json(&openai).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_surfaces_schema_specific_api_errors() {
+        let (_ollama_temp, ollama_curl) = fake_curl(
+            r#"dd of=/dev/null 2>/dev/null
+printf '%s' '{"error":"unable to load model"}'"#,
+        );
+        assert_eq!(
+            call_llm_with_program(&BrainConfig::default(), "prompt", &ollama_curl).unwrap_err(),
+            "Ollama API error: unable to load model"
+        );
+
+        let (_openai_temp, openai_curl) = fake_curl(
+            r#"dd of=/dev/null 2>/dev/null
+printf '%s' '{"error":{"message":"model unavailable","type":"server_error"}}'"#,
+        );
+        let openai_config = BrainConfig {
+            endpoint: "http://brain.example.test/v1/chat/completions".into(),
+            ..BrainConfig::default()
+        };
+        assert_eq!(
+            call_llm_with_program(&openai_config, "prompt", &openai_curl).unwrap_err(),
+            "OpenAI API error: model unavailable"
+        );
     }
 
     #[test]
