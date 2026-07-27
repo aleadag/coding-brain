@@ -8,6 +8,7 @@ use serde_json::Value;
 use super::{
     HookInputError, ParsedLifecycleHook, PermissionHookRequest, ProviderPermissionPolicy, identity,
     linked_identity, normalized_outcome, optional_command, optional_id, permission_request,
+    permission_request_key,
 };
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +46,12 @@ pub(crate) fn parse_permission(raw: &[u8]) -> Result<PermissionHookRequest, Hook
     let tool_name = optional_id(Some(input.tool_name), "tool_name")?
         .ok_or(HookInputError::Missing("tool_name"))?;
     let tool_use_id = optional_id(input.tool_use_id, "tool_use_id")?;
+    let request_key = permission_request_key(
+        AgentProvider::Codex,
+        tool_use_id.as_deref(),
+        &tool_name,
+        &input.tool_input,
+    );
     let command = (tool_name == "Bash")
         .then(|| {
             optional_command(
@@ -80,6 +87,7 @@ pub(crate) fn parse_permission(raw: &[u8]) -> Result<PermissionHookRequest, Hook
     }
     Ok(permission_request(
         lifecycle,
+        request_key,
         tool_name,
         command,
         tool_use_id,
@@ -150,6 +158,39 @@ mod tests {
         assert_eq!(request.lifecycle.session_id(), "child-1");
         assert_eq!(request.lifecycle.provider_session_id(), Some("root-1"));
         assert_eq!(request.tool_use_id, None);
+    }
+
+    #[test]
+    fn permission_request_key_distinguishes_input_and_handles_missing_tool_use_id() {
+        let mut first: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/hooks/permission-request.json"
+        ))
+        .unwrap();
+        first["tool_name"] = "Bash".into();
+        first["tool_use_id"] = "call-1".into();
+        first["tool_input"] = serde_json::json!({ "command": "cargo test" });
+        let mut changed = first.clone();
+        changed["tool_input"] = serde_json::json!({ "command": "cargo clippy" });
+
+        let first = parse_permission(&serde_json::to_vec(&first).unwrap()).unwrap();
+        let changed = parse_permission(&serde_json::to_vec(&changed).unwrap()).unwrap();
+
+        assert_eq!(first.request_key.len(), 64);
+        assert!(!first.request_key.contains("cargo test"));
+        assert_ne!(first.request_key, changed.request_key);
+
+        let mut without_id = serde_json::from_slice::<Value>(include_bytes!(
+            "../../tests/fixtures/hooks/permission-request.json"
+        ))
+        .unwrap();
+        without_id["tool_name"] = "Bash".into();
+        without_id["tool_input"] = serde_json::json!({ "command": "cargo test" });
+        let other_without_id = without_id.clone();
+        let without_id = parse_permission(&serde_json::to_vec(&without_id).unwrap()).unwrap();
+        let other_without_id =
+            parse_permission(&serde_json::to_vec(&other_without_id).unwrap()).unwrap();
+
+        assert_eq!(without_id.request_key, other_without_id.request_key);
     }
 
     #[test]

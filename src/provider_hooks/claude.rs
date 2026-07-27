@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::{
     HookInputError, ParsedLifecycleHook, PermissionHookRequest, ProviderPermissionPolicy,
     event_kind, identity, normalized_outcome, optional_command, optional_id, permission_request,
-    require_tool_use_id, required,
+    permission_request_key, require_tool_use_id, required,
 };
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +71,12 @@ pub(crate) fn parse_permission(raw: &[u8]) -> Result<PermissionHookRequest, Hook
     if !tool_input.is_object() {
         return Err(HookInputError::Invalid("tool_input"));
     }
+    let request_key = permission_request_key(
+        AgentProvider::Claude,
+        tool_use_id.as_deref(),
+        &tool_name,
+        &tool_input,
+    );
     let command = (tool_name == "Bash")
         .then(|| {
             optional_command(
@@ -99,6 +105,7 @@ pub(crate) fn parse_permission(raw: &[u8]) -> Result<PermissionHookRequest, Hook
     );
     Ok(permission_request(
         lifecycle,
+        request_key,
         tool_name,
         command,
         tool_use_id,
@@ -140,4 +147,29 @@ pub(crate) fn parse_lifecycle(raw: &[u8]) -> Result<ParsedLifecycleHook, HookInp
         outcome,
         live_process: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_request_key_distinguishes_input() {
+        let first: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/hooks/claude-permission-request.json"
+        ))
+        .unwrap();
+        let mut changed = first.clone();
+        changed["tool_use_id"] = "call-1".into();
+        changed["tool_input"] = serde_json::json!({ "command": "cargo clippy" });
+        let mut first = first;
+        first["tool_use_id"] = "call-1".into();
+
+        let first = parse_permission(&serde_json::to_vec(&first).unwrap()).unwrap();
+        let changed = parse_permission(&serde_json::to_vec(&changed).unwrap()).unwrap();
+
+        assert_eq!(first.request_key.len(), 64);
+        assert!(!first.request_key.contains("cargo test"));
+        assert_ne!(first.request_key, changed.request_key);
+    }
 }

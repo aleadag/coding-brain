@@ -13,7 +13,8 @@ use crate::provider::{AgentProvider, AgentSessionKey};
 
 use super::{
     ANTIGRAVITY_CHILD_BITS, ApplyOutcome, LIFECYCLE_SCHEMA_VERSION, LifecycleEvent,
-    LifecycleSnapshot, MAX_ACTIVE_SUBAGENTS, MAX_ANTIGRAVITY_INVOCATION_STEPS, MAX_RECENT_TURNS,
+    LifecycleSnapshot, MAX_ACTIVE_SUBAGENTS, MAX_ANTIGRAVITY_INVOCATION_STEPS,
+    MAX_PERMISSION_REQUESTS_PER_TURN, MAX_RECENT_TURNS, PERMISSION_BITS,
 };
 
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
@@ -400,6 +401,21 @@ fn valid_snapshot_shape(snapshot: &LifecycleSnapshot) -> bool {
             }
             _ => false,
         };
+        let permission_events_valid = state.permission_request_events.len()
+            <= MAX_PERMISSION_REQUESTS_PER_TURN
+            && state
+                .permission_request_events
+                .iter()
+                .all(|(request_key, bits)| {
+                    request_key.len() == 64
+                        && request_key
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                        && *bits != 0
+                        && *bits & !PERMISSION_BITS == 0
+                })
+            && (state.permission_request_events.is_empty()
+                || state.turn_open && state.current_turn.is_some());
         if !valid_id(&key.session_id)
             || !valid_path(&state.cwd)
             || !state.transcript_path.as_deref().is_none_or(valid_path)
@@ -413,6 +429,7 @@ fn valid_snapshot_shape(snapshot: &LifecycleSnapshot) -> bool {
                 .is_none_or(|sequence| sequence != 0 && sequence < snapshot.next_sequence)
             || state.active_subagents.len() > MAX_ACTIVE_SUBAGENTS
             || !antigravity_state_valid
+            || !permission_events_valid
         {
             return false;
         }
@@ -772,6 +789,28 @@ mod tests {
         );
     }
 
+    fn assert_schema_three_json_corrupt(value: serde_json::Value, label: &str) {
+        let store = store();
+        fs::create_dir_all(store.hooks_dir()).unwrap();
+        fs::write(store.snapshot_path(), serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            store.read().unwrap().condition,
+            StoreCondition::Corrupt,
+            "{label}"
+        );
+    }
+
+    fn snapshot_with_permission_events(events: serde_json::Value) -> serde_json::Value {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(prompt("session-1", "turn-1"), 1_000),
+            ApplyOutcome::Applied
+        );
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value["sessions"][key("session-1")]["permission_request_events"] = events;
+        value
+    }
+
     fn expired_linked_group(root: &str, child: &str, turn: &str) -> LifecycleSnapshot {
         let mut snapshot = LifecycleSnapshot::default();
         assert_eq!(
@@ -1017,6 +1056,77 @@ mod tests {
         let state = &loaded.sessions[&key("session-1")];
         assert_eq!(state.antigravity_initial_step, None);
         assert!(state.antigravity_child_events.is_empty());
+    }
+
+    #[test]
+    fn schema_three_snapshot_defaults_absent_permission_replay_state() {
+        let value = snapshot_with_permission_events(json!({}));
+        let mut legacy = value;
+        legacy["sessions"][key("session-1")]
+            .as_object_mut()
+            .unwrap()
+            .remove("permission_request_events");
+
+        let store = store();
+        fs::create_dir_all(store.hooks_dir()).unwrap();
+        fs::write(store.snapshot_path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let view = store.read().unwrap();
+        assert_eq!(view.condition, StoreCondition::Healthy);
+        assert!(
+            view.snapshot.unwrap().sessions[&key("session-1")]
+                .permission_request_events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_permission_replay_keys_are_rejected() {
+        for (label, request_key) in [
+            ("empty key", String::new()),
+            ("oversized key", "a".repeat(65)),
+            ("non-hex key", "g".repeat(64)),
+            ("uppercase key", "A".repeat(64)),
+        ] {
+            assert_schema_three_json_corrupt(
+                snapshot_with_permission_events(json!({ request_key: 1 })),
+                label,
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_permission_replay_state_is_rejected() {
+        let events = (0..65)
+            .map(|index| (format!("{index:064x}"), serde_json::Value::from(1)))
+            .collect();
+        assert_schema_three_json_corrupt(
+            snapshot_with_permission_events(serde_json::Value::Object(events)),
+            "permission replay capacity",
+        );
+    }
+
+    #[test]
+    fn invalid_permission_replay_bits_are_rejected() {
+        let request_key = "a".repeat(64);
+        for (label, bits) in [("zero bits", 0), ("unknown bits", 1 << 7)] {
+            assert_schema_three_json_corrupt(
+                snapshot_with_permission_events(json!({ request_key.clone(): bits })),
+                label,
+            );
+        }
+    }
+
+    #[test]
+    fn permission_replay_state_requires_an_open_current_turn() {
+        let request_key = "a".repeat(64);
+        let mut closed = snapshot_with_permission_events(json!({ request_key.clone(): 1 }));
+        closed["sessions"][key("session-1")]["turn_open"] = json!(false);
+        assert_schema_three_json_corrupt(closed, "closed turn");
+
+        let mut no_current_turn = snapshot_with_permission_events(json!({ request_key: 1 }));
+        no_current_turn["sessions"][key("session-1")]["current_turn"] = serde_json::Value::Null;
+        assert_schema_three_json_corrupt(no_current_turn, "missing current turn");
     }
 
     #[test]

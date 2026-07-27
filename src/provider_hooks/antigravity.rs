@@ -9,6 +9,7 @@ use serde_json::Value;
 use super::{HookInputError, ParsedLifecycleHook, identity, optional_id, required};
 use super::{
     PermissionHookRequest, ProviderPermissionPolicy, optional_command, permission_request,
+    permission_request_key,
 };
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +82,13 @@ pub(crate) fn parse_permission(
     if !args.is_object() {
         return Err(HookInputError::Invalid("toolCall.args"));
     }
+    let tool_use_id = format!("step-{step}");
+    let request_key = permission_request_key(
+        AgentProvider::Antigravity,
+        Some(&tool_use_id),
+        &tool_name,
+        &args,
+    );
     let command = (tool_name == "run_command")
         .then(|| {
             optional_command(
@@ -112,7 +120,7 @@ pub(crate) fn parse_permission(
         Some("allow") => ProviderPermissionPolicy::PermitsBrainDecision,
         Some(_) | None => ProviderPermissionPolicy::RequiresAsk,
     };
-    let turn_id = format!("step-{step}");
+    let turn_id = tool_use_id;
     let lifecycle = identity(
         AgentProvider::Antigravity,
         session_id,
@@ -122,6 +130,7 @@ pub(crate) fn parse_permission(
     )?;
     Ok(permission_request(
         lifecycle,
+        request_key,
         tool_name,
         command,
         Some(turn_id),
@@ -376,5 +385,21 @@ mod tests {
         assert_eq!(post.event, LifecycleEventKind::Stop);
         assert_eq!(post.identity.turn_id(), Some("invocation-3"));
         assert_eq!(post.turn_initial_step, None);
+    }
+
+    #[test]
+    fn permission_request_key_distinguishes_input() {
+        let first: Value = serde_json::from_slice(PRE_TOOL_USE).unwrap();
+        let mut changed = first.clone();
+        changed["toolCall"]["args"]["CommandLine"] = "cargo clippy".into();
+
+        let first =
+            parse_permission(Some("PreToolUse"), &serde_json::to_vec(&first).unwrap()).unwrap();
+        let changed =
+            parse_permission(Some("PreToolUse"), &serde_json::to_vec(&changed).unwrap()).unwrap();
+
+        assert_eq!(first.request_key.len(), 64);
+        assert!(!first.request_key.contains("cargo test"));
+        assert_ne!(first.request_key, changed.request_key);
     }
 }

@@ -14,6 +14,10 @@ pub const LIFECYCLE_SCHEMA_VERSION: u32 = 3;
 pub const MAX_RECENT_TURNS: usize = 32;
 pub const MAX_ACTIVE_SUBAGENTS: usize = 64;
 pub const MAX_ANTIGRAVITY_INVOCATION_STEPS: usize = 256;
+pub const MAX_PERMISSION_REQUESTS_PER_TURN: usize = 64;
+const PERMISSION_DECIDED_BIT: u8 = 1 << 0;
+const PERMISSION_NEEDS_INPUT_BIT: u8 = 1 << 1;
+pub(crate) const PERMISSION_BITS: u8 = PERMISSION_DECIDED_BIT | PERMISSION_NEEDS_INPUT_BIT;
 const ANTIGRAVITY_PERMISSION_DECIDED_BIT: u8 = 1 << 0;
 const ANTIGRAVITY_PERMISSION_NEEDS_INPUT_BIT: u8 = 1 << 1;
 const ANTIGRAVITY_PRE_TOOL_BIT: u8 = 1 << 2;
@@ -79,6 +83,8 @@ pub struct SessionLifecycleState {
     pub antigravity_initial_step: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub antigravity_child_events: BTreeMap<u64, u8>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub permission_request_events: BTreeMap<String, u8>,
     last_signature: Option<EventSignature>,
 }
 
@@ -103,6 +109,7 @@ impl SessionLifecycleState {
             ignored_reason: None,
             antigravity_initial_step: None,
             antigravity_child_events: BTreeMap::new(),
+            permission_request_events: BTreeMap::new(),
             last_signature: None,
         }
     }
@@ -147,6 +154,7 @@ impl SessionLifecycleState {
         self.active_subagents.clear();
         self.antigravity_initial_step = None;
         self.antigravity_child_events.clear();
+        self.permission_request_events.clear();
     }
 }
 
@@ -158,9 +166,11 @@ fn antigravity_child_bit(kind: &LifecycleEventKind) -> Option<u8> {
     match kind {
         LifecycleEventKind::PermissionRequest {
             disposition: PermissionDisposition::Decided,
+            ..
         } => Some(ANTIGRAVITY_PERMISSION_DECIDED_BIT),
         LifecycleEventKind::PermissionRequest {
             disposition: PermissionDisposition::NeedsInput,
+            ..
         } => Some(ANTIGRAVITY_PERMISSION_NEEDS_INPUT_BIT),
         LifecycleEventKind::PreToolUse => Some(ANTIGRAVITY_PRE_TOOL_BIT),
         LifecycleEventKind::PostToolUse => Some(ANTIGRAVITY_POST_TOOL_BIT),
@@ -193,6 +203,25 @@ fn is_antigravity_child_candidate(event: &LifecycleEvent, turn_id: &str) -> bool
     event.identity().provider() == AgentProvider::Antigravity
         && prefixed_index(turn_id, "step-").is_some()
         && antigravity_child_bit(event.kind()).is_some()
+}
+
+fn permission_event(event: &LifecycleEvent) -> Option<(&str, u8)> {
+    if event.identity().provider() == AgentProvider::Antigravity {
+        return None;
+    }
+    match event.kind() {
+        LifecycleEventKind::PermissionRequest {
+            disposition,
+            request_key: Some(request_key),
+        } => Some((
+            request_key,
+            match disposition {
+                PermissionDisposition::Decided => PERMISSION_DECIDED_BIT,
+                PermissionDisposition::NeedsInput => PERMISSION_NEEDS_INPUT_BIT,
+            },
+        )),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -443,6 +472,35 @@ impl LifecycleSnapshot {
             return state.ignore(IgnoreReason::RecentTurn);
         }
 
+        let legacy_unkeyed_permission_replay = event.identity().provider()
+            != AgentProvider::Antigravity
+            && matches!(
+                (event.kind(), state.last_signature.as_ref()),
+                (
+                    LifecycleEventKind::PermissionRequest {
+                        disposition,
+                        request_key: Some(_),
+                    },
+                    Some(EventSignature {
+                        turn_id: Some(last_turn_id),
+                        kind:
+                            LifecycleEventKind::PermissionRequest {
+                                disposition: previous_disposition,
+                                request_key: None,
+                            },
+                    }),
+                ) if state.turn_open
+                    && state.current_turn.as_deref() == Some(turn_id)
+                    && last_turn_id == turn_id
+                    && (*previous_disposition == *disposition
+                        || (*previous_disposition == PermissionDisposition::NeedsInput
+                            && *disposition == PermissionDisposition::Decided))
+            );
+        if legacy_unkeyed_permission_replay {
+            state.last_signature = Some(signature.clone());
+            return state.ignore(IgnoreReason::Duplicate);
+        }
+
         if let Some((step, bit)) = antigravity_child(state, &event, turn_id) {
             let previous = state
                 .antigravity_child_events
@@ -470,17 +528,40 @@ impl LifecycleSnapshot {
                     }
                     let current = current.to_owned();
                     state.remember_turn(&current);
+                    state.permission_request_events.clear();
                     state.current_turn = Some(turn_id.to_owned());
                 }
                 Some(current) if !state.turn_open && current == turn_id => {
                     return state.ignore(IgnoreReason::RecentTurn);
                 }
                 Some(current) if current != turn_id => {
+                    state.permission_request_events.clear();
                     state.current_turn = Some(turn_id.to_owned());
                 }
                 None => state.current_turn = Some(turn_id.to_owned()),
                 _ => {}
             }
+        }
+
+        if let Some((request_key, bit)) = permission_event(&event) {
+            let previous = state
+                .permission_request_events
+                .get(request_key)
+                .copied()
+                .unwrap_or(0);
+            let unsafe_permission_reversal =
+                bit == PERMISSION_DECIDED_BIT && previous & PERMISSION_NEEDS_INPUT_BIT != 0;
+            if previous & bit != 0 || unsafe_permission_reversal {
+                return state.ignore(IgnoreReason::Duplicate);
+            }
+            if previous == 0
+                && state.permission_request_events.len() >= MAX_PERMISSION_REQUESTS_PER_TURN
+            {
+                return state.ignore(IgnoreReason::AmbiguousTurn);
+            }
+            state
+                .permission_request_events
+                .insert(request_key.to_owned(), previous | bit);
         }
 
         let sequence = self.next_sequence;
@@ -510,7 +591,7 @@ impl LifecycleSnapshot {
                 sequence,
                 received_at_ms,
             ),
-            LifecycleEventKind::PermissionRequest { disposition } => state.set_status(
+            LifecycleEventKind::PermissionRequest { disposition, .. } => state.set_status(
                 event.name(),
                 match disposition {
                     PermissionDisposition::Decided => ProjectedStatus::Processing,
@@ -543,6 +624,7 @@ impl LifecycleSnapshot {
                 state.active_subagents.clear();
                 state.antigravity_initial_step = None;
                 state.antigravity_child_events.clear();
+                state.permission_request_events.clear();
                 state.remember_turn(turn_id);
                 state.set_status(
                     event.name(),
@@ -953,6 +1035,52 @@ mod tests {
         LifecycleEvent::permission(identity, disposition).unwrap()
     }
 
+    fn keyed_permission(
+        provider: AgentProvider,
+        turn: &str,
+        disposition: PermissionDisposition,
+        key: &str,
+    ) -> LifecycleEvent {
+        LifecycleEvent::permission_with_request_key(
+            LifecycleIdentity::try_new(
+                provider,
+                "session-1".into(),
+                Some(turn.into()),
+                None,
+                "/work/coding-brain".into(),
+            )
+            .unwrap(),
+            disposition,
+            key.into(),
+        )
+        .unwrap()
+    }
+
+    fn linked_keyed_permission(
+        child: &str,
+        provider_session: &str,
+        turn: &str,
+        key: &str,
+    ) -> LifecycleEvent {
+        LifecycleEvent::permission_with_request_key(
+            LifecycleIdentity::try_new_with_provider_session(
+                AgentProvider::Codex,
+                child.into(),
+                Some(provider_session.into()),
+                Some(turn.into()),
+                None,
+                "/work/coding-brain".into(),
+            )
+            .unwrap(),
+            PermissionDisposition::Decided,
+            key.into(),
+        )
+        .unwrap()
+    }
+
+    const KEY_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const KEY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     fn antigravity_identity(turn: &str) -> LifecycleIdentity {
         LifecycleIdentity::try_new(
             AgentProvider::Antigravity,
@@ -962,6 +1090,497 @@ mod tests {
             "/work/antigravity".into(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn keyed_permissions_are_independent_and_replay_safe() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-1",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                1,
+            ),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-1",
+                    PermissionDisposition::Decided,
+                    KEY_B,
+                ),
+                2,
+            ),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.sessions[&session_key()]
+                .permission_request_events
+                .len(),
+            2
+        );
+        let before = snapshot.clone();
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-1",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                3,
+            ),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+        assert_eq!(snapshot.next_sequence, before.next_sequence);
+        assert_eq!(
+            snapshot.sessions[&session_key()].latest_sequence,
+            before.sessions[&session_key()].latest_sequence
+        );
+    }
+
+    #[test]
+    fn keyed_permission_allows_needs_input_after_decided() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Claude,
+                    "turn-1",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                1,
+            ),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Claude,
+                    "turn-1",
+                    PermissionDisposition::NeedsInput,
+                    KEY_A,
+                ),
+                2,
+            ),
+            ApplyOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn keyed_permission_rejects_decided_after_needs_input() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-1",
+                    PermissionDisposition::NeedsInput,
+                    KEY_A,
+                ),
+                1,
+            ),
+            ApplyOutcome::Applied
+        );
+        let before = snapshot.clone();
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-1",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                2,
+            ),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+        assert_eq!(snapshot.next_sequence, before.next_sequence);
+        assert_eq!(
+            snapshot.sessions[&session_key()].permission_request_events,
+            before.sessions[&session_key()].permission_request_events
+        );
+    }
+
+    #[test]
+    fn legacy_unkeyed_permission_snapshot_preserves_adjacent_keyed_replay_guard() {
+        let legacy_snapshot = |disposition| {
+            let mut snapshot = LifecycleSnapshot::default();
+            assert_eq!(
+                snapshot.apply(permission("turn-1", disposition), 1),
+                ApplyOutcome::Applied
+            );
+            let serialized = serde_json::to_value(&snapshot).unwrap();
+            assert_eq!(serialized["schema_version"], LIFECYCLE_SCHEMA_VERSION);
+            assert!(
+                serialized["sessions"][session_key()]
+                    .get("permission_request_events")
+                    .is_none()
+            );
+            serde_json::from_value::<LifecycleSnapshot>(serialized).unwrap()
+        };
+
+        for (legacy, keyed, expected) in [
+            (
+                PermissionDisposition::Decided,
+                PermissionDisposition::Decided,
+                ApplyOutcome::Ignored(IgnoreReason::Duplicate),
+            ),
+            (
+                PermissionDisposition::NeedsInput,
+                PermissionDisposition::NeedsInput,
+                ApplyOutcome::Ignored(IgnoreReason::Duplicate),
+            ),
+            (
+                PermissionDisposition::NeedsInput,
+                PermissionDisposition::Decided,
+                ApplyOutcome::Ignored(IgnoreReason::Duplicate),
+            ),
+            (
+                PermissionDisposition::Decided,
+                PermissionDisposition::NeedsInput,
+                ApplyOutcome::Applied,
+            ),
+        ] {
+            let mut snapshot = legacy_snapshot(legacy);
+            let before = snapshot.clone();
+            assert_eq!(
+                snapshot.apply(
+                    keyed_permission(AgentProvider::Codex, "turn-1", keyed, KEY_A),
+                    2,
+                ),
+                expected
+            );
+            if expected == ApplyOutcome::Ignored(IgnoreReason::Duplicate) {
+                assert_eq!(snapshot.next_sequence, before.next_sequence);
+                assert_eq!(
+                    snapshot.sessions[&session_key()].permission_request_events,
+                    before.sessions[&session_key()].permission_request_events
+                );
+                let after_bridge = snapshot.clone();
+                assert_eq!(
+                    snapshot.apply(
+                        keyed_permission(AgentProvider::Codex, "turn-1", keyed, KEY_A),
+                        3,
+                    ),
+                    ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+                );
+                assert_eq!(snapshot.next_sequence, after_bridge.next_sequence);
+                assert_eq!(
+                    snapshot.sessions[&session_key()].permission_request_events,
+                    after_bridge.sessions[&session_key()].permission_request_events
+                );
+                assert_eq!(
+                    snapshot.apply(
+                        keyed_permission(AgentProvider::Codex, "turn-1", keyed, KEY_B),
+                        4,
+                    ),
+                    ApplyOutcome::Applied
+                );
+            } else {
+                let after_compensation = snapshot.clone();
+                assert_eq!(
+                    snapshot.apply(
+                        keyed_permission(AgentProvider::Codex, "turn-1", keyed, KEY_A),
+                        3,
+                    ),
+                    ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+                );
+                assert_eq!(snapshot.next_sequence, after_compensation.next_sequence);
+                assert_eq!(
+                    snapshot.sessions[&session_key()].permission_request_events,
+                    after_compensation.sessions[&session_key()].permission_request_events
+                );
+                assert_eq!(
+                    snapshot.apply(
+                        keyed_permission(AgentProvider::Codex, "turn-1", keyed, KEY_B),
+                        4,
+                    ),
+                    ApplyOutcome::Applied
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keyed_permission_capacity_rejects_the_sixty_fifth_key_without_a_sequence() {
+        let mut snapshot = LifecycleSnapshot::default();
+        for index in 0..64 {
+            assert_eq!(
+                snapshot.apply(
+                    keyed_permission(
+                        AgentProvider::Codex,
+                        "turn-1",
+                        PermissionDisposition::Decided,
+                        &format!("{index:064x}"),
+                    ),
+                    index + 1,
+                ),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            snapshot.sessions[&session_key()]
+                .permission_request_events
+                .len(),
+            64
+        );
+        let before = snapshot.clone();
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-1",
+                    PermissionDisposition::Decided,
+                    &format!("{:064x}", 64),
+                ),
+                65,
+            ),
+            ApplyOutcome::Ignored(IgnoreReason::AmbiguousTurn)
+        );
+        assert_eq!(snapshot.next_sequence, before.next_sequence);
+        assert_eq!(
+            snapshot.sessions[&session_key()].permission_request_events,
+            before.sessions[&session_key()].permission_request_events
+        );
+    }
+
+    #[test]
+    fn same_turn_prompt_does_not_clear_keyed_permission_replay_state() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-1",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                1,
+            ),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(snapshot.apply(prompt("turn-1"), 2), ApplyOutcome::Applied);
+        assert_eq!(
+            snapshot.sessions[&session_key()]
+                .permission_request_events
+                .len(),
+            1
+        );
+        let before = snapshot.clone();
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-1",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                3,
+            ),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+        assert_eq!(snapshot.next_sequence, before.next_sequence);
+        assert_eq!(
+            snapshot.sessions[&session_key()].permission_request_events,
+            before.sessions[&session_key()].permission_request_events
+        );
+    }
+
+    #[test]
+    fn compact_session_start_retains_keyed_permission_replay_state() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-1",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                1,
+            ),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(
+                session_start(
+                    AgentProvider::Codex,
+                    "session-1",
+                    "/work/coding-brain",
+                    SessionStartSource::Compact,
+                ),
+                2,
+            ),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.sessions[&session_key()]
+                .permission_request_events
+                .len(),
+            1
+        );
+        let before = snapshot.clone();
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-1",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                3,
+            ),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+        assert_eq!(snapshot.next_sequence, before.next_sequence);
+    }
+
+    #[test]
+    fn new_prompt_clears_keyed_permission_replay_state() {
+        let mut snapshot = LifecycleSnapshot::default();
+        snapshot.apply(
+            keyed_permission(
+                AgentProvider::Codex,
+                "turn-1",
+                PermissionDisposition::Decided,
+                KEY_A,
+            ),
+            1,
+        );
+        assert_eq!(snapshot.apply(prompt("turn-2"), 2), ApplyOutcome::Applied);
+        assert!(
+            snapshot.sessions[&session_key()]
+                .permission_request_events
+                .is_empty()
+        );
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-2",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                3,
+            ),
+            ApplyOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn stop_clears_keyed_permission_replay_state() {
+        let mut snapshot = LifecycleSnapshot::default();
+        snapshot.apply(
+            keyed_permission(
+                AgentProvider::Codex,
+                "turn-1",
+                PermissionDisposition::Decided,
+                KEY_A,
+            ),
+            1,
+        );
+        assert_eq!(snapshot.apply(stop("turn-1"), 2), ApplyOutcome::Applied);
+        assert!(
+            snapshot.sessions[&session_key()]
+                .permission_request_events
+                .is_empty()
+        );
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-2",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                3,
+            ),
+            ApplyOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn non_compact_session_start_clears_keyed_permission_replay_state() {
+        let mut snapshot = LifecycleSnapshot::default();
+        snapshot.apply(
+            keyed_permission(
+                AgentProvider::Codex,
+                "turn-1",
+                PermissionDisposition::Decided,
+                KEY_A,
+            ),
+            1,
+        );
+        assert_eq!(
+            snapshot.apply(
+                session_start(
+                    AgentProvider::Codex,
+                    "session-1",
+                    "/work/coding-brain",
+                    SessionStartSource::Startup,
+                ),
+                2,
+            ),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            snapshot.sessions[&session_key()]
+                .permission_request_events
+                .is_empty()
+        );
+        assert_eq!(
+            snapshot.apply(
+                keyed_permission(
+                    AgentProvider::Codex,
+                    "turn-2",
+                    PermissionDisposition::Decided,
+                    KEY_A,
+                ),
+                3,
+            ),
+            ApplyOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn linked_child_removal_discards_keyed_permission_replay_state() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child", "turn-1"), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_keyed_permission("child", "root", "turn-1", KEY_A), 2),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.sessions[&native_key("child")]
+                .permission_request_events
+                .len(),
+            1
+        );
+        assert_eq!(
+            snapshot.apply(subagent_stop("root", "child", "turn-1"), 3),
+            ApplyOutcome::Applied
+        );
+        assert!(!snapshot.sessions.contains_key(&native_key("child")));
+
+        assert_eq!(
+            snapshot.apply(subagent_start("root", "child", "turn-2"), 4),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(linked_keyed_permission("child", "root", "turn-2", KEY_A), 5),
+            ApplyOutcome::Applied
+        );
     }
 
     #[test]
@@ -1634,6 +2253,42 @@ mod tests {
             snapshot.apply(decided(), 7),
             ApplyOutcome::Ignored(IgnoreReason::Duplicate)
         );
+    }
+
+    #[test]
+    fn keyed_antigravity_permissions_use_invocation_step_replay_state() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(invocation("invocation-1", 5), 1),
+            ApplyOutcome::Applied
+        );
+        let decided = || {
+            LifecycleEvent::permission_with_request_key(
+                antigravity_identity("step-5"),
+                PermissionDisposition::Decided,
+                KEY_A.into(),
+            )
+            .unwrap()
+        };
+        let post_tool = || {
+            LifecycleEvent::from_parts(
+                antigravity_identity("step-5"),
+                LifecycleEventKind::PostToolUse,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(snapshot.apply(decided(), 2), ApplyOutcome::Applied);
+        assert_eq!(snapshot.apply(post_tool(), 3), ApplyOutcome::Applied);
+        let before = snapshot.clone();
+        assert_eq!(
+            snapshot.apply(decided(), 4),
+            ApplyOutcome::Ignored(IgnoreReason::Duplicate)
+        );
+        let key =
+            AgentSessionKey::native(AgentProvider::Antigravity, "agy-conversation-1").storage_key();
+        assert!(snapshot.sessions[&key].permission_request_events.is_empty());
+        assert_eq!(snapshot.next_sequence, before.next_sequence);
     }
 
     #[test]

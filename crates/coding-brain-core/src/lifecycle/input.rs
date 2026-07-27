@@ -75,13 +75,23 @@ impl LifecycleEventName {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum LifecycleEventKind {
-    SessionStart { source: SessionStartSource },
+    SessionStart {
+        source: SessionStartSource,
+    },
     UserPromptSubmit,
     PreToolUse,
     PostToolUse,
-    PermissionRequest { disposition: PermissionDisposition },
-    SubagentStart { agent_id: String },
-    SubagentStop { agent_id: String },
+    PermissionRequest {
+        disposition: PermissionDisposition,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_key: Option<String>,
+    },
+    SubagentStart {
+        agent_id: String,
+    },
+    SubagentStop {
+        agent_id: String,
+    },
     Stop,
 }
 
@@ -284,10 +294,30 @@ impl LifecycleEvent {
         identity: LifecycleIdentity,
         disposition: PermissionDisposition,
     ) -> Result<Self, LifecycleInputError> {
+        Self::permission_from_parts(identity, disposition, None)
+    }
+
+    pub fn permission_with_request_key(
+        identity: LifecycleIdentity,
+        disposition: PermissionDisposition,
+        request_key: String,
+    ) -> Result<Self, LifecycleInputError> {
+        validate_id("request_key", &request_key)?;
+        Self::permission_from_parts(identity, disposition, Some(request_key))
+    }
+
+    fn permission_from_parts(
+        identity: LifecycleIdentity,
+        disposition: PermissionDisposition,
+        request_key: Option<String>,
+    ) -> Result<Self, LifecycleInputError> {
         require_turn(&identity)?;
         Ok(Self {
             identity,
-            kind: LifecycleEventKind::PermissionRequest { disposition },
+            kind: LifecycleEventKind::PermissionRequest {
+                disposition,
+                request_key,
+            },
             turn_initial_step: None,
         })
     }
@@ -655,6 +685,38 @@ mod tests {
         assert_eq!(
             LifecycleEvent::permission(identity, PermissionDisposition::Decided).unwrap_err(),
             LifecycleInputError::Missing("turn_id")
+        );
+    }
+
+    #[test]
+    fn keyed_permission_round_trips_without_raw_input() {
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "session-1".into(),
+            Some("turn-1".into()),
+            None,
+            PathBuf::from("/work/coding-brain"),
+        )
+        .unwrap();
+        let event = LifecycleEvent::permission_with_request_key(
+            identity.clone(),
+            PermissionDisposition::Decided,
+            "a".repeat(64),
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(encoded.contains(&"a".repeat(64)));
+        assert!(!encoded.contains("cargo test"));
+        assert_eq!(
+            serde_json::from_str::<LifecycleEvent>(&encoded).unwrap(),
+            event
+        );
+
+        let legacy = LifecycleEvent::permission(identity, PermissionDisposition::Decided).unwrap();
+        let legacy_encoded = serde_json::to_string(&legacy).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LifecycleEvent>(&legacy_encoded).unwrap(),
+            legacy
         );
     }
 }
