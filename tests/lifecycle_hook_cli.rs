@@ -1224,7 +1224,10 @@ fn write_brain_config(home: &std::path::Path) {
         .expect("sh is available on the test PATH");
     fs::write(
         &curl,
-        format!("#!{}\nprintf '%s' '{body}'\n", shell.display()),
+        format!(
+            "#!{}\ncat >/dev/null\nprintf '%s' '{body}'\n",
+            shell.display()
+        ),
     )
     .unwrap();
     fs::set_permissions(curl, fs::Permissions::from_mode(0o755)).unwrap();
