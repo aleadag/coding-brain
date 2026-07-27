@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use coding_brain_core::brain_activity::{
     ActivityItem, ActivityOutcome, ActivityState, DeliveryState,
@@ -23,14 +24,20 @@ const MIN_PROJECT_WIDTH: usize = 4;
 const MIN_ACTION_WIDTH: usize = 4;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
     if area.width >= WIDE_BREAKPOINT {
-        render_wide(frame, area, app);
+        render_wide(frame, area, app, now_ms);
     } else {
-        render_narrow(frame, area, app);
+        render_narrow(frame, area, app, now_ms);
     }
 }
 
-fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
+fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &BrainApp, now_ms: u64) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
@@ -41,11 +48,11 @@ fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
         .split(columns[0]);
     render_attention(frame, lists[0], app);
     render_recent(frame, lists[1], app);
-    render_evidence(frame, columns[1], app, EvidenceDensity::Wide);
+    render_evidence(frame, columns[1], app, EvidenceDensity::Wide, now_ms);
 }
 
-fn render_narrow(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
-    let evidence_height = evidence_height(app, area.width)
+fn render_narrow(frame: &mut Frame<'_>, area: Rect, app: &BrainApp, now_ms: u64) {
+    let evidence_height = evidence_height(app, area.width, now_ms)
         .min(MAX_NARROW_EVIDENCE_HEIGHT)
         .min(area.height.saturating_sub(MIN_LIST_HEIGHT * 2));
     let rows = Layout::default()
@@ -61,10 +68,10 @@ fn render_narrow(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
         .split(rows[0]);
     render_attention(frame, lists[0], app);
     render_recent(frame, lists[1], app);
-    render_evidence(frame, rows[1], app, EvidenceDensity::Compact);
+    render_evidence(frame, rows[1], app, EvidenceDensity::Compact, now_ms);
 }
 
-fn evidence_height(app: &BrainApp, width: u16) -> u16 {
+fn evidence_height(app: &BrainApp, width: u16, now_ms: u64) -> u16 {
     let inner_width = usize::from(width.saturating_sub(2).max(1));
     let content_height = app.selected_live_activity().map_or(1, |item| {
         evidence_lines(
@@ -72,6 +79,7 @@ fn evidence_height(app: &BrainApp, width: u16) -> u16 {
             EvidenceDensity::Compact,
             app.theme(),
             app.selected_live_is_attention(),
+            now_ms,
         )
         .iter()
         .map(|line| line.width().max(1).div_ceil(inner_width))
@@ -163,11 +171,30 @@ enum EvidenceDensity {
     Compact,
 }
 
+const SECOND_MS: u64 = 1_000;
+const MINUTE_MS: u64 = 60 * SECOND_MS;
+const HOUR_MS: u64 = 60 * MINUTE_MS;
+const DAY_MS: u64 = 24 * HOUR_MS;
+
+fn relative_age(recorded_at_ms: u64, now_ms: u64) -> String {
+    let elapsed_ms = now_ms.saturating_sub(recorded_at_ms);
+    if elapsed_ms < MINUTE_MS {
+        format!("{}s ago", elapsed_ms / SECOND_MS)
+    } else if elapsed_ms < HOUR_MS {
+        format!("{}m ago", elapsed_ms / MINUTE_MS)
+    } else if elapsed_ms < DAY_MS {
+        format!("{}h ago", elapsed_ms / HOUR_MS)
+    } else {
+        format!("{}d ago", elapsed_ms / DAY_MS)
+    }
+}
+
 fn evidence_lines(
     item: &ActivityItem,
     density: EvidenceDensity,
     theme: &coding_brain_core::theme::Theme,
     needs_attention: bool,
+    now_ms: u64,
 ) -> Vec<Line<'static>> {
     let badge = activity_badge(item);
     let status_style = badge.style(theme);
@@ -176,10 +203,10 @@ fn evidence_lines(
         .add_modifier(Modifier::BOLD);
     let value_style = Style::default().fg(theme.text_primary);
     let project_style = value_style.add_modifier(Modifier::BOLD);
-    let attention_label = if needs_attention {
-        "Needs attention"
+    let context_label = if needs_attention {
+        "Needs attention".to_owned()
     } else {
-        "Recent"
+        relative_age(item.recorded_at_ms, now_ms)
     };
     let outcome = safe_evidence_text(&activity_status(item));
     let action = safe_evidence_text(command_label(item));
@@ -207,7 +234,7 @@ fn evidence_lines(
                 Line::from(vec![
                     Span::styled(format!("{:<BADGE_WIDTH$}", badge.label), status_style),
                     Span::raw("  "),
-                    Span::styled(attention_label, value_style),
+                    Span::styled(context_label, value_style),
                 ]),
                 Line::raw(""),
                 Line::styled("OUTCOME", label_style),
@@ -234,7 +261,7 @@ fn evidence_lines(
                     Span::styled("Status  ", label_style),
                     Span::styled(badge.label, status_style),
                     Span::raw("  "),
-                    Span::styled(attention_label, value_style),
+                    Span::styled(context_label, value_style),
                 ]),
                 evidence_field("Outcome", outcome, label_style, value_style),
             ];
@@ -277,9 +304,21 @@ pub(super) fn safe_evidence_text(value: &str) -> String {
     output
 }
 
-fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &BrainApp, density: EvidenceDensity) {
+fn render_evidence(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &BrainApp,
+    density: EvidenceDensity,
+    now_ms: u64,
+) {
     let lines = match app.selected_live_activity() {
-        Some(item) => evidence_lines(item, density, app.theme(), app.selected_live_is_attention()),
+        Some(item) => evidence_lines(
+            item,
+            density,
+            app.theme(),
+            app.selected_live_is_attention(),
+            now_ms,
+        ),
         None => vec![Line::raw("Select an activity to inspect its evidence")],
     };
     let inner_width = usize::from(area.width.saturating_sub(2).max(1));
@@ -653,6 +692,61 @@ mod tests {
         assert_eq!(activity_badge(&item).label, "SEND FAIL");
         item.delivery = DeliveryState::Unknown;
         assert_eq!(activity_badge(&item).label, "SEND ?");
+    }
+
+    #[test]
+    fn relative_age_uses_floored_units_and_clamps_future_timestamps() {
+        const NOW_MS: u64 = 1_000_000_000;
+        for (elapsed_ms, expected) in [
+            (0, "0s ago"),
+            (12_000, "12s ago"),
+            (59_999, "59s ago"),
+            (60_000, "1m ago"),
+            (3_599_999, "59m ago"),
+            (3_600_000, "1h ago"),
+            (86_399_999, "23h ago"),
+            (86_400_000, "1d ago"),
+            (172_800_000, "2d ago"),
+        ] {
+            assert_eq!(relative_age(NOW_MS - elapsed_ms, NOW_MS), expected);
+        }
+        assert_eq!(relative_age(NOW_MS + 1, NOW_MS), "0s ago");
+    }
+
+    #[test]
+    fn recent_evidence_uses_relative_age_in_both_densities() {
+        const NOW_MS: u64 = 1_000_000_000;
+        let mut item = activity();
+        item.recorded_at_ms = NOW_MS - 4 * MINUTE_MS;
+        let theme = Theme::from_mode(ThemeMode::Dark);
+
+        for density in [EvidenceDensity::Wide, EvidenceDensity::Compact] {
+            let text = evidence_lines(&item, density, &theme, false, NOW_MS)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("4m ago"), "{text}");
+            assert!(!text.contains("Recent"), "{text}");
+        }
+    }
+
+    #[test]
+    fn attention_evidence_keeps_actionable_label_in_both_densities() {
+        const NOW_MS: u64 = 1_000_000_000;
+        let mut item = activity();
+        item.recorded_at_ms = NOW_MS - 4 * MINUTE_MS;
+        let theme = Theme::from_mode(ThemeMode::Dark);
+
+        for density in [EvidenceDensity::Wide, EvidenceDensity::Compact] {
+            let text = evidence_lines(&item, density, &theme, true, NOW_MS)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Needs attention"), "{text}");
+            assert!(!text.contains("4m ago"), "{text}");
+        }
     }
 
     #[test]
