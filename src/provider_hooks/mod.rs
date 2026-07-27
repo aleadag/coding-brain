@@ -10,6 +10,7 @@ use coding_brain_core::lifecycle::{
 };
 use coding_brain_core::provider::{AgentProvider, LiveProcessIdentity};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub(crate) mod antigravity;
 pub(crate) mod claude;
@@ -54,6 +55,7 @@ pub(crate) enum ProviderPermissionPolicy {
 pub(crate) struct PermissionHookRequest {
     pub provider: AgentProvider,
     pub lifecycle: LifecycleIdentity,
+    pub request_key: String,
     pub project: String,
     pub tool_name: String,
     pub command: Option<String>,
@@ -123,8 +125,40 @@ pub(crate) fn parse_permission(
     }
 }
 
+const PERMISSION_REQUEST_KEY_DOMAIN: &[u8] = b"coding-brain:permission-request-key:v1";
+
+fn hash_part(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+pub(super) fn permission_request_key(
+    provider: AgentProvider,
+    tool_use_id: Option<&str>,
+    tool_name: &str,
+    tool_input: &Value,
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_part(&mut hasher, PERMISSION_REQUEST_KEY_DOMAIN);
+    hash_part(&mut hasher, provider.as_str().as_bytes());
+    match tool_use_id {
+        Some(tool_use_id) => {
+            hash_part(&mut hasher, b"tool-use-id");
+            hash_part(&mut hasher, tool_use_id.as_bytes());
+        }
+        None => hash_part(&mut hasher, b"no-tool-use-id"),
+    }
+    hash_part(&mut hasher, tool_name.as_bytes());
+    hash_part(
+        &mut hasher,
+        &serde_json::to_vec(tool_input).expect("serde_json::Value is serializable"),
+    );
+    format!("{:x}", hasher.finalize())
+}
+
 pub(super) fn permission_request(
     lifecycle: LifecycleIdentity,
+    request_key: String,
     tool_name: String,
     command: Option<String>,
     tool_use_id: Option<String>,
@@ -140,6 +174,7 @@ pub(super) fn permission_request(
     PermissionHookRequest {
         provider: lifecycle.provider(),
         lifecycle,
+        request_key,
         project,
         tool_name,
         command,
@@ -603,6 +638,60 @@ fn stable_start_identity(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn permission_request_key_is_canonical_and_scope_complete() {
+        let first = permission_request_key(
+            AgentProvider::Codex,
+            Some("call-1"),
+            "Bash",
+            &json!({"command": "cargo test", "timeout": 30}),
+        );
+        let reordered = permission_request_key(
+            AgentProvider::Codex,
+            Some("call-1"),
+            "Bash",
+            &serde_json::from_str(r#"{"timeout":30,"command":"cargo test"}"#).unwrap(),
+        );
+        assert_eq!(first, reordered);
+        assert_eq!(first.len(), 64);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+
+        for changed in [
+            permission_request_key(
+                AgentProvider::Claude,
+                Some("call-1"),
+                "Bash",
+                &json!({"command": "cargo test", "timeout": 30}),
+            ),
+            permission_request_key(
+                AgentProvider::Codex,
+                Some("call-2"),
+                "Bash",
+                &json!({"command": "cargo test", "timeout": 30}),
+            ),
+            permission_request_key(
+                AgentProvider::Codex,
+                Some("call-1"),
+                "Write",
+                &json!({"command": "cargo test", "timeout": 30}),
+            ),
+            permission_request_key(
+                AgentProvider::Codex,
+                Some("call-1"),
+                "Bash",
+                &json!({"command": "cargo clippy", "timeout": 30}),
+            ),
+        ] {
+            assert_ne!(first, changed);
+        }
+        assert!(!first.contains("cargo test"));
+    }
 
     #[test]
     fn live_process_requires_complete_exact_provider_parent_evidence() {

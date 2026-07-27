@@ -398,8 +398,14 @@ fn record_permission(
     store: &LifecycleStore,
     identity: &LifecycleIdentity,
     disposition: PermissionDisposition,
+    request_key: &str,
 ) -> Result<(), PermissionRecordError> {
-    let event = LifecycleEvent::permission(identity.clone(), disposition).map_err(|error| {
+    let event = LifecycleEvent::permission_with_request_key(
+        identity.clone(),
+        disposition,
+        request_key.to_owned(),
+    )
+    .map_err(|error| {
         PermissionRecordError::Failed(HookDiagnostic::new(format!(
             "invalid lifecycle event: {error}"
         )))
@@ -516,6 +522,7 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
             lifecycle_store,
             &request.lifecycle,
             PermissionDisposition::NeedsInput,
+            &request.request_key,
         ) {
             write_diagnostic(stderr, error);
         }
@@ -647,6 +654,7 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
             lifecycle_store,
             &request.lifecycle,
             PermissionDisposition::Decided,
+            &request.request_key,
         ) {
             write_diagnostic(&mut stderr, error);
         }
@@ -795,6 +803,7 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
             lifecycle_store,
             &request.lifecycle,
             PermissionDisposition::Decided,
+            &request.request_key,
         ) {
             let message = format!("could not persist executable permission state: {error}");
             write_diagnostic(&mut stderr, &message);
@@ -824,6 +833,7 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
                 lifecycle_store,
                 &request.lifecycle,
                 PermissionDisposition::NeedsInput,
+                &request.request_key,
             ) {
                 write_diagnostic(
                     &mut stderr,
@@ -839,6 +849,7 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
         lifecycle_store,
         &request.lifecycle,
         PermissionDisposition::Decided,
+        &request.request_key,
     ) {
         write_diagnostic(&mut stderr, error);
     }
@@ -985,6 +996,8 @@ mod tests {
     use std::path::Path;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use super::*;
     use crate::brain::activity::ActivityStore;
@@ -2028,5 +2041,175 @@ mod tests {
         assert!(!first_id.is_empty());
         assert!(!second_id.is_empty());
         assert_ne!(first_id, second_id);
+    }
+
+    fn run_concurrent_approvals(
+        payloads: &[String; 2],
+        lifecycle: &LifecycleStore,
+        activity: &ActivityStore,
+        config: &BrainConfig,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut releases = Vec::new();
+            for payload in payloads {
+                let ready_tx = ready_tx.clone();
+                let (release_tx, release_rx) = mpsc::sync_channel(0);
+                releases.push(release_tx);
+                handles.push(scope.spawn(move || {
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    run_with_gate_and_stores(
+                        Cursor::new(payload),
+                        &mut stdout,
+                        &mut stderr,
+                        Some(config),
+                        BrainGateMode::Auto,
+                        lifecycle,
+                        Some(activity),
+                        |_, _| {
+                            ready_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            Ok(suggestion(RuleAction::Approve, 0.9))
+                        },
+                    );
+                    (stdout, stderr)
+                }));
+            }
+            drop(ready_tx);
+            for _ in payloads {
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            for release in releases {
+                release.send(()).unwrap();
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn concurrent_distinct_codex_permissions_deliver_and_exact_replay_fails_safe() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore_home = set_test_home(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let config = enabled_config();
+        let payloads = [
+            payload_with_command("gh run view --job 89897083575 --log"),
+            payload_with_command("gh run view --job 89897083607 --log"),
+        ];
+        let results = run_concurrent_approvals(&payloads, &lifecycle, &activity, &config);
+
+        for (stdout, stderr) in &results {
+            assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(stderr));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(stdout).unwrap()["hookSpecificOutput"]
+                    ["decision"]["behavior"],
+                "allow"
+            );
+        }
+        let before_replay = lifecycle.read().unwrap().snapshot.unwrap();
+        let events = activity.read().unwrap().events().to_vec();
+        let allowed_ids = events
+            .iter()
+            .filter(|event| event.state == ActivityState::Allowed)
+            .map(|event| event.activity_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(allowed_ids.len(), 2);
+        let commands_by_activity_id = allowed_ids
+            .iter()
+            .map(|activity_id| {
+                (
+                    activity_id,
+                    events
+                        .iter()
+                        .find(|event| {
+                            &event.activity_id == activity_id
+                                && event.state == ActivityState::Observed
+                        })
+                        .and_then(|event| event.normalized_command.as_deref())
+                        .expect("successful activity retains its command"),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            commands_by_activity_id
+                .values()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "gh run view --job 89897083575 --log",
+                "gh run view --job 89897083607 --log",
+            ])
+        );
+        for activity_id in &allowed_ids {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| &event.activity_id == activity_id)
+                    .map(|event| event.state)
+                    .collect::<Vec<_>>(),
+                [
+                    ActivityState::Observed,
+                    ActivityState::Evaluating,
+                    ActivityState::Allowed,
+                    ActivityState::Delivered,
+                ]
+            );
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.state == ActivityState::Error)
+        );
+
+        let mut replay_stdout = Vec::new();
+        let mut replay_stderr = Vec::new();
+        run_with_gate_and_stores(
+            Cursor::new(&payloads[0]),
+            &mut replay_stdout,
+            &mut replay_stderr,
+            Some(&config),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            |_, _| Ok(suggestion(RuleAction::Approve, 0.9)),
+        );
+        assert!(replay_stdout.is_empty());
+        assert!(
+            String::from_utf8(replay_stderr)
+                .unwrap()
+                .contains("Duplicate")
+        );
+        let after_replay = lifecycle.read().unwrap().snapshot.unwrap();
+        assert_eq!(after_replay.next_sequence, before_replay.next_sequence);
+        let replay_events = activity.read().unwrap().events().to_vec();
+        let replay_activity_ids = replay_events
+            .iter()
+            .filter(|event| event.state == ActivityState::Error)
+            .map(|event| event.activity_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(replay_activity_ids.len(), 1);
+        let replay_activity_id = replay_activity_ids.into_iter().next().unwrap();
+        assert_eq!(
+            replay_events
+                .iter()
+                .filter(|event| event.activity_id == replay_activity_id)
+                .map(|event| event.state)
+                .collect::<Vec<_>>(),
+            [
+                ActivityState::Observed,
+                ActivityState::Evaluating,
+                ActivityState::Error,
+            ]
+        );
     }
 }
