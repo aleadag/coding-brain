@@ -119,13 +119,11 @@ impl LiveBrainSource {
         }
         visible
     }
-}
 
-impl BrainSource for LiveBrainSource {
-    fn refresh(&self, limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
-        let paths = brain::distill::current_paths()
-            .map_err(|error| BrainSourceError::Other(error.to_string()))?;
-        let store = brain::activity::ActivityStore::at(paths.state_root().join("activity.jsonl"));
+    fn refresh_from_store(
+        store: brain::activity::ActivityStore,
+        limits: SnapshotLimits,
+    ) -> Result<BrainRefresh, BrainSourceError> {
         let activity = store.read().map_err(|error| match error {
             brain::activity::ActivityStoreError::LockTimeout => BrainSourceError::Busy,
             other => BrainSourceError::Other(other.to_string()),
@@ -141,6 +139,17 @@ impl BrainSource for LiveBrainSource {
             review_queue: review_queue_from(records, activity.events()),
             scorecard: scorecard_from(&decisions, activity.events()),
         })
+    }
+}
+
+impl BrainSource for LiveBrainSource {
+    fn refresh(&self, limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
+        let paths = brain::distill::current_paths()
+            .map_err(|error| BrainSourceError::Other(error.to_string()))?;
+        Self::refresh_from_store(
+            brain::activity::ActivityStore::at(paths.state_root().join("activity.jsonl")),
+            limits,
+        )
     }
 
     fn gate_mode(&self) -> BrainGateMode {
@@ -608,11 +617,21 @@ mod tests {
 
         let source = LiveBrainSource::default();
 
+        let success_store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"))
+            .with_limits(brain::activity::ActivityLimits {
+                lock_timeout_ms: 5_000,
+                ..brain::activity::ActivityLimits::default()
+            });
+        let (unlocker_ready_tx, unlocker_ready_rx) = std::sync::mpsc::channel();
         let unlocker = std::thread::spawn(move || {
+            unlocker_ready_tx.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(25));
             FileExt::unlock(&lock).unwrap();
         });
-        assert!(source.refresh(SnapshotLimits::default()).is_ok());
+        unlocker_ready_rx.recv().unwrap();
+        assert!(
+            LiveBrainSource::refresh_from_store(success_store, SnapshotLimits::default()).is_ok()
+        );
         unlocker.join().unwrap();
 
         let lock = std::fs::OpenOptions::new()
