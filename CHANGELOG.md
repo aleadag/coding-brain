@@ -74,6 +74,8 @@ All notable changes to codexctl are documented here.
 - Live rows now lead with a compact condition badge and project name before
   provider and action. Evidence groups status and outcome ahead of action and
   context; use PageUp and PageDown when its title shows more content.
+- Recent Live Evidence now shows the selected activity's relative age instead
+  of repeating the list name. Needs Attention keeps its actionable label.
 - Live now uses wide terminals for stacked Needs Attention and Recent lists
   beside persistent Evidence; narrower terminals keep a bounded vertical
   Evidence pane. Use `J`/`K` to switch lists without losing each list's
