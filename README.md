@@ -7,9 +7,11 @@ The default TUI has four views:
 - **Live** shows current Brain activity, attention state, and provider-tagged decisions.
 - **Review** collects denials, corrections, and other decisions worth teaching from.
 - **Scorecard** tracks decision quality and whether the Brain is improving.
-- **Diagnostics** shows metadata-only hook/correlation diagnostics and activity-store integrity without treating them as failed commands.
+- **Diagnostics** shows metadata-only safe categories for hooks, correlation, rejected or uncertain session actions and recovery, and activity-store integrity.
 
 From Live, you can switch to the source session for the selected activity. Exact Claude background identities can use native attach; [Agent Deck](https://github.com/asheshgoplani/agent-deck) and terminal focus are optional fallbacks.
+
+Press `x` in Live to preflight the selected exact provider session, pane, and current prompt. Coding Brain exposes Allow/Deny only for a recognized permission prompt and Continue only for a recognized recovery prompt. Manual text remains explicit operator input; it is bounded and hidden. Semantic dispatch independently revalidates the exact target and prompt, so a changed prompt is rejected without fallback input. Manual-text dispatch revalidates the exact target, backend, and bounded capture but does not require prompt equality. Diagnostics is not ordinary command output and never stores captured terminal content or manual text.
 
 ## Install and activate
 

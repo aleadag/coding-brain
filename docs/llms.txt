@@ -8,7 +8,9 @@ Current product boundary:
 - Scorecard reports decision quality and learning progress.
 - Structured lifecycle, permission, and recovery hooks record bounded activity before richer provider evidence catches up.
 - Session switching uses exact provider-qualified Agent Deck navigation, native Claude background attach, or supported terminal focus.
-- Guarded tmux actions require current process identity, a unique pane, and prompt revalidation; manual text also requires explicit Live selection.
+- Pressing x in Live preflights the selected exact provider session, pane, and prompt; only recognized permission or recovery prompts expose their semantic actions.
+- Semantic dispatch independently revalidates the exact target and prompt and rejects changed evidence without fallback input. Manual text remains bounded, hidden, explicit operator input; its dispatch revalidates the exact target, backend, and capture but does not require prompt equality.
+- Diagnostics contains metadata-only safe categories for hooks, correlation, rejected or uncertain session actions and recovery, and store integrity; it is not ordinary command output and never stores terminal captures or manual text.
 - Coding Brain does not collect or display token usage or cost.
 - Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it.
 - Only that bounded percentage is retained.
