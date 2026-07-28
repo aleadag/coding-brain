@@ -2415,48 +2415,53 @@ mod tests {
         let (ready_tx, ready_rx) = mpsc::channel();
 
         let results = std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            let mut releases = Vec::new();
+            let mut workers = Vec::new();
             for payload in &payloads {
                 let start = Arc::clone(&start);
                 let ready_tx = ready_tx.clone();
                 let (release_tx, release_rx) = mpsc::sync_channel(0);
-                releases.push(release_tx);
+                let (result_tx, result_rx) = mpsc::channel();
                 let lifecycle = &lifecycle;
                 let activity = &activity;
                 let config = &config;
-                handles.push(scope.spawn(move || {
-                    start.wait();
-                    let mut stdout = Vec::new();
-                    let mut stderr = Vec::new();
-                    run_with_gate_and_stores(
-                        Cursor::new(payload),
-                        &mut stdout,
-                        &mut stderr,
-                        Some(config),
-                        BrainGateMode::Auto,
-                        lifecycle,
-                        Some(activity),
-                        |_, _| {
-                            ready_tx.send(()).unwrap();
-                            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                            Ok(suggestion(RuleAction::Approve, 0.9))
-                        },
-                    );
-                    (stdout, stderr)
-                }));
+                workers.push((
+                    release_tx,
+                    result_rx,
+                    scope.spawn(move || {
+                        start.wait();
+                        let mut stdout = Vec::new();
+                        let mut stderr = Vec::new();
+                        run_with_gate_and_stores(
+                            Cursor::new(payload),
+                            &mut stdout,
+                            &mut stderr,
+                            Some(config),
+                            BrainGateMode::Auto,
+                            lifecycle,
+                            Some(activity),
+                            |_, _| {
+                                ready_tx.send(()).unwrap();
+                                release_rx.recv().unwrap();
+                                Ok(suggestion(RuleAction::Approve, 0.9))
+                            },
+                        );
+                        result_tx.send((stdout, stderr)).unwrap();
+                    }),
+                ));
             }
             drop(ready_tx);
             for _ in &payloads {
                 ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             }
             let initial_lock_acquisitions = initial_lock_acquisitions.load(Ordering::SeqCst);
-            for release in releases {
-                release.send(()).unwrap();
-            }
-            let results = handles
+            let results = workers
                 .into_iter()
-                .map(|handle| handle.join().unwrap())
+                .map(|(release, result_rx, handle)| {
+                    release.send(()).unwrap();
+                    let result = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    handle.join().unwrap();
+                    result
+                })
                 .collect::<Vec<_>>();
             (initial_lock_acquisitions, results)
         });
