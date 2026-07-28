@@ -17,6 +17,7 @@ use coding_brain_core::lifecycle::{
     LifecycleStore, PermissionDisposition, ProjectedStatus,
 };
 use coding_brain_core::provider::AgentProvider;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[test]
 fn legacy_activity_target_defaults_to_codex_without_reemitting_provider_hints() {
@@ -150,6 +151,52 @@ fn child_permission_payload(home: &Path, agent_id: &str, turn_id: &str) -> Vec<u
     value["tool_input"] = serde_json::json!({"command": "printf child"});
     value["cwd"] = serde_json::json!(home);
     serde_json::to_vec(&value).unwrap()
+}
+
+fn child_permission_payload_with_transcript(
+    home: &Path,
+    agent_id: &str,
+    turn_id: &str,
+    transcript: &Path,
+) -> Vec<u8> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&child_permission_payload(home, agent_id, turn_id)).unwrap();
+    value["transcript_path"] = serde_json::json!(transcript);
+    serde_json::to_vec(&value).unwrap()
+}
+
+fn child_resume_metadata(
+    child_id: &str,
+    provider_session_id: &str,
+    immediate_parent_id: &str,
+) -> String {
+    format!(
+        "{{\"timestamp\":\"2026-07-27T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{child_id}\",\"session_id\":\"{provider_session_id}\",\"parent_thread_id\":\"{immediate_parent_id}\",\"cwd\":\"/work\"}}}}\n"
+    )
+}
+
+fn write_child_resume_transcript(
+    path: &Path,
+    child_id: &str,
+    provider_session_id: &str,
+    immediate_parent_id: &str,
+    turn_id: &str,
+    timestamp: &str,
+) {
+    fs::write(
+        path,
+        format!(
+            "{}{{\"timestamp\":\"{timestamp}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn_id}\"}}}}\n",
+            child_resume_metadata(child_id, provider_session_id, immediate_parent_id),
+        ),
+    )
+    .unwrap();
+}
+
+fn one_second_from_now_rfc3339() -> String {
+    (OffsetDateTime::now_utc() + time::Duration::seconds(1))
+        .format(&Rfc3339)
+        .unwrap()
 }
 
 fn with_payload_cwd(payload: Vec<u8>, cwd: &Path) -> Vec<u8> {
@@ -746,6 +793,283 @@ fn interleaved_codex_children_receive_isolated_permission_decisions() {
                 })
         }));
     }
+}
+
+#[test]
+fn resumed_codex_child_permission_is_reproved_and_delivered() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-a", "turn-a"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_stop_payload(home.path(), "child-a", "turn-a"),
+    );
+    let transcript = home.path().join("rollout-child-a.jsonl");
+    write_child_resume_transcript(
+        &transcript,
+        "child-a",
+        "root-1",
+        "root-1",
+        "turn-b",
+        &one_second_from_now_rfc3339(),
+    );
+
+    let permission = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload_with_transcript(home.path(), "child-a", "turn-b", &transcript),
+    );
+
+    assert!(permission.status.success());
+    assert!(
+        !permission.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&permission.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&permission.stdout).unwrap();
+    assert_eq!(
+        response,
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "allow"}
+            }
+        })
+    );
+    let events = activity(home.path()).read().unwrap().events().to_vec();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.kind == ActivityKind::Decision
+                    && event.session.as_ref().is_some_and(|session| {
+                        session.session_id == "child-a"
+                            && session.provider_session_id.as_deref() == Some("root-1")
+                            && session.turn_id.as_deref() == Some("turn-b")
+                    })
+            })
+            .map(|event| event.state)
+            .collect::<Vec<_>>(),
+        [
+            ActivityState::Observed,
+            ActivityState::Evaluating,
+            ActivityState::Allowed,
+            ActivityState::Delivered,
+        ]
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResumeCase {
+    NoTaskStart,
+    StoppedTurn,
+    WrongChild,
+    WrongProviderSession,
+    WrongTurn,
+    StaleTimestamp,
+    FutureTimestamp,
+}
+
+fn run_resume_case(case: ResumeCase) -> Output {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-a", "turn-a"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_stop_payload(home.path(), "child-a", "turn-a"),
+    );
+
+    let transcript = home.path().join(format!("rollout-{case:?}.jsonl"));
+    let child_id = if matches!(case, ResumeCase::WrongChild) {
+        "child-other"
+    } else {
+        "child-a"
+    };
+    let provider_session_id = if matches!(case, ResumeCase::WrongProviderSession) {
+        "root-other"
+    } else {
+        "root-1"
+    };
+    let permission_turn = if matches!(case, ResumeCase::StoppedTurn) {
+        "turn-a"
+    } else {
+        "turn-b"
+    };
+    let transcript_turn = if matches!(case, ResumeCase::WrongTurn) {
+        "turn-other"
+    } else {
+        permission_turn
+    };
+    let timestamp = match case {
+        ResumeCase::StaleTimestamp => "1970-01-01T00:00:00Z".to_owned(),
+        ResumeCase::FutureTimestamp => (OffsetDateTime::now_utc() + time::Duration::seconds(60))
+            .format(&Rfc3339)
+            .unwrap(),
+        _ => one_second_from_now_rfc3339(),
+    };
+    if matches!(case, ResumeCase::NoTaskStart) {
+        fs::write(
+            &transcript,
+            child_resume_metadata(child_id, provider_session_id, "root-1"),
+        )
+        .unwrap();
+    } else {
+        write_child_resume_transcript(
+            &transcript,
+            child_id,
+            provider_session_id,
+            "root-1",
+            transcript_turn,
+            &timestamp,
+        );
+    }
+
+    run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload_with_transcript(
+            home.path(),
+            "child-a",
+            permission_turn,
+            &transcript,
+        ),
+    )
+}
+
+#[test]
+fn invalid_codex_resume_evidence_remains_fail_closed() {
+    for case in [
+        ResumeCase::NoTaskStart,
+        ResumeCase::StoppedTurn,
+        ResumeCase::WrongChild,
+        ResumeCase::WrongProviderSession,
+        ResumeCase::WrongTurn,
+        ResumeCase::StaleTimestamp,
+        ResumeCase::FutureTimestamp,
+    ] {
+        let output = run_resume_case(case);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{case:?}");
+        assert!(output.stdout.is_empty(), "{case:?}");
+        assert!(stderr.contains("UnprovenSubagent"), "{case:?}: {stderr}");
+        assert!(
+            stderr.contains("Codex resume evidence:"),
+            "{case:?}: {stderr}"
+        );
+        assert!(!stderr.contains("rollout-"), "{case:?}: {stderr}");
+        assert!(!stderr.contains("task_started"), "{case:?}: {stderr}");
+    }
+}
+
+#[test]
+fn parent_interacted_event_is_not_codex_resume_authority() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-a", "turn-a"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_stop_payload(home.path(), "child-a", "turn-a"),
+    );
+    let parent_transcript = home.path().join("rollout-root-1.jsonl");
+    fs::write(
+        &parent_transcript,
+        format!(
+            "{}{{\"timestamp\":\"{}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"sub_agent_activity\",\"kind\":\"interacted\",\"agent_id\":\"child-a\"}}}}\n",
+            child_resume_metadata("root-1", "root-1", "root-1"),
+            one_second_from_now_rfc3339(),
+        ),
+    )
+    .unwrap();
+    let child_transcript = home.path().join("rollout-child-a.jsonl");
+    fs::write(
+        &child_transcript,
+        child_resume_metadata("child-a", "root-1", "root-1"),
+    )
+    .unwrap();
+
+    let output = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload_with_transcript(
+            home.path(),
+            "child-a",
+            "turn-b",
+            &child_transcript,
+        ),
+    );
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("UnprovenSubagent"));
+}
+
+#[test]
+fn depth_two_codex_resume_uses_shared_root_provider_identity() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-leaf", "turn-a"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_stop_payload(home.path(), "child-leaf", "turn-a"),
+    );
+    let transcript = home.path().join("rollout-child-leaf.jsonl");
+    write_child_resume_transcript(
+        &transcript,
+        "child-leaf",
+        "root-1",
+        "child-parent",
+        "turn-b",
+        &one_second_from_now_rfc3339(),
+    );
+
+    let output = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload_with_transcript(home.path(), "child-leaf", "turn-b", &transcript),
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["hookSpecificOutput"]
+            ["decision"]["behavior"],
+        "allow"
+    );
 }
 
 #[test]
