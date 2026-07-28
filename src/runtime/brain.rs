@@ -830,7 +830,9 @@ mod tests {
 
     #[test]
     fn live_brain_refresh_reports_busy_during_activity_lock_contention() {
-        let _env_lock = crate::config::HOME_ENV_LOCK.lock().unwrap();
+        let _env_lock = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let config_home = temp.path().join("config");
         let state_home = temp.path().join("state");
@@ -891,7 +893,9 @@ mod tests {
 
     #[test]
     fn live_actions_reject_unknown_authority_before_discovery() {
-        let _env_lock = crate::config::HOME_ENV_LOCK.lock().unwrap();
+        let _env_lock = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let config_home = temp.path().join("config");
         let state_home = temp.path().join("state");
