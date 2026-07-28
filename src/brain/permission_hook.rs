@@ -1861,6 +1861,73 @@ mod tests {
     }
 
     #[test]
+    fn structured_completion_failure_persists_one_actionable_error_lifecycle() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore_home = set_test_home(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let reason = "Ollama returned an incomplete structured decision after 2 attempts \
+            (Ollama completion (done=true, done_reason=stop, eval_count=746)); \
+            no action was taken";
+        let terminal_reason = format!("Brain query failed: {reason}");
+
+        run_with_gate_and_stores(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            |_, _| Err(reason.into()),
+        );
+
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr).unwrap().contains(reason));
+        assert_eq!(
+            lifecycle
+                .read()
+                .unwrap()
+                .snapshot
+                .unwrap()
+                .sessions
+                .values()
+                .next()
+                .unwrap()
+                .projected_status,
+            Some(ProjectedStatus::NeedsInput),
+        );
+        let events = activity.read().unwrap().events().to_vec();
+        assert_eq!(
+            events.iter().map(|event| event.state).collect::<Vec<_>>(),
+            [
+                ActivityState::Observed,
+                ActivityState::Evaluating,
+                ActivityState::Error,
+            ]
+        );
+        let terminal = events.last().unwrap();
+        assert_eq!(
+            terminal.reasoning.as_deref(),
+            Some(terminal_reason.as_str())
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.activity_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1,
+        );
+    }
+
+    #[test]
     fn malformed_payload_leaves_stdout_empty() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();

@@ -4,8 +4,14 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use coding_brain_core::brain_activity::bounded_redacted_activity_text;
+
 use crate::config::BrainConfig;
 use crate::rules::RuleAction;
+
+const MAX_STRUCTURED_COMPLETION_ATTEMPTS: usize = 2;
+const MIN_STRUCTURED_COMPLETION_RETRY_MS: u64 = 1_000;
+const MAX_COMPLETION_REASON_CHARS: usize = 64;
 
 /// The brain's suggestion for a session, parsed from the LLM response.
 #[derive(Debug, Clone)]
@@ -19,6 +25,112 @@ pub struct BrainSuggestion {
     pub suggested_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderFormat {
+    Ollama,
+    OpenAiCompatible,
+}
+
+impl ProviderFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ollama => "Ollama",
+            Self::OpenAiCompatible => "OpenAI-compatible",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneratedJsonKind {
+    Incomplete,
+    Malformed,
+}
+
+impl GeneratedJsonKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Incomplete => "incomplete",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CompletionMetadata {
+    done: Option<bool>,
+    done_reason: Option<String>,
+    eval_count: Option<u64>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedJsonFailure {
+    provider: ProviderFormat,
+    kind: GeneratedJsonKind,
+    metadata: CompletionMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InferenceFailure {
+    NonRetryable(String),
+    GeneratedJson(GeneratedJsonFailure),
+}
+
+fn bounded_completion_reason(value: &str) -> String {
+    let redacted = bounded_redacted_activity_text(value);
+    let mut characters = redacted.chars();
+    let mut bounded = characters
+        .by_ref()
+        .take(MAX_COMPLETION_REASON_CHARS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        bounded.push_str("...");
+    }
+    bounded
+}
+
+impl GeneratedJsonFailure {
+    fn summary(&self) -> String {
+        let mut fields = Vec::new();
+        if let Some(done) = self.metadata.done {
+            fields.push(format!("done={done}"));
+        }
+        if let Some(reason) = &self.metadata.done_reason {
+            fields.push(format!("done_reason={reason}"));
+        }
+        if let Some(eval_count) = self.metadata.eval_count {
+            fields.push(format!("eval_count={eval_count}"));
+        }
+        if let Some(reason) = &self.metadata.finish_reason {
+            fields.push(format!("finish_reason={reason}"));
+        }
+        if fields.is_empty() {
+            format!("{} generated output", self.provider.label())
+        } else {
+            format!(
+                "{} completion ({})",
+                self.provider.label(),
+                fields.join(", ")
+            )
+        }
+    }
+
+    fn diagnostic(&self, attempts: usize, retry_skipped: bool) -> String {
+        let plural = if attempts == 1 { "" } else { "s" };
+        let retry = if retry_skipped {
+            "; retry skipped because less than 1 second remained"
+        } else {
+            ""
+        };
+        format!(
+            "{} returned an {} structured decision after {attempts} attempt{plural} ({}){retry}; no action was taken",
+            self.provider.label(),
+            self.kind.label(),
+            self.summary(),
+        )
+    }
+}
+
 /// Call the local LLM endpoint via curl and parse the response.
 pub fn infer(config: &BrainConfig, prompt: &str) -> Result<BrainSuggestion, String> {
     infer_with_program(config, prompt, Path::new("curl"))
@@ -29,14 +141,17 @@ fn infer_with_program(
     prompt: &str,
     program: &Path,
 ) -> Result<BrainSuggestion, String> {
-    infer_with_command(config, prompt, Command::new(program))
+    infer_with_command_factory(config, prompt, || Command::new(program))
 }
 
-fn infer_with_command(
+fn infer_with_command_factory<F>(
     config: &BrainConfig,
     prompt: &str,
-    command: Command,
-) -> Result<BrainSuggestion, String> {
+    mut command: F,
+) -> Result<BrainSuggestion, String>
+where
+    F: FnMut() -> Command,
+{
     let is_openai = is_openai_compatible(&config.endpoint);
 
     let payload = if is_openai {
@@ -59,13 +174,70 @@ fn infer_with_command(
         })
     };
 
-    let body = serde_json::to_string(&payload).map_err(|e| format!("json error: {e}"))?;
-    let stdout = curl_post_command(command, config, &body)?;
+    let body = serde_json::to_string(&payload).map_err(|error| format!("json error: {error}"))?;
+    let started = std::time::Instant::now();
+    let mut first_generated_failure: Option<GeneratedJsonFailure> = None;
+
+    for attempt in 1..=MAX_STRUCTURED_COMPLETION_ATTEMPTS {
+        let mut attempt_config = config.clone();
+        if attempt > 1 {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let remaining_ms = config.timeout_ms.saturating_sub(elapsed_ms);
+            if remaining_ms < MIN_STRUCTURED_COMPLETION_RETRY_MS {
+                return Err(first_generated_failure
+                    .expect("retry requires a generated JSON failure")
+                    .diagnostic(attempt - 1, true));
+            }
+            attempt_config.timeout_ms = remaining_ms;
+        }
+
+        match infer_once_with_command(&attempt_config, &body, is_openai, command()) {
+            Ok(suggestion) => return Ok(suggestion),
+            Err(InferenceFailure::GeneratedJson(failure))
+                if attempt < MAX_STRUCTURED_COMPLETION_ATTEMPTS =>
+            {
+                first_generated_failure.get_or_insert(failure);
+            }
+            Err(InferenceFailure::GeneratedJson(failure)) => {
+                let diagnostic = failure.diagnostic(attempt, false);
+                return Err(match &first_generated_failure {
+                    Some(first) => format!(
+                        "{diagnostic}; first attempt was {} ({})",
+                        first.kind.label(),
+                        first.summary(),
+                    ),
+                    None => diagnostic,
+                });
+            }
+            Err(InferenceFailure::NonRetryable(message)) => {
+                return Err(match &first_generated_failure {
+                    Some(first) => format!(
+                        "{message}; first attempt was {} ({})",
+                        first.kind.label(),
+                        first.summary(),
+                    ),
+                    None => message,
+                });
+            }
+        }
+    }
+
+    unreachable!("structured completion attempt loop always returns")
+}
+
+fn infer_once_with_command(
+    config: &BrainConfig,
+    body: &str,
+    is_openai: bool,
+    command: Command,
+) -> Result<BrainSuggestion, InferenceFailure> {
+    let stdout =
+        curl_post_command(command, config, body).map_err(InferenceFailure::NonRetryable)?;
     let stdout = String::from_utf8_lossy(&stdout);
     if is_openai {
-        parse_openai_response(&stdout)
+        parse_openai_response_classified(&stdout)
     } else {
-        parse_ollama_response(&stdout)
+        parse_ollama_response_classified(&stdout)
     }
 }
 
@@ -278,6 +450,75 @@ fn parse_openai_response(response: &str) -> Result<BrainSuggestion, String> {
     parse_suggestion_json(content)
 }
 
+fn ollama_completion_metadata(json: &serde_json::Value) -> CompletionMetadata {
+    CompletionMetadata {
+        done: json.get("done").and_then(serde_json::Value::as_bool),
+        done_reason: json
+            .get("done_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(bounded_completion_reason),
+        eval_count: json.get("eval_count").and_then(serde_json::Value::as_u64),
+        finish_reason: None,
+    }
+}
+
+fn openai_completion_metadata(json: &serde_json::Value) -> CompletionMetadata {
+    CompletionMetadata {
+        finish_reason: json
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("finish_reason"))
+            .and_then(serde_json::Value::as_str)
+            .map(bounded_completion_reason),
+        ..CompletionMetadata::default()
+    }
+}
+
+fn parse_ollama_response_classified(response: &str) -> Result<BrainSuggestion, InferenceFailure> {
+    let json = serde_json::from_str(response).map_err(|error| {
+        InferenceFailure::NonRetryable(format!("invalid JSON response: {error}"))
+    })?;
+    let generated = extract_ollama_content(&json).map_err(InferenceFailure::NonRetryable)?;
+    parse_generated_suggestion(
+        generated,
+        ProviderFormat::Ollama,
+        ollama_completion_metadata(&json),
+    )
+}
+
+fn parse_openai_response_classified(response: &str) -> Result<BrainSuggestion, InferenceFailure> {
+    let json = serde_json::from_str(response).map_err(|error| {
+        InferenceFailure::NonRetryable(format!("invalid JSON response: {error}"))
+    })?;
+    let content = extract_openai_content(&json).map_err(InferenceFailure::NonRetryable)?;
+    parse_generated_suggestion(
+        content,
+        ProviderFormat::OpenAiCompatible,
+        openai_completion_metadata(&json),
+    )
+}
+
+fn parse_generated_suggestion(
+    text: &str,
+    provider: ProviderFormat,
+    metadata: CompletionMetadata,
+) -> Result<BrainSuggestion, InferenceFailure> {
+    let json = serde_json::from_str(text.trim()).map_err(|error| {
+        let kind = if error.classify() == serde_json::error::Category::Eof {
+            GeneratedJsonKind::Incomplete
+        } else {
+            GeneratedJsonKind::Malformed
+        };
+        InferenceFailure::GeneratedJson(GeneratedJsonFailure {
+            provider,
+            kind,
+            metadata,
+        })
+    })?;
+    suggestion_from_value(json).map_err(InferenceFailure::NonRetryable)
+}
+
 /// Parse the structured JSON that the brain LLM is expected to produce.
 pub fn parse_suggestion_json(text: &str) -> Result<BrainSuggestion, String> {
     // The LLM should produce JSON like:
@@ -285,9 +526,13 @@ pub fn parse_suggestion_json(text: &str) -> Result<BrainSuggestion, String> {
     let json: serde_json::Value =
         serde_json::from_str(text.trim()).map_err(|e| format!("invalid suggestion JSON: {e}"))?;
 
+    suggestion_from_value(json)
+}
+
+fn suggestion_from_value(json: serde_json::Value) -> Result<BrainSuggestion, String> {
     let action_str = json
         .get("action")
-        .and_then(|v| v.as_str())
+        .and_then(serde_json::Value::as_str)
         .ok_or("missing 'action' field")?;
 
     let action =
@@ -295,18 +540,18 @@ pub fn parse_suggestion_json(text: &str) -> Result<BrainSuggestion, String> {
 
     let message = json
         .get("message")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
 
     let reasoning = json
         .get("reasoning")
-        .and_then(|v| v.as_str())
+        .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
 
     let confidence = json
         .get("confidence")
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.5);
 
     Ok(BrainSuggestion {
@@ -367,19 +612,61 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    fn fake_curl(script: &str) -> (tempfile::TempDir, std::path::PathBuf, std::process::Command) {
+    fn fake_curl(script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("curl");
         std::fs::write(&path, format!("set -eu\n{script}\n")).unwrap();
-        let mut command = std::process::Command::new("sh");
-        command.arg(&path);
-        (temp, path, command)
+        (temp, path)
+    }
+
+    #[cfg(unix)]
+    fn fake_curl_command(script: &Path) -> Command {
+        let mut command = Command::new("sh");
+        command.arg(script);
+        command
+    }
+
+    #[cfg(unix)]
+    fn fixture_file(script: &Path, suffix: &str) -> std::path::PathBuf {
+        let mut path = script.as_os_str().to_os_string();
+        path.push(suffix);
+        std::path::PathBuf::from(path)
+    }
+
+    #[cfg(unix)]
+    fn fake_curl_responses(responses: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (temp, script) = fake_curl(
+            r#"count=0
+if [ -r "${0}.count" ]; then
+    IFS= read -r count < "${0}.count" || true
+fi
+count=$((count + 1))
+printf '%s' "$count" > "${0}.count"
+dd of=/dev/null 2>/dev/null
+dd if="${0}.response${count}" 2>/dev/null"#,
+        );
+        for (index, response) in responses.iter().enumerate() {
+            std::fs::write(
+                fixture_file(&script, &format!(".response{}", index + 1)),
+                response,
+            )
+            .unwrap();
+        }
+        (temp, script)
+    }
+
+    #[cfg(unix)]
+    fn invocation_count(script: &Path) -> u64 {
+        std::fs::read_to_string(fixture_file(script, ".count"))
+            .unwrap()
+            .parse()
+            .unwrap()
     }
 
     #[cfg(unix)]
     #[test]
     fn inference_sends_prompt_only_over_stdin_and_disables_redirects() {
-        let (temp, script, curl) = fake_curl(
+        let (temp, script) = fake_curl(
             r#"printf '%s\n' "$@" > "${0}.args"
 dd of="${0}.stdin" 2>/dev/null
 printf '%s' '{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confidence\":0.9}"}'"#,
@@ -394,7 +681,9 @@ printf '%s' '{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confi
             std::fs::metadata(&script).unwrap().permissions().mode() & 0o111,
             0
         );
-        let suggestion = infer_with_command(&config, secret_prompt, curl).unwrap();
+        let suggestion =
+            infer_with_command_factory(&config, secret_prompt, || fake_curl_command(&script))
+                .unwrap();
 
         assert_eq!(suggestion.action, RuleAction::Approve);
         let args = std::fs::read_to_string(temp.path().join("curl.args")).unwrap();
@@ -410,9 +699,127 @@ printf '%s' '{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confi
     #[cfg(unix)]
     #[test]
     fn oversized_inference_response_abstains() {
-        let (_temp, _script, curl) = fake_curl("dd if=/dev/zero bs=1048577 count=1 2>/dev/null");
-        let error = infer_with_command(&BrainConfig::default(), "prompt", curl).unwrap_err();
+        let (_temp, script) = fake_curl("dd if=/dev/zero bs=1048577 count=1 2>/dev/null");
+        let error = infer_with_command_factory(&BrainConfig::default(), "prompt", || {
+            fake_curl_command(&script)
+        })
+        .unwrap_err();
         assert!(error.contains("exceeds 1 MiB"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_decision_retries_once() {
+        let (_temp, script) = fake_curl_responses(&[
+            r#"{"response":"{\"action\":\"approve\",\"reasoning\":\"partial","done":true,"done_reason":"stop","eval_count":746}"#,
+            r#"{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confidence\":0.9}","done":true,"done_reason":"stop","eval_count":12}"#,
+        ]);
+        let suggestion =
+            infer_with_command_factory(&BrainConfig::default(), "secret prompt", || {
+                fake_curl_command(&script)
+            })
+            .unwrap();
+        assert_eq!(suggestion.action, RuleAction::Approve);
+        assert_eq!(invocation_count(&script), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_incomplete_decisions_fail_once_with_safe_metadata() {
+        let (_temp, script) = fake_curl_responses(&[
+            r#"{"model":"private-model","response":"{\"action\":\"approve\",\"reasoning\":\"first-secret","done":true,"done_reason":"stop","eval_count":746,"total_duration":123456}"#,
+            r#"{"model":"private-model","response":"{\"action\":\"approve\",\"reasoning\":\"second-secret","done":true,"done_reason":"length","eval_count":512,"total_duration":654321}"#,
+        ]);
+        let error = infer_with_command_factory(&BrainConfig::default(), "secret prompt", || {
+            fake_curl_command(&script)
+        })
+        .unwrap_err();
+        assert_eq!(invocation_count(&script), 2);
+        assert!(error.contains("incomplete structured decision"));
+        assert!(error.contains("done=true"));
+        assert!(error.contains("done_reason=length"));
+        assert!(error.contains("eval_count=512"));
+        for secret in [
+            "first-secret",
+            "second-secret",
+            "secret prompt",
+            "private-model",
+            "654321",
+        ] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_and_api_errors_are_not_retried() {
+        let (_schema_temp, schema_script) =
+            fake_curl_responses(&[r#"{"response":"{\"reasoning\":\"no decision\"}","done":true}"#]);
+        let schema_error = infer_with_command_factory(&BrainConfig::default(), "prompt", || {
+            fake_curl_command(&schema_script)
+        })
+        .unwrap_err();
+        assert_eq!(schema_error, "missing 'action' field");
+        assert_eq!(invocation_count(&schema_script), 1);
+
+        let (_api_temp, api_script) = fake_curl_responses(&[r#"{"error":"unable to load model"}"#]);
+        let api_error = infer_with_command_factory(&BrainConfig::default(), "prompt", || {
+            fake_curl_command(&api_script)
+        })
+        .unwrap_err();
+        assert_eq!(api_error, "Ollama API error: unable to load model");
+        assert_eq!(invocation_count(&api_script), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_uses_remaining_budget_and_can_be_skipped() {
+        let config = BrainConfig {
+            timeout_ms: 999,
+            ..BrainConfig::default()
+        };
+        let (_temp, script) = fake_curl_responses(&[
+            r#"{"response":"{\"action\":\"approve","done":true,"done_reason":"stop","eval_count":8}"#,
+        ]);
+        let error = infer_with_command_factory(&config, "prompt", || fake_curl_command(&script))
+            .unwrap_err();
+        assert_eq!(invocation_count(&script), 1);
+        assert!(error.contains("incomplete structured decision"));
+        assert!(error.contains("retry skipped because less than 1 second remained"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_preserves_second_provider_error() {
+        let (_temp, script) = fake_curl_responses(&[
+            r#"{"response":"{\"action\":\"approve\"]","done":true,"done_reason":"stop","eval_count":4}"#,
+            r#"{"error":"retry unavailable"}"#,
+        ]);
+        let error = infer_with_command_factory(&BrainConfig::default(), "prompt", || {
+            fake_curl_command(&script)
+        })
+        .unwrap_err();
+        assert_eq!(invocation_count(&script), 2);
+        assert!(error.contains("Ollama API error: retry unavailable"));
+        assert!(error.contains("first attempt was malformed"));
+        assert!(error.contains("done_reason=stop"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openai_syntax_failure_retries_once() {
+        let (_temp, script) = fake_curl_responses(&[
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":"{\"action\":\"deny"}}]}"#,
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":"{\"action\":\"deny\",\"reasoning\":\"unsafe\",\"confidence\":0.95}"}}]}"#,
+        ]);
+        let config = BrainConfig {
+            endpoint: "http://brain.example.test/v1/chat/completions".into(),
+            ..BrainConfig::default()
+        };
+        let suggestion =
+            infer_with_command_factory(&config, "prompt", || fake_curl_command(&script)).unwrap();
+        assert_eq!(suggestion.action, RuleAction::Deny);
+        assert_eq!(invocation_count(&script), 2);
     }
 
     #[test]
@@ -528,19 +935,95 @@ printf '%s' '{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confi
         assert_eq!(openai, "missing 'action' field");
     }
 
+    #[test]
+    fn incomplete_ollama_decision_keeps_only_safe_completion_metadata() {
+        let response = r#"{"model":"gemma4:e4b","response":"{\"action\":\"approve\",\"reasoning\":\"sk-secret-output","done":true,"done_reason":"stop","eval_count":746,"total_duration":123456}"#;
+
+        let error = parse_ollama_response_classified(response).unwrap_err();
+        let InferenceFailure::GeneratedJson(failure) = error else {
+            panic!("expected generated JSON failure");
+        };
+        assert_eq!(failure.provider, ProviderFormat::Ollama);
+        assert_eq!(failure.kind, GeneratedJsonKind::Incomplete);
+        assert_eq!(failure.metadata.done, Some(true));
+        assert_eq!(failure.metadata.done_reason.as_deref(), Some("stop"));
+        assert_eq!(failure.metadata.eval_count, Some(746));
+
+        let diagnostic = failure.diagnostic(1, false);
+        assert!(diagnostic.contains("incomplete structured decision"));
+        assert!(diagnostic.contains("done=true"));
+        assert!(diagnostic.contains("done_reason=stop"));
+        assert!(diagnostic.contains("eval_count=746"));
+        assert!(!diagnostic.contains("sk-secret-output"));
+        assert!(!diagnostic.contains("gemma4"));
+        assert!(!diagnostic.contains("123456"));
+    }
+
+    #[test]
+    fn generated_syntax_and_schema_failures_remain_distinct() {
+        let malformed = parse_ollama_response_classified(
+            r#"{"response":"{\"action\":\"approve\"]","done":true}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            malformed,
+            InferenceFailure::GeneratedJson(GeneratedJsonFailure {
+                kind: GeneratedJsonKind::Malformed,
+                ..
+            })
+        ));
+
+        let schema = parse_ollama_response_classified(
+            r#"{"response":"{\"reasoning\":\"no decision\"}","done":true}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            schema,
+            InferenceFailure::NonRetryable(ref message)
+                if message == "missing 'action' field"
+        ));
+    }
+
+    #[test]
+    fn openai_generated_failure_bounds_finish_reason() {
+        let finish_reason = format!("token=private {}", "x".repeat(200));
+        let response = serde_json::json!({
+            "choices": [{
+                "finish_reason": finish_reason,
+                "message": {"content": "{\"action\":"}
+            }]
+        })
+        .to_string();
+
+        let error = parse_openai_response_classified(&response).unwrap_err();
+        let InferenceFailure::GeneratedJson(failure) = error else {
+            panic!("expected generated JSON failure");
+        };
+        let diagnostic = failure.diagnostic(1, false);
+        assert!(diagnostic.contains("OpenAI-compatible"));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!diagnostic.contains("private"));
+        assert!(diagnostic.len() < 512);
+    }
+
     #[cfg(unix)]
     #[test]
     fn completion_extracts_generated_recovery_content_for_both_formats() {
         let recovery = r#"{"action":"continue","confidence":0.9}"#;
-        let (_ollama_temp, _ollama_script, ollama_curl) = fake_curl(
+        let (_ollama_temp, ollama_script) = fake_curl(
             r#"dd of=/dev/null 2>/dev/null
 printf '%s' '{"response":"{\"action\":\"continue\",\"confidence\":0.9}"}'"#,
         );
-        let ollama = call_llm_with_command(&BrainConfig::default(), "prompt", ollama_curl).unwrap();
+        let ollama = call_llm_with_command(
+            &BrainConfig::default(),
+            "prompt",
+            fake_curl_command(&ollama_script),
+        )
+        .unwrap();
         assert_eq!(ollama, recovery);
         assert!(parse_recovery_suggestion_json(&ollama).is_ok());
 
-        let (_openai_temp, _openai_script, openai_curl) = fake_curl(
+        let (_openai_temp, openai_script) = fake_curl(
             r#"dd of=/dev/null 2>/dev/null
 printf '%s' '{"choices":[{"message":{"content":"{\"action\":\"continue\",\"confidence\":0.9}"}}]}'"#,
         );
@@ -548,7 +1031,9 @@ printf '%s' '{"choices":[{"message":{"content":"{\"action\":\"continue\",\"confi
             endpoint: "http://brain.example.test/v1/chat/completions".into(),
             ..BrainConfig::default()
         };
-        let openai = call_llm_with_command(&openai_config, "prompt", openai_curl).unwrap();
+        let openai =
+            call_llm_with_command(&openai_config, "prompt", fake_curl_command(&openai_script))
+                .unwrap();
         assert_eq!(openai, recovery);
         assert!(parse_recovery_suggestion_json(&openai).is_ok());
     }
@@ -556,16 +1041,21 @@ printf '%s' '{"choices":[{"message":{"content":"{\"action\":\"continue\",\"confi
     #[cfg(unix)]
     #[test]
     fn completion_surfaces_schema_specific_api_errors() {
-        let (_ollama_temp, _ollama_script, ollama_curl) = fake_curl(
+        let (_ollama_temp, ollama_script) = fake_curl(
             r#"dd of=/dev/null 2>/dev/null
 printf '%s' '{"error":"unable to load model"}'"#,
         );
         assert_eq!(
-            call_llm_with_command(&BrainConfig::default(), "prompt", ollama_curl).unwrap_err(),
+            call_llm_with_command(
+                &BrainConfig::default(),
+                "prompt",
+                fake_curl_command(&ollama_script),
+            )
+            .unwrap_err(),
             "Ollama API error: unable to load model"
         );
 
-        let (_openai_temp, _openai_script, openai_curl) = fake_curl(
+        let (_openai_temp, openai_script) = fake_curl(
             r#"dd of=/dev/null 2>/dev/null
 printf '%s' '{"error":{"message":"model unavailable","type":"server_error"}}'"#,
         );
@@ -574,7 +1064,8 @@ printf '%s' '{"error":{"message":"model unavailable","type":"server_error"}}'"#,
             ..BrainConfig::default()
         };
         assert_eq!(
-            call_llm_with_command(&openai_config, "prompt", openai_curl).unwrap_err(),
+            call_llm_with_command(&openai_config, "prompt", fake_curl_command(&openai_script))
+                .unwrap_err(),
             "OpenAI API error: model unavailable"
         );
     }
