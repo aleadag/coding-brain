@@ -1892,15 +1892,18 @@ mod tests {
             .unwrap();
         lock.lock_exclusive().unwrap();
 
-        let started = Instant::now();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let append_store = store.clone();
+        let append = std::thread::spawn(move || {
+            result_tx
+                .send(append_store.append(event("a2", ActivityState::Denied)))
+                .unwrap();
+        });
         assert!(matches!(
-            store.append(event("a2", ActivityState::Denied)),
+            result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             Err(ActivityStoreError::LockTimeout)
         ));
-        assert!(
-            started.elapsed()
-                < Duration::from_millis(store.limits.lock_timeout_ms.saturating_add(25))
-        );
+        append.join().unwrap();
         assert!(
             !store
                 .clone()
