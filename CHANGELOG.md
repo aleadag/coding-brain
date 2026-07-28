@@ -48,10 +48,11 @@ All notable changes to codexctl are documented here.
   invocation. Stale, replayed, or post-invocation permission requests fall back
   to `ask`, and failed lifecycle persistence no longer appears as Allowed in
   Live.
-- Concurrent Codex subagents now keep lifecycle status, permission decisions,
-  tool outcomes, recovery, and navigation attached to the exact child turn.
-  Replayed, mismatched, or stopped child hooks cannot reuse another agent's
-  authority.
+- Concurrent and resumed Codex subagents now keep lifecycle status, permission
+  decisions, tool outcomes, recovery, and navigation attached to the exact
+  child turn. After a stopped child resumes, Coding Brain re-proves its shared
+  provider session and new turn from bounded transcript evidence before an
+  automatic decision; stale or mismatched child hooks remain fail-closed.
 
 ### Changed
 
