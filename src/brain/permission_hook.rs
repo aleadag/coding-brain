@@ -227,7 +227,7 @@ fn current_paths() -> Result<CodingBrainPaths, HookDiagnostic> {
     })
 }
 
-pub(crate) fn evaluate_request<F>(
+fn evaluate_request<F>(
     request: &BrainDecisionRequest,
     config: Option<&BrainConfig>,
     gate_mode: BrainGateMode,
@@ -238,14 +238,6 @@ pub(crate) fn evaluate_request<F>(
 where
     F: FnOnce(&BrainConfig, &str) -> Result<BrainSuggestion, String>,
 {
-    if let Some(safety) = super::safety::evaluate(request) {
-        return HookEvaluation::Deny {
-            brain: None,
-            deterministic: true,
-            safety: Some(safety),
-            terminal_state: ActivityState::Denied,
-        };
-    }
     if let Some(error) = persistence_error {
         return HookEvaluation::Abstain {
             brain: None,
@@ -573,7 +565,9 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
         tool_input: request.command.clone().unwrap_or_default(),
         diff_digest: None,
     };
-    let evaluation = if let Some(safety) = super::safety::evaluate(&brain_request) {
+    // This is the authoritative deterministic safety and provider-policy
+    // boundary; evaluate_request performs model evaluation only.
+    let evaluation = if let Some(safety) = super::safety::evaluate(request.command.as_deref()) {
         HookEvaluation::Deny {
             brain: None,
             deterministic: true,
@@ -934,6 +928,7 @@ fn run_with_gate<R, W, E, F>(
     let activity_store = current_paths()
         .ok()
         .map(|paths| ActivityStore::at(paths.state_root().join("activity.jsonl")));
+    // run_with_gate_and_stores is the authoritative safety and provider-policy boundary.
     run_with_gate_and_stores(
         stdin,
         stdout,

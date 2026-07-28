@@ -657,6 +657,97 @@ fn deterministic_deny_survives_both_audits_being_down() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("audit"));
 }
 
+fn assert_safety_deny(home: &Path, expected_rule_id: &str) {
+    let events = activity(home).read().unwrap().events().to_vec();
+    let denied = events
+        .iter()
+        .find(|event| event.state == ActivityState::Denied)
+        .expect("missing deterministic deny activity");
+    assert_eq!(denied.rule_id.as_deref(), Some(expected_rule_id));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.state != ActivityState::Allowed)
+    );
+}
+
+#[test]
+fn destructive_commands_are_denied_across_permission_providers() {
+    let codex_home = tempfile::tempdir().unwrap();
+    install_model_fixture(codex_home.path(), "approve");
+    let codex = run_provider_permission_hook(
+        codex_home.path(),
+        "codex",
+        None,
+        &permission_payload(codex_home.path(), "rm -rf /"),
+    );
+    let response: serde_json::Value = serde_json::from_slice(&codex.stdout).unwrap();
+    assert_eq!(
+        response["hookSpecificOutput"]["decision"]["behavior"],
+        "deny"
+    );
+    assert_safety_deny(codex_home.path(), "irreversible-root-delete");
+    assert!(!codex_home.path().join("bin/curl.args").exists());
+
+    let claude_home = tempfile::tempdir().unwrap();
+    install_model_fixture(claude_home.path(), "approve");
+    let mut claude_payload: serde_json::Value =
+        serde_json::from_slice(&claude_permission_payload(claude_home.path(), None)).unwrap();
+    claude_payload["tool_input"]["command"] = serde_json::json!("rm -rf /");
+    let claude = run_provider_permission_hook(
+        claude_home.path(),
+        "claude",
+        None,
+        &serde_json::to_vec(&claude_payload).unwrap(),
+    );
+    let response: serde_json::Value = serde_json::from_slice(&claude.stdout).unwrap();
+    assert_eq!(
+        response["hookSpecificOutput"]["decision"]["behavior"],
+        "deny"
+    );
+    assert_safety_deny(claude_home.path(), "irreversible-root-delete");
+    assert!(!claude_home.path().join("bin/curl.args").exists());
+
+    let antigravity_home = tempfile::tempdir().unwrap();
+    install_model_fixture(antigravity_home.path(), "approve");
+    let mut antigravity_payload: serde_json::Value = serde_json::from_slice(
+        &antigravity_permission_payload(antigravity_home.path(), None),
+    )
+    .unwrap();
+    antigravity_payload["toolCall"]["args"]["CommandLine"] = serde_json::json!("rm -rf /");
+    let antigravity = run_provider_permission_hook(
+        antigravity_home.path(),
+        "antigravity",
+        Some("PreToolUse"),
+        &serde_json::to_vec(&antigravity_payload).unwrap(),
+    );
+    let response: serde_json::Value = serde_json::from_slice(&antigravity.stdout).unwrap();
+    assert_eq!(response["decision"], "deny");
+    assert_safety_deny(antigravity_home.path(), "irreversible-root-delete");
+    assert!(!antigravity_home.path().join("bin/curl.args").exists());
+}
+
+#[test]
+fn antigravity_dynamic_rm_arguments_deny_before_inference() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&antigravity_permission_payload(home.path(), None)).unwrap();
+    payload["toolCall"]["args"]["CommandLine"] = serde_json::json!("rm $(printf '%s\\n' -rf /)");
+
+    let output = run_provider_permission_hook(
+        home.path(),
+        "antigravity",
+        Some("PreToolUse"),
+        &serde_json::to_vec(&payload).unwrap(),
+    );
+
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["decision"], "deny");
+    assert_safety_deny(home.path(), "unsafe-recursive-delete-expansion");
+    assert!(!home.path().join("bin/curl.args").exists());
+}
+
 #[test]
 fn model_action_requires_proposal_and_terminal_before_delivery() {
     let home = tempfile::tempdir().unwrap();

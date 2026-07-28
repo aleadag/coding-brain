@@ -58,6 +58,7 @@ pub(crate) struct PermissionHookRequest {
     pub request_key: String,
     pub project: String,
     pub tool_name: String,
+    /// Shell command extracted only for a provider's recognized command tool.
     pub command: Option<String>,
     pub tool_use_id: Option<String>,
     pub provider_policy: ProviderPermissionPolicy,
