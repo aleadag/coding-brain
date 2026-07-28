@@ -134,6 +134,20 @@ impl LifecycleStore {
             ) else {
                 return ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent);
             };
+            let requested_path = lexical_normalize_path(&evidence.requested_transcript_path);
+            let canonical_identity_path = fs::canonicalize(transcript_path).ok();
+            let canonical_identity_is_file = canonical_identity_path
+                .as_deref()
+                .and_then(|path| fs::metadata(path).ok())
+                .is_some_and(|metadata| metadata.is_file());
+            let evidence_matches_identity = evidence.child_session_id == identity.session_id()
+                && evidence.provider_session_id == parent_id
+                && evidence.turn_id == turn_id
+                && requested_path.as_deref() == Some(transcript_path)
+                && canonical_identity_path.as_deref()
+                    == Some(evidence.canonical_transcript_path.as_path())
+                && canonical_identity_is_file
+                && evidence.started_at_ms <= received_at_ms.saturating_add(5_000);
             if let Some((owner_key, active)) =
                 snapshot.sessions.iter().find_map(|(storage_key, state)| {
                     (AgentSessionKey::from_storage_key(storage_key)
@@ -142,19 +156,46 @@ impl LifecycleStore {
                         state
                             .active_subagents
                             .get(identity.session_id())
-                            .map(|active| (storage_key, active))
+                            .cloned()
+                            .map(|active| (storage_key.clone(), active))
                     })
                     .flatten()
                 })
             {
-                if !snapshot.topology_contains_session(AgentProvider::Codex, parent_id, owner_key) {
+                if !snapshot.topology_contains_session(AgentProvider::Codex, parent_id, &owner_key)
+                {
                     return ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch);
                 }
-                return ApplyOutcome::Ignored(if active.turn_id == turn_id {
-                    IgnoreReason::Duplicate
-                } else {
-                    IgnoreReason::SubagentTurnMismatch
-                });
+                if active.turn_id == turn_id {
+                    return ApplyOutcome::Ignored(IgnoreReason::Duplicate);
+                }
+                if !evidence_matches_identity || evidence.started_at_ms <= active.received_at_ms {
+                    return ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent);
+                }
+                if snapshot.next_sequence == 0 || snapshot.next_sequence >= u64::MAX - 1 {
+                    return ApplyOutcome::Ignored(IgnoreReason::SequenceExhausted);
+                }
+
+                let sequence = snapshot.next_sequence;
+                snapshot.next_sequence += 1;
+                snapshot
+                    .remove_linked_subagent_projection(AgentProvider::Codex, identity.session_id());
+                let parent = snapshot
+                    .sessions
+                    .get_mut(&owner_key)
+                    .expect("validated Codex topology owner");
+                parent.active_subagents.insert(
+                    identity.session_id().to_owned(),
+                    ActiveSubagentState {
+                        started_sequence: sequence,
+                        received_at_ms,
+                        turn_id: turn_id.to_owned(),
+                    },
+                );
+                parent.latest_sequence = sequence;
+                parent.latest_received_at_ms = received_at_ms;
+                parent.ignored_reason = None;
+                return ApplyOutcome::Applied;
             }
             let Some(parent_key) = snapshot.stopped_subagent_owner_key(
                 AgentProvider::Codex,
@@ -175,22 +216,9 @@ impl LifecycleStore {
             };
             let parent = &snapshot.sessions[&parent_key];
             let stopped = &parent.stopped_subagents[identity.session_id()];
-            let requested_path = lexical_normalize_path(&evidence.requested_transcript_path);
-            let canonical_identity_path = fs::canonicalize(transcript_path).ok();
-            let canonical_identity_is_file = canonical_identity_path
-                .as_deref()
-                .and_then(|path| fs::metadata(path).ok())
-                .is_some_and(|metadata| metadata.is_file());
-            if evidence.child_session_id != identity.session_id()
-                || evidence.provider_session_id != parent_id
-                || evidence.turn_id != turn_id
-                || requested_path.as_deref() != Some(transcript_path)
-                || canonical_identity_path.as_deref()
-                    != Some(evidence.canonical_transcript_path.as_path())
-                || !canonical_identity_is_file
+            if !evidence_matches_identity
                 || evidence.turn_id == stopped.turn_id
                 || evidence.started_at_ms <= stopped.received_at_ms
-                || evidence.started_at_ms > received_at_ms.saturating_add(5_000)
             {
                 return ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent);
             }
@@ -1165,6 +1193,35 @@ mod tests {
         )
     }
 
+    fn active_store(
+        transcript_path: &Path,
+    ) -> (
+        LifecycleStore,
+        super::super::LifecycleIdentity,
+        CodexResumeEvidence,
+    ) {
+        let store = store();
+        assert_eq!(
+            store.record_at(subagent_start("root-1", "child-1", "turn-1"), 1_000),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            store.record_at(linked_tool("child-1", "root-1", "turn-1"), 1_500),
+            Ok(ApplyOutcome::Applied)
+        );
+        (
+            store,
+            linked_identity(
+                AgentProvider::Codex,
+                "child-1",
+                "root-1",
+                "turn-2",
+                transcript_path,
+            ),
+            resume_evidence("child-1", "root-1", "turn-2", transcript_path, 2_500),
+        )
+    }
+
     fn linked_subagent_start(
         child: &str,
         provider_session: &str,
@@ -1612,6 +1669,191 @@ mod tests {
         assert_eq!(
             store.record_at(permission(identity), 3_003),
             Ok(ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent))
+        );
+    }
+
+    #[test]
+    fn exact_newer_codex_resume_evidence_replaces_stale_active_turn() {
+        let path = transcript_path("rollout-child-1.jsonl");
+        let (store, identity, evidence) = active_store(&path);
+        assert_eq!(
+            store.record_at(subagent_start("root-1", "sibling", "sibling-turn"), 1_550),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            store.record_at(linked_tool("sibling", "root-1", "sibling-turn"), 1_575),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            store.record_at(
+                linked_subagent_start("child-1", "root-1", "turn-1", "grandchild"),
+                1_600,
+            ),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            store.record_at(linked_tool("grandchild", "root-1", "turn-1"), 1_700),
+            Ok(ApplyOutcome::Applied)
+        );
+
+        assert_eq!(
+            store.reprove_codex_subagent_at(&identity, &evidence, 3_000),
+            Ok(ApplyOutcome::Applied)
+        );
+
+        let snapshot = store.read().unwrap().snapshot.unwrap();
+        let parent = &snapshot.sessions[&key("root-1")];
+        assert_eq!(parent.active_subagents["child-1"].turn_id, "turn-2");
+        assert_eq!(parent.active_subagents["sibling"].turn_id, "sibling-turn");
+        assert!(!snapshot.sessions.contains_key(&key("child-1")));
+        assert!(!snapshot.sessions.contains_key(&key("grandchild")));
+        assert!(snapshot.sessions.contains_key(&key("sibling")));
+        assert_eq!(snapshot.next_sequence, 8);
+        assert_eq!(
+            store.record_at(permission(identity), 3_001),
+            Ok(ApplyOutcome::Applied)
+        );
+    }
+
+    #[test]
+    fn rejected_active_codex_resume_evidence_does_not_consume_a_sequence() {
+        let path = transcript_path("rollout-child-1.jsonl");
+        let other_path = transcript_path("rollout-other.jsonl");
+        let (_, _, base) = active_store(&path);
+        let mut cases = Vec::new();
+
+        let mut evidence = base.clone();
+        evidence.child_session_id = "child-2".into();
+        cases.push(("child mismatch", evidence, IgnoreReason::UnprovenSubagent));
+        let mut evidence = base.clone();
+        evidence.provider_session_id = "root-2".into();
+        cases.push((
+            "provider session mismatch",
+            evidence,
+            IgnoreReason::UnprovenSubagent,
+        ));
+        let mut evidence = base.clone();
+        evidence.turn_id = "turn-3".into();
+        cases.push(("turn mismatch", evidence, IgnoreReason::UnprovenSubagent));
+        let mut evidence = base.clone();
+        evidence.requested_transcript_path = other_path.clone();
+        cases.push((
+            "requested transcript mismatch",
+            evidence,
+            IgnoreReason::UnprovenSubagent,
+        ));
+        let mut evidence = base.clone();
+        evidence.canonical_transcript_path = fs::canonicalize(&other_path).unwrap();
+        cases.push((
+            "canonical transcript mismatch",
+            evidence,
+            IgnoreReason::UnprovenSubagent,
+        ));
+        let mut evidence = base.clone();
+        evidence.started_at_ms = 1_500;
+        cases.push((
+            "timestamp equal to active proof",
+            evidence,
+            IgnoreReason::UnprovenSubagent,
+        ));
+        let mut evidence = base.clone();
+        evidence.started_at_ms = 8_001;
+        cases.push((
+            "timestamp too far in future",
+            evidence,
+            IgnoreReason::UnprovenSubagent,
+        ));
+
+        for (label, evidence, reason) in cases {
+            let (store, identity, _) = active_store(&path);
+            let before = store.read().unwrap().snapshot.unwrap().next_sequence;
+            assert_eq!(
+                store.reprove_codex_subagent_at(&identity, &evidence, 3_000),
+                Ok(ApplyOutcome::Ignored(reason)),
+                "{label}"
+            );
+            let after = store.read().unwrap().snapshot.unwrap();
+            assert_eq!(after.next_sequence, before, "{label}");
+            assert_eq!(
+                after.sessions[&key("root-1")].active_subagents["child-1"].turn_id,
+                "turn-1",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_codex_resume_evidence_preserves_capacity_and_duplicate_guards() {
+        let path = transcript_path("rollout-child-1.jsonl");
+        let (store, identity, evidence) = active_store(&path);
+        let duplicate_identity =
+            linked_identity(AgentProvider::Codex, "child-1", "root-1", "turn-1", &path);
+        let duplicate_evidence = resume_evidence("child-1", "root-1", "turn-1", &path, 2_500);
+        let before = store.read().unwrap().snapshot.unwrap().next_sequence;
+        assert_eq!(
+            store.reprove_codex_subagent_at(&duplicate_identity, &duplicate_evidence, 3_000),
+            Ok(ApplyOutcome::Ignored(IgnoreReason::Duplicate))
+        );
+        assert_eq!(
+            store.read().unwrap().snapshot.unwrap().next_sequence,
+            before
+        );
+
+        for index in 0..MAX_ACTIVE_SUBAGENTS - 1 {
+            assert_eq!(
+                store.record_at(
+                    subagent_start("root-1", &format!("other-{index}"), "other-turn"),
+                    2_100 + index as u64,
+                ),
+                Ok(ApplyOutcome::Applied)
+            );
+        }
+        assert_eq!(
+            store.reprove_codex_subagent_at(&identity, &evidence, 3_000),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            store.read().unwrap().snapshot.unwrap().sessions[&key("root-1")]
+                .active_subagents["child-1"]
+                .turn_id,
+            "turn-2"
+        );
+    }
+
+    #[test]
+    fn active_codex_resume_evidence_rejects_cross_parent_and_sequence_exhaustion() {
+        let path = transcript_path("rollout-child-1.jsonl");
+        let (store, _, _) = active_store(&path);
+        let cross_parent_identity =
+            linked_identity(AgentProvider::Codex, "child-1", "root-2", "turn-2", &path);
+        let cross_parent_evidence = resume_evidence("child-1", "root-2", "turn-2", &path, 2_500);
+        let before = store.read().unwrap().snapshot.unwrap().next_sequence;
+        assert_eq!(
+            store.reprove_codex_subagent_at(&cross_parent_identity, &cross_parent_evidence, 3_000),
+            Ok(ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch))
+        );
+        assert_eq!(
+            store.read().unwrap().snapshot.unwrap().next_sequence,
+            before
+        );
+
+        let (store, identity, evidence) = active_store(&path);
+        let mut snapshot = store.read().unwrap().snapshot.unwrap();
+        snapshot.next_sequence = u64::MAX - 1;
+        fs::write(
+            store.snapshot_path(),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.reprove_codex_subagent_at(&identity, &evidence, 3_000),
+            Ok(ApplyOutcome::Ignored(IgnoreReason::SequenceExhausted))
+        );
+        let after = store.read().unwrap().snapshot.unwrap();
+        assert_eq!(after.next_sequence, u64::MAX - 1);
+        assert_eq!(
+            after.sessions[&key("root-1")].active_subagents["child-1"].turn_id,
+            "turn-1"
         );
     }
 
