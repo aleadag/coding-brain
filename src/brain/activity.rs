@@ -18,6 +18,7 @@ use coding_brain_core::brain_activity::{
     ActivityOutcome, ActivitySnapshot, ActivityState, AttentionItem, DEFAULT_INTERRUPTED_AFTER_MS,
     DeliveryState, MAX_ACTIVITY_EVENT_BYTES, MIN_ACTIVITY_SCHEMA_VERSION, SnapshotLimits,
 };
+use coding_brain_core::durable_file::durable_replace;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
@@ -519,39 +520,41 @@ impl ActivityStore {
                 .map(|(activity_id, _)| activity_id),
         );
 
-        let parent = parent_dir(&self.path);
-        let mut temporary = tempfile::Builder::new()
-            .prefix("activity.tmp-")
-            .tempfile_in(parent)?;
-        set_file_mode(temporary.as_file())?;
-        if log.diagnostics.truncated_tails > 0 {
-            write_diagnostic(
-                &mut temporary,
-                StoreDiagnostic::TruncatedTail {
-                    discarded_bytes: log.diagnostics.discarded_tail_bytes,
-                },
-            )?;
-        }
-        if log.diagnostics.malformed_rows > 0 {
-            write_diagnostic(
-                &mut temporary,
-                StoreDiagnostic::MalformedRows {
-                    count: log.diagnostics.malformed_rows,
-                },
-            )?;
-        }
-        for event in &log.events {
-            let activity_id = event.activity_id.as_str();
-            if retained.contains(activity_id) || retained_incomplete.contains(activity_id) {
-                serde_json::to_writer(&mut temporary, event)?;
-                temporary.write_all(b"\n")?;
+        let replacement_path = if self
+            .path
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+        {
+            self.path.clone()
+        } else {
+            Path::new(".").join(&self.path)
+        };
+        durable_replace(&replacement_path, "activity.tmp-", |temporary| {
+            if log.diagnostics.truncated_tails > 0 {
+                write_diagnostic(
+                    temporary,
+                    StoreDiagnostic::TruncatedTail {
+                        discarded_bytes: log.diagnostics.discarded_tail_bytes,
+                    },
+                )?;
             }
-        }
-        temporary.flush()?;
-        temporary.as_file().sync_data()?;
-        temporary
-            .persist(&self.path)
-            .map_err(|error| ActivityStoreError::Io(error.error))?;
+            if log.diagnostics.malformed_rows > 0 {
+                write_diagnostic(
+                    temporary,
+                    StoreDiagnostic::MalformedRows {
+                        count: log.diagnostics.malformed_rows,
+                    },
+                )?;
+            }
+            for event in &log.events {
+                let activity_id = event.activity_id.as_str();
+                if retained.contains(activity_id) || retained_incomplete.contains(activity_id) {
+                    serde_json::to_writer(&mut *temporary, event)?;
+                    temporary.write_all(b"\n")?;
+                }
+            }
+            Ok::<(), ActivityStoreError>(())
+        })?;
         Ok(true)
     }
 
@@ -1075,6 +1078,133 @@ mod tests {
 
     fn event(activity_id: &str, state: ActivityState) -> ActivityEvent {
         event_at(activity_id, state, 100)
+    }
+
+    #[test]
+    fn durable_compaction_writes_complete_private_jsonl_without_temp_leak() {
+        let (root, store) = fixture_store();
+        let store = store.with_limits(ActivityLimits {
+            compact_at_bytes: 1,
+            retained_lifecycles: 10,
+            ..ActivityLimits::default()
+        });
+        store
+            .append(event_at("first", ActivityState::Allowed, 1))
+            .unwrap();
+        store
+            .append(event_at("second", ActivityState::Denied, 2))
+            .unwrap();
+
+        let path = root.path().join("activity.jsonl");
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"malformed\n")
+            .unwrap();
+        assert!(store.compact_if_needed().unwrap());
+
+        let bytes = fs::read(&path).unwrap();
+        let rows = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            serde_json::from_slice::<serde_json::Value>(row).unwrap();
+        }
+        let log = store.read().unwrap();
+        assert_eq!(log.diagnostics().malformed_rows, 1);
+        assert_eq!(
+            log.events()
+                .iter()
+                .map(|event| event.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        let temps = fs::read_dir(root.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("activity.tmp-")
+            })
+            .collect::<Vec<_>>();
+        assert!(temps.is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_accepts_bare_relative_activity_path() {
+        #[cfg(unix)]
+        let original_permissions = fs::metadata(".").unwrap().permissions();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join(".bare-relative-compaction-helper"),
+            b"isolated",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "brain::activity::tests::bare_relative_compaction_subprocess_helper",
+                "--nocapture",
+            ])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "bare-relative compaction helper failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(".").unwrap().permissions().mode() & 0o777,
+                original_permissions.mode() & 0o777
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn bare_relative_compaction_subprocess_helper() {
+        if !Path::new(".bare-relative-compaction-helper").is_file() {
+            return;
+        }
+        let store = ActivityStore::at("activity.jsonl").with_limits(ActivityLimits {
+            compact_at_bytes: 1,
+            retained_lifecycles: 10,
+            ..ActivityLimits::default()
+        });
+        store
+            .append(event_at("relative", ActivityState::Allowed, 1))
+            .unwrap();
+        assert!(store.compact_if_needed().unwrap());
+        assert_eq!(
+            store
+                .read()
+                .unwrap()
+                .events()
+                .iter()
+                .map(|event| event.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["relative"]
+        );
     }
 
     #[test]

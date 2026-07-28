@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10,6 +10,7 @@ use fs2::FileExt;
 use serde::Deserialize;
 
 use crate::codex_transcript::CodexResumeEvidence;
+use crate::durable_file::durable_replace;
 use crate::provider::{AgentProvider, AgentSessionKey};
 
 use super::{
@@ -381,16 +382,10 @@ impl LifecycleStore {
     }
 
     fn persist(&self, bytes: &[u8]) -> Result<(), StoreError> {
-        let mut temp = tempfile::Builder::new()
-            .prefix("lifecycle.tmp-")
-            .tempfile_in(self.hooks_dir())
-            .map_err(|_| StoreError::Io)?;
-        set_file_mode(temp.as_file())?;
-        temp.write_all(bytes).map_err(|_| StoreError::Io)?;
-        temp.flush().map_err(|_| StoreError::Io)?;
-        temp.persist(self.snapshot_path())
-            .map_err(|_| StoreError::Io)?;
-        Ok(())
+        durable_replace::<io::Error, _>(&self.snapshot_path(), "lifecycle.tmp-", |file| {
+            file.write_all(bytes)
+        })
+        .map_err(|_| StoreError::Io)
     }
 
     fn cleanup_abandoned_temps(&self) -> Result<(), StoreError> {

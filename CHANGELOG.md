@@ -36,6 +36,9 @@ All notable changes to codexctl are documented here.
 - Release tags now rerun formatting, Clippy, and all-target tests before
   publishing. The curl installer now requires a valid release checksum and a
   supported verifier before extracting or installing the binary.
+- Lifecycle snapshots and activity-log compaction now use private,
+  same-directory atomic replacements with durable file syncs and
+  parent-directory sync on Unix, preventing partial JSON after a crash.
 - New Recent activity no longer moves the selected Live row or its Evidence
   pane while the selected activity is still present.
 - Live corrections now target the selected Decision in either Needs Attention

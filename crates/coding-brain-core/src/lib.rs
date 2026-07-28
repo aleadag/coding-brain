@@ -18,6 +18,7 @@ pub mod codex_transcript;
 pub mod config;
 pub mod context_pressure;
 pub mod discovery;
+pub mod durable_file;
 pub mod health;
 pub mod helpers;
 pub mod hooks;
