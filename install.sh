@@ -1,11 +1,24 @@
 #!/bin/sh
 # Coding Brain installer — downloads the latest release binary for your platform.
-# Usage: curl -fsSL https://raw.githubusercontent.com/aleadag/codexctl/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/aleadag/coding-brain/main/install.sh | sh
 
 set -e
 
-REPO="aleadag/codexctl"
+REPO="aleadag/coding-brain"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+
+if command -v shasum >/dev/null 2>&1; then
+    verify_checksum() {
+    shasum -a 256 -c "$1"
+    }
+elif command -v sha256sum >/dev/null 2>&1; then
+    verify_checksum() {
+    sha256sum -c "$1"
+    }
+else
+    echo "Error: checksum verification requires shasum or sha256sum" >&2
+    exit 1
+fi
 
 # Detect OS and architecture
 OS="$(uname -s)"
@@ -44,30 +57,23 @@ CHECKSUM_URL="${URL}.sha256"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+curl -fsSL -o "${TMP_DIR}/checksum.sha256" "$CHECKSUM_URL"
 curl -fsSL -o "${TMP_DIR}/${ARCHIVE}" "$URL"
 
-# Verify checksum if available
-if curl -fsSL -o "${TMP_DIR}/checksum.sha256" "$CHECKSUM_URL" 2>/dev/null; then
+(
     cd "$TMP_DIR"
-    if command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 -c checksum.sha256
-    elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum -c checksum.sha256
-    fi
-    cd - >/dev/null
-fi
+    verify_checksum checksum.sha256
+)
 
 # Extract and install
 tar xzf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR"
 
 if [ -w "$INSTALL_DIR" ]; then
-    mv "${TMP_DIR}/coding-brain" "${INSTALL_DIR}/coding-brain"
+    install -m 0755 "${TMP_DIR}/coding-brain" "${INSTALL_DIR}/coding-brain"
 else
     echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-    sudo mv "${TMP_DIR}/coding-brain" "${INSTALL_DIR}/coding-brain"
+    sudo install -m 0755 "${TMP_DIR}/coding-brain" "${INSTALL_DIR}/coding-brain"
 fi
-
-chmod +x "${INSTALL_DIR}/coding-brain"
 
 echo "Coding Brain ${LATEST} installed to ${INSTALL_DIR}/coding-brain"
 echo "Run 'coding-brain init' to get started."
