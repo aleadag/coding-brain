@@ -36,7 +36,7 @@ impl From<HookProvider> for AgentProvider {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedLifecycleHook {
     pub identity: LifecycleIdentity,
-    pub event: LifecycleEventKind,
+    pub event: Option<LifecycleEventKind>,
     pub turn_initial_step: Option<u64>,
     pub tool_use_id: Option<String>,
     pub tool_name: Option<String>,

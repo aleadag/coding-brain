@@ -313,6 +313,14 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     );
     assert!(pre_invocation.status.success());
     assert!(pre_invocation.stderr.is_empty());
+    let state_root = invocation_home.path().join(".local/state/coding-brain");
+    let lifecycle = LifecycleStore::at(&state_root);
+    let before_post = lifecycle.read().unwrap().snapshot.unwrap();
+    let activity_path = state_root.join("activity.jsonl");
+    let activity_before_post = fs::read(&activity_path).unwrap();
+    let links_path = state_root.join("session-links.jsonl");
+    let links_before_post = fs::read(&links_path).ok();
+
     let post_invocation = run_provider_hook_with_event(
         invocation_home.path(),
         Some("antigravity"),
@@ -321,20 +329,57 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     );
     assert!(post_invocation.status.success());
     assert!(post_invocation.stderr.is_empty());
-    let snapshot = LifecycleStore::at(invocation_home.path().join(".local/state/coding-brain"))
-        .read()
-        .unwrap()
-        .snapshot
-        .unwrap();
     assert_eq!(
-        snapshot.sessions[&key].latest_event,
-        Some(LifecycleEventName::Stop)
+        lifecycle.read().unwrap().snapshot.unwrap(),
+        before_post,
+        "PostInvocation changed lifecycle state"
     );
     assert_eq!(
-        snapshot.sessions[&key].current_turn.as_deref(),
-        Some("invocation-3")
+        fs::read(&activity_path).unwrap(),
+        activity_before_post,
+        "PostInvocation appended activity"
     );
-    assert!(!snapshot.sessions[&key].turn_open);
+    assert_eq!(
+        fs::read(&links_path).ok(),
+        links_before_post,
+        "PostInvocation appended a session link"
+    );
+
+    let mut continued_payload: serde_json::Value =
+        serde_json::from_slice(ANTIGRAVITY_PRE_TOOL_USE).unwrap();
+    continued_payload["stepIdx"] = serde_json::json!(10);
+    let continued_output = run_provider_hook_with_event(
+        invocation_home.path(),
+        Some("antigravity"),
+        Some("PreToolUse"),
+        &serde_json::to_vec(&continued_payload).unwrap(),
+    );
+    assert!(continued_output.status.success());
+    assert!(continued_output.stderr.is_empty());
+
+    let stop = run_provider_hook_with_event(
+        invocation_home.path(),
+        Some("antigravity"),
+        Some("Stop"),
+        ANTIGRAVITY_STOP,
+    );
+    assert!(stop.status.success());
+    assert!(stop.stderr.is_empty());
+    let snapshot = lifecycle.read().unwrap().snapshot.unwrap();
+    let state = &snapshot.sessions[&key];
+    assert_eq!(state.latest_event, Some(LifecycleEventName::Stop));
+    assert_eq!(state.current_turn.as_deref(), Some("invocation-3"));
+    assert!(!state.turn_open);
+
+    continued_payload["stepIdx"] = serde_json::json!(11);
+    let after_stop = run_provider_hook_with_event(
+        invocation_home.path(),
+        Some("antigravity"),
+        Some("PreToolUse"),
+        &serde_json::to_vec(&continued_payload).unwrap(),
+    );
+    assert!(after_stop.status.success());
+    assert!(String::from_utf8_lossy(&after_stop.stderr).contains("AmbiguousTurn"));
 }
 
 #[test]

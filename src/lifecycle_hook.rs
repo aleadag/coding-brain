@@ -210,10 +210,13 @@ fn run_provider_with_activity_and_live_process<R: Read, E: Write>(
         }
     };
     parsed.live_process = live_process;
+    let Some(event_kind) = parsed.event.clone() else {
+        return;
+    };
     let activity_input = LifecycleActivityInput::from_parsed(&parsed, &input);
     let event = match LifecycleEvent::from_parts_with_turn_initial_step(
         parsed.identity.clone(),
-        parsed.event.clone(),
+        event_kind,
         parsed.turn_initial_step,
     ) {
         Ok(event) => event,
@@ -322,10 +325,14 @@ fn persist_provider_hook_with_live_process(
         }
     };
     parsed.live_process = live_process;
+    let event_kind = parsed
+        .event
+        .clone()
+        .ok_or_else(|| "provider hook has no lifecycle transition".to_owned())?;
     let activity_input = LifecycleActivityInput::from_parsed(&parsed, input);
     let event = match LifecycleEvent::from_parts_with_turn_initial_step(
         parsed.identity.clone(),
-        parsed.event.clone(),
+        event_kind,
         parsed.turn_initial_step,
     ) {
         Ok(event) => event,
