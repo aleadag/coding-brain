@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Component, Path};
 
-use super::query::BrainDecisionRequest;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SafetyDeny {
     pub rule_id: &'static str,
@@ -15,15 +13,14 @@ struct ShellWord {
     text: String,
     variable_expansion: bool,
     tilde_expansion: bool,
+    command_substitution: bool,
 }
 
-pub(crate) fn evaluate(request: &BrainDecisionRequest) -> Option<SafetyDeny> {
-    if request.tool_name != "Bash" {
-        return None;
-    }
+pub(crate) fn evaluate(command: Option<&str>) -> Option<SafetyDeny> {
+    let input = command?;
 
     let mut assignments = HashMap::new();
-    for command in tokenize_commands(&request.tool_input) {
+    for command in tokenize_commands(input) {
         let mut words = command.as_slice();
         while let Some((name, value)) = words.first().and_then(|word| word.text.split_once('=')) {
             if is_variable_name(name) {
@@ -41,6 +38,12 @@ pub(crate) fn evaluate(request: &BrainDecisionRequest) -> Option<SafetyDeny> {
             continue;
         }
         let args = &words[1..];
+        if args.iter().any(|argument| argument.command_substitution) {
+            return Some(SafetyDeny {
+                rule_id: "unsafe-recursive-delete-expansion",
+                reason: "refusing deletion through an unresolved command substitution".into(),
+            });
+        }
         if !args.iter().any(|arg| is_recursive_flag(&arg.text)) {
             continue;
         }
@@ -285,6 +288,7 @@ fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
     let mut word_started = false;
     let mut variable_expansion = false;
     let mut tilde_expansion = false;
+    let mut command_substitution = false;
     let mut quote = None;
     let mut escaped = false;
     let mut chars = input.chars().peekable();
@@ -304,8 +308,15 @@ fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
             if character == active_quote {
                 quote = None;
             } else {
-                if active_quote == '"' && character == '$' {
-                    variable_expansion = true;
+                if active_quote == '"' {
+                    if character == '$' {
+                        variable_expansion = true;
+                        if chars.peek() == Some(&'(') && chars.clone().nth(1) != Some('(') {
+                            command_substitution = true;
+                        }
+                    } else if character == '`' {
+                        command_substitution = true;
+                    }
                 }
                 word.push(character);
             }
@@ -323,6 +334,7 @@ fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
                 &mut word_started,
                 &mut variable_expansion,
                 &mut tilde_expansion,
+                &mut command_substitution,
             ),
             ';' | '\n' => push_command(
                 &mut commands,
@@ -331,6 +343,7 @@ fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
                 &mut word_started,
                 &mut variable_expansion,
                 &mut tilde_expansion,
+                &mut command_substitution,
             ),
             '&' | '|' => {
                 if chars.peek() == Some(&character) {
@@ -343,10 +356,18 @@ fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
                     &mut word_started,
                     &mut variable_expansion,
                     &mut tilde_expansion,
+                    &mut command_substitution,
                 );
             }
             '$' => {
                 variable_expansion = true;
+                command_substitution |=
+                    chars.peek() == Some(&'(') && chars.clone().nth(1) != Some('(');
+                word_started = true;
+                word.push(character);
+            }
+            '`' => {
+                command_substitution = true;
                 word_started = true;
                 word.push(character);
             }
@@ -371,6 +392,7 @@ fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
         &mut word_started,
         &mut variable_expansion,
         &mut tilde_expansion,
+        &mut command_substitution,
     );
     commands
 }
@@ -381,12 +403,14 @@ fn push_word(
     word_started: &mut bool,
     variable_expansion: &mut bool,
     tilde_expansion: &mut bool,
+    command_substitution: &mut bool,
 ) {
     if *word_started {
         command.push(ShellWord {
             text: std::mem::take(word),
             variable_expansion: std::mem::take(variable_expansion),
             tilde_expansion: std::mem::take(tilde_expansion),
+            command_substitution: std::mem::take(command_substitution),
         });
         *word_started = false;
     }
@@ -399,6 +423,7 @@ fn push_command(
     word_started: &mut bool,
     variable_expansion: &mut bool,
     tilde_expansion: &mut bool,
+    command_substitution: &mut bool,
 ) {
     push_word(
         command,
@@ -406,6 +431,7 @@ fn push_command(
         word_started,
         variable_expansion,
         tilde_expansion,
+        command_substitution,
     );
     if !command.is_empty() {
         commands.push(std::mem::take(command));
@@ -416,13 +442,8 @@ fn push_command(
 mod tests {
     use super::*;
 
-    fn request(command: &str) -> BrainDecisionRequest {
-        BrainDecisionRequest {
-            project: "coding-brain".into(),
-            tool_name: "Bash".into(),
-            tool_input: command.into(),
-            diff_digest: None,
-        }
+    fn evaluate_command(command: &str) -> Option<SafetyDeny> {
+        evaluate(Some(command))
     }
 
     #[test]
@@ -441,7 +462,7 @@ mod tests {
             "env -- /bin/rm -rf /",
             "env -u PATH /bin/rm -rf /",
         ] {
-            let deny = evaluate(&request(command)).unwrap_or_else(|| panic!("{command}"));
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
             assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
         }
     }
@@ -461,7 +482,7 @@ mod tests {
             commands.push(format!("rm -Rf {}/./", Path::new(&home).display()));
         }
         for command in commands {
-            let deny = evaluate(&request(&command)).unwrap();
+            let deny = evaluate_command(&command).unwrap();
             assert_eq!(deny.rule_id, "irreversible-home-delete", "{command}");
         }
     }
@@ -478,11 +499,48 @@ mod tests {
             "rm -rf \"${UNSET:=/}\"",
             "rm -rf \"${SET:+/}\"",
         ] {
-            let deny = evaluate(&request(command)).unwrap_or_else(|| panic!("{command}"));
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
             assert_eq!(
                 deny.rule_id, "unsafe-recursive-delete-expansion",
                 "{command}"
             );
+        }
+    }
+
+    #[test]
+    fn command_substitution_in_rm_arguments_denies() {
+        for command in [
+            "rm -rf \"$(resolve-target)\"",
+            "rm -rf `resolve-target`",
+            "rm -rf \"prefix-$(resolve-target)\"",
+            "rm -rf \"$((1 + $(resolve-target)))\"",
+            "rm $(printf '%s\\n' -rf /)",
+            "rm `printf '%s\\n' -rf /`",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn arithmetic_expansion_has_no_deterministic_decision() {
+        for command in ["rm -rf \"$((1+1))\"", "rm -rf $((1+1))"] {
+            assert!(evaluate_command(command).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn inert_command_substitution_syntax_has_no_deterministic_decision() {
+        for command in [
+            "rm -rf '$(resolve-target)'",
+            "rm -rf '`resolve-target`'",
+            "rm -rf \"\\$(resolve-target)\"",
+            "rm -rf \\`resolve-target\\`",
+        ] {
+            assert!(evaluate_command(command).is_none(), "{command}");
         }
     }
 
@@ -497,14 +555,12 @@ mod tests {
             "rm -rf '~'",
             "rm -rf \"${TMPDIR:-/tmp}/work\"",
         ] {
-            assert!(evaluate(&request(command)).is_none(), "{command}");
+            assert!(evaluate_command(command).is_none(), "{command}");
         }
     }
 
     #[test]
-    fn unsupported_tool_has_no_deterministic_decision() {
-        let mut request = request("rm -rf /");
-        request.tool_name = "apply_patch".into();
-        assert!(evaluate(&request).is_none());
+    fn missing_command_capability_has_no_deterministic_decision() {
+        assert!(evaluate(None).is_none());
     }
 }
