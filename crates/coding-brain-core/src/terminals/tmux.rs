@@ -1,5 +1,7 @@
 use crate::session::AgentSession;
-use crate::terminals::{BoundedOutput, PaneCapture, Terminal, checked_capture, run_bounded};
+use crate::terminals::{
+    BoundedOutput, ExactTargetFailure, PaneCapture, Terminal, checked_capture, run_bounded,
+};
 
 const MAX_ANCESTRY_DEPTH: usize = 64;
 
@@ -82,7 +84,7 @@ fn select_exact_pane(
     identity: &crate::provider::LiveProcessIdentity,
     panes: &[TmuxPane],
     mut parent_of: impl FnMut(u32) -> Option<u32>,
-) -> Result<String, String> {
+) -> Result<String, ExactTargetFailure> {
     let matches = panes
         .iter()
         .filter(|pane| {
@@ -91,8 +93,12 @@ fn select_exact_pane(
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [pane] => Ok(pane.target.clone()),
-        [] => Err("no tmux pane matched the exact live process identity".into()),
-        _ => Err("multiple tmux panes matched the live process ancestry".into()),
+        [] => Err(ExactTargetFailure::unavailable(
+            "no tmux pane matched the exact live process identity",
+        )),
+        _ => Err(ExactTargetFailure::ambiguous(
+            "multiple tmux panes matched the live process ancestry",
+        )),
     }
 }
 
@@ -185,31 +191,55 @@ fn process_start_matches(
     process_start_matches_lstart(identity.process_start_identity, &output)
 }
 
+fn resolve_exact_target_classified_with(
+    session: &AgentSession,
+    runner: &dyn CommandRunner,
+) -> Result<String, ExactTargetFailure> {
+    let identity = session.live_process_identity().ok_or_else(|| {
+        ExactTargetFailure::unavailable(
+            "guarded terminal action requires an exact live process identity",
+        )
+    })?;
+    let (pid, _, tty) =
+        process_row(runner, identity.pid).map_err(ExactTargetFailure::unavailable)?;
+    if !identity.matches_provider(session.provider, pid, identity.process_start_identity, &tty)
+        || !process_start_matches(runner, &identity)
+    {
+        return Err(ExactTargetFailure::unavailable(
+            "live process identity changed",
+        ));
+    }
+    let panes = parse_panes(
+        &runner
+            .run(
+                "tmux",
+                &[
+                    "list-panes".into(),
+                    "-a".into(),
+                    "-F".into(),
+                    "#{pane_id}\t#{pane_tty}\t#{pane_pid}".into(),
+                ],
+            )
+            .map_err(ExactTargetFailure::unavailable)?,
+    )
+    .map_err(ExactTargetFailure::unavailable)?;
+    select_exact_pane(&identity, &panes, |pid| {
+        process_row(runner, pid).ok().map(|(_, parent, _)| parent)
+    })
+}
+
 fn resolve_exact_target_with(
     session: &AgentSession,
     runner: &dyn CommandRunner,
 ) -> Result<String, String> {
-    let identity = session.live_process_identity().ok_or_else(|| {
-        "guarded terminal action requires an exact live process identity".to_string()
-    })?;
-    let (pid, _, tty) = process_row(runner, identity.pid)?;
-    if !identity.matches_provider(session.provider, pid, identity.process_start_identity, &tty)
-        || !process_start_matches(runner, &identity)
-    {
-        return Err("live process identity changed".into());
-    }
-    let panes = parse_panes(&runner.run(
-        "tmux",
-        &[
-            "list-panes".into(),
-            "-a".into(),
-            "-F".into(),
-            "#{pane_id}\t#{pane_tty}\t#{pane_pid}".into(),
-        ],
-    )?)?;
-    select_exact_pane(&identity, &panes, |pid| {
-        process_row(runner, pid).ok().map(|(_, parent, _)| parent)
-    })
+    resolve_exact_target_classified_with(session, runner)
+        .map_err(|error| error.message().to_string())
+}
+
+pub fn resolve_exact_target_classified(
+    session: &AgentSession,
+) -> Result<String, ExactTargetFailure> {
+    resolve_exact_target_classified_with(session, &RealCommandRunner)
 }
 
 pub fn resolve_exact_target(session: &AgentSession) -> Result<String, String> {
@@ -357,6 +387,7 @@ mod tests {
     use super::*;
     use crate::provider::{AgentProvider, LiveProcessIdentity};
     use crate::session::RawAgentSession;
+    use crate::terminals::ExactTargetFailureKind;
     use std::collections::VecDeque;
 
     struct FakeCommandRunner {
@@ -447,7 +478,29 @@ mod tests {
         })
         .unwrap_err();
 
-        assert!(error.contains("multiple"));
+        assert_eq!(error.kind, ExactTargetFailureKind::Ambiguous);
+    }
+
+    #[test]
+    fn exact_tmux_target_distinguishes_absent_and_ambiguous() {
+        let identity = LiveProcessIdentity::try_new(AgentProvider::Codex, 42, 99, "pts/1").unwrap();
+        assert_eq!(
+            select_exact_pane(&identity, &[], |_| None)
+                .unwrap_err()
+                .kind,
+            ExactTargetFailureKind::Unavailable
+        );
+        let panes = parse_panes("%1\t/dev/pts/1\t10\n%2\t/dev/pts/1\t11\n").unwrap();
+        assert_eq!(
+            select_exact_pane(&identity, &panes, |pid| match pid {
+                42 => Some(11),
+                11 => Some(10),
+                _ => None,
+            })
+            .unwrap_err()
+            .kind,
+            ExactTargetFailureKind::Ambiguous
+        );
     }
 
     #[test]

@@ -1,22 +1,29 @@
 //! Bind Brain read contracts to the binary's brain subsystem.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use coding_brain_core::brain_activity::{
-    ActivityEvent, ActivityKind, CorrectionDisposition, SessionTargetProvenance, SnapshotLimits,
+    ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, CorrectionDisposition,
+    ProjectEvidence, SessionTargetProvenance, SnapshotLimits,
 };
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use coding_brain_core::runtime::{
     BrainActions, BrainGateMode, BrainRefresh, BrainSource, BrainSourceError, CacheSummary,
     CorrectionInput, CounterfactualSummary, DecisionSummary, EndpointHealth, LatencySummary,
     ProviderScoreSummary, ReviewItemSummary, RiskTierSummary, ScorecardSummary,
-    SessionActionRequest,
+    SessionActionAttempt, SessionActionAvailability, SessionActionCapability, SessionActionFailure,
+    SessionActionFailureCategory, SessionActionPreflightRequest, SessionActionRequest,
+    SessionActionTarget,
 };
 use coding_brain_core::session::AgentSession;
-use coding_brain_core::terminals::execute_guarded_action;
+use coding_brain_core::session_links::SessionIdentityProjection;
+use coding_brain_core::terminals::{
+    ActionablePrompt, GuardedActionFailureCategory, TerminalSessionAction,
+    execute_guarded_action_classified, probe_actionable_prompt_classified,
+};
 
 use crate::{brain, config};
 
@@ -399,52 +406,281 @@ impl BrainActions for LiveBrainActions {
         brain::review::mark_by_id(decision_id, note.as_deref())
     }
 
-    fn send_session_action(&self, request: SessionActionRequest) -> Result<(), String> {
-        if request.target.provenance == SessionTargetProvenance::Unknown {
-            return Err("session action authority is unavailable".into());
+    fn preflight_session_action(
+        &self,
+        request: SessionActionPreflightRequest,
+    ) -> Result<SessionActionAvailability, SessionActionFailure> {
+        if request.attempt.target.provenance == SessionTargetProvenance::Unknown {
+            return Err(record_live_session_action_failure(
+                &request.attempt,
+                None,
+                SessionActionFailureCategory::AuthorityUnavailable,
+            ));
         }
-        let mut discovery = self
-            .action_discovery
-            .lock()
-            .map_err(|_| "provider discovery state is unavailable".to_string())?;
-        let sessions = coding_brain_core::discovery::scan_agent_sessions_with_state(&mut discovery);
-        drop(discovery);
-        let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
-        let link_path = state_root.join("session-links.jsonl");
-        let projection = match link_path.try_exists() {
-            Ok(false) => coding_brain_core::session_links::SessionIdentityProjection::default(),
-            Ok(true) => coding_brain_core::session_links::SessionLinkStore::at(&link_path)
-                .read_projection()
-                .map_err(|_| "session identity evidence is unavailable".to_string())?,
-            Err(_) => return Err("session identity evidence is unavailable".into()),
-        };
-        let native = AgentSessionKey::native(request.target.provider, &request.target.session_id);
-        let projected_live = projection.live_for(&native);
-        let exact = sessions
-            .iter()
-            .filter(|session| {
-                action_target_matches(
-                    session,
-                    request.target.provider,
-                    request.target.provenance,
-                    &request.target.session_id,
-                    projected_live,
-                )
-            })
-            .collect::<Vec<_>>();
-        let session = match exact.as_slice() {
-            [session] => *session,
-            [] => return Err("no exact live provider session for action".into()),
-            many => {
-                return Err(format!(
-                    "exact live provider session is ambiguous ({} matches)",
-                    many.len()
+        let (sessions, projection) = match self.discover_action_sessions() {
+            Ok(discovery) => discovery,
+            Err(category) => {
+                return Err(record_live_session_action_failure(
+                    &request.attempt,
+                    None,
+                    category,
                 ));
             }
         };
-        execute_guarded_action(session, request.action)
-            .map(|_| ())
-            .map_err(|error| bounded_display(&error))
+        preflight_session_action_from(
+            request,
+            sessions,
+            projection,
+            probe_actionable_prompt_classified,
+            |request, category| {
+                let failure = record_live_session_action_failure(&request.attempt, None, category);
+                failure
+                    .diagnostic_persisted
+                    .then_some(())
+                    .ok_or_else(|| "activity diagnostic append failed".into())
+            },
+        )
+    }
+
+    fn send_session_action(
+        &self,
+        request: SessionActionRequest,
+    ) -> Result<(), SessionActionFailure> {
+        if request.attempt.target.provenance == SessionTargetProvenance::Unknown {
+            return Err(record_live_session_action_failure(
+                &request.attempt,
+                Some(&request.action),
+                SessionActionFailureCategory::AuthorityUnavailable,
+            ));
+        }
+        let (sessions, projection) = match self.discover_action_sessions() {
+            Ok(discovery) => discovery,
+            Err(category) => {
+                return Err(record_live_session_action_failure(
+                    &request.attempt,
+                    Some(&request.action),
+                    category,
+                ));
+            }
+        };
+        let session = match resolve_action_session(&request.attempt.target, sessions, &projection) {
+            Ok(session) => session,
+            Err(category) => {
+                return Err(record_live_session_action_failure(
+                    &request.attempt,
+                    Some(&request.action),
+                    category,
+                ));
+            }
+        };
+        dispatch_session_action_from(
+            request,
+            |request| {
+                execute_guarded_action_classified(&session, request.action.clone())
+                    .map(|_| ())
+                    .map_err(|error| error.category)
+            },
+            |attempt, action, category| {
+                let failure = record_live_session_action_failure(attempt, action, category);
+                failure
+                    .diagnostic_persisted
+                    .then_some(())
+                    .ok_or_else(|| "activity diagnostic append failed".into())
+            },
+        )
+    }
+}
+
+impl LiveBrainActions {
+    fn discover_action_sessions(
+        &self,
+    ) -> Result<(Vec<AgentSession>, SessionIdentityProjection), SessionActionFailureCategory> {
+        let mut discovery = self
+            .action_discovery
+            .lock()
+            .map_err(|_| SessionActionFailureCategory::AuthorityUnavailable)?;
+        let sessions = coding_brain_core::discovery::scan_agent_sessions_with_state(&mut discovery);
+        drop(discovery);
+        let link_path =
+            coding_brain_core::lifecycle::coding_brain_state_root().join("session-links.jsonl");
+        let projection = match link_path.try_exists() {
+            Ok(false) => SessionIdentityProjection::default(),
+            Ok(true) => coding_brain_core::session_links::SessionLinkStore::at(&link_path)
+                .read_projection()
+                .map_err(|_| SessionActionFailureCategory::AuthorityUnavailable)?,
+            Err(_) => return Err(SessionActionFailureCategory::AuthorityUnavailable),
+        };
+        Ok((sessions, projection))
+    }
+}
+
+fn resolve_action_session(
+    target: &SessionActionTarget,
+    sessions: Vec<AgentSession>,
+    projection: &SessionIdentityProjection,
+) -> Result<AgentSession, SessionActionFailureCategory> {
+    let native = AgentSessionKey::native(target.provider, &target.session_id);
+    let projected_live = projection.live_for(&native);
+    let exact = sessions
+        .iter()
+        .filter(|session| {
+            action_target_matches(
+                session,
+                target.provider,
+                target.provenance,
+                &target.session_id,
+                projected_live,
+            )
+        })
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [session] => Ok((*session).clone()),
+        [] => Err(SessionActionFailureCategory::ExactSessionUnavailable),
+        _ => Err(SessionActionFailureCategory::ExactSessionAmbiguous),
+    }
+}
+
+fn capabilities_for_prompt(prompt: Option<ActionablePrompt>) -> Vec<SessionActionCapability> {
+    match prompt {
+        Some(ActionablePrompt::Allow | ActionablePrompt::Deny) => vec![
+            SessionActionCapability::Allow,
+            SessionActionCapability::Deny,
+            SessionActionCapability::ManualText,
+        ],
+        Some(ActionablePrompt::Continue) => vec![
+            SessionActionCapability::Continue,
+            SessionActionCapability::ManualText,
+        ],
+        None => vec![SessionActionCapability::ManualText],
+    }
+}
+
+fn preflight_session_action_from(
+    request: SessionActionPreflightRequest,
+    sessions: Vec<AgentSession>,
+    projection: SessionIdentityProjection,
+    probe: impl FnOnce(
+        &AgentSession,
+    ) -> Result<
+        Option<ActionablePrompt>,
+        coding_brain_core::terminals::GuardedActionFailure,
+    >,
+    persist_failure: impl FnOnce(
+        &SessionActionPreflightRequest,
+        SessionActionFailureCategory,
+    ) -> Result<(), String>,
+) -> Result<SessionActionAvailability, SessionActionFailure> {
+    let result = resolve_action_session(&request.attempt.target, sessions, &projection).and_then(
+        |session| {
+            probe(&session)
+                .map(capabilities_for_prompt)
+                .map_err(|error| SessionActionFailureCategory::Guarded(error.category))
+        },
+    );
+    match result {
+        Ok(capabilities) => Ok(SessionActionAvailability {
+            attempt: request.attempt,
+            capabilities,
+        }),
+        Err(category) => Err(SessionActionFailure {
+            category,
+            diagnostic_persisted: persist_failure(&request, category).is_ok(),
+        }),
+    }
+}
+
+fn dispatch_session_action_from(
+    request: SessionActionRequest,
+    dispatch: impl FnOnce(&SessionActionRequest) -> Result<(), GuardedActionFailureCategory>,
+    persist_failure: impl FnOnce(
+        &SessionActionAttempt,
+        Option<&TerminalSessionAction>,
+        SessionActionFailureCategory,
+    ) -> Result<(), String>,
+) -> Result<(), SessionActionFailure> {
+    match dispatch(&request) {
+        Ok(()) => Ok(()),
+        Err(category) => {
+            let category = SessionActionFailureCategory::Guarded(category);
+            Err(SessionActionFailure {
+                category,
+                diagnostic_persisted: persist_failure(
+                    &request.attempt,
+                    Some(&request.action),
+                    category,
+                )
+                .is_ok(),
+            })
+        }
+    }
+}
+
+fn record_live_session_action_failure(
+    attempt: &SessionActionAttempt,
+    action: Option<&TerminalSessionAction>,
+    category: SessionActionFailureCategory,
+) -> SessionActionFailure {
+    match brain::distill::current_paths() {
+        Ok(paths) => record_session_action_failure(
+            paths.state_root().join("activity.jsonl"),
+            attempt,
+            action,
+            category,
+        ),
+        Err(_) => SessionActionFailure {
+            category,
+            diagnostic_persisted: false,
+        },
+    }
+}
+
+fn record_session_action_failure(
+    path: impl Into<PathBuf>,
+    attempt: &SessionActionAttempt,
+    _action: Option<&TerminalSessionAction>,
+    category: SessionActionFailureCategory,
+) -> SessionActionFailure {
+    let store = brain::activity::ActivityStore::at(path.into());
+    let diagnostic_persisted = store
+        .append(ActivityEvent {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            kind: ActivityKind::Diagnostic,
+            activity_id: format!("session_action:{}", attempt.attempt_id),
+            recorded_at_ms: epoch_ms(),
+            project: ProjectEvidence {
+                project_id: attempt.target.project_id.clone(),
+                cwd: attempt.target.cwd.clone(),
+                label: None,
+            },
+            session: Some(coding_brain_core::brain_activity::SessionTarget {
+                provider: attempt.target.provider,
+                session_id: attempt.target.session_id.clone(),
+                provider_session_id: None,
+                turn_id: None,
+                tool_use_id: None,
+                project_id: attempt.target.project_id.clone(),
+                cwd: attempt.target.cwd.clone(),
+                provider_hints: Vec::new(),
+                provenance: attempt.target.provenance,
+            }),
+            state: ActivityState::Error,
+            tool: Some("session_action".into()),
+            normalized_command: None,
+            fingerprint: None,
+            rule_id: Some(category.rule_id()),
+            confidence: None,
+            threshold: None,
+            reasoning: Some(category.safe_message().into()),
+            decision_id: None,
+            outcome: None,
+            correction: None,
+            note: None,
+            supersedes: None,
+        })
+        .is_ok();
+    SessionActionFailure {
+        category,
+        diagnostic_persisted,
     }
 }
 
@@ -557,6 +793,11 @@ fn epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use coding_brain_core::session_links::{
+        SESSION_IDENTITY_LINK_SCHEMA_VERSION, SessionIdentityLink, SessionLinkStore,
+    };
     use fs2::FileExt;
 
     use super::*;
@@ -650,9 +891,25 @@ mod tests {
 
     #[test]
     fn live_actions_reject_unknown_authority_before_discovery() {
+        let _env_lock = crate::config::HOME_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let config_home = temp.path().join("config");
+        let state_home = temp.path().join("state");
+        let _env = RefreshEnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+        };
+        // SAFETY: this test holds HOME_ENV_LOCK and the guard restores all values.
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            std::env::set_var("XDG_STATE_HOME", &state_home);
+        }
+        std::fs::create_dir_all(state_home.join("coding-brain")).unwrap();
         let actions = LiveBrainActions::default();
-        let request = SessionActionRequest {
-            target: coding_brain_core::brain_activity::SessionTarget {
+        let request =
+            SessionActionPreflightRequest::new(coding_brain_core::brain_activity::SessionTarget {
                 provider: AgentProvider::Codex,
                 session_id: "live:opaque-native".into(),
                 provider_session_id: None,
@@ -662,14 +919,182 @@ mod tests {
                 cwd: "/work/project".into(),
                 provider_hints: Vec::new(),
                 provenance: SessionTargetProvenance::Unknown,
-            },
-            action: coding_brain_core::terminals::TerminalSessionAction::Continue,
-        };
+            });
+
+        let failure = actions.preflight_session_action(request).unwrap_err();
 
         assert_eq!(
-            actions.send_session_action(request).unwrap_err(),
-            "session action authority is unavailable"
+            failure.category,
+            SessionActionFailureCategory::AuthorityUnavailable
         );
+        assert!(failure.diagnostic_persisted);
+    }
+
+    #[test]
+    fn preflight_maps_recovery_prompt_to_continue_and_manual_text() {
+        let request = SessionActionPreflightRequest::new(structured_target());
+
+        let result = preflight_session_action_from(
+            request,
+            vec![discovered_session(AgentProvider::Codex, "native-1")],
+            SessionIdentityProjection::default(),
+            |_| Ok(Some(ActionablePrompt::Continue)),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.capabilities,
+            vec![
+                SessionActionCapability::Continue,
+                SessionActionCapability::ManualText,
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_maps_permission_prompt_to_allow_deny_and_manual_text() {
+        let result = preflight_session_action_from(
+            SessionActionPreflightRequest::new(structured_target()),
+            vec![discovered_session(AgentProvider::Codex, "native-1")],
+            SessionIdentityProjection::default(),
+            |_| Ok(Some(ActionablePrompt::Allow)),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.capabilities,
+            vec![
+                SessionActionCapability::Allow,
+                SessionActionCapability::Deny,
+                SessionActionCapability::ManualText,
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_maps_no_prompt_to_manual_text_only() {
+        let result = preflight_session_action_from(
+            SessionActionPreflightRequest::new(structured_target()),
+            vec![discovered_session(AgentProvider::Codex, "native-1")],
+            SessionIdentityProjection::default(),
+            |_| Ok(None),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.capabilities,
+            vec![SessionActionCapability::ManualText]
+        );
+    }
+
+    #[test]
+    fn preflight_missing_or_stale_exact_session_is_unavailable_without_terminal_probe() {
+        let projected = projected_target_fixture();
+        let cases = [
+            (
+                SessionActionPreflightRequest::new(structured_target()),
+                Vec::new(),
+                SessionIdentityProjection::default(),
+            ),
+            (
+                SessionActionPreflightRequest::new(structured_target()),
+                vec![projected.stale_session],
+                projected.projection,
+            ),
+        ];
+
+        for (request, sessions, projection) in cases {
+            assert_preflight_cardinality_failure(
+                request,
+                sessions,
+                projection,
+                SessionActionFailureCategory::ExactSessionUnavailable,
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_multiple_structured_or_projected_exact_sessions_is_ambiguous_without_terminal_probe()
+     {
+        let structured = discovered_session(AgentProvider::Codex, "native-1");
+        let projected = projected_target_fixture();
+        let mut projected_duplicate = projected.matching_session.clone();
+        projected_duplicate.session_id = "different-discovery-id".into();
+        let cases = [
+            (
+                SessionActionPreflightRequest::new(structured_target()),
+                vec![structured.clone(), structured],
+                SessionIdentityProjection::default(),
+            ),
+            (
+                SessionActionPreflightRequest::new(structured_target()),
+                vec![projected.matching_session, projected_duplicate],
+                projected.projection,
+            ),
+        ];
+
+        for (request, sessions, projection) in cases {
+            assert_preflight_cardinality_failure(
+                request,
+                sessions,
+                projection,
+                SessionActionFailureCategory::ExactSessionAmbiguous,
+            );
+        }
+    }
+
+    #[test]
+    fn manual_failure_diagnostic_contains_category_but_not_terminal_or_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = manual_request("top-secret-literal");
+
+        let failure = record_session_action_failure(
+            temp.path().join("activity.jsonl"),
+            &request.attempt,
+            Some(&request.action),
+            SessionActionFailureCategory::Guarded(
+                GuardedActionFailureCategory::PostflightUnconfirmed,
+            ),
+        );
+
+        assert!(failure.diagnostic_persisted);
+        let stored = std::fs::read_to_string(temp.path().join("activity.jsonl")).unwrap();
+        assert!(stored.contains("session_action_postflight_unconfirmed"));
+        for secret in [
+            "top-secret-literal",
+            "provider-session-secret",
+            "turn-secret",
+            "tool-use-secret",
+            "provider-hint-secret",
+        ] {
+            assert!(!stored.contains(secret));
+        }
+    }
+
+    #[test]
+    fn diagnostic_failure_preserves_category_and_never_retries_delivery() {
+        let sends = Cell::new(0);
+        let request = manual_request("top-secret-literal");
+
+        let failure = dispatch_session_action_from(
+            request,
+            |_| {
+                sends.set(sends.get() + 1);
+                Err(GuardedActionFailureCategory::SendFailed)
+            },
+            |_, _, _| Err("activity store busy".into()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            failure.category,
+            SessionActionFailureCategory::Guarded(GuardedActionFailureCategory::SendFailed)
+        );
+        assert!(!failure.diagnostic_persisted);
+        assert_eq!(sends.get(), 1);
     }
 
     #[test]
@@ -1221,5 +1646,107 @@ mod tests {
         session.identity_provenance =
             coding_brain_core::session::SessionIdentityProvenance::Structured;
         session
+    }
+
+    fn structured_target() -> coding_brain_core::brain_activity::SessionTarget {
+        coding_brain_core::brain_activity::SessionTarget {
+            provider: AgentProvider::Codex,
+            session_id: "native-1".into(),
+            provider_session_id: None,
+            turn_id: Some("turn-1".into()),
+            tool_use_id: None,
+            project_id: coding_brain_core::project::ProjectId::Temporary("project".into()),
+            cwd: "/work/project".into(),
+            provider_hints: Vec::new(),
+            provenance: SessionTargetProvenance::Structured,
+        }
+    }
+
+    struct ProjectedTargetFixture {
+        projection: SessionIdentityProjection,
+        matching_session: AgentSession,
+        stale_session: AgentSession,
+    }
+
+    fn projected_target_fixture() -> ProjectedTargetFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionLinkStore::at(temp.path().join("session-links.jsonl"));
+        let matching_session = discovered_session(AgentProvider::Codex, "projected-discovery-id");
+        let live = matching_session.live_process_identity().unwrap();
+        store
+            .append(SessionIdentityLink {
+                schema_version: SESSION_IDENTITY_LINK_SCHEMA_VERSION,
+                recorded_at_ms: 1,
+                provider: AgentProvider::Codex,
+                native_session_id: "native-1".into(),
+                live_process: live.clone(),
+            })
+            .unwrap();
+        let mut stale_session = matching_session.clone();
+        stale_session.process_start_identity = Some(live.process_start_identity + 1);
+        ProjectedTargetFixture {
+            projection: store.read_projection().unwrap(),
+            matching_session,
+            stale_session,
+        }
+    }
+
+    fn assert_preflight_cardinality_failure(
+        request: SessionActionPreflightRequest,
+        sessions: Vec<AgentSession>,
+        projection: SessionIdentityProjection,
+        expected: SessionActionFailureCategory,
+    ) {
+        let probes = Cell::new(0);
+        let diagnostics = Cell::new(0);
+        let persisted_category = Cell::new(None);
+
+        let failure = preflight_session_action_from(
+            request,
+            sessions,
+            projection,
+            |_| {
+                probes.set(probes.get() + 1);
+                Ok(Some(ActionablePrompt::Continue))
+            },
+            |request, category| {
+                diagnostics.set(diagnostics.get() + 1);
+                persisted_category.set(Some(category));
+                assert!(!request.attempt.target.session_id.contains("secret"));
+                assert!(
+                    !request
+                        .attempt
+                        .target
+                        .cwd
+                        .to_string_lossy()
+                        .contains("secret")
+                );
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.category, expected);
+        assert!(failure.diagnostic_persisted);
+        assert_eq!(probes.get(), 0);
+        assert_eq!(diagnostics.get(), 1);
+        assert_eq!(persisted_category.get(), Some(expected));
+    }
+
+    fn manual_request(text: &str) -> SessionActionRequest {
+        let preflight = SessionActionPreflightRequest::new(sensitive_target());
+        SessionActionRequest {
+            attempt: preflight.attempt,
+            action: coding_brain_core::terminals::TerminalSessionAction::Text(text.into()),
+        }
+    }
+
+    fn sensitive_target() -> coding_brain_core::brain_activity::SessionTarget {
+        let mut target = structured_target();
+        target.provider_session_id = Some("provider-session-secret".into());
+        target.turn_id = Some("turn-secret".into());
+        target.tool_use_id = Some("tool-use-secret".into());
+        target.provider_hints = vec!["provider-hint-secret".into()];
+        target
     }
 }
