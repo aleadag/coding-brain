@@ -47,6 +47,9 @@ ctrlc = "3"
 fs2 = "0.4"
 tempfile = "3"
 
+[dev-dependencies]
+time = { version = "0.3", features = ["formatting"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -330,7 +330,7 @@ fn update_codex_tokens(session: &mut AgentSession) {
                             }
                             CodexEvent::Lifecycle(event) => {
                                 match &event {
-                                    CodexLifecycleEvent::TaskStarted => {
+                                    CodexLifecycleEvent::TaskStarted { .. } => {
                                         last_stop_reason.clear();
                                     }
                                     CodexLifecycleEvent::TaskComplete => {
@@ -436,7 +436,7 @@ fn update_transcript_evidence(
 ) {
     let evidence = match event {
         CodexEvent::Lifecycle(
-            CodexLifecycleEvent::TaskStarted
+            CodexLifecycleEvent::TaskStarted { .. }
             | CodexLifecycleEvent::UserMessage
             | CodexLifecycleEvent::AgentMessage,
         ) => Some(TranscriptEvidence::progress(observed_at_ms)),
@@ -504,7 +504,7 @@ fn read_complete_lines(
 
 fn apply_lifecycle(event: CodexLifecycleEvent, session: &mut AgentSession) {
     match event {
-        CodexLifecycleEvent::TaskStarted | CodexLifecycleEvent::UserMessage => {
+        CodexLifecycleEvent::TaskStarted { .. } | CodexLifecycleEvent::UserMessage => {
             session.task_state = CodexTaskState::Processing;
             session.explicit_input_required = false;
             clear_pending_tool(session);
@@ -831,7 +831,7 @@ mod tests {
         let mut session = session();
         let cases = [
             (
-                CodexEvent::Lifecycle(CodexLifecycleEvent::TaskStarted),
+                CodexEvent::Lifecycle(CodexLifecycleEvent::TaskStarted { turn_id: None }),
                 crate::lifecycle::TranscriptEvidence::progress(Some(1_000)),
             ),
             (

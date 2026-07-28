@@ -12,6 +12,7 @@ use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, ProjectEvidence,
     SessionTarget, bounded_redacted_activity_text, lossless_redacted_activity_text,
 };
+use coding_brain_core::codex_transcript::{CodexResumeEvidenceError, read_codex_resume_evidence};
 use coding_brain_core::lifecycle::{
     ApplyOutcome, IgnoreReason, LifecycleEvent, LifecycleIdentity, LifecycleStore,
     PermissionDisposition, coding_brain_state_root,
@@ -419,6 +420,31 @@ fn record_permission(
     }
 }
 
+fn try_reprove_codex_subagent(
+    store: &LifecycleStore,
+    identity: &LifecycleIdentity,
+) -> Option<CodexResumeEvidenceError> {
+    if identity.provider() != AgentProvider::Codex || identity.provider_session_id().is_none() {
+        return None;
+    }
+    match store.codex_subagent_is_proven(identity) {
+        Ok(true) => return None,
+        Ok(false) => {}
+        Err(_) => return Some(CodexResumeEvidenceError::InvalidRecord),
+    }
+    let Some(path) = identity.transcript_path() else {
+        return Some(CodexResumeEvidenceError::MetadataMissing);
+    };
+    let evidence = match read_codex_resume_evidence(path) {
+        Ok(evidence) => evidence,
+        Err(error) => return Some(error),
+    };
+    match store.reprove_codex_subagent(identity, &evidence) {
+        Ok(ApplyOutcome::Applied | ApplyOutcome::Ignored(IgnoreReason::Duplicate)) => None,
+        Ok(ApplyOutcome::Ignored(_)) | Err(_) => Some(CodexResumeEvidenceError::InvalidRecord),
+    }
+}
+
 fn run_with_gate_and_store<R, W, E, F>(
     stdin: R,
     stdout: W,
@@ -529,6 +555,7 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
     };
     let activity_context =
         current_paths().and_then(|paths| HookActivity::from_request(&request, &paths));
+    let reproof_error = try_reprove_codex_subagent(lifecycle_store, &request.lifecycle);
     let mut persistence_error = match (&activity_context, activity_store) {
         (Err(error), _) => Some(error.to_string()),
         (_, None) => Some("activity store unavailable".into()),
@@ -805,7 +832,10 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
             PermissionDisposition::Decided,
             &request.request_key,
         ) {
-            let message = format!("could not persist executable permission state: {error}");
+            let mut message = format!("could not persist executable permission state: {error}");
+            if let Some(error) = reproof_error {
+                message.push_str(&format!("; Codex resume evidence: {error}"));
+            }
             write_diagnostic(&mut stderr, &message);
             if let (Ok(context), Some(activity_store)) = (&activity_context, activity_store) {
                 let mut event = context.event(ActivityState::Error);
