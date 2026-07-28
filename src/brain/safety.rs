@@ -12,7 +12,17 @@ pub(crate) struct SafetyDeny {
 struct ShellWord {
     text: String,
     variable_expansion: bool,
+    non_arithmetic_expansion: bool,
+    ansi_c_escape: bool,
     tilde_expansion: bool,
+    command_substitution: bool,
+}
+
+#[derive(Default)]
+struct ShellExpansions {
+    variable: bool,
+    non_arithmetic: bool,
+    ansi_c_escape: bool,
     command_substitution: bool,
 }
 
@@ -21,11 +31,11 @@ pub(crate) fn evaluate(command: Option<&str>) -> Option<SafetyDeny> {
 
     let mut assignments = HashMap::new();
     for command in tokenize_commands(input) {
+        let mut dynamic_execution = command.iter().any(|word| word.command_substitution);
+        let command = without_redirections(&command);
         let mut words = command.as_slice();
-        let mut dynamic_execution = false;
         while let Some((name, value)) = words.first().and_then(|word| word.text.split_once('=')) {
             if is_variable_name(name) {
-                dynamic_execution |= words[0].command_substitution;
                 assignments.insert(name.to_string(), value.to_string());
                 words = &words[1..];
             } else {
@@ -36,29 +46,28 @@ pub(crate) fn evaluate(command: Option<&str>) -> Option<SafetyDeny> {
             if dynamic_execution {
                 return Some(SafetyDeny {
                     rule_id: "unsafe-recursive-delete-expansion",
-                    reason: "refusing execution through an unresolved command substitution".into(),
+                    reason:
+                        "refusing execution through unresolved or dynamically parsed shell input"
+                            .into(),
                 });
             }
             continue;
         }
         words = unwrap_command(words, &mut dynamic_execution);
-        dynamic_execution |= words.first().is_some_and(|word| word.command_substitution);
+        dynamic_execution |= words
+            .first()
+            .is_some_and(|word| word.non_arithmetic_expansion || word.ansi_c_escape);
         if dynamic_execution {
             return Some(SafetyDeny {
                 rule_id: "unsafe-recursive-delete-expansion",
-                reason: "refusing execution through an unresolved command substitution".into(),
+                reason: "refusing execution through unresolved or dynamically parsed shell input"
+                    .into(),
             });
         }
         if words.first().map(|word| command_name(&word.text)) != Some("rm") {
             continue;
         }
         let args = &words[1..];
-        if args.iter().any(|argument| argument.command_substitution) {
-            return Some(SafetyDeny {
-                rule_id: "unsafe-recursive-delete-expansion",
-                reason: "refusing deletion through an unresolved command substitution".into(),
-            });
-        }
         if !args.iter().any(|arg| is_recursive_flag(&arg.text)) {
             continue;
         }
@@ -217,7 +226,37 @@ fn command_name(command: &str) -> &str {
 
 fn unwrap_command<'a>(mut words: &'a [ShellWord], dynamic_execution: &mut bool) -> &'a [ShellWord] {
     loop {
+        while words.first().is_some_and(|word| is_assignment(&word.text)) {
+            words = &words[1..];
+        }
         match words.first().map(|word| command_name(&word.text)) {
+            Some("!" | "if" | "while" | "until" | "then" | "elif" | "do") => words = &words[1..],
+            Some("time") => {
+                words = &words[1..];
+                while words
+                    .first()
+                    .is_some_and(|word| word.text.starts_with('-') && word.text != "-")
+                {
+                    words = &words[1..];
+                }
+            }
+            Some("exec") => {
+                words = &words[1..];
+                while let Some(option) = words.first() {
+                    if option.text == "--" {
+                        words = &words[1..];
+                        break;
+                    }
+                    if !option.text.starts_with('-') || option.text == "-" {
+                        break;
+                    }
+                    let takes_value = option.text == "-a";
+                    words = &words[1..];
+                    if takes_value && !words.is_empty() {
+                        words = &words[1..];
+                    }
+                }
+            }
             Some("sudo") => {
                 words = &words[1..];
                 while let Some(option) = words.first() {
@@ -228,28 +267,7 @@ fn unwrap_command<'a>(mut words: &'a [ShellWord], dynamic_execution: &mut bool) 
                     if !option.text.starts_with('-') || option.text == "-" {
                         break;
                     }
-                    let takes_value = matches!(
-                        option.text.as_str(),
-                        "-u" | "-g"
-                            | "-h"
-                            | "-p"
-                            | "-C"
-                            | "-T"
-                            | "-R"
-                            | "-D"
-                            | "-t"
-                            | "--user"
-                            | "--group"
-                            | "--host"
-                            | "--prompt"
-                            | "--close-from"
-                            | "--command-timeout"
-                            | "--chroot"
-                            | "--chdir"
-                            | "--role"
-                            | "--type"
-                            | "--other-user"
-                    );
+                    let takes_value = sudo_option_takes_separate_value(&option.text);
                     words = &words[1..];
                     if takes_value && !words.is_empty() {
                         words = &words[1..];
@@ -271,28 +289,22 @@ fn unwrap_command<'a>(mut words: &'a [ShellWord], dynamic_execution: &mut bool) 
                     if word.text == "--" {
                         words = &words[1..];
                         break;
-                    } else if word.text.starts_with("--split-string=")
-                        || (word.text.starts_with("-S") && word.text != "-S")
-                    {
-                        *dynamic_execution |= word.command_substitution;
-                        words = &words[1..];
-                    } else if matches!(
-                        word.text.as_str(),
-                        "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string"
-                    ) {
-                        let split_string = matches!(word.text.as_str(), "-S" | "--split-string");
-                        words = &words[1..];
-                        if !words.is_empty() {
-                            if split_string {
-                                *dynamic_execution |= words[0].command_substitution;
-                            }
-                            words = &words[1..];
-                        }
                     } else if is_assignment(&word.text) {
-                        *dynamic_execution |= word.command_substitution;
                         words = &words[1..];
-                    } else if word.text.starts_with('-') {
-                        words = &words[1..];
+                    } else if word.text.starts_with('-') && word.text != "-" {
+                        match classify_env_option(&word.text) {
+                            EnvOption::Flag => words = &words[1..],
+                            EnvOption::TakesSeparateValue => {
+                                words = &words[1..];
+                                if !words.is_empty() {
+                                    words = &words[1..];
+                                }
+                            }
+                            EnvOption::SplitString => {
+                                *dynamic_execution = true;
+                                words = &words[1..];
+                            }
+                        }
                     } else {
                         break;
                     }
@@ -308,15 +320,124 @@ fn is_assignment(word: &str) -> bool {
         .is_some_and(|(name, _)| is_variable_name(name))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvOption {
+    Flag,
+    TakesSeparateValue,
+    SplitString,
+}
+
+fn classify_env_option(word: &str) -> EnvOption {
+    if let Some(long) = word.strip_prefix("--") {
+        let (name, attached) = long
+            .split_once('=')
+            .map_or((long, false), |(name, _)| (name, true));
+        if !name.is_empty() && "split-string".starts_with(name) {
+            return EnvOption::SplitString;
+        }
+        if !attached && !name.is_empty() && ("unset".starts_with(name) || "chdir".starts_with(name))
+        {
+            return EnvOption::TakesSeparateValue;
+        }
+        return EnvOption::Flag;
+    }
+
+    let mut options = word
+        .strip_prefix('-')
+        .unwrap_or_default()
+        .chars()
+        .peekable();
+    while let Some(option) = options.next() {
+        match option {
+            'S' => return EnvOption::SplitString,
+            'u' | 'C' if options.peek().is_none() => return EnvOption::TakesSeparateValue,
+            'u' | 'C' => return EnvOption::Flag,
+            _ => {}
+        }
+    }
+    EnvOption::Flag
+}
+
+fn sudo_option_takes_separate_value(word: &str) -> bool {
+    if let Some(long) = word.strip_prefix("--") {
+        let (name, attached) = long
+            .split_once('=')
+            .map_or((long, false), |(name, _)| (name, true));
+        return !attached
+            && !name.is_empty()
+            && [
+                "user",
+                "group",
+                "host",
+                "prompt",
+                "close-from",
+                "command-timeout",
+                "chroot",
+                "chdir",
+                "role",
+                "type",
+                "other-user",
+            ]
+            .into_iter()
+            .any(|option| option.starts_with(name));
+    }
+
+    let mut options = word
+        .strip_prefix('-')
+        .unwrap_or_default()
+        .chars()
+        .peekable();
+    while let Some(option) = options.next() {
+        if matches!(option, 'u' | 'g' | 'h' | 'p' | 'C' | 'T' | 'R' | 'D' | 't') {
+            return options.peek().is_none();
+        }
+    }
+    false
+}
+
+fn without_redirections(words: &[ShellWord]) -> Vec<ShellWord> {
+    let mut normalized = Vec::with_capacity(words.len());
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        let Some(consumes_next) = redirection_consumes_next(&word.text) else {
+            normalized.push(word.clone());
+            continue;
+        };
+        if consumes_next {
+            words.next();
+        }
+    }
+    normalized
+}
+
+fn redirection_consumes_next(word: &str) -> Option<bool> {
+    let operator = word.find(['<', '>'])?;
+    let prefix = &word[..operator];
+    let valid_prefix = prefix.is_empty()
+        || prefix.chars().all(|character| character.is_ascii_digit())
+        || prefix
+            .strip_prefix('{')
+            .and_then(|value| value.strip_suffix('}'))
+            .is_some_and(is_variable_name);
+    if !valid_prefix {
+        return None;
+    }
+    let consumes_next = word[operator..]
+        .trim_start_matches(['<', '>', '|', '&', '-'])
+        .is_empty();
+    Some(consumes_next)
+}
+
 fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
     let mut commands = Vec::new();
     let mut command = Vec::new();
     let mut word = String::new();
     let mut word_started = false;
-    let mut variable_expansion = false;
+    let mut expansions = ShellExpansions::default();
     let mut tilde_expansion = false;
-    let mut command_substitution = false;
     let mut quote = None;
+    let mut ansi_c_quote = false;
+    let mut ansi_c_quote_pending = false;
     let mut escaped = false;
     let mut chars = input.chars().peekable();
 
@@ -338,16 +459,20 @@ fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
         if let Some(active_quote) = quote {
             if character == active_quote {
                 quote = None;
+                ansi_c_quote = false;
             } else {
                 if active_quote == '"' {
                     if character == '$' {
-                        variable_expansion = true;
+                        expansions.variable = true;
+                        expansions.non_arithmetic |= !arithmetic_expansion_follows(chars.clone());
                         if command_substitution_follows(chars.clone()) {
-                            command_substitution = true;
+                            expansions.command_substitution = true;
                         }
                     } else if character == '`' {
-                        command_substitution = true;
+                        expansions.command_substitution = true;
                     }
+                } else if ansi_c_quote && character == '\\' {
+                    expansions.ansi_c_escape = true;
                 }
                 word.push(character);
             }
@@ -357,24 +482,24 @@ fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
         match character {
             '\'' | '"' => {
                 quote = Some(character);
+                ansi_c_quote = ansi_c_quote_pending && character == '\'';
+                ansi_c_quote_pending = false;
                 word_started = true;
             }
             ' ' | '\t' | '\r' => push_word(
                 &mut command,
                 &mut word,
                 &mut word_started,
-                &mut variable_expansion,
+                &mut expansions,
                 &mut tilde_expansion,
-                &mut command_substitution,
             ),
             ';' | '\n' => push_command(
                 &mut commands,
                 &mut command,
                 &mut word,
                 &mut word_started,
-                &mut variable_expansion,
+                &mut expansions,
                 &mut tilde_expansion,
-                &mut command_substitution,
             ),
             '&' | '|' => {
                 if chars.peek() == Some(&character) {
@@ -385,19 +510,24 @@ fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
                     &mut command,
                     &mut word,
                     &mut word_started,
-                    &mut variable_expansion,
+                    &mut expansions,
                     &mut tilde_expansion,
-                    &mut command_substitution,
                 );
             }
             '$' => {
-                variable_expansion = true;
-                command_substitution |= command_substitution_follows(chars.clone());
+                let shell_quote = shell_quote_follows(chars.clone());
+                if let Some(shell_quote) = shell_quote {
+                    ansi_c_quote_pending = shell_quote == '\'';
+                } else {
+                    expansions.variable = true;
+                    expansions.non_arithmetic |= !arithmetic_expansion_follows(chars.clone());
+                    expansions.command_substitution |= command_substitution_follows(chars.clone());
+                    word.push(character);
+                }
                 word_started = true;
-                word.push(character);
             }
             '`' => {
-                command_substitution = true;
+                expansions.command_substitution = true;
                 word_started = true;
                 word.push(character);
             }
@@ -420,9 +550,8 @@ fn tokenize_commands(input: &str) -> Vec<Vec<ShellWord>> {
         &mut command,
         &mut word,
         &mut word_started,
-        &mut variable_expansion,
+        &mut expansions,
         &mut tilde_expansion,
-        &mut command_substitution,
     );
     commands
 }
@@ -432,6 +561,24 @@ where
     I: Iterator<Item = char>,
 {
     next_shell_character(&mut chars) == Some('(') && next_shell_character(&mut chars) != Some('(')
+}
+
+fn arithmetic_expansion_follows<I>(mut chars: std::iter::Peekable<I>) -> bool
+where
+    I: Iterator<Item = char>,
+{
+    match next_shell_character(&mut chars) {
+        Some('[') => true,
+        Some('(') => next_shell_character(&mut chars) == Some('('),
+        _ => false,
+    }
+}
+
+fn shell_quote_follows<I>(mut chars: std::iter::Peekable<I>) -> Option<char>
+where
+    I: Iterator<Item = char>,
+{
+    next_shell_character(&mut chars).filter(|character| matches!(character, '\'' | '"'))
 }
 
 fn next_shell_character<I>(chars: &mut std::iter::Peekable<I>) -> Option<char>
@@ -452,16 +599,17 @@ fn push_word(
     command: &mut Vec<ShellWord>,
     word: &mut String,
     word_started: &mut bool,
-    variable_expansion: &mut bool,
+    expansions: &mut ShellExpansions,
     tilde_expansion: &mut bool,
-    command_substitution: &mut bool,
 ) {
     if *word_started {
         command.push(ShellWord {
             text: std::mem::take(word),
-            variable_expansion: std::mem::take(variable_expansion),
+            variable_expansion: std::mem::take(&mut expansions.variable),
+            non_arithmetic_expansion: std::mem::take(&mut expansions.non_arithmetic),
+            ansi_c_escape: std::mem::take(&mut expansions.ansi_c_escape),
             tilde_expansion: std::mem::take(tilde_expansion),
-            command_substitution: std::mem::take(command_substitution),
+            command_substitution: std::mem::take(&mut expansions.command_substitution),
         });
         *word_started = false;
     }
@@ -472,18 +620,10 @@ fn push_command(
     command: &mut Vec<ShellWord>,
     word: &mut String,
     word_started: &mut bool,
-    variable_expansion: &mut bool,
+    expansions: &mut ShellExpansions,
     tilde_expansion: &mut bool,
-    command_substitution: &mut bool,
 ) {
-    push_word(
-        command,
-        word,
-        word_started,
-        variable_expansion,
-        tilde_expansion,
-        command_substitution,
-    );
+    push_word(command, word, word_started, expansions, tilde_expansion);
     if !command.is_empty() {
         commands.push(std::mem::take(command));
     }
@@ -512,9 +652,24 @@ mod tests {
             "sudo --user root /usr/bin/rm -rf /",
             "env -- /bin/rm -rf /",
             "env -u PATH /bin/rm -rf /",
+            "$'rm' --no-preserve-root -rf /",
         ] {
             let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
             assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn ansi_c_escaped_command_position_denies() {
+        for command in [
+            "$'\\x72\\x6d' --no-preserve-root -rf /",
+            "$'r\\155' --no-preserve-root -rf /",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
         }
     }
 
@@ -577,6 +732,63 @@ mod tests {
     }
 
     #[test]
+    fn command_substitution_in_any_argument_denies() {
+        for command in [
+            "printf '%s' \"$(rm --no-preserve-root -rf /)\"",
+            "echo $(rm --no-preserve-root -rf /)",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_expanded_command_position_denies() {
+        for command in [
+            "CMD=rm; $CMD --no-preserve-root -rf /",
+            "COMMAND=/bin/rm; ${COMMAND} --no-preserve-root -rf /",
+            "CMD=rm; >/dev/null $CMD --no-preserve-root -rf /",
+            "CMD=rm; > /dev/null $CMD --no-preserve-root -rf /",
+            "CMD=rm; exec $CMD --no-preserve-root -rf /",
+            "CMD=rm; ! $CMD --no-preserve-root -rf /",
+            "CMD=rm; if $CMD --no-preserve-root -rf /; then :; fi",
+            "CMD=rm; while $CMD --no-preserve-root -rf /; do :; done",
+            "CMD=rm; until $CMD --no-preserve-root -rf /; do :; done",
+            "CMD=rm; time $CMD --no-preserve-root -rf /",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_expanded_command_after_supported_wrappers_denies() {
+        for command in [
+            "CMD=rm; sudo FOO=bar $CMD --no-preserve-root -rf /",
+            "CMD=rm; env -iC /tmp $CMD --no-preserve-root -rf /",
+            "CMD=rm; sudo >/dev/null -u root $CMD --no-preserve-root -rf /",
+            "CMD=rm; sudo -u >/dev/null root $CMD --no-preserve-root -rf /",
+            "CMD=rm; sudo -nu root $CMD --no-preserve-root -rf /",
+            "CMD=rm; env >/dev/null -iC /tmp $CMD --no-preserve-root -rf /",
+            "CMD=rm; env -iC >/dev/null /tmp $CMD --no-preserve-root -rf /",
+            "CMD=rm; exec >/dev/null -a fake $CMD --no-preserve-root -rf /",
+            "CMD=rm; command >/dev/null -- $CMD --no-preserve-root -rf /",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn command_substitution_in_execution_control_positions_denies() {
         for command in [
             "TARGET=$(printf /); rm -rf \"$TARGET\"",
@@ -585,6 +797,26 @@ mod tests {
             "`printf rm` -rf /",
             "env TARGET=$(printf /) rm -rf \"$TARGET\"",
             "env TARGET=`printf /` rm -rf \"$TARGET\"",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_env_split_string_execution_denies() {
+        for command in [
+            "env -S 'rm -rf /'",
+            "env -S'rm -rf /'",
+            "env -iS 'rm -rf /'",
+            "env -iS'rm -rf /'",
+            "env --split-string 'rm -rf /'",
+            "env --split-string='rm -rf /'",
+            "env --split 'rm -rf /'",
+            "env --split='rm -rf /'",
         ] {
             let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
             assert_eq!(
@@ -637,6 +869,7 @@ mod tests {
             "$\\\n((1+1)) -rf /",
             "TARGET=$(\\\n(1+1)); echo \"$TARGET\"",
             "$(\\\n(1+1)) -rf /",
+            "$[1+1] -rf /",
         ] {
             assert!(evaluate_command(command).is_none(), "{command}");
         }
@@ -651,6 +884,8 @@ mod tests {
             "rm -rf \\`resolve-target\\`",
             "TARGET='$(printf /)'; echo \"$TARGET\"",
             "'$(printf rm)' -rf /",
+            "$'$(rm --no-preserve-root -rf /)' ignored",
+            "$'printf' hello",
         ] {
             assert!(evaluate_command(command).is_none(), "{command}");
         }

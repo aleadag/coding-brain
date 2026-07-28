@@ -33,6 +33,9 @@ All notable changes to codexctl are documented here.
 
 ### Fixed
 
+- Deterministic shell safety now blocks command substitutions, variable-expanded
+  command positions, and GNU `env` split strings before model inference, so
+  dynamic spellings cannot bypass destructive recursive-delete denials.
 - Release tags now rerun formatting, Clippy, and all-target tests before
   publishing. The curl installer now requires a valid release checksum and a
   supported verifier before extracting or installing the binary.
