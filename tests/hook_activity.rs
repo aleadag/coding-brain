@@ -871,16 +871,176 @@ fn resumed_codex_child_permission_is_reproved_and_delivered() {
             }
         })
     );
-    let events = activity(home.path()).read().unwrap().events().to_vec();
+    assert_delivered_child_decision(home.path(), "child-a", "turn-b");
+}
+
+#[test]
+fn interrupted_codex_child_permission_refreshes_active_turn_and_is_delivered() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-a", "turn-a"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_pre_payload(home.path(), "child-a", "turn-a", "tool-a"),
+    );
+    let transcript = home.path().join("rollout-child-a.jsonl");
+    write_child_resume_transcript(
+        &transcript,
+        "child-a",
+        "root-1",
+        "root-1",
+        "turn-b",
+        &one_second_from_now_rfc3339(),
+    );
+
+    let permission = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload_with_transcript(home.path(), "child-a", "turn-b", &transcript),
+    );
+
+    assert!(permission.status.success());
+    assert!(
+        !permission.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&permission.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&permission.stderr).contains("AmbiguousTurn"));
+    assert!(!String::from_utf8_lossy(&permission.stderr).contains("SubagentTurnMismatch"));
+    assert_delivered_child_decision(home.path(), "child-a", "turn-b");
+}
+
+#[test]
+fn stopped_codex_child_skips_permissionless_followup_and_delivers_next_turn() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-a", "turn-a"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_stop_payload(home.path(), "child-a", "turn-a"),
+    );
+    let turn_b = one_second_from_now_rfc3339();
+    let transcript = home.path().join("rollout-child-a.jsonl");
+    fs::write(
+        &transcript,
+        format!(
+            "{}\
+             {{\"timestamp\":\"{turn_b}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-b\"}}}}\n\
+             {{\"timestamp\":\"{turn_b}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-b\"}}}}\n",
+            child_resume_metadata("child-a", "root-1", "root-1"),
+        ),
+    )
+    .unwrap();
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_stop_payload(home.path(), "child-a", "turn-b"),
+    );
+    let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
+    let snapshot = lifecycle.read().unwrap().snapshot.unwrap();
+    let root_key =
+        coding_brain_core::provider::AgentSessionKey::native(AgentProvider::Codex, "root-1")
+            .storage_key();
+    let stopped = &snapshot.sessions[&root_key].stopped_subagents["child-a"];
+    assert_eq!(stopped.turn_id, "turn-b");
+    let turn_c = OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(stopped.received_at_ms + 1_000) * 1_000_000,
+    )
+    .unwrap()
+    .format(&Rfc3339)
+    .unwrap();
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap(),
+        "{{\"timestamp\":\"{turn_c}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-c\"}}}}"
+    )
+    .unwrap();
+
+    let permission = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload_with_transcript(home.path(), "child-a", "turn-c", &transcript),
+    );
+
+    assert!(permission.status.success());
+    assert!(
+        !permission.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&permission.stderr)
+    );
+    assert_delivered_child_decision(home.path(), "child-a", "turn-c");
+}
+
+#[test]
+fn invalid_active_codex_followup_evidence_emits_no_allow() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &subagent_start_payload(home.path(), "child-a", "turn-a"),
+    );
+    run_provider_lifecycle_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_pre_payload(home.path(), "child-a", "turn-a", "tool-a"),
+    );
+    let transcript = home.path().join("rollout-child-a.jsonl");
+    write_child_resume_transcript(
+        &transcript,
+        "child-a",
+        "root-1",
+        "root-1",
+        "turn-other",
+        &one_second_from_now_rfc3339(),
+    );
+
+    let permission = run_provider_permission_hook(
+        home.path(),
+        "codex",
+        None,
+        &child_permission_payload_with_transcript(home.path(), "child-a", "turn-b", &transcript),
+    );
+
+    let stderr = String::from_utf8_lossy(&permission.stderr);
+    assert!(permission.status.success());
+    assert!(permission.stdout.is_empty());
+    assert!(stderr.contains("SubagentTurnMismatch"), "{stderr}");
+    assert!(stderr.contains("Codex resume evidence:"), "{stderr}");
+}
+
+fn assert_delivered_child_decision(home: &Path, child_id: &str, turn_id: &str) {
+    let events = activity(home).read().unwrap().events().to_vec();
     assert_eq!(
         events
             .iter()
             .filter(|event| {
                 event.kind == ActivityKind::Decision
                     && event.session.as_ref().is_some_and(|session| {
-                        session.session_id == "child-a"
+                        session.session_id == child_id
                             && session.provider_session_id.as_deref() == Some("root-1")
-                            && session.turn_id.as_deref() == Some("turn-b")
+                            && session.turn_id.as_deref() == Some(turn_id)
                     })
             })
             .map(|event| event.state)

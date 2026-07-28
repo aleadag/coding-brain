@@ -792,6 +792,14 @@ impl LifecycleSnapshot {
         );
     }
 
+    pub(crate) fn remove_linked_subagent_projection(
+        &mut self,
+        provider: AgentProvider,
+        child_id: &str,
+    ) {
+        self.remove_linked_children(provider, child_id, false, None);
+    }
+
     fn linked_subtree(
         &self,
         provider: AgentProvider,
