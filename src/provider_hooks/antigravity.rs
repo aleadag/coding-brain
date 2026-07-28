@@ -210,7 +210,7 @@ pub(crate) fn parse_lifecycle(
                 None => return Err(HookInputError::Missing("fullyIdle")),
             }
             (
-                LifecycleEventKind::Stop,
+                Some(LifecycleEventKind::Stop),
                 format!("execution-{execution}"),
                 None,
                 None,
@@ -226,7 +226,7 @@ pub(crate) fn parse_lifecycle(
                 .initial_num_steps
                 .ok_or(HookInputError::Missing("initialNumSteps"))?;
             (
-                LifecycleEventKind::UserPromptSubmit,
+                Some(LifecycleEventKind::UserPromptSubmit),
                 format!("invocation-{invocation}"),
                 Some(initial_num_steps),
                 None,
@@ -242,7 +242,7 @@ pub(crate) fn parse_lifecycle(
                 .initial_num_steps
                 .ok_or(HookInputError::Missing("initialNumSteps"))?;
             (
-                LifecycleEventKind::Stop,
+                None,
                 format!("invocation-{invocation}"),
                 None,
                 None,
@@ -259,7 +259,7 @@ pub(crate) fn parse_lifecycle(
                 return Err(HookInputError::Invalid("toolCall.args"));
             }
             (
-                LifecycleEventKind::PreToolUse,
+                Some(LifecycleEventKind::PreToolUse),
                 format!("step-{step}"),
                 None,
                 Some(format!("step-{step}")),
@@ -270,7 +270,7 @@ pub(crate) fn parse_lifecycle(
         TrustedAntigravityEvent::PostToolUse => {
             let step = input.step_idx.ok_or(HookInputError::Missing("stepIdx"))?;
             (
-                LifecycleEventKind::PostToolUse,
+                Some(LifecycleEventKind::PostToolUse),
                 format!("step-{step}"),
                 None,
                 Some(format!("step-{step}")),
@@ -344,7 +344,7 @@ mod tests {
         let parsed =
             parse_lifecycle(Some("PreToolUse"), &serde_json::to_vec(&payload).unwrap()).unwrap();
 
-        assert_eq!(parsed.event, LifecycleEventKind::PreToolUse);
+        assert_eq!(parsed.event, Some(LifecycleEventKind::PreToolUse));
         assert_eq!(parsed.tool_use_id.as_deref(), Some("step-5"));
         assert_eq!(parsed.tool_name.as_deref(), Some("run_command"));
     }
@@ -359,13 +359,13 @@ mod tests {
         let parsed =
             parse_lifecycle(Some("PostToolUse"), &serde_json::to_vec(&payload).unwrap()).unwrap();
 
-        assert_eq!(parsed.event, LifecycleEventKind::PostToolUse);
+        assert_eq!(parsed.event, Some(LifecycleEventKind::PostToolUse));
         assert_eq!(parsed.tool_use_id.as_deref(), Some("step-5"));
         assert_eq!(parsed.tool_name, None);
     }
 
     #[test]
-    fn invocation_events_open_and_close_the_same_trajectory() {
+    fn post_invocation_is_a_validated_no_transition_callback() {
         let payload = serde_json::json!({
             "invocationNum": 3,
             "initialNumSteps": 10,
@@ -377,12 +377,12 @@ mod tests {
         let raw = serde_json::to_vec(&payload).unwrap();
 
         let pre = parse_lifecycle(Some("PreInvocation"), &raw).unwrap();
-        assert_eq!(pre.event, LifecycleEventKind::UserPromptSubmit);
+        assert_eq!(pre.event, Some(LifecycleEventKind::UserPromptSubmit));
         assert_eq!(pre.identity.turn_id(), Some("invocation-3"));
         assert_eq!(pre.turn_initial_step, Some(10));
 
         let post = parse_lifecycle(Some("PostInvocation"), &raw).unwrap();
-        assert_eq!(post.event, LifecycleEventKind::Stop);
+        assert_eq!(post.event, None);
         assert_eq!(post.identity.turn_id(), Some("invocation-3"));
         assert_eq!(post.turn_initial_step, None);
     }

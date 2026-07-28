@@ -140,7 +140,7 @@ pub(crate) fn parse_lifecycle(raw: &[u8]) -> Result<ParsedLifecycleHook, HookInp
         .then(|| normalized_outcome(input.tool_response.as_ref()));
     Ok(ParsedLifecycleHook {
         identity,
-        event,
+        event: Some(event),
         turn_initial_step: None,
         tool_use_id,
         tool_name,

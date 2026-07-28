@@ -270,6 +270,33 @@ fn run_provider_lifecycle_hook(
     child.wait_with_output().unwrap()
 }
 
+fn antigravity_invocation_payload(home: &Path, invocation: u64, initial_step: u64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "invocationNum": invocation,
+        "initialNumSteps": initial_step,
+        "conversationId": "agy-conversation-1",
+        "workspacePaths": [home],
+        "transcriptPath": "/tmp/agy-conversation-1/transcript.jsonl",
+        "artifactDirectoryPath": "/tmp/agy-conversation-1/artifacts"
+    }))
+    .unwrap()
+}
+
+fn antigravity_permission_payload_for_step(home: &Path, step: u64) -> Vec<u8> {
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&antigravity_permission_payload(home, None)).unwrap();
+    payload["stepIdx"] = serde_json::json!(step);
+    serde_json::to_vec(&payload).unwrap()
+}
+
+fn antigravity_stop_payload(home: &Path, execution: u64) -> Vec<u8> {
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/hooks/antigravity-stop.json")).unwrap();
+    payload["executionNum"] = serde_json::json!(execution);
+    payload["workspacePaths"] = serde_json::json!([home]);
+    serde_json::to_vec(&payload).unwrap()
+}
+
 fn claude_permission_payload(cwd: &Path, policy: Option<&str>) -> Vec<u8> {
     let mut payload: serde_json::Value = serde_json::from_slice(include_bytes!(
         "fixtures/hooks/claude-permission-request.json"
@@ -1497,6 +1524,117 @@ fn antigravity_open_invocation_allows_in_range_step() {
             .iter()
             .any(|event| event.state == ActivityState::Delivered)
     );
+}
+
+#[test]
+fn antigravity_post_invocation_preserves_bounded_permission_authority_until_stop() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    let invocation = antigravity_invocation_payload(home.path(), 14, 70);
+
+    let pre = run_provider_lifecycle_hook(
+        home.path(),
+        "antigravity",
+        Some("PreInvocation"),
+        &invocation,
+    );
+    assert!(pre.status.success());
+    assert!(pre.stderr.is_empty());
+
+    for step in [70, 72] {
+        if step == 72 {
+            let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
+            let before_snapshot = lifecycle.read().unwrap().snapshot.unwrap();
+            let before_activity = activity(home.path()).read().unwrap().events().to_vec();
+            let post = run_provider_lifecycle_hook(
+                home.path(),
+                "antigravity",
+                Some("PostInvocation"),
+                &invocation,
+            );
+            assert!(post.status.success());
+            assert!(post.stderr.is_empty());
+            assert_eq!(lifecycle.read().unwrap().snapshot.unwrap(), before_snapshot);
+            assert_eq!(
+                activity(home.path()).read().unwrap().events(),
+                before_activity
+            );
+        }
+
+        let before_permission = activity(home.path()).read().unwrap().events().to_vec();
+        let output = run_provider_permission_hook(
+            home.path(),
+            "antigravity",
+            Some("PreToolUse"),
+            &antigravity_permission_payload_for_step(home.path(), step),
+        );
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::json!({"decision": "allow"})
+        );
+        let all_events = activity(home.path()).read().unwrap().events().to_vec();
+        let new_events = &all_events[before_permission.len()..];
+        let expected_tool_use_id = format!("step-{step}");
+        let allowed = new_events
+            .iter()
+            .find(|event| {
+                event.state == ActivityState::Allowed
+                    && event.tool.as_deref() == Some("run_command")
+                    && event
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.tool_use_id.as_deref())
+                        == Some(expected_tool_use_id.as_str())
+            })
+            .unwrap();
+        assert!(new_events.iter().any(|event| {
+            event.state == ActivityState::Delivered && event.activity_id == allowed.activity_id
+        }));
+    }
+
+    let before_stop_rejection = activity(home.path()).read().unwrap().events().to_vec();
+    let stop = run_provider_lifecycle_hook(
+        home.path(),
+        "antigravity",
+        Some("Stop"),
+        &antigravity_stop_payload(home.path(), 3),
+    );
+    assert!(stop.status.success());
+    assert!(stop.stderr.is_empty());
+
+    let after_stop = run_provider_permission_hook(
+        home.path(),
+        "antigravity",
+        Some("PreToolUse"),
+        &antigravity_permission_payload_for_step(home.path(), 74),
+    );
+    assert!(after_stop.status.success());
+    assert!(String::from_utf8_lossy(&after_stop.stderr).contains("AmbiguousTurn"));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&after_stop.stdout).unwrap(),
+        serde_json::json!({
+            "decision": "ask",
+            "reason": "Coding Brain abstained"
+        })
+    );
+
+    let all_events = activity(home.path()).read().unwrap().events().to_vec();
+    let new_events = &all_events[before_stop_rejection.len()..];
+    assert_eq!(
+        new_events
+            .iter()
+            .filter(|event| event.state == ActivityState::Error)
+            .count(),
+        1
+    );
+    assert!(new_events.iter().all(|event| {
+        !matches!(
+            event.state,
+            ActivityState::Allowed | ActivityState::Delivered
+        )
+    }));
 }
 
 #[test]

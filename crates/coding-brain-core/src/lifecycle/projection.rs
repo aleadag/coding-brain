@@ -216,6 +216,22 @@ fn is_antigravity_child_candidate(event: &LifecycleEvent, turn_id: &str) -> bool
         && antigravity_child_bit(event.kind()).is_some()
 }
 
+fn is_antigravity_execution_stop(
+    state: &SessionLifecycleState,
+    event: &LifecycleEvent,
+    turn_id: &str,
+) -> bool {
+    event.identity().provider() == AgentProvider::Antigravity
+        && matches!(event.kind(), LifecycleEventKind::Stop)
+        && prefixed_index(turn_id, "execution-").is_some()
+        && state.turn_open
+        && state
+            .current_turn
+            .as_deref()
+            .and_then(|turn| prefixed_index(turn, "invocation-"))
+            .is_some()
+}
+
 fn permission_event(event: &LifecycleEvent) -> Option<(&str, u8)> {
     if event.identity().provider() == AgentProvider::Antigravity {
         return None;
@@ -611,13 +627,18 @@ impl LifecycleSnapshot {
         } else {
             match state.current_turn.as_deref() {
                 Some(current) if state.turn_open && current != turn_id => {
-                    if !matches!(event.kind(), LifecycleEventKind::UserPromptSubmit) {
-                        return state.ignore(IgnoreReason::AmbiguousTurn);
+                    if is_antigravity_execution_stop(state, &event, turn_id) {
+                        let current = current.to_owned();
+                        state.remember_turn(&current);
+                    } else {
+                        if !matches!(event.kind(), LifecycleEventKind::UserPromptSubmit) {
+                            return state.ignore(IgnoreReason::AmbiguousTurn);
+                        }
+                        let current = current.to_owned();
+                        state.remember_turn(&current);
+                        state.permission_request_events.clear();
+                        state.current_turn = Some(turn_id.to_owned());
                     }
-                    let current = current.to_owned();
-                    state.remember_turn(&current);
-                    state.permission_request_events.clear();
-                    state.current_turn = Some(turn_id.to_owned());
                 }
                 Some(current) if !state.turn_open && current == turn_id => {
                     return state.ignore(IgnoreReason::RecentTurn);
@@ -2755,6 +2776,62 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot.apply(close, 4), ApplyOutcome::Applied);
         assert!(!snapshot.sessions[&key].turn_open);
+    }
+
+    #[test]
+    fn antigravity_execution_stop_revokes_open_invocation() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(invocation("invocation-1", 5), 1),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(
+                LifecycleEvent::permission(
+                    antigravity_identity("step-5"),
+                    PermissionDisposition::Decided,
+                )
+                .unwrap(),
+                2,
+            ),
+            ApplyOutcome::Applied
+        );
+
+        let stop = LifecycleEvent::from_parts(
+            antigravity_identity("execution-1"),
+            LifecycleEventKind::Stop,
+        )
+        .unwrap();
+        assert_eq!(snapshot.apply(stop, 3), ApplyOutcome::Applied);
+
+        let key =
+            AgentSessionKey::native(AgentProvider::Antigravity, "agy-conversation-1").storage_key();
+        let state = &snapshot.sessions[&key];
+        assert!(!state.turn_open);
+        assert_eq!(state.current_turn.as_deref(), Some("invocation-1"));
+        assert_eq!(state.antigravity_initial_step, None);
+        assert!(state.antigravity_child_events.is_empty());
+        assert!(state.recent_turns.iter().any(|turn| turn == "invocation-1"));
+        assert!(state.recent_turns.iter().any(|turn| turn == "execution-1"));
+
+        let after_stop = LifecycleEvent::permission(
+            antigravity_identity("step-6"),
+            PermissionDisposition::Decided,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.apply(after_stop, 4),
+            ApplyOutcome::Ignored(IgnoreReason::AmbiguousTurn)
+        );
+
+        assert_eq!(
+            snapshot.apply(invocation("invocation-2", 7), 5),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            snapshot.apply(invocation("invocation-1", 5), 6),
+            ApplyOutcome::Ignored(IgnoreReason::RecentTurn)
+        );
     }
 
     #[test]
