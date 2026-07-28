@@ -5,6 +5,11 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -43,6 +48,8 @@ pub struct ActivityStore {
     lock_path: PathBuf,
     limits: ActivityLimits,
     now_ms: Option<u64>,
+    #[cfg(test)]
+    lock_acquisitions: Option<Arc<AtomicUsize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +192,8 @@ impl ActivityStore {
             lock_path,
             limits: ActivityLimits::default(),
             now_ms: None,
+            #[cfg(test)]
+            lock_acquisitions: None,
         }
     }
 
@@ -198,13 +207,27 @@ impl ActivityStore {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_lock_acquisition_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
+        self.lock_acquisitions = Some(counter);
+        self
+    }
+
     pub fn append(&self, event: ActivityEvent) -> Result<(), ActivityStoreError> {
         if event.schema_version != ACTIVITY_SCHEMA_VERSION {
             return Err(ActivityStoreError::UnsupportedSchema(event.schema_version));
         }
+        self.append_batch(&[event])
+    }
+
+    pub(crate) fn append_batch(&self, events: &[ActivityEvent]) -> Result<(), ActivityStoreError> {
         let lock = self.open_lock()?;
         let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Exclusive)?;
-        self.append_events_unlocked(&[event])
+        #[cfg(test)]
+        if let Some(counter) = &self.lock_acquisitions {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        self.append_events_unlocked(events)
     }
 
     pub(crate) fn append_from_snapshot<F>(&self, build: F) -> Result<(), ActivityStoreError>

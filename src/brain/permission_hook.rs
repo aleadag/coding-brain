@@ -231,7 +231,7 @@ pub(crate) fn evaluate_request<F>(
     request: &BrainDecisionRequest,
     config: Option<&BrainConfig>,
     gate_mode: BrainGateMode,
-    persistence_ready: bool,
+    persistence_error: Option<&str>,
     supported: bool,
     infer: F,
 ) -> HookEvaluation
@@ -246,10 +246,10 @@ where
             terminal_state: ActivityState::Denied,
         };
     }
-    if !persistence_ready {
+    if let Some(error) = persistence_error {
         return HookEvaluation::Abstain {
             brain: None,
-            reason: "initial activity persistence failed".into(),
+            reason: format!("initial activity persistence failed: {error}"),
             terminal_state: ActivityState::Error,
         };
     }
@@ -559,15 +559,13 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
     let mut persistence_error = match (&activity_context, activity_store) {
         (Err(error), _) => Some(error.to_string()),
         (_, None) => Some("activity store unavailable".into()),
-        (Ok(context), Some(activity_store)) => {
-            let observed = activity_store
-                .append(context.event(ActivityState::Observed))
-                .err();
-            let evaluating = activity_store
-                .append(context.event(ActivityState::Evaluating))
-                .err();
-            observed.or(evaluating).map(|error| error.to_string())
-        }
+        (Ok(context), Some(activity_store)) => activity_store
+            .append_batch(&[
+                context.event(ActivityState::Observed),
+                context.event(ActivityState::Evaluating),
+            ])
+            .err()
+            .map(|error| error.to_string()),
     };
     let brain_request = BrainDecisionRequest {
         project: request.project.clone(),
@@ -594,7 +592,7 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
             &brain_request,
             config,
             gate_mode,
-            persistence_error.is_none(),
+            persistence_error.as_deref(),
             request.command.is_some(),
             infer,
         );
@@ -1021,16 +1019,17 @@ pub(crate) fn run(
 mod tests {
     use std::cell::RefCell;
     use std::ffi::OsString;
+    use std::fs::OpenOptions;
     use std::io::Cursor;
     use std::panic::AssertUnwindSafe;
     use std::path::Path;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::brain::activity::ActivityStore;
+    use crate::brain::activity::{ActivityLimits, ActivityStore};
     use crate::brain::client::BrainSuggestion;
     use crate::brain::decisions::decisions_dir;
     use crate::config::BrainConfig;
@@ -1039,6 +1038,7 @@ mod tests {
         ActivityKind, ActivityState, MAX_ACTIVITY_FIELD_BYTES, bounded_redacted_activity_text,
     };
     use coding_brain_core::lifecycle::{LifecycleEventKind, LifecycleStore, ProjectedStatus};
+    use fs2::FileExt;
 
     struct FailingWriter;
 
@@ -1671,7 +1671,7 @@ mod tests {
             },
             Some(&enabled_config()),
             BrainGateMode::Off,
-            true,
+            None,
             true,
             |_, _| panic!("mode off must not invoke the model"),
         );
@@ -1680,6 +1680,87 @@ mod tests {
             evaluation,
             HookEvaluation::Abstain { brain: None, .. }
         ));
+    }
+
+    #[test]
+    fn initial_persistence_failure_reports_specific_cause() {
+        let evaluation = evaluate_request(
+            &BrainDecisionRequest {
+                project: "project".into(),
+                tool_name: "Bash".into(),
+                tool_input: "cargo test".into(),
+                diff_digest: None,
+            },
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            Some("activity store lock timed out"),
+            true,
+            |_, _| panic!("persistence failure must not invoke the model"),
+        );
+
+        assert!(matches!(
+            evaluation,
+            HookEvaluation::Abstain {
+                brain: None,
+                reason,
+                terminal_state: ActivityState::Error,
+            } if reason
+                == "initial activity persistence failed: activity store lock timed out"
+        ));
+    }
+
+    #[test]
+    fn locked_activity_store_fails_closed_with_specific_bounded_diagnostic() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore_home = set_test_home(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity_path = temp.path().join("activity.jsonl");
+        let activity = ActivityStore::at(&activity_path);
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(activity_path.with_extension("lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        let calls = AtomicUsize::new(0);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let started = Instant::now();
+
+        run_with_gate_and_stores(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("locked activity store must not invoke the model")
+            },
+        );
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(stdout.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("activity store lock timed out")
+        );
+        assert_eq!(
+            projected_status(&lifecycle),
+            Some(ProjectedStatus::NeedsInput)
+        );
+        assert!(!activity_path.exists());
+        FileExt::unlock(&lock).unwrap();
     }
 
     #[test]
@@ -1694,7 +1775,7 @@ mod tests {
                 },
                 None,
                 mode,
-                true,
+                None,
                 true,
                 |config, _| {
                     let defaults = BrainConfig::default();
@@ -1732,7 +1813,7 @@ mod tests {
             },
             Some(&disabled),
             resolved.mode,
-            true,
+            None,
             true,
             |_, _| Ok(suggestion(RuleAction::Approve, 0.9)),
         );
@@ -2241,5 +2322,108 @@ mod tests {
                 ActivityState::Error,
             ]
         );
+    }
+
+    #[test]
+    fn parallel_codex_permission_burst_preserves_complete_initial_lifecycles() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore_home = set_test_home(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let initial_lock_acquisitions = Arc::new(AtomicUsize::new(0));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"))
+            .with_limits(ActivityLimits {
+                lock_timeout_ms: 5_000,
+                ..ActivityLimits::default()
+            })
+            .with_lock_acquisition_counter(Arc::clone(&initial_lock_acquisitions));
+        let config = enabled_config();
+        let payloads = (0..15)
+            .map(|index| payload_with_command(&format!("cargo info crate-{index}")))
+            .collect::<Vec<_>>();
+        let start = Arc::new(Barrier::new(payloads.len()));
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut releases = Vec::new();
+            for payload in &payloads {
+                let start = Arc::clone(&start);
+                let ready_tx = ready_tx.clone();
+                let (release_tx, release_rx) = mpsc::sync_channel(0);
+                releases.push(release_tx);
+                let lifecycle = &lifecycle;
+                let activity = &activity;
+                let config = &config;
+                handles.push(scope.spawn(move || {
+                    start.wait();
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    run_with_gate_and_stores(
+                        Cursor::new(payload),
+                        &mut stdout,
+                        &mut stderr,
+                        Some(config),
+                        BrainGateMode::Auto,
+                        lifecycle,
+                        Some(activity),
+                        |_, _| {
+                            ready_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            Ok(suggestion(RuleAction::Approve, 0.9))
+                        },
+                    );
+                    (stdout, stderr)
+                }));
+            }
+            drop(ready_tx);
+            for _ in &payloads {
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            let initial_lock_acquisitions = initial_lock_acquisitions.load(Ordering::SeqCst);
+            for release in releases {
+                release.send(()).unwrap();
+            }
+            let results = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>();
+            (initial_lock_acquisitions, results)
+        });
+        let (initial_lock_acquisitions, results) = results;
+
+        assert_eq!(initial_lock_acquisitions, payloads.len());
+        for (stdout, stderr) in &results {
+            assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(stderr));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(stdout).unwrap()["hookSpecificOutput"]
+                    ["decision"]["behavior"],
+                "allow"
+            );
+        }
+        let events = activity.read().unwrap().events().to_vec();
+        let activity_ids = events
+            .iter()
+            .map(|event| event.activity_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(activity_ids.len(), payloads.len());
+        for activity_id in activity_ids {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.activity_id == activity_id)
+                    .map(|event| event.state)
+                    .collect::<Vec<_>>(),
+                [
+                    ActivityState::Observed,
+                    ActivityState::Evaluating,
+                    ActivityState::Allowed,
+                    ActivityState::Delivered,
+                ]
+            );
+        }
     }
 }
