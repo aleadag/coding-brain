@@ -38,7 +38,7 @@ Init validates and stages every selected file before replacement. Unrelated and 
 
 ## Use the TUI
 
-Run `coding-brain` to open Live. Press the view keys shown in the footer to move between Live, Review, Scorecard, and Diagnostics. Live presents provider-tagged Brain activity and attention; Review concentrates decisions worth correcting or retaining; Scorecard summarizes decision quality. Diagnostics is the user-facing viewer for metadata-only hook/correlation diagnostics and activity-store integrity, not failed commands. These are Brain views, not a general session dashboard.
+Run `coding-brain` to open Live. Press the view keys shown in the footer to move between Live, Review, Scorecard, and Diagnostics. Live presents provider-tagged Brain activity and attention; Review concentrates decisions worth correcting or retaining; Scorecard summarizes decision quality. Diagnostics shows metadata-only safe categories for hooks, correlation, rejected or uncertain session actions and recovery, and activity-store integrity. It is not ordinary command output and never stores captured terminal content or manual text. These are Brain views, not a general session dashboard.
 
 Coding Brain does not collect or display token usage or cost. Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it. Only that bounded percentage is retained. The percentage uses provider-supplied context capacity when available and otherwise a known-model fallback; it is not raw usage or cost accounting.
 
@@ -46,7 +46,7 @@ Within Live, use `j`/`k` or the arrow keys to move inside the selected list. Pre
 
 Press Enter in Live to switch to the selected activity's source session. Coding Brain can use exact provider-qualified Agent Deck navigation, native `claude attach` for a background identity, or exact terminal focus; cancellation returns directly to the Brain TUI.
 
-For an activity with exact current authority, press `x` to enter one-shot action mode, then `a` to allow, `d` to deny, `c` to continue, or `t` to enter bounded hidden literal text. Press Enter to send manual text and Escape to cancel. Outside action mode, Enter keeps its navigation behavior. Review, Scorecard, and Diagnostics remain read-only for session actions.
+Press `x` in Live to preflight the selected exact provider session, pane, and current prompt. Allow/Deny appears only for a recognized permission prompt, Continue only for a recognized recovery prompt, and bounded hidden manual text remains an explicit operator action. Semantic dispatch independently revalidates the exact target and prompt, so changed evidence is rejected without fallback input. Manual-text dispatch revalidates the exact target, backend, and bounded capture but does not require prompt equality. Press Enter to send manual text and Escape to cancel. Outside action mode, Enter keeps its navigation behavior. Review, Scorecard, and Diagnostics remain read-only for session actions.
 
 ## Add a local model
 

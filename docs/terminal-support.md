@@ -28,7 +28,9 @@ Coding Brain restores the terminal before it hands control to an external attach
 | Claude Code | `PermissionRequest` allow/deny | `claude attach <id>` for exact background identities | tmux allow, deny, continue, or explicit literal text |
 | Antigravity CLI | `PreToolUse` allow/deny/ask and `Stop` continue | None | tmux for process-only, manual, or uncovered prompts |
 
-Automatic recovery runs only in Brain `auto` mode and only after current Stop and prompt evidence is reserved and revalidated. Antigravity can receive `continue` through its structured Stop response. Codex and Claude use guarded terminal `continue`. Manual Live actions use `x`, then `a`, `d`, `c`, or `t`; an unknown prompt can be focused or answered with explicit manual text, but it never triggers an automatic semantic action.
+Automatic recovery runs only in Brain `auto` mode and only after current Stop and prompt evidence is reserved and revalidated. Antigravity can receive `continue` through its structured Stop response. Codex and Claude use guarded terminal `continue`.
+
+Press `x` in Live to preflight the selected exact provider session, pane, and current prompt. Allow/Deny appears only for a recognized permission prompt, and Continue appears only for a recognized recovery prompt. Explicit operator-entered manual text remains available after exact target and capture validation; unrecognized evidence never enables semantic input. Semantic dispatch repeats exact-target and prompt validation and rejects changed evidence without fallback input. Manual-text dispatch revalidates the exact target, backend, and bounded capture but does not require prompt equality.
 
 ## Optional Agent Deck
 

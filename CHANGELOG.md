@@ -8,9 +8,10 @@ All notable changes to codexctl are documented here.
 
 ### Added
 
-- You can inspect metadata-only hook and correlation diagnostics plus
-  activity-store integrity in a read-only Diagnostics tab. Use `j`/`k` or the
-  arrow keys to select events and PageUp/PageDown to scroll Evidence.
+- You can inspect metadata-only hook and correlation diagnostics, rejected or
+  uncertain session actions and recovery, plus activity-store integrity in a
+  read-only Diagnostics tab. Use `j`/`k` or the arrow keys to select events and
+  PageUp/PageDown to scroll Evidence.
 - You can configure Codex, Claude Code, and Antigravity CLI together with
   `coding-brain init codex|claude|antigravity|all`; bare interactive init
   detects providers and asks which managed hooks to install.
@@ -24,10 +25,11 @@ All notable changes to codexctl are documented here.
   [Home Manager configuration guide](docs/configuration.md#home-manager) to
   migrate existing Antigravity definitions, rebuild, restart providers, and
   verify the result with `coding-brain doctor`.
-- Live now labels Brain activity by provider and offers exact-target one-shot
-  allow, deny, continue, and bounded manual-text actions through `x` action
-  mode. Claude background sessions can use native attach, while guarded tmux
-  fallback covers exact live targets when structured delivery is unavailable.
+- Live now labels Brain activity by provider and preflights `x` action mode so
+  only recognized allow, deny, or continue actions appear alongside bounded
+  manual text. Dispatch revalidates exact live targets before guarded tmux
+  input, and guarded tmux fallback covers those targets when structured
+  delivery is unavailable. Claude background sessions can use native attach.
 
 ### Fixed
 
