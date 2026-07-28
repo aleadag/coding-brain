@@ -29,6 +29,14 @@ fn infer_with_program(
     prompt: &str,
     program: &Path,
 ) -> Result<BrainSuggestion, String> {
+    infer_with_command(config, prompt, Command::new(program))
+}
+
+fn infer_with_command(
+    config: &BrainConfig,
+    prompt: &str,
+    command: Command,
+) -> Result<BrainSuggestion, String> {
     let is_openai = is_openai_compatible(&config.endpoint);
 
     let payload = if is_openai {
@@ -52,7 +60,7 @@ fn infer_with_program(
     };
 
     let body = serde_json::to_string(&payload).map_err(|e| format!("json error: {e}"))?;
-    let stdout = curl_post(program, config, &body)?;
+    let stdout = curl_post_command(command, config, &body)?;
     let stdout = String::from_utf8_lossy(&stdout);
     if is_openai {
         parse_openai_response(&stdout)
@@ -61,9 +69,13 @@ fn infer_with_program(
     }
 }
 
-fn curl_post(program: &Path, config: &BrainConfig, body: &str) -> Result<Vec<u8>, String> {
+fn curl_post_command(
+    mut command: Command,
+    config: &BrainConfig,
+    body: &str,
+) -> Result<Vec<u8>, String> {
     let timeout_secs = ((config.timeout_ms / 1000).max(1)).to_string();
-    let mut child = Command::new(program)
+    let mut child = command
         .args([
             "--silent",
             "--show-error",
@@ -210,6 +222,14 @@ fn call_llm_with_program(
     prompt: &str,
     program: &Path,
 ) -> Result<String, String> {
+    call_llm_with_command(config, prompt, Command::new(program))
+}
+
+fn call_llm_with_command(
+    config: &BrainConfig,
+    prompt: &str,
+    command: Command,
+) -> Result<String, String> {
     let is_openai = is_openai_compatible(&config.endpoint);
 
     let payload = if is_openai {
@@ -227,7 +247,7 @@ fn call_llm_with_program(
     };
 
     let body = serde_json::to_string(&payload).map_err(|e| format!("json error: {e}"))?;
-    let stdout = curl_post(program, config, &body)?;
+    let stdout = curl_post_command(command, config, &body)?;
     let stdout = String::from_utf8_lossy(&stdout);
     let json: serde_json::Value =
         serde_json::from_str(&stdout).map_err(|e| format!("invalid response: {e}"))?;
@@ -347,18 +367,19 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    fn fake_curl(script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    fn fake_curl(script: &str) -> (tempfile::TempDir, std::path::PathBuf, std::process::Command) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("curl");
-        std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        (temp, path)
+        std::fs::write(&path, format!("set -eu\n{script}\n")).unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.arg(&path);
+        (temp, path, command)
     }
 
     #[cfg(unix)]
     #[test]
     fn inference_sends_prompt_only_over_stdin_and_disables_redirects() {
-        let (temp, curl) = fake_curl(
+        let (temp, script, curl) = fake_curl(
             r#"printf '%s\n' "$@" > "${0}.args"
 dd of="${0}.stdin" 2>/dev/null
 printf '%s' '{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confidence\":0.9}"}'"#,
@@ -369,7 +390,11 @@ printf '%s' '{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confi
         };
         let secret_prompt = "unique prompt fragment";
 
-        let suggestion = infer_with_program(&config, secret_prompt, &curl).unwrap();
+        assert_eq!(
+            std::fs::metadata(&script).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        let suggestion = infer_with_command(&config, secret_prompt, curl).unwrap();
 
         assert_eq!(suggestion.action, RuleAction::Approve);
         let args = std::fs::read_to_string(temp.path().join("curl.args")).unwrap();
@@ -385,8 +410,8 @@ printf '%s' '{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confi
     #[cfg(unix)]
     #[test]
     fn oversized_inference_response_abstains() {
-        let (_temp, curl) = fake_curl("dd if=/dev/zero bs=1048577 count=1 2>/dev/null");
-        let error = infer_with_program(&BrainConfig::default(), "prompt", &curl).unwrap_err();
+        let (_temp, _script, curl) = fake_curl("dd if=/dev/zero bs=1048577 count=1 2>/dev/null");
+        let error = infer_with_command(&BrainConfig::default(), "prompt", curl).unwrap_err();
         assert!(error.contains("exceeds 1 MiB"), "{error}");
     }
 
@@ -507,16 +532,15 @@ printf '%s' '{"response":"{\"action\":\"approve\",\"reasoning\":\"safe\",\"confi
     #[test]
     fn completion_extracts_generated_recovery_content_for_both_formats() {
         let recovery = r#"{"action":"continue","confidence":0.9}"#;
-        let (_ollama_temp, ollama_curl) = fake_curl(
+        let (_ollama_temp, _ollama_script, ollama_curl) = fake_curl(
             r#"dd of=/dev/null 2>/dev/null
 printf '%s' '{"response":"{\"action\":\"continue\",\"confidence\":0.9}"}'"#,
         );
-        let ollama =
-            call_llm_with_program(&BrainConfig::default(), "prompt", &ollama_curl).unwrap();
+        let ollama = call_llm_with_command(&BrainConfig::default(), "prompt", ollama_curl).unwrap();
         assert_eq!(ollama, recovery);
         assert!(parse_recovery_suggestion_json(&ollama).is_ok());
 
-        let (_openai_temp, openai_curl) = fake_curl(
+        let (_openai_temp, _openai_script, openai_curl) = fake_curl(
             r#"dd of=/dev/null 2>/dev/null
 printf '%s' '{"choices":[{"message":{"content":"{\"action\":\"continue\",\"confidence\":0.9}"}}]}'"#,
         );
@@ -524,7 +548,7 @@ printf '%s' '{"choices":[{"message":{"content":"{\"action\":\"continue\",\"confi
             endpoint: "http://brain.example.test/v1/chat/completions".into(),
             ..BrainConfig::default()
         };
-        let openai = call_llm_with_program(&openai_config, "prompt", &openai_curl).unwrap();
+        let openai = call_llm_with_command(&openai_config, "prompt", openai_curl).unwrap();
         assert_eq!(openai, recovery);
         assert!(parse_recovery_suggestion_json(&openai).is_ok());
     }
@@ -532,16 +556,16 @@ printf '%s' '{"choices":[{"message":{"content":"{\"action\":\"continue\",\"confi
     #[cfg(unix)]
     #[test]
     fn completion_surfaces_schema_specific_api_errors() {
-        let (_ollama_temp, ollama_curl) = fake_curl(
+        let (_ollama_temp, _ollama_script, ollama_curl) = fake_curl(
             r#"dd of=/dev/null 2>/dev/null
 printf '%s' '{"error":"unable to load model"}'"#,
         );
         assert_eq!(
-            call_llm_with_program(&BrainConfig::default(), "prompt", &ollama_curl).unwrap_err(),
+            call_llm_with_command(&BrainConfig::default(), "prompt", ollama_curl).unwrap_err(),
             "Ollama API error: unable to load model"
         );
 
-        let (_openai_temp, openai_curl) = fake_curl(
+        let (_openai_temp, _openai_script, openai_curl) = fake_curl(
             r#"dd of=/dev/null 2>/dev/null
 printf '%s' '{"error":{"message":"model unavailable","type":"server_error"}}'"#,
         );
@@ -550,7 +574,7 @@ printf '%s' '{"error":{"message":"model unavailable","type":"server_error"}}'"#,
             ..BrainConfig::default()
         };
         assert_eq!(
-            call_llm_with_program(&openai_config, "prompt", &openai_curl).unwrap_err(),
+            call_llm_with_command(&openai_config, "prompt", openai_curl).unwrap_err(),
             "OpenAI API error: model unavailable"
         );
     }
