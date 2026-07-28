@@ -9,7 +9,7 @@ use crate::brain_activity::{
     ActivitySnapshot, CorrectionDisposition, SessionTarget, SnapshotLimits,
 };
 use crate::provider::AgentProvider;
-use crate::terminals::TerminalSessionAction;
+use crate::terminals::{GuardedActionFailureCategory, TerminalSessionAction};
 
 // ============================================================================
 // Brain
@@ -220,8 +220,123 @@ pub struct CorrectionInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionActionTarget {
+    pub provider: AgentProvider,
+    pub session_id: String,
+    pub project_id: crate::project::ProjectId,
+    pub cwd: std::path::PathBuf,
+    pub provenance: crate::brain_activity::SessionTargetProvenance,
+}
+
+impl From<SessionTarget> for SessionActionTarget {
+    fn from(target: SessionTarget) -> Self {
+        Self {
+            provider: target.provider,
+            session_id: target.session_id,
+            project_id: target.project_id,
+            cwd: target.cwd,
+            provenance: target.provenance,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionActionAttempt {
+    pub attempt_id: String,
+    pub target: SessionActionTarget,
+}
+
+impl SessionActionAttempt {
+    pub fn new(target: SessionTarget) -> Self {
+        Self {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            target: target.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionActionPreflightRequest {
+    pub attempt: SessionActionAttempt,
+}
+
+impl SessionActionPreflightRequest {
+    pub fn new(target: SessionTarget) -> Self {
+        Self {
+            attempt: SessionActionAttempt::new(target),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionActionCapability {
+    Allow,
+    Deny,
+    Continue,
+    ManualText,
+}
+
+impl SessionActionCapability {
+    pub fn permits(self, action: &TerminalSessionAction) -> bool {
+        matches!(
+            (self, action),
+            (Self::Allow, TerminalSessionAction::Allow)
+                | (Self::Deny, TerminalSessionAction::Deny)
+                | (Self::Continue, TerminalSessionAction::Continue)
+                | (Self::ManualText, TerminalSessionAction::Text(_))
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionActionAvailability {
+    pub attempt: SessionActionAttempt,
+    pub capabilities: Vec<SessionActionCapability>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionActionFailureCategory {
+    AuthorityUnavailable,
+    ExactSessionUnavailable,
+    ExactSessionAmbiguous,
+    Guarded(GuardedActionFailureCategory),
+}
+
+impl SessionActionFailureCategory {
+    pub fn rule_id(self) -> String {
+        match self {
+            Self::AuthorityUnavailable => "session_action_authority_unavailable".into(),
+            Self::ExactSessionUnavailable => "session_action_session_unavailable".into(),
+            Self::ExactSessionAmbiguous => "session_action_session_ambiguous".into(),
+            Self::Guarded(category) => format!("session_action_{}", category.rule_suffix()),
+        }
+    }
+
+    pub fn safe_message(self) -> &'static str {
+        match self {
+            Self::AuthorityUnavailable => "Session action authority is unavailable",
+            Self::ExactSessionUnavailable => "No exact live provider session for action",
+            Self::ExactSessionAmbiguous => "Exact live provider session is ambiguous",
+            Self::Guarded(category) => category.safe_message(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionActionFailure {
+    pub category: SessionActionFailureCategory,
+    pub diagnostic_persisted: bool,
+}
+
+impl SessionActionFailure {
+    pub fn safe_message(&self) -> &'static str {
+        self.category.safe_message()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionActionRequest {
-    pub target: SessionTarget,
+    pub attempt: SessionActionAttempt,
     pub action: TerminalSessionAction,
 }
 
@@ -256,7 +371,14 @@ pub trait BrainSource: Send + Sync {
 pub trait BrainActions: Send + Sync {
     fn record_correction(&self, correction: CorrectionInput) -> Result<(), String>;
     fn mark_canonical(&self, decision_id: &str, note: Option<String>) -> Result<(), String>;
-    fn send_session_action(&self, request: SessionActionRequest) -> Result<(), String>;
+    fn preflight_session_action(
+        &self,
+        request: SessionActionPreflightRequest,
+    ) -> Result<SessionActionAvailability, SessionActionFailure>;
+    fn send_session_action(
+        &self,
+        request: SessionActionRequest,
+    ) -> Result<(), SessionActionFailure>;
     fn poll_recovery(&self) -> Vec<String> {
         Vec::new()
     }
@@ -380,7 +502,6 @@ impl SessionNavigation for UnavailableSessionNavigation {
     }
 }
 
-#[derive(Default)]
 pub struct MockBrainRuntime {
     pub activity_snapshot: ActivitySnapshot,
     pub review_queue: Vec<ReviewItemSummary>,
@@ -388,7 +509,32 @@ pub struct MockBrainRuntime {
     pub endpoint_health: EndpointHealth,
     pub gate_mode: std::sync::Mutex<Option<BrainGateMode>>,
     pub actions_log: std::sync::Mutex<Vec<MockBrainAction>>,
+    pub session_action_capabilities: std::sync::Mutex<Vec<SessionActionCapability>>,
+    pub session_action_preflight_failure: std::sync::Mutex<Option<SessionActionFailure>>,
+    pub session_action_failure: std::sync::Mutex<Option<SessionActionFailure>>,
     pub session_action_error: std::sync::Mutex<Option<String>>,
+}
+
+impl Default for MockBrainRuntime {
+    fn default() -> Self {
+        Self {
+            activity_snapshot: ActivitySnapshot::default(),
+            review_queue: Vec::new(),
+            scorecard: ScorecardSummary::default(),
+            endpoint_health: EndpointHealth::default(),
+            gate_mode: std::sync::Mutex::new(None),
+            actions_log: std::sync::Mutex::new(Vec::new()),
+            session_action_capabilities: std::sync::Mutex::new(vec![
+                SessionActionCapability::Allow,
+                SessionActionCapability::Deny,
+                SessionActionCapability::Continue,
+                SessionActionCapability::ManualText,
+            ]),
+            session_action_preflight_failure: std::sync::Mutex::new(None),
+            session_action_failure: std::sync::Mutex::new(None),
+            session_action_error: std::sync::Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,6 +545,7 @@ pub enum MockBrainAction {
         decision_id: String,
         note: Option<String>,
     },
+    SessionActionPreflight(SessionActionPreflightRequest),
     SessionAction(SessionActionRequest),
 }
 
@@ -465,16 +612,62 @@ impl BrainActions for MockBrainRuntime {
         Ok(())
     }
 
-    fn send_session_action(&self, request: SessionActionRequest) -> Result<(), String> {
+    fn preflight_session_action(
+        &self,
+        request: SessionActionPreflightRequest,
+    ) -> Result<SessionActionAvailability, SessionActionFailure> {
+        self.actions_log
+            .lock()
+            .expect("brain actions_log poisoned")
+            .push(MockBrainAction::SessionActionPreflight(request.clone()));
+        if let Some(failure) = self
+            .session_action_preflight_failure
+            .lock()
+            .expect("brain session_action_preflight_failure poisoned")
+            .clone()
+        {
+            return Err(failure);
+        }
+        Ok(SessionActionAvailability {
+            attempt: request.attempt,
+            capabilities: self
+                .session_action_capabilities
+                .lock()
+                .expect("brain session_action_capabilities poisoned")
+                .clone(),
+        })
+    }
+
+    fn send_session_action(
+        &self,
+        request: SessionActionRequest,
+    ) -> Result<(), SessionActionFailure> {
         self.actions_log
             .lock()
             .expect("brain actions_log poisoned")
             .push(MockBrainAction::SessionAction(request));
-        self.session_action_error
+        if let Some(failure) = self
+            .session_action_failure
+            .lock()
+            .expect("brain session_action_failure poisoned")
+            .clone()
+        {
+            return Err(failure);
+        }
+        if self
+            .session_action_error
             .lock()
             .expect("brain session_action_error poisoned")
-            .clone()
-            .map_or(Ok(()), Err)
+            .is_some()
+        {
+            return Err(SessionActionFailure {
+                category: SessionActionFailureCategory::Guarded(
+                    GuardedActionFailureCategory::SendFailed,
+                ),
+                diagnostic_persisted: false,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -519,18 +712,13 @@ mod tests {
     fn brain_runtime_records_exact_session_action_request() {
         let mock = Arc::new(MockBrainRuntime::default());
         let runtime = BrainRuntime::new(mock.clone(), mock.clone());
+        let preflight = SessionActionPreflightRequest::new(session_target());
+        let availability = runtime
+            .actions
+            .preflight_session_action(preflight.clone())
+            .unwrap();
         let request = SessionActionRequest {
-            target: SessionTarget {
-                provider: AgentProvider::Claude,
-                session_id: "session-42".into(),
-                provider_session_id: None,
-                turn_id: Some("turn-7".into()),
-                tool_use_id: None,
-                project_id: crate::project::ProjectId::Stable("project-1".into()),
-                cwd: "/work/project".into(),
-                provider_hints: Vec::new(),
-                provenance: crate::brain_activity::SessionTargetProvenance::Structured,
-            },
+            attempt: availability.attempt,
             action: TerminalSessionAction::Continue,
         };
 
@@ -539,10 +727,43 @@ mod tests {
             .send_session_action(request.clone())
             .unwrap();
 
+        assert!(matches!(
+            mock.actions()[0],
+            MockBrainAction::SessionActionPreflight(_)
+        ));
+        assert_eq!(mock.actions()[1], MockBrainAction::SessionAction(request));
+    }
+
+    #[test]
+    fn session_action_preflight_creates_opaque_attempt_identity() {
+        let request = SessionActionPreflightRequest::new(session_target());
+
+        assert!(uuid::Uuid::parse_str(&request.attempt.attempt_id).is_ok());
         assert_eq!(
-            mock.actions(),
-            vec![MockBrainAction::SessionAction(request)]
+            request.attempt.target,
+            SessionActionTarget::from(session_target())
         );
+    }
+
+    #[test]
+    fn session_action_preflight_discards_sensitive_target_fields() {
+        let mock = Arc::new(MockBrainRuntime::default());
+        let runtime = BrainRuntime::new(mock.clone(), mock);
+        let request = SessionActionPreflightRequest::new(sensitive_session_target());
+        let availability = runtime
+            .actions
+            .preflight_session_action(request.clone())
+            .unwrap();
+
+        for secret in [
+            "provider-session-secret",
+            "turn-secret",
+            "tool-use-secret",
+            "provider-hint-secret",
+        ] {
+            assert!(!format!("{:?}", request.attempt).contains(secret));
+            assert!(!format!("{:?}", availability).contains(secret));
+        }
     }
 
     #[test]
@@ -581,5 +802,28 @@ mod tests {
         assert_eq!(refresh.snapshot.unresolved_count, 2);
         assert!(refresh.review_queue.is_empty());
         assert_eq!(refresh.scorecard.total_decisions, 3);
+    }
+
+    fn session_target() -> SessionTarget {
+        SessionTarget {
+            provider: AgentProvider::Claude,
+            session_id: "session-42".into(),
+            provider_session_id: None,
+            turn_id: Some("turn-7".into()),
+            tool_use_id: None,
+            project_id: crate::project::ProjectId::Stable("project-1".into()),
+            cwd: "/work/project".into(),
+            provider_hints: Vec::new(),
+            provenance: crate::brain_activity::SessionTargetProvenance::Structured,
+        }
+    }
+
+    fn sensitive_session_target() -> SessionTarget {
+        let mut target = session_target();
+        target.provider_session_id = Some("provider-session-secret".into());
+        target.turn_id = Some("turn-secret".into());
+        target.tool_use_id = Some("tool-use-secret".into());
+        target.provider_hints = vec!["provider-hint-secret".into()];
+        target
     }
 }

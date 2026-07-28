@@ -12,6 +12,7 @@ mod warp;
 mod wezterm;
 mod windows_terminal;
 
+use crate::brain_activity::bounded_redacted_activity_text;
 use crate::provider::AgentProvider;
 use crate::session::{AgentSession, ApprovalEvidence, ApprovalObservation};
 #[cfg(unix)]
@@ -50,6 +51,13 @@ pub enum TerminalSessionAction {
     Text(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionablePrompt {
+    Allow,
+    Deny,
+    Continue,
+}
+
 impl std::fmt::Debug for TerminalSessionAction {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -84,21 +92,124 @@ pub struct TerminalActionOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GuardedActionFailure {
-    NotSent(String),
-    DeliveryUnknown(String),
+pub struct ExactTargetFailure {
+    pub kind: ExactTargetFailureKind,
+    detail: String,
 }
 
-impl GuardedActionFailure {
-    pub fn message(&self) -> &str {
+impl ExactTargetFailure {
+    pub(crate) fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            kind: ExactTargetFailureKind::Unavailable,
+            detail: bounded_redacted_activity_text(&detail.into()),
+        }
+    }
+
+    pub(crate) fn ambiguous(detail: impl Into<String>) -> Self {
+        Self {
+            kind: ExactTargetFailureKind::Ambiguous,
+            detail: bounded_redacted_activity_text(&detail.into()),
+        }
+    }
+
+    fn message(&self) -> &str {
+        &self.detail
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactTargetFailureKind {
+    Unavailable,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardedActionFailureCategory {
+    LiveProcessUnavailable,
+    ExactTargetUnavailable,
+    ExactTargetAmbiguous,
+    CaptureUnavailable,
+    PromptUnrecognized,
+    PromptChanged,
+    SendFailed,
+    PostflightUnconfirmed,
+}
+
+impl GuardedActionFailureCategory {
+    pub fn rule_suffix(self) -> &'static str {
         match self {
-            Self::NotSent(message) | Self::DeliveryUnknown(message) => message,
+            Self::LiveProcessUnavailable => "live_process_unavailable",
+            Self::ExactTargetUnavailable => "exact_target_unavailable",
+            Self::ExactTargetAmbiguous => "exact_target_ambiguous",
+            Self::CaptureUnavailable => "capture_unavailable",
+            Self::PromptUnrecognized => "prompt_unrecognized",
+            Self::PromptChanged => "prompt_changed",
+            Self::SendFailed => "send_failed",
+            Self::PostflightUnconfirmed => "postflight_unconfirmed",
+        }
+    }
+
+    pub fn safe_message(self) -> &'static str {
+        match self {
+            Self::LiveProcessUnavailable => "Exact live process identity is unavailable",
+            Self::ExactTargetUnavailable => "Exact terminal target is unavailable",
+            Self::ExactTargetAmbiguous => "Exact terminal target is ambiguous",
+            Self::CaptureUnavailable => "Terminal capture is unavailable",
+            Self::PromptUnrecognized => "No recognized provider prompt for action",
+            Self::PromptChanged => "Provider prompt changed before action",
+            Self::SendFailed => "Terminal action delivery is unconfirmed",
+            Self::PostflightUnconfirmed => "Terminal action postflight is unconfirmed",
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryCertainty {
+    NotSent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedActionFailure {
+    pub category: GuardedActionFailureCategory,
+    pub certainty: DeliveryCertainty,
+    detail: String,
+}
+
+impl GuardedActionFailure {
+    fn not_sent(category: GuardedActionFailureCategory, detail: impl Into<String>) -> Self {
+        Self {
+            category,
+            certainty: DeliveryCertainty::NotSent,
+            detail: bounded_redacted_activity_text(&detail.into()),
+        }
+    }
+
+    fn unknown(category: GuardedActionFailureCategory, detail: impl Into<String>) -> Self {
+        Self {
+            category,
+            certainty: DeliveryCertainty::Unknown,
+            detail: bounded_redacted_activity_text(&detail.into()),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.detail
+    }
+
+    fn from_exact_target(error: ExactTargetFailure) -> Self {
+        let category = match error.kind {
+            ExactTargetFailureKind::Unavailable => {
+                GuardedActionFailureCategory::ExactTargetUnavailable
+            }
+            ExactTargetFailureKind::Ambiguous => GuardedActionFailureCategory::ExactTargetAmbiguous,
+        };
+        Self::not_sent(category, error.detail)
+    }
+}
+
 trait GuardedTerminalBackend {
-    fn resolve_exact_target(&self, session: &AgentSession) -> Result<String, String>;
+    fn resolve_exact_target(&self, session: &AgentSession) -> Result<String, ExactTargetFailure>;
     fn capture(&self, target: &str) -> Result<PaneCapture, String>;
     fn send_literal(&self, target: &str, text: &str) -> Result<(), String>;
     fn send_keys(&self, target: &str, keys: &[&str]) -> Result<(), String>;
@@ -107,8 +218,8 @@ trait GuardedTerminalBackend {
 struct TmuxGuardedBackend;
 
 impl GuardedTerminalBackend for TmuxGuardedBackend {
-    fn resolve_exact_target(&self, session: &AgentSession) -> Result<String, String> {
-        tmux::resolve_exact_target(session)
+    fn resolve_exact_target(&self, session: &AgentSession) -> Result<String, ExactTargetFailure> {
+        tmux::resolve_exact_target_classified(session)
     }
 
     fn capture(&self, target: &str) -> Result<PaneCapture, String> {
@@ -1433,7 +1544,7 @@ pub fn switch_to_terminal(session: &AgentSession) -> Result<(), String> {
 
 /// Focuses only a terminal pane bound to the session's complete live process identity.
 pub fn focus_exact_terminal(session: &AgentSession) -> Result<(), String> {
-    let target = TmuxGuardedBackend.resolve_exact_target(session)?;
+    let target = tmux::resolve_exact_target(session)?;
     tmux::focus_target(&target)
 }
 
@@ -2136,40 +2247,74 @@ fn execute_guarded_action_classified_with(
     action: TerminalSessionAction,
     backend: &dyn GuardedTerminalBackend,
 ) -> Result<TerminalActionOutcome, GuardedActionFailure> {
-    let not_sent = GuardedActionFailure::NotSent;
-    let delivery_unknown = GuardedActionFailure::DeliveryUnknown;
     if let TerminalSessionAction::Text(text) = &action {
-        validate_manual_text(text).map_err(not_sent)?;
+        validate_manual_text(text).map_err(|detail| {
+            GuardedActionFailure::not_sent(GuardedActionFailureCategory::PromptUnrecognized, detail)
+        })?;
     }
     session.live_process_identity().ok_or_else(|| {
-        not_sent("guarded terminal action requires an exact live process identity".to_string())
+        GuardedActionFailure::not_sent(
+            GuardedActionFailureCategory::LiveProcessUnavailable,
+            "guarded terminal action requires an exact live process identity",
+        )
     })?;
 
-    let target = backend.resolve_exact_target(session).map_err(not_sent)?;
-    let initial = checked_target_capture(backend, &target).map_err(not_sent)?;
+    let target = backend
+        .resolve_exact_target(session)
+        .map_err(GuardedActionFailure::from_exact_target)?;
+    let initial = checked_target_capture(backend, &target).map_err(|detail| {
+        GuardedActionFailure::not_sent(GuardedActionFailureCategory::CaptureUnavailable, detail)
+    })?;
 
     if let TerminalSessionAction::Text(text) = &action {
-        let baseline_fingerprint = fingerprint(&normalize_whitespace(&initial.text));
-        if backend.resolve_exact_target(session).map_err(not_sent)? != target {
-            return Err(not_sent(
-                "guarded terminal target changed; action cancelled".into(),
+        if backend
+            .resolve_exact_target(session)
+            .map_err(GuardedActionFailure::from_exact_target)?
+            != target
+        {
+            return Err(GuardedActionFailure::not_sent(
+                GuardedActionFailureCategory::ExactTargetUnavailable,
+                "guarded terminal target changed; action cancelled",
             ));
         }
-        backend
-            .send_literal(&target, text)
-            .map_err(|_| not_sent("guarded terminal literal send failed".to_string()))?;
-        backend
-            .send_keys(&target, &["Enter"])
-            .map_err(|_| delivery_unknown("guarded terminal key send failed".to_string()))?;
-        let post = checked_target_capture(backend, &target).map_err(delivery_unknown)?;
+        let recapture = checked_target_capture(backend, &target).map_err(|detail| {
+            GuardedActionFailure::not_sent(GuardedActionFailureCategory::CaptureUnavailable, detail)
+        })?;
+        if recapture.backend != initial.backend {
+            return Err(GuardedActionFailure::not_sent(
+                GuardedActionFailureCategory::CaptureUnavailable,
+                "guarded terminal capture backend changed",
+            ));
+        }
+        let baseline_fingerprint = fingerprint(&normalize_whitespace(&recapture.text));
+        backend.send_literal(&target, text).map_err(|_| {
+            GuardedActionFailure::unknown(
+                GuardedActionFailureCategory::SendFailed,
+                "guarded terminal literal send failed",
+            )
+        })?;
+        backend.send_keys(&target, &["Enter"]).map_err(|_| {
+            GuardedActionFailure::unknown(
+                GuardedActionFailureCategory::SendFailed,
+                "guarded terminal key send failed",
+            )
+        })?;
+        let post = checked_target_capture(backend, &target).map_err(|detail| {
+            GuardedActionFailure::unknown(
+                GuardedActionFailureCategory::PostflightUnconfirmed,
+                detail,
+            )
+        })?;
         if post.backend != initial.backend {
-            return Err(delivery_unknown(
-                "guarded terminal capture backend changed".into(),
+            return Err(GuardedActionFailure::unknown(
+                GuardedActionFailureCategory::PostflightUnconfirmed,
+                "guarded terminal capture backend changed",
             ));
         }
         if fingerprint(&normalize_whitespace(&post.text)) == baseline_fingerprint {
-            return Err(delivery_unknown(
-                "terminal prompt did not advance after action".into(),
+            return Err(GuardedActionFailure::unknown(
+                GuardedActionFailureCategory::PostflightUnconfirmed,
+                "terminal prompt did not advance after action",
             ));
         }
         return Ok(TerminalActionOutcome {
@@ -2180,44 +2325,78 @@ fn execute_guarded_action_classified_with(
         });
     }
 
-    let expected = match_semantic_prompt(&initial, session, &action)
-        .ok_or_else(|| not_sent("no recognized complete provider prompt for action".to_string()))?;
-    if backend.resolve_exact_target(session).map_err(not_sent)? != target {
-        return Err(not_sent(
-            "guarded terminal target changed; action cancelled".into(),
+    let expected = match_semantic_prompt(&initial, session, &action).ok_or_else(|| {
+        GuardedActionFailure::not_sent(
+            GuardedActionFailureCategory::PromptUnrecognized,
+            "no recognized complete provider prompt for action",
+        )
+    })?;
+    if backend
+        .resolve_exact_target(session)
+        .map_err(GuardedActionFailure::from_exact_target)?
+        != target
+    {
+        return Err(GuardedActionFailure::not_sent(
+            GuardedActionFailureCategory::ExactTargetUnavailable,
+            "guarded terminal target changed; action cancelled",
         ));
     }
-    let recapture = checked_target_capture(backend, &target).map_err(not_sent)?;
-    let current = match_semantic_prompt(&recapture, session, &action)
-        .ok_or_else(|| not_sent("provider prompt changed or disappeared".to_string()))?;
+    let recapture = checked_target_capture(backend, &target).map_err(|detail| {
+        GuardedActionFailure::not_sent(GuardedActionFailureCategory::CaptureUnavailable, detail)
+    })?;
+    let current = match_semantic_prompt(&recapture, session, &action).ok_or_else(|| {
+        GuardedActionFailure::not_sent(
+            GuardedActionFailureCategory::PromptChanged,
+            "provider prompt changed or disappeared",
+        )
+    })?;
     if current != expected {
-        return Err(not_sent("provider prompt changed; action cancelled".into()));
+        return Err(GuardedActionFailure::not_sent(
+            GuardedActionFailureCategory::PromptChanged,
+            "provider prompt changed; action cancelled",
+        ));
     }
     if session.provider == AgentProvider::Codex && matches!(action, TerminalSessionAction::Continue)
     {
-        backend
-            .send_literal(&target, "continue")
-            .map_err(|_| not_sent("guarded terminal literal send failed".to_string()))?;
-        backend
-            .send_keys(&target, &["Enter"])
-            .map_err(|_| not_sent("guarded terminal key send failed".to_string()))?;
+        backend.send_literal(&target, "continue").map_err(|_| {
+            GuardedActionFailure::unknown(
+                GuardedActionFailureCategory::SendFailed,
+                "guarded terminal literal send failed",
+            )
+        })?;
+        backend.send_keys(&target, &["Enter"]).map_err(|_| {
+            GuardedActionFailure::unknown(
+                GuardedActionFailureCategory::SendFailed,
+                "guarded terminal key send failed",
+            )
+        })?;
     } else {
         let keys = semantic_keys(session.provider, &action).ok_or_else(|| {
-            not_sent("provider does not support this terminal action".to_string())
+            GuardedActionFailure::not_sent(
+                GuardedActionFailureCategory::PromptUnrecognized,
+                "provider does not support this terminal action",
+            )
         })?;
-        backend
-            .send_keys(&target, keys)
-            .map_err(|_| not_sent("guarded terminal key send failed".to_string()))?;
+        backend.send_keys(&target, keys).map_err(|_| {
+            GuardedActionFailure::unknown(
+                GuardedActionFailureCategory::SendFailed,
+                "guarded terminal key send failed",
+            )
+        })?;
     }
-    let post = checked_target_capture(backend, &target).map_err(delivery_unknown)?;
+    let post = checked_target_capture(backend, &target).map_err(|detail| {
+        GuardedActionFailure::unknown(GuardedActionFailureCategory::PostflightUnconfirmed, detail)
+    })?;
     if post.backend != initial.backend {
-        return Err(delivery_unknown(
-            "guarded terminal capture backend changed".into(),
+        return Err(GuardedActionFailure::unknown(
+            GuardedActionFailureCategory::PostflightUnconfirmed,
+            "guarded terminal capture backend changed",
         ));
     }
     if !post_prompt_advanced(&post, session, &action, &expected) {
-        return Err(delivery_unknown(
-            "terminal prompt did not advance after action".into(),
+        return Err(GuardedActionFailure::unknown(
+            GuardedActionFailureCategory::PostflightUnconfirmed,
+            "terminal prompt did not advance after action",
         ));
     }
 
@@ -2245,7 +2424,9 @@ fn probe_recovery_prompt_with(
     session.live_process_identity().ok_or_else(|| {
         "recovery prompt probe requires an exact live process identity".to_string()
     })?;
-    let target = backend.resolve_exact_target(session)?;
+    let target = backend
+        .resolve_exact_target(session)
+        .map_err(|error| error.message().to_string())?;
     let capture = checked_target_capture(backend, &target)?;
     match_semantic_prompt(&capture, session, &TerminalSessionAction::Continue)
         .ok_or_else(|| "no recognized complete provider recovery prompt".to_string())
@@ -2255,23 +2436,60 @@ pub fn probe_recovery_prompt(session: &AgentSession) -> Result<PromptEvidence, S
     probe_recovery_prompt_with(session, &TmuxGuardedBackend)
 }
 
-fn probe_actionable_prompt_with(
+fn probe_actionable_prompt_evidence_with(
     session: &AgentSession,
     backend: &dyn GuardedTerminalBackend,
-) -> Result<PromptEvidence, String> {
+) -> Result<Option<PromptEvidence>, GuardedActionFailure> {
     session.live_process_identity().ok_or_else(|| {
-        "actionable prompt probe requires an exact live process identity".to_string()
+        GuardedActionFailure::not_sent(
+            GuardedActionFailureCategory::LiveProcessUnavailable,
+            "actionable prompt probe requires an exact live process identity",
+        )
     })?;
-    let target = backend.resolve_exact_target(session)?;
-    let capture = checked_target_capture(backend, &target)?;
-    [
+    let target = backend
+        .resolve_exact_target(session)
+        .map_err(GuardedActionFailure::from_exact_target)?;
+    let capture = checked_target_capture(backend, &target).map_err(|detail| {
+        GuardedActionFailure::not_sent(GuardedActionFailureCategory::CaptureUnavailable, detail)
+    })?;
+    Ok([
         TerminalSessionAction::Continue,
         TerminalSessionAction::Allow,
         TerminalSessionAction::Deny,
     ]
     .into_iter()
-    .find_map(|action| match_semantic_prompt(&capture, session, &action))
-    .ok_or_else(|| "no recognized complete provider actionable prompt".to_string())
+    .find_map(|action| match_semantic_prompt(&capture, session, &action)))
+}
+
+fn probe_actionable_prompt_classified_with(
+    session: &AgentSession,
+    backend: &dyn GuardedTerminalBackend,
+) -> Result<Option<ActionablePrompt>, GuardedActionFailure> {
+    probe_actionable_prompt_evidence_with(session, backend).map(|evidence| {
+        evidence.map(|evidence| match evidence.action {
+            TerminalSessionAction::Allow => ActionablePrompt::Allow,
+            TerminalSessionAction::Deny => ActionablePrompt::Deny,
+            TerminalSessionAction::Continue => ActionablePrompt::Continue,
+            TerminalSessionAction::Text(_) => {
+                unreachable!("semantic prompt evidence cannot be text")
+            }
+        })
+    })
+}
+
+fn probe_actionable_prompt_with(
+    session: &AgentSession,
+    backend: &dyn GuardedTerminalBackend,
+) -> Result<PromptEvidence, String> {
+    probe_actionable_prompt_evidence_with(session, backend)
+        .map_err(|error| error.message().to_string())?
+        .ok_or_else(|| "no recognized complete provider actionable prompt".to_string())
+}
+
+pub fn probe_actionable_prompt_classified(
+    session: &AgentSession,
+) -> Result<Option<ActionablePrompt>, GuardedActionFailure> {
+    probe_actionable_prompt_classified_with(session, &TmuxGuardedBackend)
 }
 
 pub fn probe_actionable_prompt(session: &AgentSession) -> Result<PromptEvidence, String> {
@@ -2430,7 +2648,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeGuardedBackend {
-        targets: std::sync::Mutex<VecDeque<Result<String, String>>>,
+        targets: std::sync::Mutex<VecDeque<Result<String, ExactTargetFailure>>>,
         captures: std::sync::Mutex<VecDeque<Result<PaneCapture, String>>>,
         literals: std::sync::Mutex<Vec<String>>,
         keys: std::sync::Mutex<Vec<Vec<String>>>,
@@ -2453,14 +2671,21 @@ mod tests {
 
         fn with_target_error(error: &str) -> Self {
             Self {
-                targets: std::sync::Mutex::new([Err(error.into())].into_iter().collect()),
+                targets: std::sync::Mutex::new(
+                    [Err(ExactTargetFailure::unavailable(error))]
+                        .into_iter()
+                        .collect(),
+                ),
                 ..Self::default()
             }
         }
     }
 
     impl GuardedTerminalBackend for FakeGuardedBackend {
-        fn resolve_exact_target(&self, _session: &AgentSession) -> Result<String, String> {
+        fn resolve_exact_target(
+            &self,
+            _session: &AgentSession,
+        ) -> Result<String, ExactTargetFailure> {
             self.targets.lock().unwrap().pop_front().unwrap()
         }
 
@@ -2562,7 +2787,10 @@ mod tests {
                 TerminalSessionAction::Continue,
                 &active_backend,
             ),
-            Err(GuardedActionFailure::NotSent(_))
+            Err(GuardedActionFailure {
+                certainty: DeliveryCertainty::NotSent,
+                ..
+            })
         ));
         assert!(active_backend.literals.lock().unwrap().is_empty());
 
@@ -2577,7 +2805,10 @@ mod tests {
                 TerminalSessionAction::Continue,
                 &unchanged_backend,
             ),
-            Err(GuardedActionFailure::DeliveryUnknown(_))
+            Err(GuardedActionFailure {
+                certainty: DeliveryCertainty::Unknown,
+                ..
+            })
         ));
     }
 
@@ -2601,7 +2832,10 @@ mod tests {
                     TerminalSessionAction::Continue,
                     &backend,
                 ),
-                Err(GuardedActionFailure::DeliveryUnknown(_))
+                Err(GuardedActionFailure {
+                    certainty: DeliveryCertainty::Unknown,
+                    ..
+                })
             ));
             assert_eq!(backend.literals.lock().unwrap().as_slice(), ["continue"]);
             assert_eq!(backend.keys.lock().unwrap().as_slice(), [vec!["Enter"]]);
@@ -2651,6 +2885,38 @@ mod tests {
         .unwrap();
 
         assert_eq!(evidence.action, TerminalSessionAction::Allow);
+        assert!(backend.keys.lock().unwrap().is_empty());
+        assert!(backend.literals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn actionable_probe_allows_manual_only_when_no_semantic_prompt_is_present() {
+        let backend =
+            FakeGuardedBackend::with_captures([Ok(guarded_capture("ordinary terminal output"))]);
+        let result = probe_actionable_prompt_classified_with(
+            &guarded_session(AgentProvider::Codex),
+            &backend,
+        )
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn actionable_probe_classifies_without_exposing_prompt_evidence_or_sending() {
+        let fixture = include_str!("../../../../tests/fixtures/antigravity-permission-pane.txt");
+        let backend = FakeGuardedBackend::with_captures([Ok(guarded_capture(fixture))]);
+
+        let result = probe_actionable_prompt_classified_with(
+            &guarded_session(AgentProvider::Antigravity),
+            &backend,
+        )
+        .unwrap();
+
+        assert_eq!(result, Some(ActionablePrompt::Allow));
+        let debug = format!("{result:?}");
+        assert!(!debug.contains("tool-42"));
+        assert!(!debug.contains("test-pane"));
         assert!(backend.keys.lock().unwrap().is_empty());
         assert!(backend.literals.lock().unwrap().is_empty());
     }
@@ -2896,7 +3162,11 @@ mod tests {
                 TerminalSessionAction::Continue,
                 &send_failure,
             ),
-            Err(GuardedActionFailure::NotSent(_))
+            Err(GuardedActionFailure {
+                category: GuardedActionFailureCategory::SendFailed,
+                certainty: DeliveryCertainty::Unknown,
+                ..
+            })
         ));
 
         let uncertain = FakeGuardedBackend::with_captures([
@@ -2910,7 +3180,10 @@ mod tests {
                 TerminalSessionAction::Continue,
                 &uncertain,
             ),
-            Err(GuardedActionFailure::DeliveryUnknown(_))
+            Err(GuardedActionFailure {
+                certainty: DeliveryCertainty::Unknown,
+                ..
+            })
         ));
         assert_eq!(
             uncertain.keys.lock().unwrap().as_slice(),
@@ -2997,6 +3270,7 @@ mod tests {
         let secret = "C-c secret-token-42";
         let backend = FakeGuardedBackend::with_captures([
             Ok(guarded_capture("arbitrary unrecognized prompt")),
+            Ok(guarded_capture("arbitrary unrecognized prompt")),
             Ok(guarded_capture("agent resumed")),
         ]);
 
@@ -3011,6 +3285,30 @@ mod tests {
         assert_eq!(backend.keys.lock().unwrap().as_slice(), [vec!["Enter"]]);
         assert_eq!(outcome.action, TerminalSessionAction::Text(String::new()));
         assert!(!format!("{outcome:?}").contains(secret));
+    }
+
+    #[test]
+    fn guarded_manual_text_requires_postflight_advancement_from_fresh_recapture() {
+        let backend = FakeGuardedBackend::with_captures([
+            Ok(guarded_capture("initial terminal output")),
+            Ok(guarded_capture("fresh terminal output")),
+            Ok(guarded_capture("fresh terminal output")),
+        ]);
+
+        let failure = execute_guarded_action_classified_with(
+            &guarded_session(crate::provider::AgentProvider::Claude),
+            TerminalSessionAction::Text("continue".into()),
+            &backend,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            failure.category,
+            GuardedActionFailureCategory::PostflightUnconfirmed
+        );
+        assert_eq!(failure.certainty, DeliveryCertainty::Unknown);
+        assert_eq!(backend.literals.lock().unwrap().as_slice(), ["continue"]);
+        assert_eq!(backend.keys.lock().unwrap().as_slice(), [vec!["Enter"]]);
     }
 
     #[test]
@@ -3041,7 +3339,11 @@ mod tests {
                     .into_iter()
                     .collect(),
             ),
-            captures: std::sync::Mutex::new([Ok(guarded_capture("prompt"))].into_iter().collect()),
+            captures: std::sync::Mutex::new(
+                [Ok(guarded_capture("prompt")), Ok(guarded_capture("prompt"))]
+                    .into_iter()
+                    .collect(),
+            ),
             literal_error: Some(format!("failed to send {secret}")),
             ..FakeGuardedBackend::default()
         };
@@ -3057,7 +3359,102 @@ mod tests {
     }
 
     #[test]
-    fn guarded_manual_text_rejects_changed_capture_backend() {
+    fn guarded_failures_bound_and_redact_backend_details() {
+        let detail = format!("token=top-secret-backend-detail {}", "x".repeat(8_192));
+        let exact = ExactTargetFailure::unavailable(&detail);
+        let guarded =
+            GuardedActionFailure::unknown(GuardedActionFailureCategory::SendFailed, &detail);
+
+        for message in [exact.message(), guarded.message()] {
+            assert!(message.len() <= crate::brain_activity::MAX_ACTIVITY_FIELD_BYTES);
+            assert!(!message.contains("top-secret-backend-detail"));
+        }
+        assert!(!format!("{exact:?}").contains("top-secret-backend-detail"));
+        assert!(!format!("{guarded:?}").contains("top-secret-backend-detail"));
+    }
+
+    struct SendFailureFixture {
+        session: AgentSession,
+        action: TerminalSessionAction,
+        backend: FakeGuardedBackend,
+    }
+
+    fn send_failure_fixtures() -> Vec<SendFailureFixture> {
+        let claude_fixture = include_str!("../../../../tests/fixtures/claude-recovery-pane.txt");
+        let codex_fixture =
+            include_str!("../../../../tests/fixtures/codex-recovery-composer-pane.txt");
+        [
+            (
+                AgentProvider::Codex,
+                TerminalSessionAction::Continue,
+                codex_fixture,
+                Some("literal failed"),
+                None,
+            ),
+            (
+                AgentProvider::Claude,
+                TerminalSessionAction::Continue,
+                claude_fixture,
+                None,
+                Some("keys failed"),
+            ),
+            (
+                AgentProvider::Claude,
+                TerminalSessionAction::Text("top-secret-literal".into()),
+                "ordinary terminal output",
+                Some("literal failed"),
+                None,
+            ),
+            (
+                AgentProvider::Claude,
+                TerminalSessionAction::Text("top-secret-literal".into()),
+                "ordinary terminal output",
+                None,
+                Some("keys failed"),
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(provider, action, capture, literal_error, keys_error)| SendFailureFixture {
+                session: guarded_session(provider),
+                action,
+                backend: FakeGuardedBackend {
+                    targets: std::sync::Mutex::new(
+                        [Ok("test-pane".into()), Ok("test-pane".into())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    captures: std::sync::Mutex::new(
+                        [Ok(guarded_capture(capture)), Ok(guarded_capture(capture))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    literal_error: literal_error.map(str::to_owned),
+                    keys_error: keys_error.map(str::to_owned),
+                    ..FakeGuardedBackend::default()
+                },
+            },
+        )
+        .collect()
+    }
+
+    #[test]
+    fn every_semantic_and_manual_send_call_failure_is_delivery_unknown_and_redacted() {
+        for fixture in send_failure_fixtures() {
+            let failure = execute_guarded_action_classified_with(
+                &fixture.session,
+                fixture.action,
+                &fixture.backend,
+            )
+            .unwrap_err();
+            assert_eq!(failure.category, GuardedActionFailureCategory::SendFailed);
+            assert_eq!(failure.certainty, DeliveryCertainty::Unknown);
+            assert!(!format!("{failure:?}").contains("top-secret-literal"));
+        }
+    }
+
+    #[test]
+    fn guarded_manual_text_rejects_changed_recapture_backend_before_sending() {
         let backend = FakeGuardedBackend::with_captures([
             Ok(guarded_capture("prompt")),
             Ok(PaneCapture {
@@ -3075,6 +3472,8 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("backend changed"));
+        assert!(backend.literals.lock().unwrap().is_empty());
+        assert!(backend.keys.lock().unwrap().is_empty());
     }
 
     #[test]

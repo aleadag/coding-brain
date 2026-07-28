@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
@@ -16,10 +16,11 @@ use coding_brain_core::provider::{AgentProvider, AgentSessionKey, LiveProcessIde
 use coding_brain_core::runtime::BrainGateMode;
 use coding_brain_core::session::{AgentSession, RawAgentSession, SessionStatus};
 use coding_brain_core::terminals::{
-    GuardedActionFailure, TerminalSessionAction, execute_guarded_action_classified,
-    probe_actionable_prompt, probe_recovery_prompt,
+    DeliveryCertainty, GuardedActionFailure, GuardedActionFailureCategory, TerminalSessionAction,
+    execute_guarded_action_classified, probe_actionable_prompt, probe_recovery_prompt,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::activity::{ActivityStore, ActivityStoreError, AtomicReservationOutcome};
 use crate::config::BrainConfig;
@@ -180,13 +181,111 @@ pub enum ReservationOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryExecution {
     Continued,
-    Abstained,
+    InactiveMode,
+    InvalidEvidence,
+    InferenceFailed,
+    ModelAbstained,
+    BelowThreshold,
+    EvidenceUnavailable,
+    EvidenceChanged,
+    ReservationDuplicate,
+    ReservationCooldown,
+    ReservationFailed,
+    PreSendAuditFailed,
+    DeliveryNotSent(GuardedActionFailureCategory),
+    DeliveryUnknown(GuardedActionFailureCategory),
+    PostflightUncertain,
+    PostSendAuditUncertain,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl RecoveryExecution {
+    fn diagnostic_category(self) -> Option<&'static str> {
+        match self {
+            Self::Continued | Self::InactiveMode | Self::InvalidEvidence => None,
+            Self::InferenceFailed => Some("inference_failed"),
+            Self::ModelAbstained => Some("model_abstained"),
+            Self::BelowThreshold => Some("below_threshold"),
+            Self::EvidenceUnavailable => Some("evidence_unavailable"),
+            Self::EvidenceChanged => Some("evidence_changed"),
+            Self::ReservationDuplicate => Some("reservation_duplicate"),
+            Self::ReservationCooldown => Some("reservation_cooldown"),
+            Self::ReservationFailed => Some("reservation_failed"),
+            Self::PreSendAuditFailed => Some("pre_send_audit_failed"),
+            Self::DeliveryNotSent(category) => Some(match category {
+                GuardedActionFailureCategory::LiveProcessUnavailable => {
+                    "delivery_not_sent_live_process_unavailable"
+                }
+                GuardedActionFailureCategory::ExactTargetUnavailable => {
+                    "delivery_not_sent_exact_target_unavailable"
+                }
+                GuardedActionFailureCategory::ExactTargetAmbiguous => {
+                    "delivery_not_sent_exact_target_ambiguous"
+                }
+                GuardedActionFailureCategory::CaptureUnavailable => {
+                    "delivery_not_sent_capture_unavailable"
+                }
+                GuardedActionFailureCategory::PromptUnrecognized => {
+                    "delivery_not_sent_prompt_unrecognized"
+                }
+                GuardedActionFailureCategory::PromptChanged => "delivery_not_sent_prompt_changed",
+                GuardedActionFailureCategory::SendFailed => "delivery_not_sent_send_failed",
+                GuardedActionFailureCategory::PostflightUnconfirmed => {
+                    "delivery_not_sent_postflight_unconfirmed"
+                }
+            }),
+            Self::DeliveryUnknown(category) => Some(match category {
+                GuardedActionFailureCategory::LiveProcessUnavailable => {
+                    "delivery_unknown_live_process_unavailable"
+                }
+                GuardedActionFailureCategory::ExactTargetUnavailable => {
+                    "delivery_unknown_exact_target_unavailable"
+                }
+                GuardedActionFailureCategory::ExactTargetAmbiguous => {
+                    "delivery_unknown_exact_target_ambiguous"
+                }
+                GuardedActionFailureCategory::CaptureUnavailable => {
+                    "delivery_unknown_capture_unavailable"
+                }
+                GuardedActionFailureCategory::PromptUnrecognized => {
+                    "delivery_unknown_prompt_unrecognized"
+                }
+                GuardedActionFailureCategory::PromptChanged => "delivery_unknown_prompt_changed",
+                GuardedActionFailureCategory::SendFailed => "delivery_unknown_send_failed",
+                GuardedActionFailureCategory::PostflightUnconfirmed => {
+                    "delivery_unknown_postflight_unconfirmed"
+                }
+            }),
+            Self::PostflightUncertain => Some("postflight_uncertain"),
+            Self::PostSendAuditUncertain => Some("post_send_audit_uncertain"),
+        }
+    }
+
+    fn safe_message(self) -> &'static str {
+        match self {
+            Self::Continued => "Automatic recovery continued the session",
+            Self::InactiveMode => "Automatic recovery mode is inactive",
+            Self::InvalidEvidence => "Automatic recovery evidence is invalid",
+            Self::InferenceFailed => "Automatic recovery inference failed",
+            Self::ModelAbstained => "Automatic recovery model abstained",
+            Self::BelowThreshold => "Automatic recovery confidence was below threshold",
+            Self::EvidenceUnavailable => "Automatic recovery evidence is unavailable",
+            Self::EvidenceChanged => "Automatic recovery evidence changed",
+            Self::ReservationDuplicate => "Automatic recovery attempt was already reserved",
+            Self::ReservationCooldown => "Automatic recovery session is in cooldown",
+            Self::ReservationFailed => "Automatic recovery reservation failed",
+            Self::PreSendAuditFailed => "Automatic recovery pre-send audit failed",
+            Self::DeliveryNotSent(_) => "Automatic recovery action was not sent",
+            Self::DeliveryUnknown(_) => "Automatic recovery delivery is unconfirmed",
+            Self::PostflightUncertain => "Automatic recovery postflight is unconfirmed",
+            Self::PostSendAuditUncertain => "Automatic recovery delivery audit is unconfirmed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryDeliveryFailure {
-    Failed,
-    Unknown,
+    NotSent(GuardedActionFailureCategory),
+    Unknown(GuardedActionFailureCategory),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -209,44 +308,57 @@ where
     Deliver: FnMut(&RecoveryTargetSnapshot) -> Result<(), RecoveryDeliveryFailure>,
     Postflight: FnMut(&RecoveryTargetSnapshot) -> Result<(), String>,
 {
-    if mode != BrainGateMode::Auto || !target.has_consistent_evidence() {
-        return RecoveryExecution::Abstained;
+    if mode != BrainGateMode::Auto {
+        return RecoveryExecution::InactiveMode;
     }
-    let Ok(suggestion) = infer() else {
-        return RecoveryExecution::Abstained;
+    if !target.has_consistent_evidence() {
+        return RecoveryExecution::InvalidEvidence;
+    }
+    let suggestion = match infer() {
+        Ok(suggestion) => suggestion,
+        Err(_) => return RecoveryExecution::InferenceFailed,
     };
-    if !matches!(
-        evaluate_recovery(mode, &target, &suggestion, threshold),
-        RecoveryDecision::Continue(_)
-    ) {
-        return RecoveryExecution::Abstained;
+    if !suggestion.confidence.is_finite() || suggestion.confidence < threshold {
+        return RecoveryExecution::BelowThreshold;
+    }
+    if !matches!(suggestion.decision, RecoveryDecision::Continue(_)) {
+        return RecoveryExecution::ModelAbstained;
     }
     let pending = PendingRecovery::bound(suggestion, target.clone());
-    if !snapshot().is_ok_and(|current| pending.matches(&current)) {
-        return RecoveryExecution::Abstained;
+    match snapshot() {
+        Err(_) => return RecoveryExecution::EvidenceUnavailable,
+        Ok(current) if !pending.matches(&current) => return RecoveryExecution::EvidenceChanged,
+        Ok(_) => {}
     }
-    if !matches!(reserve(&target), Ok(ReservationOutcome::Reserved)) {
-        return RecoveryExecution::Abstained;
+    match reserve(&target) {
+        Ok(ReservationOutcome::Reserved) => {}
+        Ok(ReservationOutcome::Duplicate) => return RecoveryExecution::ReservationDuplicate,
+        Ok(ReservationOutcome::Cooldown) => return RecoveryExecution::ReservationCooldown,
+        Err(_) => return RecoveryExecution::ReservationFailed,
     }
     if audit(ActivityState::Evaluating).is_err() {
-        return RecoveryExecution::Abstained;
+        return RecoveryExecution::PreSendAuditFailed;
     }
-    if !snapshot().is_ok_and(|current| pending.matches(&current)) {
-        return RecoveryExecution::Abstained;
+    match snapshot() {
+        Err(_) => return RecoveryExecution::EvidenceUnavailable,
+        Ok(current) if !pending.matches(&current) => return RecoveryExecution::EvidenceChanged,
+        Ok(_) => {}
     }
     match deliver(&target) {
         Ok(()) => {}
-        Err(RecoveryDeliveryFailure::Failed) => {
+        Err(RecoveryDeliveryFailure::NotSent(category)) => {
             let _ = audit(ActivityState::DeliveryFailed);
-            return RecoveryExecution::Abstained;
+            return RecoveryExecution::DeliveryNotSent(category);
         }
-        Err(RecoveryDeliveryFailure::Unknown) => return RecoveryExecution::Abstained,
+        Err(RecoveryDeliveryFailure::Unknown(category)) => {
+            return RecoveryExecution::DeliveryUnknown(category);
+        }
     }
     if postflight(&target).is_err() {
-        return RecoveryExecution::Abstained;
+        return RecoveryExecution::PostflightUncertain;
     }
     if audit(ActivityState::Delivered).is_err() {
-        return RecoveryExecution::Abstained;
+        return RecoveryExecution::PostSendAuditUncertain;
     }
     RecoveryExecution::Continued
 }
@@ -269,40 +381,51 @@ where
     Audit: FnMut(ActivityState) -> Result<(), String>,
     Deliver: FnMut(&RecoveryTargetSnapshot) -> Result<(), String>,
 {
-    if mode != BrainGateMode::Auto || !target.has_consistent_evidence() {
-        return RecoveryExecution::Abstained;
+    if mode != BrainGateMode::Auto {
+        return RecoveryExecution::InactiveMode;
     }
-    let Ok(suggestion) = infer() else {
-        return RecoveryExecution::Abstained;
+    if !target.has_consistent_evidence() {
+        return RecoveryExecution::InvalidEvidence;
+    }
+    let suggestion = match infer() {
+        Ok(suggestion) => suggestion,
+        Err(_) => return RecoveryExecution::InferenceFailed,
     };
-    if !matches!(
-        evaluate_recovery(mode, &target, &suggestion, threshold),
-        RecoveryDecision::Continue(_)
-    ) {
-        return RecoveryExecution::Abstained;
+    if !suggestion.confidence.is_finite() || suggestion.confidence < threshold {
+        return RecoveryExecution::BelowThreshold;
+    }
+    if !matches!(suggestion.decision, RecoveryDecision::Continue(_)) {
+        return RecoveryExecution::ModelAbstained;
     }
     let pending = PendingRecovery::bound(suggestion, target.clone());
-    if !snapshot().is_ok_and(|current| pending.matches(&current)) {
-        return RecoveryExecution::Abstained;
+    match snapshot() {
+        Err(_) => return RecoveryExecution::EvidenceUnavailable,
+        Ok(current) if !pending.matches(&current) => return RecoveryExecution::EvidenceChanged,
+        Ok(_) => {}
     }
-    if !matches!(reserve(&target), Ok(ReservationOutcome::Reserved)) {
-        return RecoveryExecution::Abstained;
+    match reserve(&target) {
+        Ok(ReservationOutcome::Reserved) => {}
+        Ok(ReservationOutcome::Duplicate) => return RecoveryExecution::ReservationDuplicate,
+        Ok(ReservationOutcome::Cooldown) => return RecoveryExecution::ReservationCooldown,
+        Err(_) => return RecoveryExecution::ReservationFailed,
     }
     if audit(ActivityState::Evaluating).is_err() {
-        return RecoveryExecution::Abstained;
+        return RecoveryExecution::PreSendAuditFailed;
     }
     // This is the final evidence check before writing the irreversible Stop response.
-    if !snapshot().is_ok_and(|current| pending.matches(&current)) {
-        return RecoveryExecution::Abstained;
+    match snapshot() {
+        Err(_) => return RecoveryExecution::EvidenceUnavailable,
+        Ok(current) if !pending.matches(&current) => return RecoveryExecution::EvidenceChanged,
+        Ok(_) => {}
     }
     if deliver(&target).is_err() {
         let _ = audit(ActivityState::DeliveryFailed);
-        return RecoveryExecution::Abstained;
+        return RecoveryExecution::DeliveryUnknown(GuardedActionFailureCategory::SendFailed);
     }
     if audit(ActivityState::Delivered).is_err() {
         // The response cannot be retracted. The persisted Evaluating state therefore
         // remains Unknown rather than falsely claiming Delivered.
-        return RecoveryExecution::Abstained;
+        return RecoveryExecution::PostSendAuditUncertain;
     }
     RecoveryExecution::Continued
 }
@@ -506,14 +629,22 @@ fn run_hook_with<R: Read, W: Write, E: Write>(
             reserve,
             |state| append_recovery_audit(&activity, &session, &initial, state, threshold),
             |_| {
-                execute_guarded_action_classified(&session, TerminalSessionAction::Continue)
-                    .map(|_| ())
-                    .map_err(recovery_delivery_failure)
+                if session.provider == AgentProvider::Codex {
+                    deliver_guarded_codex_continue_with(&session, execute_guarded_action_classified)
+                } else {
+                    execute_guarded_action_classified(&session, TerminalSessionAction::Continue)
+                        .map(|_| ())
+                        .map_err(recovery_delivery_failure)
+                }
             },
             |target| hook_postflight_matches(&lifecycle, &session, target),
         )
     };
-    let _ = outcome;
+    if outcome.diagnostic_category().is_some()
+        && append_recovery_diagnostic(&activity, &session, &initial, outcome).is_err()
+    {
+        write_recovery_diagnostic(&mut stderr, "recovery diagnostic persistence failed");
+    }
 }
 
 fn hook_session(recorded: &crate::lifecycle_hook::RecordedProviderHook) -> Option<AgentSession> {
@@ -610,30 +741,15 @@ fn append_recovery_audit(
     let attempt = serde_json::to_string(&target.attempt)
         .map_err(|_| "recovery audit serialization failed".to_string())?;
     let fingerprint = target.evidence_json()?;
-    let project_id =
-        ProjectId::Temporary(format!("recovery:{}", target.attempt.session.storage_key()));
+    let project = recovery_project(session, target);
     activity
         .append(ActivityEvent {
             schema_version: ACTIVITY_SCHEMA_VERSION,
             kind: ActivityKind::Decision,
             activity_id: format!("recovery_delivery:{attempt}"),
             recorded_at_ms: epoch_ms(),
-            project: ProjectEvidence {
-                project_id: project_id.clone(),
-                cwd: PathBuf::from(&session.cwd),
-                label: None,
-            },
-            session: Some(SessionTarget {
-                provider: session.provider,
-                session_id: session.session_id.clone(),
-                provider_session_id: None,
-                turn_id: target.turn_id.clone(),
-                tool_use_id: target.pending_tool_use_id.clone(),
-                project_id,
-                cwd: PathBuf::from(&session.cwd),
-                provider_hints: Vec::new(),
-                provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Unknown,
-            }),
+            project,
+            session: Some(recovery_session_target(session, target)),
             state,
             tool: Some("recovery".into()),
             normalized_command: None,
@@ -656,6 +772,202 @@ fn append_recovery_audit(
             supersedes: None,
         })
         .map_err(|_| "recovery audit persistence failed".to_string())
+}
+
+fn recovery_project(session: &AgentSession, target: &RecoveryTargetSnapshot) -> ProjectEvidence {
+    ProjectEvidence {
+        project_id: ProjectId::Temporary(format!(
+            "recovery:{}",
+            target.attempt.session.storage_key()
+        )),
+        cwd: PathBuf::from(&session.cwd),
+        label: None,
+    }
+}
+
+fn recovery_session_target(
+    session: &AgentSession,
+    target: &RecoveryTargetSnapshot,
+) -> SessionTarget {
+    let project = recovery_project(session, target);
+    SessionTarget {
+        provider: session.provider,
+        session_id: session.session_id.clone(),
+        provider_session_id: None,
+        turn_id: target.turn_id.clone(),
+        tool_use_id: target.pending_tool_use_id.clone(),
+        project_id: project.project_id,
+        cwd: project.cwd,
+        provider_hints: Vec::new(),
+        provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Unknown,
+    }
+}
+
+fn recovery_diagnostic_id(attempt: &RecoveryAttemptKey, category: &str) -> Result<String, String> {
+    let canonical = serde_json::to_vec(&(attempt, category))
+        .map_err(|_| "recovery diagnostic identity failed".to_string())?;
+    Ok(format!(
+        "recovery_diagnostic:{:x}",
+        Sha256::digest(canonical)
+    ))
+}
+
+fn append_recovery_diagnostic(
+    activity: &ActivityStore,
+    session: &AgentSession,
+    target: &RecoveryTargetSnapshot,
+    outcome: RecoveryExecution,
+) -> Result<bool, String> {
+    activity
+        .append_if_absent(recovery_diagnostic_event(session, target, outcome)?)
+        .map_err(|_| "recovery diagnostic persistence failed".to_string())
+}
+
+fn recovery_diagnostic_event(
+    session: &AgentSession,
+    target: &RecoveryTargetSnapshot,
+    outcome: RecoveryExecution,
+) -> Result<ActivityEvent, String> {
+    let category = outcome
+        .diagnostic_category()
+        .ok_or_else(|| "recovery outcome is not diagnostic".to_string())?;
+    Ok(ActivityEvent {
+        schema_version: ACTIVITY_SCHEMA_VERSION,
+        kind: ActivityKind::Diagnostic,
+        activity_id: recovery_diagnostic_id(&target.attempt, category)?,
+        recorded_at_ms: epoch_ms(),
+        project: recovery_project(session, target),
+        session: Some(recovery_session_target(session, target)),
+        state: ActivityState::Error,
+        tool: Some("recovery".into()),
+        rule_id: Some(format!("recovery_{category}")),
+        reasoning: Some(outcome.safe_message().into()),
+        normalized_command: None,
+        fingerprint: None,
+        confidence: None,
+        threshold: None,
+        decision_id: None,
+        outcome: None,
+        correction: None,
+        note: None,
+        supersedes: None,
+    })
+}
+
+#[derive(Clone)]
+struct PendingRecoveryDiagnostic {
+    id: String,
+    event: ActivityEvent,
+}
+
+enum ReportedRecoveryDiagnostic {
+    InFlight(PendingRecoveryDiagnostic),
+    Pending(PendingRecoveryDiagnostic),
+    Retained,
+}
+
+#[derive(Default)]
+struct ReportedRecoveryDiagnostics {
+    order: VecDeque<String>,
+    entries: HashMap<String, ReportedRecoveryDiagnostic>,
+}
+
+impl ReportedRecoveryDiagnostics {
+    fn reserve_if_new(&mut self, event: ActivityEvent) -> bool {
+        let id = event.activity_id.clone();
+        if self.entries.contains_key(&id) {
+            return false;
+        }
+        if self.order.len() >= MAX_RECOVERY_QUEUE
+            && let Some(index) = self.order.iter().position(|candidate| {
+                !matches!(
+                    self.entries.get(candidate),
+                    Some(ReportedRecoveryDiagnostic::InFlight(_))
+                )
+            })
+            && let Some(evicted) = self.order.remove(index)
+        {
+            self.entries.remove(&evicted);
+        }
+        if self.order.len() >= MAX_RECOVERY_QUEUE {
+            return false;
+        }
+        self.order.push_back(id);
+        self.entries.insert(
+            event.activity_id.clone(),
+            ReportedRecoveryDiagnostic::InFlight(PendingRecoveryDiagnostic {
+                id: event.activity_id.clone(),
+                event,
+            }),
+        );
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn finish(&mut self, id: &str, persisted: bool) {
+        let Some(entry) = self.entries.remove(id) else {
+            return;
+        };
+        let payload = match entry {
+            ReportedRecoveryDiagnostic::InFlight(payload)
+            | ReportedRecoveryDiagnostic::Pending(payload) => payload,
+            ReportedRecoveryDiagnostic::Retained => {
+                self.entries
+                    .insert(id.to_string(), ReportedRecoveryDiagnostic::Retained);
+                return;
+            }
+        };
+        let next = if persisted {
+            ReportedRecoveryDiagnostic::Retained
+        } else {
+            ReportedRecoveryDiagnostic::Pending(payload)
+        };
+        self.entries.insert(id.to_string(), next);
+    }
+
+    fn take_pending(&mut self) -> Option<PendingRecoveryDiagnostic> {
+        let id = self.order.iter().find_map(|id| {
+            matches!(
+                self.entries.get(id),
+                Some(ReportedRecoveryDiagnostic::Pending(_))
+            )
+            .then(|| id.clone())
+        })?;
+        let Some(ReportedRecoveryDiagnostic::Pending(payload)) = self.entries.remove(&id) else {
+            return None;
+        };
+        self.entries
+            .insert(id, ReportedRecoveryDiagnostic::InFlight(payload.clone()));
+        Some(payload)
+    }
+}
+
+fn append_recovery_diagnostic_cached(
+    cache: &Arc<Mutex<ReportedRecoveryDiagnostics>>,
+    writer: &Arc<RecoveryDiagnosticWrite>,
+    session: &AgentSession,
+    target: &RecoveryTargetSnapshot,
+    outcome: RecoveryExecution,
+) -> Result<bool, String> {
+    let event = recovery_diagnostic_event(session, target, outcome)?;
+    let id = event.activity_id.clone();
+    {
+        let mut cache = cache
+            .lock()
+            .map_err(|_| "recovery diagnostic cache failed".to_string())?;
+        if !cache.reserve_if_new(event.clone()) {
+            return Ok(false);
+        }
+    }
+    let persisted = writer(event);
+    if let Ok(mut cache) = cache.lock() {
+        cache.finish(&id, persisted.is_ok());
+    }
+    persisted
 }
 
 fn write_recovery_diagnostic(stderr: &mut impl Write, message: &str) {
@@ -687,6 +999,10 @@ enum RecoveryPollResult {
         attempt: RecoveryAttemptKey,
         message: Option<String>,
     },
+    DiagnosticRetried {
+        id: String,
+        result: Result<bool, String>,
+    },
 }
 
 struct RecoveryPollState {
@@ -700,12 +1016,21 @@ struct RecoveryPollState {
 }
 
 type RecoveryScan = dyn Fn() -> Vec<RecoveryPollWork> + Send + Sync;
-type RecoveryEvaluate = dyn Fn(&RecoveryPollWork) -> Option<String> + Send + Sync;
+type RecoveryDiagnosticWrite = dyn Fn(ActivityEvent) -> Result<bool, String> + Send + Sync;
+type RecoveryEvaluate = dyn Fn(
+        &RecoveryPollWork,
+        &Arc<Mutex<ReportedRecoveryDiagnostics>>,
+        &Arc<RecoveryDiagnosticWrite>,
+    ) -> Option<String>
+    + Send
+    + Sync;
 
 pub struct RecoveryCoordinator {
     state: Mutex<RecoveryPollState>,
     scan: Arc<RecoveryScan>,
     evaluate: Arc<RecoveryEvaluate>,
+    reported_diagnostics: Arc<Mutex<ReportedRecoveryDiagnostics>>,
+    diagnostic_writer: Arc<RecoveryDiagnosticWrite>,
 }
 
 impl Default for RecoveryCoordinator {
@@ -720,6 +1045,23 @@ impl Default for RecoveryCoordinator {
 
 impl RecoveryCoordinator {
     fn with_workers(scan: Arc<RecoveryScan>, evaluate: Arc<RecoveryEvaluate>) -> Self {
+        Self::with_workers_and_writer(
+            scan,
+            evaluate,
+            Arc::new(|event| {
+                let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
+                ActivityStore::at(state_root.join("activity.jsonl"))
+                    .append_if_absent(event)
+                    .map_err(|_| "recovery diagnostic persistence failed".to_string())
+            }),
+        )
+    }
+
+    fn with_workers_and_writer(
+        scan: Arc<RecoveryScan>,
+        evaluate: Arc<RecoveryEvaluate>,
+        diagnostic_writer: Arc<RecoveryDiagnosticWrite>,
+    ) -> Self {
         let (tx, rx) = sync_channel(MAX_RECOVERY_QUEUE);
         Self {
             state: Mutex::new(RecoveryPollState {
@@ -733,6 +1075,8 @@ impl RecoveryCoordinator {
             }),
             scan,
             evaluate,
+            reported_diagnostics: Arc::new(Mutex::new(ReportedRecoveryDiagnostics::default())),
+            diagnostic_writer,
         }
     }
 
@@ -773,7 +1117,45 @@ impl RecoveryCoordinator {
                         messages.push(message);
                     }
                 }
+                Ok(RecoveryPollResult::DiagnosticRetried { id, result }) => {
+                    state.active_workers = state.active_workers.saturating_sub(1);
+                    if let Ok(mut diagnostics) = self.reported_diagnostics.lock() {
+                        diagnostics.finish(&id, result.is_ok());
+                    }
+                    if result.is_err() {
+                        messages.push("Recovery diagnostic persistence failed".into());
+                    }
+                }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        if state.active_workers < MAX_RECOVERY_WORKERS {
+            let pending = self
+                .reported_diagnostics
+                .lock()
+                .ok()
+                .and_then(|mut diagnostics| diagnostics.take_pending());
+            if let Some(pending) = pending {
+                state.active_workers += 1;
+                let tx = state.tx.clone();
+                let writer = Arc::clone(&self.diagnostic_writer);
+                let failed_id = pending.id.clone();
+                if std::thread::Builder::new()
+                    .name("coding-brain-recovery-diagnostic".into())
+                    .spawn(move || {
+                        let result = writer(pending.event);
+                        let _ = tx.send(RecoveryPollResult::DiagnosticRetried {
+                            id: pending.id,
+                            result,
+                        });
+                    })
+                    .is_err()
+                {
+                    state.active_workers = state.active_workers.saturating_sub(1);
+                    if let Ok(mut diagnostics) = self.reported_diagnostics.lock() {
+                        diagnostics.finish(&failed_id, false);
+                    }
+                }
             }
         }
         while state.active_workers < MAX_RECOVERY_WORKERS {
@@ -787,11 +1169,13 @@ impl RecoveryCoordinator {
             state.active_workers += 1;
             let tx = state.tx.clone();
             let evaluate = Arc::clone(&self.evaluate);
+            let reported_diagnostics = Arc::clone(&self.reported_diagnostics);
+            let diagnostic_writer = Arc::clone(&self.diagnostic_writer);
             let failed_attempt = attempt.clone();
             if std::thread::Builder::new()
                 .name("coding-brain-recovery".into())
                 .spawn(move || {
-                    let message = evaluate(&work);
+                    let message = evaluate(&work, &reported_diagnostics, &diagnostic_writer);
                     let _ = tx.send(RecoveryPollResult::Evaluated { attempt, message });
                 })
                 .is_err()
@@ -1007,7 +1391,11 @@ fn refresh_poll_target(work: &RecoveryPollWork) -> Result<RecoveryTargetSnapshot
     refresh_poll_evidence(work).map(|evidence| evidence.target)
 }
 
-fn evaluate_poll_work(work: &RecoveryPollWork) -> Option<String> {
+fn evaluate_poll_work(
+    work: &RecoveryPollWork,
+    reported_diagnostics: &Arc<Mutex<ReportedRecoveryDiagnostics>>,
+    diagnostic_writer: &Arc<RecoveryDiagnosticWrite>,
+) -> Option<String> {
     let config = crate::config::Config::load();
     let mode = super::resolve_gate_mode(config.brain.as_ref()).mode;
     let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
@@ -1032,19 +1420,49 @@ fn evaluate_poll_work(work: &RecoveryPollWork) -> Option<String> {
         },
         |state| append_recovery_audit(&activity, &work.session, &work.target, state, threshold),
         |target| {
-            let refreshed =
-                refresh_poll_evidence(work).map_err(|_| RecoveryDeliveryFailure::Failed)?;
+            let refreshed = refresh_poll_evidence(work).map_err(|_| {
+                RecoveryDeliveryFailure::NotSent(GuardedActionFailureCategory::CaptureUnavailable)
+            })?;
             if refreshed.target != *target {
-                return Err(RecoveryDeliveryFailure::Failed);
+                return Err(RecoveryDeliveryFailure::NotSent(
+                    GuardedActionFailureCategory::PromptChanged,
+                ));
             }
-            execute_guarded_action_classified(&refreshed.session, TerminalSessionAction::Continue)
+            if refreshed.session.provider == AgentProvider::Codex {
+                deliver_guarded_codex_continue_with(
+                    &refreshed.session,
+                    execute_guarded_action_classified,
+                )
+            } else {
+                execute_guarded_action_classified(
+                    &refreshed.session,
+                    TerminalSessionAction::Continue,
+                )
                 .map(|_| ())
                 .map_err(recovery_delivery_failure)
+            }
         },
         |target| poll_postflight_matches(work, target),
     );
-    (outcome == RecoveryExecution::Continued)
-        .then(|| format!("Recovered {} session", work.session.provider.label()))
+    if outcome == RecoveryExecution::Continued {
+        return Some(format!(
+            "Recovered {} session",
+            work.session.provider.label()
+        ));
+    }
+    if outcome.diagnostic_category().is_some()
+        && append_recovery_diagnostic_cached(
+            reported_diagnostics,
+            diagnostic_writer,
+            &work.session,
+            &work.target,
+            outcome,
+        )
+        .is_err()
+    {
+        return Some("Recovery diagnostic persistence failed".into());
+    }
+    None
 }
 
 fn infer_configured_recovery(
@@ -1063,10 +1481,24 @@ fn infer_configured_recovery(
 }
 
 fn recovery_delivery_failure(error: GuardedActionFailure) -> RecoveryDeliveryFailure {
-    match error {
-        GuardedActionFailure::NotSent(_) => RecoveryDeliveryFailure::Failed,
-        GuardedActionFailure::DeliveryUnknown(_) => RecoveryDeliveryFailure::Unknown,
+    match error.certainty {
+        DeliveryCertainty::NotSent => RecoveryDeliveryFailure::NotSent(error.category),
+        DeliveryCertainty::Unknown => RecoveryDeliveryFailure::Unknown(error.category),
     }
+}
+
+fn deliver_guarded_codex_continue_with<T>(
+    session: &AgentSession,
+    deliver: impl FnOnce(&AgentSession, TerminalSessionAction) -> Result<T, GuardedActionFailure>,
+) -> Result<(), RecoveryDeliveryFailure> {
+    if session.provider != AgentProvider::Codex {
+        return Err(RecoveryDeliveryFailure::NotSent(
+            GuardedActionFailureCategory::PromptUnrecognized,
+        ));
+    }
+    deliver(session, TerminalSessionAction::Continue)
+        .map(|_| ())
+        .map_err(recovery_delivery_failure)
 }
 
 fn poll_postflight_matches(
@@ -1308,6 +1740,298 @@ mod tests {
     }
 
     #[test]
+    fn recovery_returns_exact_abstention_category_without_sending() {
+        for (inference, expected) in [
+            (
+                Ok(RecoverySuggestion {
+                    decision: RecoveryDecision::LeaveAlone,
+                    reasoning: "leave alone".into(),
+                    confidence: 0.91,
+                    suggested_at: 1_000,
+                }),
+                RecoveryExecution::ModelAbstained,
+            ),
+            (Ok(suggestion(0.59)), RecoveryExecution::BelowThreshold),
+            (
+                Err("model raw secret".into()),
+                RecoveryExecution::InferenceFailed,
+            ),
+        ] {
+            let sends = std::cell::Cell::new(0);
+            let original = target(AgentProvider::Codex);
+            let outcome = execute_recovery_with(
+                BrainGateMode::Auto,
+                original.clone(),
+                0.60,
+                || inference.clone(),
+                || Ok(original.clone()),
+                |_| Ok(ReservationOutcome::Reserved),
+                |_| Ok(()),
+                |_| {
+                    sends.set(sends.get() + 1);
+                    Ok(())
+                },
+                |_| Ok(()),
+            );
+            assert_eq!(outcome, expected);
+            assert_eq!(sends.get(), 0);
+        }
+    }
+
+    #[test]
+    fn recovery_returns_exact_snapshot_reservation_and_delivery_categories() {
+        use coding_brain_core::terminals::GuardedActionFailureCategory;
+
+        let original = target(AgentProvider::Codex);
+        let unavailable = execute_recovery_with(
+            BrainGateMode::Auto,
+            original.clone(),
+            0.60,
+            || Ok(suggestion(0.91)),
+            || Err("snapshot raw detail".into()),
+            |_| Ok(ReservationOutcome::Reserved),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        );
+        assert_eq!(unavailable, RecoveryExecution::EvidenceUnavailable);
+
+        let mut changed = original.clone();
+        changed.prompt_fingerprint = Some(99);
+        let changed_outcome = execute_recovery_with(
+            BrainGateMode::Auto,
+            original.clone(),
+            0.60,
+            || Ok(suggestion(0.91)),
+            || Ok(changed.clone()),
+            |_| Ok(ReservationOutcome::Reserved),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        );
+        assert_eq!(changed_outcome, RecoveryExecution::EvidenceChanged);
+
+        for (reservation, expected) in [
+            (
+                Ok(ReservationOutcome::Duplicate),
+                RecoveryExecution::ReservationDuplicate,
+            ),
+            (
+                Ok(ReservationOutcome::Cooldown),
+                RecoveryExecution::ReservationCooldown,
+            ),
+            (
+                Err("reservation raw detail".into()),
+                RecoveryExecution::ReservationFailed,
+            ),
+        ] {
+            let outcome = execute_recovery_with(
+                BrainGateMode::Auto,
+                original.clone(),
+                0.60,
+                || Ok(suggestion(0.91)),
+                || Ok(original.clone()),
+                |_| reservation.clone(),
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+            );
+            assert_eq!(outcome, expected);
+        }
+
+        for (delivery, expected) in [
+            (
+                RecoveryDeliveryFailure::NotSent(GuardedActionFailureCategory::PromptChanged),
+                RecoveryExecution::DeliveryNotSent(GuardedActionFailureCategory::PromptChanged),
+            ),
+            (
+                RecoveryDeliveryFailure::Unknown(GuardedActionFailureCategory::SendFailed),
+                RecoveryExecution::DeliveryUnknown(GuardedActionFailureCategory::SendFailed),
+            ),
+        ] {
+            let outcome = execute_recovery_with(
+                BrainGateMode::Auto,
+                original.clone(),
+                0.60,
+                || Ok(suggestion(0.91)),
+                || Ok(original.clone()),
+                |_| Ok(ReservationOutcome::Reserved),
+                |_| Ok(()),
+                |_| Err(delivery),
+                |_| Ok(()),
+            );
+            assert_eq!(outcome, expected);
+        }
+    }
+
+    #[test]
+    fn antigravity_recovery_returns_exact_bounded_exit_categories() {
+        let original = target(AgentProvider::Antigravity);
+        assert_eq!(
+            execute_antigravity_recovery_with(
+                BrainGateMode::Auto,
+                original.clone(),
+                0.60,
+                || Ok(suggestion(0.91)),
+                || Err("snapshot raw detail".into()),
+                |_| Ok(ReservationOutcome::Reserved),
+                |_| Ok(()),
+                |_| Ok(()),
+            ),
+            RecoveryExecution::EvidenceUnavailable
+        );
+        assert_eq!(
+            execute_antigravity_recovery_with(
+                BrainGateMode::Auto,
+                original.clone(),
+                0.60,
+                || Ok(suggestion(0.91)),
+                || Ok(original.clone()),
+                |_| Ok(ReservationOutcome::Reserved),
+                |_| Ok(()),
+                |_| Err("write raw detail".into()),
+            ),
+            RecoveryExecution::DeliveryUnknown(
+                coding_brain_core::terminals::GuardedActionFailureCategory::SendFailed,
+            )
+        );
+    }
+
+    #[test]
+    fn recovery_diagnostic_is_atomic_and_contains_no_model_or_prompt_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let target = target(AgentProvider::Codex);
+        assert!(
+            append_recovery_diagnostic(
+                &activity,
+                &process_session(AgentProvider::Codex),
+                &target,
+                RecoveryExecution::BelowThreshold,
+            )
+            .unwrap()
+        );
+        assert!(
+            !append_recovery_diagnostic(
+                &activity,
+                &process_session(AgentProvider::Codex),
+                &target,
+                RecoveryExecution::BelowThreshold,
+            )
+            .unwrap()
+        );
+        let stored = std::fs::read_to_string(temp.path().join("activity.jsonl")).unwrap();
+        assert!(!stored.contains("model raw secret"));
+        assert!(!stored.contains("terminal pane"));
+        let log = activity.read().unwrap();
+        let event = &log.events()[0];
+        assert_eq!(event.kind, ActivityKind::Diagnostic);
+        assert_eq!(event.state, ActivityState::Error);
+        assert_eq!(event.rule_id.as_deref(), Some("recovery_below_threshold"));
+    }
+
+    #[test]
+    fn bounded_reported_diagnostics_cache_suppresses_repeats() {
+        let mut cache = ReportedRecoveryDiagnostics::default();
+        let session = process_session(AgentProvider::Codex);
+        let first = recovery_diagnostic_event(
+            &session,
+            &target(AgentProvider::Codex),
+            RecoveryExecution::ReservationDuplicate,
+        )
+        .unwrap();
+        assert!(cache.reserve_if_new(first.clone()));
+        assert!(!cache.reserve_if_new(first));
+        for index in 0..MAX_RECOVERY_QUEUE {
+            let mut target = target(AgentProvider::Codex);
+            target.attempt.epoch = RecoveryEpoch::LifecycleSequence(index as u64 + 1);
+            cache.reserve_if_new(
+                recovery_diagnostic_event(&session, &target, RecoveryExecution::BelowThreshold)
+                    .unwrap(),
+            );
+        }
+        assert!(cache.len() <= MAX_RECOVERY_QUEUE);
+    }
+
+    #[test]
+    fn concurrent_diagnostic_write_reserves_once_and_retains_failed_payload() {
+        let cache = Arc::new(Mutex::new(ReportedRecoveryDiagnostics::default()));
+        let session = process_session(AgentProvider::Codex);
+        let target = target(AgentProvider::Codex);
+        let reserved = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let writer: Arc<RecoveryDiagnosticWrite> = {
+            let writes = Arc::clone(&writes);
+            let reserved = Arc::clone(&reserved);
+            let release = Arc::clone(&release);
+            Arc::new(move |_| {
+                writes.fetch_add(1, Ordering::SeqCst);
+                reserved.wait();
+                release.wait();
+                Err("injected diagnostic failure".into())
+            })
+        };
+        let worker = {
+            let cache = Arc::clone(&cache);
+            let writer = Arc::clone(&writer);
+            let session = session.clone();
+            let target = target.clone();
+            std::thread::spawn(move || {
+                append_recovery_diagnostic_cached(
+                    &cache,
+                    &writer,
+                    &session,
+                    &target,
+                    RecoveryExecution::BelowThreshold,
+                )
+            })
+        };
+        reserved.wait();
+        assert!(
+            !append_recovery_diagnostic_cached(
+                &cache,
+                &writer,
+                &session,
+                &target,
+                RecoveryExecution::BelowThreshold,
+            )
+            .unwrap()
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        release.wait();
+        assert!(worker.join().unwrap().is_err());
+        assert!(cache.lock().unwrap().take_pending().is_some());
+    }
+
+    #[test]
+    fn recovery_diagnostic_identity_changes_with_attempt_or_category() {
+        let first = target(AgentProvider::Codex).attempt;
+        let mut second = first.clone();
+        second.epoch = RecoveryEpoch::LifecycleSequence(8);
+        let base = recovery_diagnostic_id(&first, "below_threshold").unwrap();
+        assert_eq!(
+            base,
+            recovery_diagnostic_id(&first, "below_threshold").unwrap()
+        );
+        assert_ne!(
+            base,
+            recovery_diagnostic_id(&second, "below_threshold").unwrap()
+        );
+        assert_ne!(
+            base,
+            recovery_diagnostic_id(&first, "model_abstained").unwrap()
+        );
+        assert_eq!(base.len(), "recovery_diagnostic:".len() + 64);
+        assert!(
+            base.strip_prefix("recovery_diagnostic:")
+                .unwrap()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
     fn durable_reservation_deduplicates_attempt_and_enforces_session_cooldown() {
         let temp = tempfile::tempdir().unwrap();
         let store = RecoveryReservationStore::at(
@@ -1523,7 +2247,7 @@ mod tests {
             },
             |_| Ok(()),
         );
-        assert_eq!(outcome, RecoveryExecution::Abstained);
+        assert_eq!(outcome, RecoveryExecution::EvidenceChanged);
         assert_eq!(sends.get(), 0);
 
         assert!(resolve_current_poll_session(&work, Vec::new()).is_err());
@@ -1610,7 +2334,7 @@ mod tests {
                 worker.wait();
                 Vec::new()
             }),
-            Arc::new(|_| None),
+            Arc::new(|_, _, _| None),
         );
 
         let started = Instant::now();
@@ -1637,7 +2361,7 @@ mod tests {
                 let _ = scan_tx.send(());
                 work
             }),
-            Arc::new(move |_| {
+            Arc::new(move |_, _, _| {
                 evaluation_count.fetch_add(1, Ordering::SeqCst);
                 let _ = evaluation_tx.send(());
                 let (lock, ready) = &*worker_release;
@@ -1683,6 +2407,108 @@ mod tests {
     }
 
     #[test]
+    fn failed_post_reservation_diagnostic_retries_without_recovery_redelivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("activity.jsonl");
+        let scans = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scan_once = Arc::clone(&scans);
+        let inferences = Arc::new(AtomicUsize::new(0));
+        let inference_count = Arc::clone(&inferences);
+        let reservations = Arc::new(AtomicUsize::new(0));
+        let reservation_count = Arc::clone(&reservations);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let send_count = Arc::clone(&sends);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let write_count = Arc::clone(&writes);
+        let writer_path = path.clone();
+        let coordinator = RecoveryCoordinator::with_workers_and_writer(
+            Arc::new(move || {
+                if scan_once.swap(true, Ordering::SeqCst) {
+                    Vec::new()
+                } else {
+                    vec![poll_work(7)]
+                }
+            }),
+            Arc::new(move |work, diagnostics, writer| {
+                let outcome = execute_recovery_with(
+                    BrainGateMode::Auto,
+                    work.target.clone(),
+                    0.60,
+                    || {
+                        inference_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(suggestion(0.91))
+                    },
+                    || Ok(work.target.clone()),
+                    |_| {
+                        reservation_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(ReservationOutcome::Reserved)
+                    },
+                    |_| Ok(()),
+                    |_| {
+                        send_count.fetch_add(1, Ordering::SeqCst);
+                        Err(RecoveryDeliveryFailure::Unknown(
+                            GuardedActionFailureCategory::SendFailed,
+                        ))
+                    },
+                    |_| Ok(()),
+                );
+                assert_eq!(
+                    outcome,
+                    RecoveryExecution::DeliveryUnknown(GuardedActionFailureCategory::SendFailed)
+                );
+                let _ = append_recovery_diagnostic_cached(
+                    diagnostics,
+                    writer,
+                    &work.session,
+                    &work.target,
+                    outcome,
+                );
+                None
+            }),
+            Arc::new(move |event| {
+                if write_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("injected diagnostic write failure".into());
+                }
+                ActivityStore::at(&writer_path)
+                    .append_if_absent(event)
+                    .map_err(|_| "injected diagnostic persistence failed".into())
+            }),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            coordinator.poll();
+            if writes.load(Ordering::SeqCst) >= 2
+                && ActivityStore::at(&path)
+                    .read()
+                    .is_ok_and(|log| log.events().len() == 1)
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
+        assert_eq!(inferences.load(Ordering::SeqCst), 1);
+        assert_eq!(reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        let events = ActivityStore::at(&path).read().unwrap();
+        assert_eq!(events.events().len(), 1);
+        assert_eq!(
+            events.events()[0].rule_id.as_deref(),
+            Some("recovery_delivery_unknown_send_failed")
+        );
+
+        for _ in 0..10 {
+            coordinator.poll();
+            std::thread::yield_now();
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
+        assert_eq!(inferences.load(Ordering::SeqCst), 1);
+        assert_eq!(reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn auto_recovery_sends_only_after_stable_evidence_reservation_and_audits() {
         let original = target(AgentProvider::Antigravity);
         let sends = std::cell::Cell::new(0);
@@ -1715,6 +2541,82 @@ mod tests {
     }
 
     #[test]
+    fn automatic_codex_continue_composes_guarded_delivery_and_auditable_order() {
+        let original = target(AgentProvider::Codex);
+        let session = process_session(AgentProvider::Codex);
+        let trace = std::cell::RefCell::new(Vec::new());
+        let sends = std::cell::Cell::new(0);
+        let reservations = std::cell::Cell::new(0);
+        let idle_composer = include_str!("../../tests/fixtures/codex-recovery-composer-pane.txt");
+        let advanced_composer = include_str!("../../tests/fixtures/codex-active-composer-pane.txt");
+
+        let outcome = execute_recovery_with(
+            BrainGateMode::Auto,
+            original.clone(),
+            0.60,
+            || {
+                trace.borrow_mut().push("infer");
+                Ok(suggestion(0.91))
+            },
+            || {
+                trace.borrow_mut().push("snapshot");
+                Ok(original.clone())
+            },
+            |_| {
+                trace.borrow_mut().push("reserve");
+                reservations.set(reservations.get() + 1);
+                Ok(ReservationOutcome::Reserved)
+            },
+            |state| {
+                trace.borrow_mut().push(match state {
+                    ActivityState::Evaluating => "audit:evaluating",
+                    ActivityState::Delivered => "audit:delivered",
+                    _ => "audit:unexpected",
+                });
+                Ok(())
+            },
+            |_| {
+                deliver_guarded_codex_continue_with(&session, |delivered_session, action| {
+                    assert_eq!(delivered_session.provider, AgentProvider::Codex);
+                    assert_eq!(action, TerminalSessionAction::Continue);
+                    trace.borrow_mut().push("capture:idle");
+                    assert!(idle_composer.contains("Ask Codex to do anything"));
+                    trace.borrow_mut().push("send-literal:continue");
+                    trace.borrow_mut().push("send-key:Enter");
+                    sends.set(sends.get() + 1);
+                    trace.borrow_mut().push("capture:advanced");
+                    assert!(advanced_composer.contains("esc to interrupt"));
+                    Ok(())
+                })
+            },
+            |_| {
+                trace.borrow_mut().push("postflight");
+                Ok(())
+            },
+        );
+
+        assert_eq!(outcome, RecoveryExecution::Continued);
+        assert_eq!(reservations.get(), 1);
+        assert_eq!(sends.get(), 1);
+        assert_eq!(
+            trace.into_inner(),
+            vec![
+                "infer",
+                "snapshot",
+                "reserve",
+                "audit:evaluating",
+                "snapshot",
+                "capture:idle",
+                "send-literal:continue",
+                "send-key:Enter",
+                "capture:advanced",
+                "postflight",
+                "audit:delivered",
+            ]
+        );
+    }
+
+    #[test]
     fn antigravity_recovery_emits_only_after_final_stable_preflight() {
         let original = target(AgentProvider::Antigravity);
         let deliveries = std::cell::Cell::new(0);
@@ -1741,7 +2643,7 @@ mod tests {
             },
         );
 
-        assert_eq!(outcome, RecoveryExecution::Abstained);
+        assert_eq!(outcome, RecoveryExecution::EvidenceChanged);
         assert_eq!(deliveries.get(), 0);
     }
 
@@ -1820,7 +2722,17 @@ mod tests {
                 },
             );
 
-            assert_eq!(outcome, RecoveryExecution::Abstained, "{failure:?}");
+            let expected = match failure {
+                AntigravityFailure::Off | AntigravityFailure::On => RecoveryExecution::InactiveMode,
+                AntigravityFailure::LowConfidence => RecoveryExecution::BelowThreshold,
+                AntigravityFailure::Inference => RecoveryExecution::InferenceFailed,
+                AntigravityFailure::Reservation => RecoveryExecution::ReservationFailed,
+                AntigravityFailure::Audit => RecoveryExecution::PreSendAuditFailed,
+                AntigravityFailure::Delivery => {
+                    RecoveryExecution::DeliveryUnknown(GuardedActionFailureCategory::SendFailed)
+                }
+            };
+            assert_eq!(outcome, expected, "{failure:?}");
             assert_eq!(emissions.get(), 0, "{failure:?}");
         }
     }
@@ -1901,7 +2813,9 @@ mod tests {
                 |_| {
                     sends.set(sends.get() + 1);
                     if failure == RecoveryFailurePoint::Delivery {
-                        Err(RecoveryDeliveryFailure::Failed)
+                        Err(RecoveryDeliveryFailure::NotSent(
+                            GuardedActionFailureCategory::PromptChanged,
+                        ))
                     } else {
                         Ok(())
                     }
@@ -1915,7 +2829,19 @@ mod tests {
                 },
             );
 
-            assert_eq!(outcome, RecoveryExecution::Abstained, "{failure:?}");
+            let expected = match failure {
+                RecoveryFailurePoint::Inference => RecoveryExecution::InferenceFailed,
+                RecoveryFailurePoint::EvidenceAfterProposal
+                | RecoveryFailurePoint::EvidenceBeforeSend => RecoveryExecution::EvidenceChanged,
+                RecoveryFailurePoint::Reservation => RecoveryExecution::ReservationFailed,
+                RecoveryFailurePoint::PreSendAudit => RecoveryExecution::PreSendAuditFailed,
+                RecoveryFailurePoint::Delivery => {
+                    RecoveryExecution::DeliveryNotSent(GuardedActionFailureCategory::PromptChanged)
+                }
+                RecoveryFailurePoint::PostflightEvidence => RecoveryExecution::PostflightUncertain,
+                RecoveryFailurePoint::PostSendAudit => RecoveryExecution::PostSendAuditUncertain,
+            };
+            assert_eq!(outcome, expected, "{failure:?}");
             let expected_sends = usize::from(matches!(
                 failure,
                 RecoveryFailurePoint::Delivery
@@ -1954,11 +2880,18 @@ mod tests {
                 audits.borrow_mut().push(state);
                 Ok(())
             },
-            |_| Err(RecoveryDeliveryFailure::Unknown),
+            |_| {
+                Err(RecoveryDeliveryFailure::Unknown(
+                    GuardedActionFailureCategory::SendFailed,
+                ))
+            },
             |_| Ok(()),
         );
 
-        assert_eq!(outcome, RecoveryExecution::Abstained);
+        assert_eq!(
+            outcome,
+            RecoveryExecution::DeliveryUnknown(GuardedActionFailureCategory::SendFailed)
+        );
         assert_eq!(audits.into_inner(), vec![ActivityState::Evaluating]);
     }
 }

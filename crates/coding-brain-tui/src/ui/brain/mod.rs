@@ -264,6 +264,54 @@ mod tests {
     }
 
     #[test]
+    fn wide_and_narrow_live_keep_action_entry_point_discoverable() {
+        for width in [119, 120] {
+            let mock = MockBrainRuntime {
+                activity_snapshot: ActivitySnapshot {
+                    attention: vec![AttentionItem {
+                        activity: activity("attention-1", DeliveryState::Unknown),
+                        occurrences: 1,
+                        unresolved_occurrences: 1,
+                    }],
+                    unresolved_count: 1,
+                    ..ActivitySnapshot::default()
+                },
+                session_action_preflight_failure: std::sync::Mutex::new(Some(
+                    coding_brain_core::runtime::SessionActionFailure {
+                        category: coding_brain_core::runtime::SessionActionFailureCategory::ExactSessionUnavailable,
+                        diagnostic_persisted: false,
+                    },
+                )),
+                ..MockBrainRuntime::default()
+            };
+            let mut app = fixture_app(mock);
+
+            let live = render_text_at(&app, width, 24);
+            assert!(live.contains("x action"), "{live}");
+
+            app.handle_key(key(KeyCode::Char('x')));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while app.status()
+                != Some("No exact live provider session for action; diagnostic unavailable")
+                && std::time::Instant::now() < deadline
+            {
+                app.refresh();
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                app.status(),
+                Some("No exact live provider session for action; diagnostic unavailable")
+            );
+            for _ in 0..3 {
+                app.handle_key(key(KeyCode::Tab));
+            }
+
+            let diagnostics = render_text_at(&app, width, 24);
+            assert!(diagnostics.contains("[ Diagnostics ]"), "{diagnostics}");
+        }
+    }
+
+    #[test]
     fn diagnostics_store_health_remains_visible_without_events() {
         let mut mock = MockBrainRuntime::default();
         mock.activity_snapshot.diagnostics = ActivityDiagnostics {
