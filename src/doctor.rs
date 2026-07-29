@@ -24,7 +24,9 @@ use crate::brain::activity::ActivityStore;
 
 use coding_brain_core::provider::AgentProvider;
 
-use crate::init::provider_hooks::ProviderHookInspection;
+use crate::init::provider_hooks::{
+    ProviderHookInspection, ProviderHookOwnership, ProviderHookState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -222,7 +224,7 @@ fn check_antigravity_hook_contract_with(
     evidence: ProviderSetupEvidence,
     probe: impl FnOnce() -> Option<[u64; 3]>,
 ) -> Option<Check> {
-    if !evidence.executable_available || evidence.hooks != ProviderHookInspection::Current {
+    if !evidence.executable_available || evidence.hooks.state != ProviderHookState::Current {
         return None;
     }
     (probe()? == [1, 1, 5]).then(|| Check {
@@ -293,7 +295,10 @@ fn check_provider_setups() -> Vec<Check> {
                 ProviderSetupEvidence {
                     recorded: false,
                     executable_available: executables.contains(&provider),
-                    hooks: ProviderHookInspection::Invalid,
+                    hooks: ProviderHookInspection {
+                        state: ProviderHookState::Invalid,
+                        ownership: ProviderHookOwnership::Unsupported,
+                    },
                 },
             )
         })
@@ -333,44 +338,50 @@ fn check_provider_setups_at(
 }
 
 fn check_provider_setup(provider: AgentProvider, evidence: ProviderSetupEvidence) -> Check {
-    let (state, message) = match evidence.hooks {
-        ProviderHookInspection::Invalid => (
+    let (state, message) = match evidence.hooks.state {
+        ProviderHookState::Invalid => (
             ProviderSetupState::Stale,
             "invalid or unsafe managed definitions".to_string(),
         ),
-        ProviderHookInspection::Stale => (
+        ProviderHookState::Stale => (
             ProviderSetupState::Stale,
             "managed definition stale".to_string(),
         ),
-        ProviderHookInspection::Duplicate if !evidence.executable_available => (
+        ProviderHookState::Duplicate if !evidence.executable_available => (
             ProviderSetupState::Unavailable,
             "unavailable: provider executable is absent; managed definitions are duplicated"
                 .to_string(),
         ),
-        ProviderHookInspection::Duplicate => (
+        ProviderHookState::Duplicate => (
             ProviderSetupState::Degraded,
             "degraded: managed definitions are duplicated across scopes".to_string(),
         ),
-        ProviderHookInspection::Missing if evidence.recorded && !evidence.executable_available => (
-            ProviderSetupState::Unavailable,
-            "unavailable: provider executable is absent and managed definitions are missing"
-                .to_string(),
-        ),
-        ProviderHookInspection::Missing if evidence.executable_available => (
+        ProviderHookState::Missing
+            if !evidence.executable_available
+                && (evidence.recorded
+                    || matches!(evidence.hooks.ownership, ProviderHookOwnership::HomeManager)) =>
+        {
+            (
+                ProviderSetupState::Unavailable,
+                "unavailable: provider executable is absent and managed definitions are missing"
+                    .to_string(),
+            )
+        }
+        ProviderHookState::Missing if evidence.executable_available => (
             ProviderSetupState::Degraded,
             "degraded: executable available with process fallback; structured hooks missing"
                 .to_string(),
         ),
-        ProviderHookInspection::Missing => (
+        ProviderHookState::Missing => (
             ProviderSetupState::Skipped,
             "skipped: provider was not selected and executable is absent".to_string(),
         ),
-        ProviderHookInspection::Current if !evidence.executable_available => (
+        ProviderHookState::Current if !evidence.executable_available => (
             ProviderSetupState::Unavailable,
             "unavailable: managed definitions current, but provider executable is absent"
                 .to_string(),
         ),
-        ProviderHookInspection::Current => (
+        ProviderHookState::Current => (
             ProviderSetupState::Current,
             "current: executable and managed definitions are available".to_string(),
         ),
@@ -381,17 +392,34 @@ fn check_provider_setup(provider: AgentProvider, evidence: ProviderSetupEvidence
         ProviderSetupState::Stale => CheckStatus::Fail,
         ProviderSetupState::Skipped => CheckStatus::Skipped,
     };
-    let fix_hint = (!matches!(
-        state,
-        ProviderSetupState::Current | ProviderSetupState::Skipped
-    ))
-    .then(|| {
-        format!(
+    let fix_hint = match (state, evidence.hooks.ownership) {
+        (ProviderSetupState::Current | ProviderSetupState::Skipped, _) => None,
+        (ProviderSetupState::Unavailable, ProviderHookOwnership::HomeManager)
+            if evidence.hooks.state == ProviderHookState::Current =>
+        {
+            Some(format!(
+                "Install or enable the {} provider executable; managed definitions are current, then rerun `coding-brain doctor`.",
+                provider.label()
+            ))
+        }
+        (_, ProviderHookOwnership::HomeManager) => Some(format!(
+            "Repair the Home Manager-owned {} definitions in your Nix configuration, rebuild Home Manager, then rerun `coding-brain doctor`.",
+            provider.label()
+        )),
+        (_, ProviderHookOwnership::Mixed) => Some(format!(
+            "Remove the duplicate scope for {} from either Home Manager or the regular provider configuration, then rerun `coding-brain doctor`.",
+            provider.label()
+        )),
+        (_, ProviderHookOwnership::Unsupported) => Some(format!(
+            "Replace the unsafe {} provider file or link before rerunning setup.",
+            provider.label()
+        )),
+        (_, ProviderHookOwnership::Imperative | ProviderHookOwnership::Absent) => Some(format!(
             "Repair {} setup with `coding-brain init {}`.",
             provider.label(),
             provider.as_str()
-        )
-    });
+        )),
+    };
     Check {
         name: format!("{} setup", provider.label()),
         status,
@@ -1001,7 +1029,9 @@ mod tests {
     use coding_brain_core::provider::AgentProvider;
 
     use crate::brain::activity::ActivityStore;
-    use crate::init::provider_hooks::ProviderHookInspection;
+    use crate::init::provider_hooks::{
+        ProviderHookInspection, ProviderHookOwnership, ProviderHookState,
+    };
 
     fn telemetry_event(
         activity_id: &str,
@@ -1601,12 +1631,28 @@ mod tests {
         write_hooks(&home.join(".codex/hooks.json"), &current_hooks());
 
         let definitions = check_codex_hooks_at(Some(&home), &cwd);
+        let setup = check_provider_setup(
+            AgentProvider::Codex,
+            ProviderSetupEvidence {
+                recorded: true,
+                executable_available: true,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Current,
+                    ownership: ProviderHookOwnership::HomeManager,
+                },
+            },
+        );
         let trust = check_codex_hook_trust_at(Some(&home), &cwd);
 
         assert_eq!(definitions.status, CheckStatus::Pass);
         assert_eq!(definitions.message, "global definitions current");
+        assert_eq!(setup.status, CheckStatus::Pass);
+        assert!(setup.fix_hint.is_none());
         assert_eq!(trust.status, CheckStatus::Advisory);
         assert_eq!(trust.message, "trust unverified; review /hooks");
+        assert!(!definitions.message.contains("/hooks"));
+        assert!(!setup.message.contains("/hooks"));
+        assert!(trust.message.contains("/hooks"));
     }
 
     #[test]
@@ -1732,51 +1778,51 @@ mod tests {
             AgentProvider::Claude,
             AgentProvider::Antigravity,
         ] {
-            for hooks in [
-                ProviderHookInspection::Missing,
-                ProviderHookInspection::Current,
-                ProviderHookInspection::Duplicate,
-                ProviderHookInspection::Stale,
-                ProviderHookInspection::Invalid,
+            for state in [
+                ProviderHookState::Missing,
+                ProviderHookState::Current,
+                ProviderHookState::Duplicate,
+                ProviderHookState::Stale,
+                ProviderHookState::Invalid,
             ] {
                 for recorded in [false, true] {
                     for executable_available in [false, true] {
-                        let (status, state) = match hooks {
-                            ProviderHookInspection::Invalid => (CheckStatus::Fail, "invalid"),
-                            ProviderHookInspection::Stale => {
-                                (CheckStatus::Fail, "definition stale")
-                            }
-                            ProviderHookInspection::Duplicate if executable_available => {
+                        let (status, state_label) = match state {
+                            ProviderHookState::Invalid => (CheckStatus::Fail, "invalid"),
+                            ProviderHookState::Stale => (CheckStatus::Fail, "definition stale"),
+                            ProviderHookState::Duplicate if executable_available => {
                                 (CheckStatus::Advisory, "degraded")
                             }
-                            ProviderHookInspection::Duplicate => {
-                                (CheckStatus::Advisory, "unavailable")
-                            }
-                            ProviderHookInspection::Missing if executable_available => {
+                            ProviderHookState::Duplicate => (CheckStatus::Advisory, "unavailable"),
+                            ProviderHookState::Missing if executable_available => {
                                 (CheckStatus::Advisory, "degraded")
                             }
-                            ProviderHookInspection::Missing if recorded => {
+                            ProviderHookState::Missing if recorded => {
                                 (CheckStatus::Advisory, "unavailable")
                             }
-                            ProviderHookInspection::Missing => (CheckStatus::Skipped, "skipped"),
-                            ProviderHookInspection::Current if executable_available => {
+                            ProviderHookState::Missing => (CheckStatus::Skipped, "skipped"),
+                            ProviderHookState::Current if executable_available => {
                                 (CheckStatus::Pass, "current")
                             }
-                            ProviderHookInspection::Current => {
-                                (CheckStatus::Advisory, "unavailable")
-                            }
+                            ProviderHookState::Current => (CheckStatus::Advisory, "unavailable"),
                         };
                         let check = check_provider_setup(
                             provider,
                             ProviderSetupEvidence {
                                 recorded,
                                 executable_available,
-                                hooks,
+                                hooks: ProviderHookInspection {
+                                    state,
+                                    ownership: ProviderHookOwnership::Imperative,
+                                },
                             },
                         );
                         assert_eq!(check.name, format!("{} setup", provider.label()));
-                        assert_eq!(check.status, status, "{provider} {state}");
-                        assert!(check.message.contains(state), "{provider} {state}");
+                        assert_eq!(check.status, status, "{provider} {state_label}");
+                        assert!(
+                            check.message.contains(state_label),
+                            "{provider} {state_label}"
+                        );
                         if let Some(hint) = check.fix_hint {
                             assert!(hint.contains(provider.label()));
                             assert!(
@@ -1790,17 +1836,222 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_or_stale_definition_fails_even_when_provider_was_not_selected() {
-        for hooks in [
-            ProviderHookInspection::Stale,
-            ProviderHookInspection::Invalid,
+    fn provider_setup_routes_remediation_by_ownership() {
+        for (
+            state,
+            ownership,
+            recorded,
+            executable_available,
+            expected_status,
+            expected_message,
+            expected_hint,
+            expects_definition_repair,
+        ) in [
+            (
+                ProviderHookState::Missing,
+                ProviderHookOwnership::HomeManager,
+                false,
+                false,
+                CheckStatus::Advisory,
+                "unavailable",
+                Some("Home Manager"),
+                true,
+            ),
+            (
+                ProviderHookState::Missing,
+                ProviderHookOwnership::HomeManager,
+                false,
+                true,
+                CheckStatus::Advisory,
+                "degraded",
+                Some("Home Manager"),
+                true,
+            ),
+            (
+                ProviderHookState::Missing,
+                ProviderHookOwnership::HomeManager,
+                true,
+                false,
+                CheckStatus::Advisory,
+                "unavailable",
+                Some("Home Manager"),
+                true,
+            ),
+            (
+                ProviderHookState::Missing,
+                ProviderHookOwnership::HomeManager,
+                true,
+                true,
+                CheckStatus::Advisory,
+                "degraded",
+                Some("Home Manager"),
+                true,
+            ),
+            (
+                ProviderHookState::Current,
+                ProviderHookOwnership::HomeManager,
+                false,
+                false,
+                CheckStatus::Advisory,
+                "unavailable",
+                Some("provider executable"),
+                false,
+            ),
+            (
+                ProviderHookState::Current,
+                ProviderHookOwnership::HomeManager,
+                false,
+                true,
+                CheckStatus::Pass,
+                "current",
+                None,
+                false,
+            ),
+            (
+                ProviderHookState::Current,
+                ProviderHookOwnership::HomeManager,
+                true,
+                false,
+                CheckStatus::Advisory,
+                "unavailable",
+                Some("provider executable"),
+                false,
+            ),
+            (
+                ProviderHookState::Current,
+                ProviderHookOwnership::HomeManager,
+                true,
+                true,
+                CheckStatus::Pass,
+                "current",
+                None,
+                false,
+            ),
+            (
+                ProviderHookState::Stale,
+                ProviderHookOwnership::HomeManager,
+                true,
+                true,
+                CheckStatus::Fail,
+                "stale",
+                Some("Home Manager"),
+                true,
+            ),
+            (
+                ProviderHookState::Invalid,
+                ProviderHookOwnership::HomeManager,
+                true,
+                true,
+                CheckStatus::Fail,
+                "unsafe",
+                Some("Home Manager"),
+                true,
+            ),
+            (
+                ProviderHookState::Duplicate,
+                ProviderHookOwnership::Mixed,
+                true,
+                true,
+                CheckStatus::Advisory,
+                "degraded",
+                Some("duplicate scope"),
+                false,
+            ),
+            (
+                ProviderHookState::Invalid,
+                ProviderHookOwnership::Unsupported,
+                true,
+                true,
+                CheckStatus::Fail,
+                "unsafe",
+                Some("unsafe"),
+                false,
+            ),
         ] {
+            let check = check_provider_setup(
+                AgentProvider::Claude,
+                ProviderSetupEvidence {
+                    recorded,
+                    executable_available,
+                    hooks: ProviderHookInspection { state, ownership },
+                },
+            );
+            assert_eq!(check.status, expected_status);
+            assert!(check.message.contains(expected_message));
+            match (check.fix_hint.as_deref(), expected_hint) {
+                (None, None) => {}
+                (Some(hint), Some(phrase)) => {
+                    assert!(hint.contains(phrase));
+                    assert!(!hint.contains("coding-brain init"));
+                    if !expects_definition_repair {
+                        assert!(!hint.contains("rebuild Home Manager"));
+                    }
+                }
+                pair => panic!("unexpected hint pair: {pair:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn missing_unselected_home_manager_setup_is_advisory_with_declarative_repair() {
+        let check = check_provider_setup(
+            AgentProvider::Claude,
+            ProviderSetupEvidence {
+                recorded: false,
+                executable_available: false,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Missing,
+                    ownership: ProviderHookOwnership::HomeManager,
+                },
+            },
+        );
+
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert!(check.message.contains("unavailable"));
+        let hint = check
+            .fix_hint
+            .expect("missing Home Manager setup needs repair");
+        assert!(hint.contains("Home Manager"));
+        assert!(!hint.contains("coding-brain init"));
+    }
+
+    #[test]
+    fn current_home_manager_setup_without_executable_repairs_the_executable() {
+        let check = check_provider_setup(
+            AgentProvider::Claude,
+            ProviderSetupEvidence {
+                recorded: true,
+                executable_available: false,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Current,
+                    ownership: ProviderHookOwnership::HomeManager,
+                },
+            },
+        );
+
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert!(check.message.contains("unavailable"));
+        let hint = check
+            .fix_hint
+            .expect("current definitions still need executable guidance");
+        assert!(hint.contains("provider executable"));
+        assert!(hint.contains("definitions are current"));
+        assert!(!hint.contains("rebuild Home Manager"));
+        assert!(!hint.contains("coding-brain init"));
+    }
+
+    #[test]
+    fn unsafe_or_stale_definition_fails_even_when_provider_was_not_selected() {
+        for state in [ProviderHookState::Stale, ProviderHookState::Invalid] {
             let check = check_provider_setup(
                 AgentProvider::Claude,
                 ProviderSetupEvidence {
                     recorded: false,
                     executable_available: false,
-                    hooks,
+                    hooks: ProviderHookInspection {
+                        state,
+                        ownership: ProviderHookOwnership::Imperative,
+                    },
                 },
             );
             assert_eq!(check.status, CheckStatus::Fail);
@@ -1813,7 +2064,10 @@ mod tests {
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection::Current,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Current,
+                    ownership: ProviderHookOwnership::Imperative,
+                },
             },
             || Some([1, 1, 5]),
         )
@@ -1840,27 +2094,42 @@ mod tests {
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: false,
-                hooks: ProviderHookInspection::Current,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Current,
+                    ownership: ProviderHookOwnership::Imperative,
+                },
             },
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection::Missing,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Missing,
+                    ownership: ProviderHookOwnership::Absent,
+                },
             },
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection::Stale,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Stale,
+                    ownership: ProviderHookOwnership::Imperative,
+                },
             },
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection::Duplicate,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Duplicate,
+                    ownership: ProviderHookOwnership::Imperative,
+                },
             },
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection::Invalid,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Invalid,
+                    ownership: ProviderHookOwnership::Imperative,
+                },
             },
         ] {
             let calls = Cell::new(0);
@@ -1880,7 +2149,10 @@ mod tests {
                 ProviderSetupEvidence {
                     recorded: true,
                     executable_available: true,
-                    hooks: ProviderHookInspection::Current,
+                    hooks: ProviderHookInspection {
+                        state: ProviderHookState::Current,
+                        ownership: ProviderHookOwnership::Imperative,
+                    },
                 },
                 || version,
             );
@@ -2059,7 +2331,10 @@ mod tests {
                 ProviderSetupEvidence {
                     recorded: true,
                     executable_available: true,
-                    hooks: ProviderHookInspection::Current,
+                    hooks: ProviderHookInspection {
+                        state: ProviderHookState::Current,
+                        ownership: ProviderHookOwnership::Imperative,
+                    },
                 },
             ),
             check_provider_setup(
@@ -2067,7 +2342,10 @@ mod tests {
                 ProviderSetupEvidence {
                     recorded: true,
                     executable_available: false,
-                    hooks: ProviderHookInspection::Current,
+                    hooks: ProviderHookInspection {
+                        state: ProviderHookState::Current,
+                        ownership: ProviderHookOwnership::Imperative,
+                    },
                 },
             ),
             check_provider_setup(
@@ -2075,7 +2353,10 @@ mod tests {
                 ProviderSetupEvidence {
                     recorded: false,
                     executable_available: false,
-                    hooks: ProviderHookInspection::Missing,
+                    hooks: ProviderHookInspection {
+                        state: ProviderHookState::Missing,
+                        ownership: ProviderHookOwnership::Absent,
+                    },
                 },
             ),
         ];

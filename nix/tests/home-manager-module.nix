@@ -22,6 +22,9 @@ let
     home.homeDirectory = "/home/codexctl-test";
     home.stateVersion = "25.11";
   };
+  doctorPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs {
+    doCheck = false;
+  };
   configured = home-manager.lib.homeManagerConfiguration {
     inherit pkgs;
     modules = [
@@ -51,6 +54,28 @@ let
             model = "gemma4:e4b";
             timeout_ms = 25000;
           };
+        };
+      }
+    ];
+  };
+  doctorConfigured = home-manager.lib.homeManagerConfiguration {
+    inherit pkgs;
+    modules = [
+      self.homeManagerModules.default
+      baseHome
+      {
+        programs.codex.enable = true;
+        programs.claude-code = {
+          enable = true;
+          package = null;
+        };
+        programs.antigravity-cli = {
+          enable = true;
+          package = null;
+        };
+        programs.coding-brain = {
+          enable = true;
+          package = doctorPackage;
         };
       }
     ];
@@ -412,6 +437,25 @@ let
   unsupportedFailures = builtins.filter (item: !item.assertion) unsupportedHooks.config.assertions;
   enableOnlyFailures = builtins.filter (item: !item.assertion) enableOnlyCodex.config.assertions;
   disabledFailures = builtins.filter (item: !item.assertion) disabledCodex.config.assertions;
+  codexHooksJson = pkgs.writeText "codex-hooks.json" (
+    builtins.toJSON { hooks = doctorConfigured.config.programs.codex.hooks; }
+  );
+  claudeSettingsJson = pkgs.writeText "claude-settings.json" (
+    builtins.toJSON doctorConfigured.config.programs.claude-code.settings
+  );
+  providerHomeManagerFiles = pkgs.runCommand "home-manager-files" { } ''
+    mkdir -p "$out/.codex" "$out/.claude" "$out/.gemini/config"
+    cp ${codexHooksJson} "$out/.codex/hooks.json"
+    cp ${claudeSettingsJson} "$out/.claude/settings.json"
+    cp ${doctorConfigured.config.home.file.".gemini/config/hooks.json".source} \
+      "$out/.gemini/config/hooks.json"
+  '';
+  fakeProviders = pkgs.runCommand "coding-brain-fake-providers" { } ''
+    mkdir -p "$out/bin"
+    ln -s ${pkgs.coreutils}/bin/true "$out/bin/codex"
+    ln -s ${pkgs.coreutils}/bin/true "$out/bin/claude"
+    ln -s ${pkgs.coreutils}/bin/true "$out/bin/agy"
+  '';
 in
 assert builtins.elem testPackage cfg.home.packages;
 assert aliasConfigured.config.programs.coding-brain.enable;
@@ -575,65 +619,119 @@ assert
     "services"
     "coding-brain-headless"
   ] cfg);
-pkgs.runCommand "coding-brain-home-manager-module-check" { nativeBuildInputs = [ pkgs.jq ]; } ''
-  grep -F 'endpoint = "http://localhost:11434/api/generate"' \
-    ${cfg.xdg.configFile."coding-brain/config.toml".source}
-  grep -F 'model = "gemma4:e4b"' \
-    ${cfg.xdg.configFile."coding-brain/config.toml".source}
-  grep -F 'timeout_ms = 25000' \
-    ${cfg.xdg.configFile."coding-brain/config.toml".source}
-  grep -F 'theme = "dark"' \
-    ${cfg.xdg.configFile."coding-brain/config.toml".source}
-  ! grep -F 'enabled =' ${cfg.xdg.configFile."coding-brain/config.toml".source}
-  ! grep -F 'auto =' ${cfg.xdg.configFile."coding-brain/config.toml".source}
-  ! grep -F 'terminal_auto_approve_fallback' ${cfg.xdg.configFile."coding-brain/config.toml".source}
-  grep -F 'restart Codex' ${configured.activationPackage}/activate
-  grep -F '/hooks' ${configured.activationPackage}/activate
-  grep -F 'Coding Brain provider hooks use ${expectedExe}' ${configured.activationPackage}/activate
-  grep -F 'restart Claude Code or Antigravity CLI' ${configured.activationPackage}/activate
-  grep -F 'coding-brain doctor' ${configured.activationPackage}/activate
-  jq -e '."external".enabled == false' \
-    ${cfg.home.file.".gemini/config/hooks.json".source}
-  jq -e --arg exe "${expectedExe}" '
-    ."coding-brain" == {
-      "PreToolUse": [{
-        "matcher": "*",
-        "hooks": [{
+pkgs.runCommand "coding-brain-home-manager-module-check"
+  {
+    nativeBuildInputs = [
+      pkgs.jq
+      doctorPackage
+    ];
+  }
+  ''
+    grep -F 'endpoint = "http://localhost:11434/api/generate"' \
+      ${cfg.xdg.configFile."coding-brain/config.toml".source}
+    grep -F 'model = "gemma4:e4b"' \
+      ${cfg.xdg.configFile."coding-brain/config.toml".source}
+    grep -F 'timeout_ms = 25000' \
+      ${cfg.xdg.configFile."coding-brain/config.toml".source}
+    grep -F 'theme = "dark"' \
+      ${cfg.xdg.configFile."coding-brain/config.toml".source}
+    ! grep -F 'enabled =' ${cfg.xdg.configFile."coding-brain/config.toml".source}
+    ! grep -F 'auto =' ${cfg.xdg.configFile."coding-brain/config.toml".source}
+    ! grep -F 'terminal_auto_approve_fallback' ${cfg.xdg.configFile."coding-brain/config.toml".source}
+    grep -F 'restart Codex' ${configured.activationPackage}/activate
+    grep -F '/hooks' ${configured.activationPackage}/activate
+    grep -F 'Coding Brain provider hooks use ${expectedExe}' ${configured.activationPackage}/activate
+    grep -F 'restart Claude Code or Antigravity CLI' ${configured.activationPackage}/activate
+    grep -F 'coding-brain doctor' ${configured.activationPackage}/activate
+    jq -e '."external".enabled == false' \
+      ${cfg.home.file.".gemini/config/hooks.json".source}
+    jq -e --arg exe "${expectedExe}" '
+      ."coding-brain" == {
+        "PreToolUse": [{
+          "matcher": "*",
+          "hooks": [{
+            "type": "command",
+            "command": ($exe + " --permission-hook --provider antigravity --antigravity-hook-event PreToolUse"),
+            "timeout": 30
+          }]
+        }],
+        "PostToolUse": [{
+          "matcher": "*",
+          "hooks": [{
+            "type": "command",
+            "command": ($exe + " --lifecycle-hook --provider antigravity --antigravity-hook-event PostToolUse"),
+            "timeout": 2
+          }]
+        }],
+        "PreInvocation": [{
           "type": "command",
-          "command": ($exe + " --permission-hook --provider antigravity --antigravity-hook-event PreToolUse"),
+          "command": ($exe + " --lifecycle-hook --provider antigravity --antigravity-hook-event PreInvocation"),
+          "timeout": 2
+        }],
+        "PostInvocation": [{
+          "type": "command",
+          "command": ($exe + " --lifecycle-hook --provider antigravity --antigravity-hook-event PostInvocation"),
+          "timeout": 2
+        }],
+        "Stop": [{
+          "type": "command",
+          "command": ($exe + " --recovery-hook --provider antigravity --antigravity-hook-event Stop"),
           "timeout": 30
         }]
-      }],
-      "PostToolUse": [{
-        "matcher": "*",
-        "hooks": [{
-          "type": "command",
-          "command": ($exe + " --lifecycle-hook --provider antigravity --antigravity-hook-event PostToolUse"),
-          "timeout": 2
-        }]
-      }],
-      "PreInvocation": [{
-        "type": "command",
-        "command": ($exe + " --lifecycle-hook --provider antigravity --antigravity-hook-event PreInvocation"),
-        "timeout": 2
-      }],
-      "PostInvocation": [{
-        "type": "command",
-        "command": ($exe + " --lifecycle-hook --provider antigravity --antigravity-hook-event PostInvocation"),
-        "timeout": 2
-      }],
-      "Stop": [{
-        "type": "command",
-        "command": ($exe + " --recovery-hook --provider antigravity --antigravity-hook-event Stop"),
-        "timeout": 30
-      }]
-    }
-  ' \
-    ${cfg.home.file.".gemini/config/hooks.json".source}
-  jq -e '
-    ."coding-brain"
-    | all(.[]; length == 1)
-  ' \
-    ${dualAliasConfigured.config.home.file.".gemini/config/hooks.json".source}
-  touch "$out"
-''
+      }
+    ' \
+      ${cfg.home.file.".gemini/config/hooks.json".source}
+    jq -e '
+      ."coding-brain"
+      | all(.[]; length == 1)
+    ' \
+      ${dualAliasConfigured.config.home.file.".gemini/config/hooks.json".source}
+
+    fixture_home="$TMPDIR/home"
+    mkdir -p \
+      "$fixture_home/.codex" \
+      "$fixture_home/.claude" \
+      "$fixture_home/.gemini/config" \
+      "$TMPDIR/config" \
+      "$TMPDIR/state"
+    ln -s ${providerHomeManagerFiles}/.codex/hooks.json \
+      "$fixture_home/.codex/hooks.json"
+    ln -s ${providerHomeManagerFiles}/.claude/settings.json \
+      "$fixture_home/.claude/settings.json"
+    ln -s ${providerHomeManagerFiles}/.gemini/config/hooks.json \
+      "$fixture_home/.gemini/config/hooks.json"
+
+    export HOME="$fixture_home"
+    export XDG_CONFIG_HOME="$TMPDIR/config"
+    export XDG_STATE_HOME="$TMPDIR/state"
+    export PATH="${fakeProviders}/bin:$PATH"
+
+    cd "$TMPDIR"
+    doctor_status=0
+    coding-brain doctor --json > "$TMPDIR/doctor.json" \
+      || doctor_status="$?"
+    test "$doctor_status" -eq 0 -o "$doctor_status" -eq 1
+
+    for provider in Codex Claude Antigravity; do
+      jq -e --arg name "$provider setup" '
+        any(.[]; .name == $name and .status == "pass" and .fix_hint == null)
+      ' "$TMPDIR/doctor.json"
+    done
+    jq -e '
+      any(.[];
+        .name == "Codex hook trust"
+        and .status == "advisory"
+        and (.message | contains("trust unverified"))
+        and (.fix_hint | contains("/hooks"))
+      )
+    ' "$TMPDIR/doctor.json"
+    jq -e '
+      all(.[];
+        if (.name | endswith(" setup"))
+        then ((.fix_hint // "") | contains("coding-brain init") | not)
+        else true
+        end
+      )
+    ' "$TMPDIR/doctor.json"
+    touch "$out"
+  ''

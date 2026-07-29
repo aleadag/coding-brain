@@ -33,6 +33,11 @@ All notable changes to codexctl are documented here.
 
 ### Fixed
 
+- Home Manager users can now run `coding-brain doctor` against exact
+  `home-manager-files` provider symlinks for Codex, Claude, and Antigravity.
+  Current declarative definitions pass without an imperative init hint; stale
+  definitions point back to Home Manager, while Codex runtime trust remains a
+  separate `/hooks` advisory.
 - Deterministic shell safety now blocks command substitutions, variable-expanded
   command positions, and GNU `env` split strings before model inference, so
   dynamic spellings cannot bypass destructive recursive-delete denials.

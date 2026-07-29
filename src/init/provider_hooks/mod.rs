@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_TRANSACTION_BYTES: usize = 3 * MAX_FILE_BYTES;
+const NIX_STORE_ROOT: &str = "/nix/store";
 const JOURNAL_SCHEMA_VERSION: u32 = 2;
 static TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -36,12 +37,63 @@ pub struct ProviderHookPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProviderHookInspection {
+pub(crate) enum ProviderHookState {
     Missing,
     Current,
     Duplicate,
     Stale,
     Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderHookOwnership {
+    Absent,
+    Imperative,
+    HomeManager,
+    Mixed,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderHookInspection {
+    pub(crate) state: ProviderHookState,
+    pub(crate) ownership: ProviderHookOwnership,
+}
+
+#[derive(Debug)]
+enum InspectedProviderFile {
+    Missing,
+    Readable {
+        bytes: Vec<u8>,
+        ownership: ProviderHookOwnership,
+    },
+    Invalid {
+        ownership: ProviderHookOwnership,
+    },
+}
+
+struct ProviderHookComparison {
+    replacement: Option<Vec<u8>>,
+    preserved_modified_entries: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProviderHookComparisonContract<'a> {
+    Imperative,
+    HomeManager { executable: &'a Path },
+}
+
+#[derive(Debug)]
+enum ProviderHookComparisonError {
+    InvalidJson,
+    NonObject,
+    Processing(io::Error),
+}
+
+impl From<io::Error> for ProviderHookComparisonError {
+    fn from(error: io::Error) -> Self {
+        Self::Processing(error)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +186,32 @@ pub(crate) fn inspect_provider_hooks_at(
     home: &Path,
     cwd: &Path,
 ) -> ProviderHookInspection {
+    inspect_provider_hooks_at_with_store(provider, home, cwd, Path::new(NIX_STORE_ROOT))
+}
+
+fn inspect_provider_hooks_at_with_store(
+    provider: AgentProvider,
+    home: &Path,
+    cwd: &Path,
+    nix_store_root: &Path,
+) -> ProviderHookInspection {
+    let executable = managed_executable();
+    inspect_provider_hooks_at_with_store_and_executable(
+        provider,
+        home,
+        cwd,
+        nix_store_root,
+        &executable,
+    )
+}
+
+fn inspect_provider_hooks_at_with_store_and_executable(
+    provider: AgentProvider,
+    home: &Path,
+    cwd: &Path,
+    nix_store_root: &Path,
+    executable: &Path,
+) -> ProviderHookInspection {
     let mut candidates = vec![(HookScope::Global, cwd.to_path_buf())];
     if provider != AgentProvider::Antigravity {
         candidates.extend(
@@ -147,56 +225,216 @@ pub(crate) fn inspect_provider_hooks_at(
         .into_iter()
         .filter_map(|(scope, directory)| {
             let path = provider_path(provider, scope, home, &directory);
-            seen_paths
-                .insert(path)
-                .then(|| inspect_provider_hook_at(provider, scope, home, &directory))
+            seen_paths.insert(path.clone()).then(|| {
+                inspect_provider_hook_at(provider, scope, &path, nix_store_root, executable)
+            })
         })
         .collect::<Vec<_>>();
-    if inspections.contains(&ProviderHookInspection::Invalid) {
-        return ProviderHookInspection::Invalid;
-    }
-    if inspections.contains(&ProviderHookInspection::Stale) {
-        return ProviderHookInspection::Stale;
-    }
-    match inspections
+    let ownership = inspections
         .iter()
-        .filter(|state| **state == ProviderHookInspection::Current)
-        .count()
+        .fold(ProviderHookOwnership::Absent, |ownership, inspection| {
+            combine_ownership(ownership, inspection.ownership)
+        });
+    let state = if inspections
+        .iter()
+        .any(|inspection| inspection.state == ProviderHookState::Invalid)
     {
-        0 => ProviderHookInspection::Missing,
-        1 => ProviderHookInspection::Current,
-        _ => ProviderHookInspection::Duplicate,
-    }
+        ProviderHookState::Invalid
+    } else if inspections
+        .iter()
+        .any(|inspection| inspection.state == ProviderHookState::Stale)
+    {
+        ProviderHookState::Stale
+    } else {
+        match inspections
+            .iter()
+            .filter(|inspection| inspection.state == ProviderHookState::Current)
+            .count()
+        {
+            0 => ProviderHookState::Missing,
+            1 => ProviderHookState::Current,
+            _ => ProviderHookState::Duplicate,
+        }
+    };
+    ProviderHookInspection { state, ownership }
 }
 
 fn inspect_provider_hook_at(
     provider: AgentProvider,
     scope: HookScope,
-    home: &Path,
-    cwd: &Path,
+    path: &Path,
+    nix_store_root: &Path,
+    executable: &Path,
 ) -> ProviderHookInspection {
-    let Ok(mut plans) = stage_provider_hooks_at(&[provider], scope, home, cwd) else {
-        return ProviderHookInspection::Invalid;
-    };
-    let Some(plan) = plans.pop() else {
-        return ProviderHookInspection::Invalid;
-    };
-    if !plan.preserved_modified_entries.is_empty() {
-        return ProviderHookInspection::Stale;
+    match read_provider_file_for_inspection(path, provider, scope, nix_store_root) {
+        InspectedProviderFile::Missing => ProviderHookInspection {
+            state: ProviderHookState::Missing,
+            ownership: ProviderHookOwnership::Absent,
+        },
+        InspectedProviderFile::Readable { bytes, ownership } => {
+            let contract = match ownership {
+                ProviderHookOwnership::HomeManager => {
+                    ProviderHookComparisonContract::HomeManager { executable }
+                }
+                _ => ProviderHookComparisonContract::Imperative,
+            };
+            let state = compare_provider_hook(provider, Some(&bytes), false, contract)
+                .map(|comparison| state_from_comparison(&comparison, Some(&bytes)))
+                .unwrap_or(ProviderHookState::Invalid);
+            ProviderHookInspection { state, ownership }
+        }
+        InspectedProviderFile::Invalid { ownership } => ProviderHookInspection {
+            state: ProviderHookState::Invalid,
+            ownership,
+        },
     }
-    let Some(edit) = plan.edits.first() else {
-        return ProviderHookInspection::Current;
+}
+
+fn combine_ownership(
+    left: ProviderHookOwnership,
+    right: ProviderHookOwnership,
+) -> ProviderHookOwnership {
+    use ProviderHookOwnership::*;
+    match (left, right) {
+        (Unsupported, _) | (_, Unsupported) => Unsupported,
+        (Absent, owner) | (owner, Absent) => owner,
+        (owner, other) if owner == other => owner,
+        _ => Mixed,
+    }
+}
+
+fn expected_home_manager_suffix(provider: AgentProvider) -> &'static Path {
+    match provider {
+        AgentProvider::Codex => Path::new(".codex/hooks.json"),
+        AgentProvider::Claude => Path::new(".claude/settings.json"),
+        AgentProvider::Antigravity => Path::new(".gemini/config/hooks.json"),
+    }
+}
+
+fn invalid_inspected_file(ownership: ProviderHookOwnership) -> InspectedProviderFile {
+    InspectedProviderFile::Invalid { ownership }
+}
+
+fn home_manager_parent_topology_is_supported(
+    nix_store_root: &Path,
+    relative_parent: &Path,
+) -> bool {
+    let mut current = nix_store_root.to_path_buf();
+    if !fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        return false;
+    }
+    for component in relative_parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            return false;
+        };
+        current.push(component);
+        if !fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn read_provider_file_for_inspection(
+    path: &Path,
+    provider: AgentProvider,
+    scope: HookScope,
+    nix_store_root: &Path,
+) -> InspectedProviderFile {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return InspectedProviderFile::Missing;
+        }
+        Err(_) => {
+            return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+        }
     };
-    let Some(original) = edit.original.as_deref() else {
-        return ProviderHookInspection::Missing;
+    if metadata.file_type().is_file() {
+        return match read_managed_file(path) {
+            Ok((Some(bytes), _)) => InspectedProviderFile::Readable {
+                bytes,
+                ownership: ProviderHookOwnership::Imperative,
+            },
+            Ok((None, _)) | Err(_) => invalid_inspected_file(ProviderHookOwnership::Imperative),
+        };
+    }
+    if !metadata.file_type().is_symlink() || scope == HookScope::Project {
+        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+    }
+
+    let target = match fs::read_link(path) {
+        Ok(target) => target,
+        Err(_) => {
+            return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+        }
     };
-    let Ok(root) = serde_json::from_slice::<serde_json::Value>(original) else {
-        return ProviderHookInspection::Invalid;
+    let Some(raw_target) = target.to_str() else {
+        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
     };
-    if contains_managed_command(&root) {
-        ProviderHookInspection::Stale
-    } else {
-        ProviderHookInspection::Missing
+    if !raw_target.starts_with('/')
+        || raw_target[1..]
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+    }
+    let Ok(relative) = target.strip_prefix(nix_store_root) else {
+        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+    };
+    let mut components = relative.components();
+    let generation = components.next().and_then(|component| match component {
+        std::path::Component::Normal(component) => component.to_str(),
+        _ => None,
+    });
+    let suffix = components.collect::<PathBuf>();
+    if !generation.is_some_and(|generation| generation.ends_with("-home-manager-files"))
+        || suffix != expected_home_manager_suffix(provider)
+    {
+        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+    }
+    let Some(relative_parent) = relative.parent() else {
+        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+    };
+    if !home_manager_parent_topology_is_supported(nix_store_root, relative_parent) {
+        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+    }
+
+    let target_metadata = match fs::symlink_metadata(&target) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+        }
+    };
+    if target_metadata.file_type().is_symlink() || !target_metadata.file_type().is_file() {
+        return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+    }
+    let mut file = match File::open(&target) {
+        Ok(file) => file,
+        Err(_) => {
+            return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+        }
+    };
+    let opened_metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+        }
+    };
+    if !opened_metadata.file_type().is_file() || opened_metadata.len() > MAX_FILE_BYTES as u64 {
+        return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+    }
+    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+    if Read::take(&mut file, (MAX_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > MAX_FILE_BYTES
+    {
+        return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+    }
+    InspectedProviderFile::Readable {
+        bytes,
+        ownership: ProviderHookOwnership::HomeManager,
     }
 }
 
@@ -250,14 +488,6 @@ fn stage_provider_hooks_with(
             )));
         }
         let (original, original_mode) = read_managed_file(&path)?;
-        if remove && original.is_none() {
-            plans.push(ProviderHookPlan {
-                provider,
-                edits: Vec::new(),
-                preserved_modified_entries: Vec::new(),
-            });
-            continue;
-        }
         total = total
             .checked_add(original.as_ref().map_or(0, Vec::len))
             .ok_or_else(|| io::Error::other("selected provider configuration is too large"))?;
@@ -266,42 +496,238 @@ fn stage_provider_hooks_with(
                 "selected provider configuration exceeds the transaction size limit",
             ));
         }
-        let mut root = match original.as_deref() {
-            Some(bytes) => serde_json::from_slice::<serde_json::Value>(bytes)
-                .map_err(|_| invalid_config(&path, "contains invalid JSON"))?,
-            None => serde_json::json!({}),
-        };
-        if !root.is_object() {
-            return Err(invalid_config(&path, "must contain a JSON object"));
-        }
-        let original_root = root.clone();
-        let mut preserved = Vec::new();
-        match provider {
-            AgentProvider::Codex => codex::merge(&mut root, remove, &mut preserved)?,
-            AgentProvider::Claude => claude::merge(&mut root, remove, &mut preserved)?,
-            AgentProvider::Antigravity => antigravity::merge(&mut root, remove, &mut preserved)?,
-        }
-        let edits = if root == original_root {
-            Vec::new()
-        } else {
-            let mut replacement = serde_json::to_vec_pretty(&root).map_err(io::Error::other)?;
-            replacement.push(b'\n');
-            vec![ManagedFileEdit {
-                path,
-                original_hash: original.as_deref().map(hash_bytes),
-                original,
-                original_mode,
-                replacement_hash: hash_bytes(&replacement),
-                replacement,
-            }]
+        let comparison = compare_provider_hook(
+            provider,
+            original.as_deref(),
+            remove,
+            ProviderHookComparisonContract::Imperative,
+        )
+        .map_err(|error| provider_comparison_error_for_mutation(error, &path))?;
+        let edits = match comparison.replacement {
+            Some(replacement) => {
+                vec![ManagedFileEdit {
+                    path,
+                    original_hash: original.as_deref().map(hash_bytes),
+                    original,
+                    original_mode,
+                    replacement_hash: hash_bytes(&replacement),
+                    replacement,
+                }]
+            }
+            None => Vec::new(),
         };
         plans.push(ProviderHookPlan {
             provider,
             edits,
-            preserved_modified_entries: preserved,
+            preserved_modified_entries: comparison.preserved_modified_entries,
         });
     }
     Ok(plans)
+}
+
+fn compare_provider_hook(
+    provider: AgentProvider,
+    original: Option<&[u8]>,
+    remove: bool,
+    contract: ProviderHookComparisonContract<'_>,
+) -> Result<ProviderHookComparison, ProviderHookComparisonError> {
+    let mut root = match original {
+        Some(bytes) => serde_json::from_slice::<serde_json::Value>(bytes)
+            .map_err(|_| ProviderHookComparisonError::InvalidJson)?,
+        None => serde_json::json!({}),
+    };
+    if !root.is_object() {
+        return Err(ProviderHookComparisonError::NonObject);
+    }
+    let original_root = root.clone();
+    let home_manager_current = match (provider, contract) {
+        (AgentProvider::Claude, ProviderHookComparisonContract::HomeManager { .. }) => {
+            home_manager_claude_is_current(&root)?
+        }
+        (
+            AgentProvider::Antigravity,
+            ProviderHookComparisonContract::HomeManager { executable },
+        ) => home_manager_antigravity_is_current(&root, executable)?,
+        _ => false,
+    };
+    let mut preserved_modified_entries = Vec::new();
+    match provider {
+        AgentProvider::Codex => codex::merge(&mut root, remove, &mut preserved_modified_entries)?,
+        AgentProvider::Claude => claude::merge(&mut root, remove, &mut preserved_modified_entries)?,
+        AgentProvider::Antigravity => {
+            antigravity::merge(&mut root, remove, &mut preserved_modified_entries)?
+        }
+    }
+    if home_manager_current {
+        let expected = match provider {
+            AgentProvider::Claude => ["claude:PermissionRequest"].as_slice(),
+            AgentProvider::Antigravity => ["antigravity:coding-brain"].as_slice(),
+            AgentProvider::Codex => &[],
+        };
+        if preserved_modified_entries == expected {
+            preserved_modified_entries.clear();
+        }
+    }
+    let replacement = if root == original_root {
+        None
+    } else {
+        let mut replacement = serde_json::to_vec_pretty(&root).map_err(io::Error::other)?;
+        replacement.push(b'\n');
+        Some(replacement)
+    };
+    Ok(ProviderHookComparison {
+        replacement,
+        preserved_modified_entries,
+    })
+}
+
+fn home_manager_claude_is_current(root: &serde_json::Value) -> io::Result<bool> {
+    let mut comparable = root.clone();
+    let Some(matchers) = comparable
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut("PermissionRequest"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(false);
+    };
+    let mut augmented = false;
+    for matcher in matchers {
+        let Some(matcher) = matcher.as_object_mut() else {
+            continue;
+        };
+        if matcher.len() != 2
+            || matcher.get("matcher").and_then(serde_json::Value::as_str) != Some("*")
+        {
+            continue;
+        }
+        let Some(handlers) = matcher
+            .get_mut("hooks")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for handler in handlers {
+            let Some(handler) = handler.as_object_mut() else {
+                continue;
+            };
+            if handler.len() == 3
+                && handler.get("type").and_then(serde_json::Value::as_str) == Some("command")
+                && handler.get("timeout").and_then(serde_json::Value::as_u64) == Some(30)
+                && handler
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|command| {
+                        exact_command(command, &["--permission-hook", "--provider", "claude"])
+                    })
+            {
+                handler.insert(
+                    "statusMessage".to_owned(),
+                    serde_json::Value::String("Brain reviewing permission…".to_owned()),
+                );
+                augmented = true;
+            }
+        }
+    }
+    if !augmented {
+        return Ok(false);
+    }
+    let expected = comparable.clone();
+    let mut preserved = Vec::new();
+    claude::merge(&mut comparable, false, &mut preserved)?;
+    Ok(comparable == expected && preserved.is_empty())
+}
+
+fn home_manager_antigravity_is_current(
+    root: &serde_json::Value,
+    executable: &Path,
+) -> io::Result<bool> {
+    let Some(actual) = root.get("coding-brain") else {
+        return Ok(false);
+    };
+    let Some(executable) = executable.to_str() else {
+        return Ok(false);
+    };
+    let mut expected_root = serde_json::json!({});
+    antigravity::merge(&mut expected_root, false, &mut Vec::new())?;
+    let expected = expected_root
+        .get("coding-brain")
+        .expect("Antigravity merge inserts its managed definition");
+    Ok(home_manager_antigravity_definition_matches(
+        actual, expected, executable,
+    ))
+}
+
+fn home_manager_antigravity_definition_matches(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    executable: &str,
+) -> bool {
+    match (actual, expected) {
+        (serde_json::Value::Object(actual), serde_json::Value::Object(expected)) => {
+            actual.len() == expected.len()
+                && expected.iter().all(|(key, expected_value)| {
+                    let Some(actual_value) = actual.get(key) else {
+                        return false;
+                    };
+                    if key == "command" {
+                        let Some(expected_command) = expected_value.as_str() else {
+                            return false;
+                        };
+                        let Some((_, arguments)) = expected_command.split_once(' ') else {
+                            return false;
+                        };
+                        let expected_command = format!("{executable} {arguments}");
+                        actual_value.as_str() == Some(expected_command.as_str())
+                    } else {
+                        home_manager_antigravity_definition_matches(
+                            actual_value,
+                            expected_value,
+                            executable,
+                        )
+                    }
+                })
+        }
+        (serde_json::Value::Array(actual), serde_json::Value::Array(expected)) => {
+            actual.len() == expected.len()
+                && actual.iter().zip(expected).all(|(actual, expected)| {
+                    home_manager_antigravity_definition_matches(actual, expected, executable)
+                })
+        }
+        _ => actual == expected,
+    }
+}
+
+fn provider_comparison_error_for_mutation(
+    error: ProviderHookComparisonError,
+    path: &Path,
+) -> io::Error {
+    match error {
+        ProviderHookComparisonError::InvalidJson => invalid_config(path, "contains invalid JSON"),
+        ProviderHookComparisonError::NonObject => {
+            invalid_config(path, "must contain a JSON object")
+        }
+        ProviderHookComparisonError::Processing(error) => error,
+    }
+}
+
+fn state_from_comparison(
+    comparison: &ProviderHookComparison,
+    original: Option<&[u8]>,
+) -> ProviderHookState {
+    if !comparison.preserved_modified_entries.is_empty() {
+        return ProviderHookState::Stale;
+    }
+    if comparison.replacement.is_none() {
+        return ProviderHookState::Current;
+    }
+    let Some(original) = original else {
+        return ProviderHookState::Missing;
+    };
+    match serde_json::from_slice::<serde_json::Value>(original) {
+        Ok(root) if contains_managed_command(&root) => ProviderHookState::Stale,
+        Ok(_) => ProviderHookState::Missing,
+        Err(_) => ProviderHookState::Invalid,
+    }
 }
 
 pub fn apply_hook_transaction(plans: &[ProviderHookPlan]) -> io::Result<()> {
@@ -1134,6 +1560,8 @@ mod tests {
     use super::*;
     use coding_brain_core::provider::AgentProvider;
     #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
@@ -1164,6 +1592,51 @@ mod tests {
             std::fs::read(home.join(".codex/hooks.json")).unwrap(),
             b"{\"keep\":\"codex\"}\n"
         );
+    }
+
+    #[test]
+    fn mutation_staging_preserves_path_qualified_semantic_errors() {
+        for (bytes, reason) in [
+            (
+                b"not json SECRET_PROVIDER_CONTENT".as_slice(),
+                "contains invalid JSON",
+            ),
+            (b"[]".as_slice(), "must contain a JSON object"),
+        ] {
+            for remove in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let home = temp.path().join("home");
+                let project = temp.path().join("project");
+                let path = home.join(".codex/hooks.json");
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, bytes).unwrap();
+
+                let error = if remove {
+                    stage_provider_hooks_with(
+                        &[AgentProvider::Codex],
+                        HookScope::Global,
+                        &home,
+                        &project,
+                        true,
+                    )
+                    .unwrap_err()
+                } else {
+                    stage_provider_hooks_at(
+                        &[AgentProvider::Codex],
+                        HookScope::Global,
+                        &home,
+                        &project,
+                    )
+                    .unwrap_err()
+                };
+
+                assert_eq!(
+                    error.to_string(),
+                    format!("provider configuration {} {reason}", path.display())
+                );
+                assert!(!error.to_string().contains("SECRET_PROVIDER_CONTENT"));
+            }
+        }
     }
 
     #[test]
@@ -1964,6 +2437,629 @@ mod tests {
         serde_json::from_slice(bytes).unwrap()
     }
 
+    #[cfg(unix)]
+    fn write_home_manager_provider_file(
+        store: &Path,
+        home: &Path,
+        project: &Path,
+        provider: AgentProvider,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let generation = store.join("0123456789abcdefghijklmnopqrstuv-home-manager-files");
+        let target = match provider {
+            AgentProvider::Codex => generation.join(".codex/hooks.json"),
+            AgentProvider::Claude => generation.join(".claude/settings.json"),
+            AgentProvider::Antigravity => generation.join(".gemini/config/hooks.json"),
+        };
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, bytes).unwrap();
+        let link = provider_path(provider, HookScope::Global, home, project);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        target
+    }
+
+    #[cfg(unix)]
+    fn exact_provider_bytes(home: &Path, project: &Path, provider: AgentProvider) -> Vec<u8> {
+        let mut plans =
+            stage_provider_hooks_at(&[provider], HookScope::Global, home, project).unwrap();
+        let mut plan = plans.remove(0);
+        plan.edits.remove(0).replacement
+    }
+
+    #[cfg(unix)]
+    fn replace_managed_program(value: &mut serde_json::Value, executable: &Path) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(command) = object
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                {
+                    let (_, arguments) = command.split_once(' ').unwrap();
+                    object["command"] =
+                        serde_json::Value::String(format!("{} {arguments}", executable.display()));
+                } else {
+                    for value in object.values_mut() {
+                        replace_managed_program(value, executable);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    replace_managed_program(value, executable);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(unix)]
+    fn home_manager_schema_variant_bytes(
+        home: &Path,
+        project: &Path,
+        provider: AgentProvider,
+        executable: &Path,
+    ) -> Vec<u8> {
+        let mut root = serde_json::from_slice::<serde_json::Value>(&exact_provider_bytes(
+            home, project, provider,
+        ))
+        .unwrap();
+        match provider {
+            AgentProvider::Claude => {
+                root["hooks"]["PermissionRequest"][0]["hooks"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("statusMessage");
+            }
+            AgentProvider::Antigravity => {
+                replace_managed_program(&mut root, executable);
+            }
+            AgentProvider::Codex => {}
+        }
+        let mut bytes = serde_json::to_vec_pretty(&root).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_accepts_home_manager_schema_variants() {
+        let executable = Path::new("/nix/store/current-coding-brain/bin/coding-brain");
+        for provider in [AgentProvider::Claude, AgentProvider::Antigravity] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            std::fs::create_dir_all(&project).unwrap();
+            let bytes = home_manager_schema_variant_bytes(&home, &project, provider, executable);
+            write_home_manager_provider_file(&store, &home, &project, provider, &bytes);
+
+            assert_eq!(
+                inspect_provider_hooks_at_with_store_and_executable(
+                    provider, &home, &project, &store, executable,
+                ),
+                ProviderHookInspection {
+                    state: ProviderHookState::Current,
+                    ownership: ProviderHookOwnership::HomeManager,
+                },
+                "{provider:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_rejects_wrong_home_manager_executable_for_all_providers() {
+        let executable = Path::new("/nix/store/current-coding-brain/bin/coding-brain");
+        let wrong_executable = Path::new("/nix/store/wrong-coding-brain/bin/coding-brain");
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            std::fs::create_dir_all(&project).unwrap();
+            let mut root = serde_json::from_slice::<serde_json::Value>(&exact_provider_bytes(
+                &home, &project, provider,
+            ))
+            .unwrap();
+            replace_managed_program(&mut root, wrong_executable);
+            let mut bytes = serde_json::to_vec_pretty(&root).unwrap();
+            bytes.push(b'\n');
+            write_home_manager_provider_file(&store, &home, &project, provider, &bytes);
+
+            assert_eq!(
+                inspect_provider_hooks_at_with_store_and_executable(
+                    provider, &home, &project, &store, executable,
+                ),
+                ProviderHookInspection {
+                    state: ProviderHookState::Stale,
+                    ownership: ProviderHookOwnership::HomeManager,
+                },
+                "{provider:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_files_retain_the_imperative_provider_contract() {
+        let executable = Path::new("/nix/store/current-coding-brain/bin/coding-brain");
+        for provider in [AgentProvider::Claude, AgentProvider::Antigravity] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            std::fs::create_dir_all(&project).unwrap();
+            let bytes = home_manager_schema_variant_bytes(&home, &project, provider, executable);
+            let path = provider_path(provider, HookScope::Global, &home, &project);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+
+            assert_eq!(
+                inspect_provider_hooks_at_with_store_and_executable(
+                    provider, &home, &project, &store, executable,
+                ),
+                ProviderHookInspection {
+                    state: ProviderHookState::Stale,
+                    ownership: ProviderHookOwnership::Imperative,
+                },
+                "{provider:?}"
+            );
+            let plans =
+                stage_provider_hooks_at(&[provider], HookScope::Global, &home, &project).unwrap();
+            assert!(plans[0].edits.is_empty(), "{provider:?}");
+            assert!(
+                !plans[0].preserved_modified_entries.is_empty(),
+                "{provider:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_accepts_home_manager_files_for_all_providers() {
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            std::fs::create_dir_all(&project).unwrap();
+            let bytes = exact_provider_bytes(&home, &project, provider);
+            write_home_manager_provider_file(&store, &home, &project, provider, &bytes);
+
+            assert_eq!(
+                inspect_provider_hooks_at_with_store(provider, &home, &project, &store),
+                ProviderHookInspection {
+                    state: ProviderHookState::Current,
+                    ownership: ProviderHookOwnership::HomeManager,
+                }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_classifies_home_manager_definition_failures() {
+        let provider = AgentProvider::Claude;
+        let cases = [
+            ("malformed", b"{".to_vec(), ProviderHookState::Invalid),
+            (
+                "missing",
+                br#"{"user":true}"#.to_vec(),
+                ProviderHookState::Missing,
+            ),
+            (
+                "oversized",
+                vec![b' '; MAX_FILE_BYTES + 1],
+                ProviderHookState::Invalid,
+            ),
+        ];
+        for (name, bytes, state) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            std::fs::create_dir_all(&project).unwrap();
+            write_home_manager_provider_file(&store, &home, &project, provider, &bytes);
+
+            assert_eq!(
+                inspect_provider_hooks_at_with_store(provider, &home, &project, &store),
+                ProviderHookInspection {
+                    state,
+                    ownership: ProviderHookOwnership::HomeManager,
+                },
+                "{name}"
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let store = temp.path().join("nix/store");
+        std::fs::create_dir_all(&project).unwrap();
+        let stale = String::from_utf8(exact_provider_bytes(&home, &project, provider))
+            .unwrap()
+            .replace(" --provider claude", " --provider codex");
+        write_home_manager_provider_file(&store, &home, &project, provider, stale.as_bytes());
+        assert_eq!(
+            inspect_provider_hooks_at_with_store(provider, &home, &project, &store),
+            ProviderHookInspection {
+                state: ProviderHookState::Stale,
+                ownership: ProviderHookOwnership::HomeManager,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_rejects_unsupported_symlinks_and_targets() {
+        #[derive(Debug, Clone, Copy)]
+        enum Fixture {
+            Relative,
+            Parent,
+            CurrentDirectory,
+            RepeatedSeparator,
+            NonUtf8,
+            NonStore,
+            WrongSuffix,
+            NestedSymlink,
+            Directory,
+            Broken,
+            ProjectLocal,
+        }
+
+        for fixture in [
+            Fixture::Relative,
+            Fixture::Parent,
+            Fixture::CurrentDirectory,
+            Fixture::RepeatedSeparator,
+            Fixture::NonUtf8,
+            Fixture::NonStore,
+            Fixture::WrongSuffix,
+            Fixture::NestedSymlink,
+            Fixture::Directory,
+            Fixture::Broken,
+            Fixture::ProjectLocal,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            let generation = store.join("0123456789abcdefghijklmnopqrstuv-home-manager-files");
+            let expected = generation.join(".codex/hooks.json");
+            let global = provider_path(AgentProvider::Codex, HookScope::Global, &home, &project);
+            let project_link =
+                provider_path(AgentProvider::Codex, HookScope::Project, &home, &project);
+            std::fs::create_dir_all(&project).unwrap();
+
+            let (link, target, ownership) = match fixture {
+                Fixture::Relative => (
+                    global,
+                    PathBuf::from("relative-target"),
+                    ProviderHookOwnership::Unsupported,
+                ),
+                Fixture::Parent => {
+                    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+                    std::fs::write(&expected, b"{}").unwrap();
+                    (
+                        global,
+                        generation
+                            .join("..")
+                            .join(generation.file_name().unwrap())
+                            .join(".codex/hooks.json"),
+                        ProviderHookOwnership::Unsupported,
+                    )
+                }
+                Fixture::CurrentDirectory => {
+                    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+                    std::fs::write(&expected, b"{}").unwrap();
+                    (
+                        global,
+                        PathBuf::from(format!(
+                            "{}/0123456789abcdefghijklmnopqrstuv-home-manager-files/./.codex/hooks.json",
+                            store.display()
+                        )),
+                        ProviderHookOwnership::Unsupported,
+                    )
+                }
+                Fixture::RepeatedSeparator => {
+                    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+                    std::fs::write(&expected, b"{}").unwrap();
+                    (
+                        global,
+                        PathBuf::from(format!(
+                            "{}/0123456789abcdefghijklmnopqrstuv-home-manager-files//.codex/hooks.json",
+                            store.display()
+                        )),
+                        ProviderHookOwnership::Unsupported,
+                    )
+                }
+                Fixture::NonUtf8 => {
+                    let mut target = store.as_os_str().as_bytes().to_vec();
+                    target.extend_from_slice(b"/\xff-home-manager-files/.codex/hooks.json");
+                    (
+                        global,
+                        PathBuf::from(std::ffi::OsString::from_vec(target)),
+                        ProviderHookOwnership::Unsupported,
+                    )
+                }
+                Fixture::NonStore => {
+                    let target = temp.path().join("outside/hooks.json");
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(&target, b"{}").unwrap();
+                    (global, target, ProviderHookOwnership::Unsupported)
+                }
+                Fixture::WrongSuffix => {
+                    let target = generation.join(".claude/settings.json");
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(&target, b"{}").unwrap();
+                    (global, target, ProviderHookOwnership::Unsupported)
+                }
+                Fixture::NestedSymlink => {
+                    let target = temp.path().join("actual.json");
+                    std::fs::write(&target, b"{}").unwrap();
+                    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(target, &expected).unwrap();
+                    (global, expected, ProviderHookOwnership::HomeManager)
+                }
+                Fixture::Directory => {
+                    std::fs::create_dir_all(&expected).unwrap();
+                    (global, expected, ProviderHookOwnership::HomeManager)
+                }
+                Fixture::Broken => {
+                    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+                    (global, expected, ProviderHookOwnership::HomeManager)
+                }
+                Fixture::ProjectLocal => {
+                    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+                    std::fs::write(&expected, b"{}").unwrap();
+                    (project_link, expected, ProviderHookOwnership::Unsupported)
+                }
+            };
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target, link).unwrap();
+
+            assert_eq!(
+                inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store,),
+                ProviderHookInspection {
+                    state: ProviderHookState::Invalid,
+                    ownership,
+                },
+                "{fixture:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_rejects_symlinked_home_manager_ancestor_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let store = temp.path().join("nix/store");
+        let generation = store.join("0123456789abcdefghijklmnopqrstuv-home-manager-files");
+        let outside_generation = temp.path().join("outside-generation");
+        let target = generation.join(".codex/hooks.json");
+        let outside_target = outside_generation.join(".codex/hooks.json");
+        let link = provider_path(AgentProvider::Codex, HookScope::Global, &home, &project);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(outside_target.parent().unwrap()).unwrap();
+        std::fs::write(
+            &outside_target,
+            exact_provider_bytes(&home, &project, AgentProvider::Codex),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside_generation, &generation).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store),
+            ProviderHookInspection {
+                state: ProviderHookState::Invalid,
+                ownership: ProviderHookOwnership::Unsupported,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_rejects_symlinked_home_manager_ancestor_suffix_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let store = temp.path().join("nix/store");
+        let generation = store.join("0123456789abcdefghijklmnopqrstuv-home-manager-files");
+        let suffix_directory = generation.join(".codex");
+        let outside_suffix = temp.path().join("outside-codex");
+        let target = suffix_directory.join("hooks.json");
+        let outside_target = outside_suffix.join("hooks.json");
+        let link = provider_path(AgentProvider::Codex, HookScope::Global, &home, &project);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&generation).unwrap();
+        std::fs::create_dir_all(&outside_suffix).unwrap();
+        std::fs::write(
+            &outside_target,
+            exact_provider_bytes(&home, &project, AgentProvider::Codex),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside_suffix, &suffix_directory).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store),
+            ProviderHookInspection {
+                state: ProviderHookState::Invalid,
+                ownership: ProviderHookOwnership::Unsupported,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_preserves_failure_precedence_across_sources() {
+        enum Fixture {
+            Duplicate,
+            Stale,
+            Invalid,
+            Unsupported,
+            Absent,
+        }
+
+        for (fixture, expected) in [
+            (
+                Fixture::Duplicate,
+                ProviderHookInspection {
+                    state: ProviderHookState::Duplicate,
+                    ownership: ProviderHookOwnership::Mixed,
+                },
+            ),
+            (
+                Fixture::Stale,
+                ProviderHookInspection {
+                    state: ProviderHookState::Stale,
+                    ownership: ProviderHookOwnership::Mixed,
+                },
+            ),
+            (
+                Fixture::Invalid,
+                ProviderHookInspection {
+                    state: ProviderHookState::Invalid,
+                    ownership: ProviderHookOwnership::Mixed,
+                },
+            ),
+            (
+                Fixture::Unsupported,
+                ProviderHookInspection {
+                    state: ProviderHookState::Invalid,
+                    ownership: ProviderHookOwnership::Unsupported,
+                },
+            ),
+            (
+                Fixture::Absent,
+                ProviderHookInspection {
+                    state: ProviderHookState::Current,
+                    ownership: ProviderHookOwnership::Imperative,
+                },
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            std::fs::create_dir_all(&project).unwrap();
+            let provider = AgentProvider::Claude;
+            let exact = exact_provider_bytes(&home, &project, provider);
+            let project_path = provider_path(provider, HookScope::Project, &home, &project);
+
+            match fixture {
+                Fixture::Duplicate => {
+                    write_home_manager_provider_file(&store, &home, &project, provider, &exact);
+                    std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+                    std::fs::write(project_path, &exact).unwrap();
+                }
+                Fixture::Stale => {
+                    let stale = String::from_utf8(exact.clone()).unwrap().replacen(
+                        "--lifecycle-hook",
+                        "--lifecycle-hook --changed",
+                        1,
+                    );
+                    write_home_manager_provider_file(
+                        &store,
+                        &home,
+                        &project,
+                        provider,
+                        stale.as_bytes(),
+                    );
+                    std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+                    std::fs::write(project_path, &exact).unwrap();
+                }
+                Fixture::Invalid => {
+                    let stale = String::from_utf8(exact.clone()).unwrap().replacen(
+                        "--lifecycle-hook",
+                        "--lifecycle-hook --changed",
+                        1,
+                    );
+                    write_home_manager_provider_file(
+                        &store,
+                        &home,
+                        &project,
+                        provider,
+                        stale.as_bytes(),
+                    );
+                    std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+                    std::fs::write(project_path, b"[").unwrap();
+                }
+                Fixture::Unsupported => {
+                    let stale = String::from_utf8(exact).unwrap().replacen(
+                        "--lifecycle-hook",
+                        "--lifecycle-hook --changed",
+                        1,
+                    );
+                    write_home_manager_provider_file(
+                        &store,
+                        &home,
+                        &project,
+                        provider,
+                        stale.as_bytes(),
+                    );
+                    std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink("relative-target", project_path).unwrap();
+                }
+                Fixture::Absent => {
+                    std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+                    std::fs::write(project_path, &exact).unwrap();
+                }
+            }
+
+            assert_eq!(
+                inspect_provider_hooks_at_with_store(provider, &home, &project, &store),
+                expected
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_staging_still_rejects_home_manager_symlinks() {
+        for home_manager in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            let provider = AgentProvider::Codex;
+            let bytes = exact_provider_bytes(&home, &project, provider);
+            if home_manager {
+                write_home_manager_provider_file(&store, &home, &project, provider, &bytes);
+            } else {
+                let target = temp.path().join("arbitrary.json");
+                std::fs::write(&target, bytes).unwrap();
+                let link = provider_path(provider, HookScope::Global, &home, &project);
+                std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(target, link).unwrap();
+            }
+
+            assert!(
+                stage_provider_hooks_at(&[provider], HookScope::Global, &home, &project).is_err()
+            );
+            assert!(
+                stage_provider_hooks_with(&[provider], HookScope::Global, &home, &project, true,)
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn public_contract_types_are_usable() {
         let _: Option<ManagedFileEdit> = None;
@@ -1987,7 +3083,10 @@ mod tests {
             std::fs::create_dir_all(&project).unwrap();
             assert_eq!(
                 inspect_provider_hooks_at(provider, &home, &project),
-                ProviderHookInspection::Missing
+                ProviderHookInspection {
+                    state: ProviderHookState::Missing,
+                    ownership: ProviderHookOwnership::Absent,
+                }
             );
 
             let plans =
@@ -1997,7 +3096,10 @@ mod tests {
             std::fs::write(&edit.path, &edit.replacement).unwrap();
             assert_eq!(
                 inspect_provider_hooks_at(provider, &home, &project),
-                ProviderHookInspection::Current
+                ProviderHookInspection {
+                    state: ProviderHookState::Current,
+                    ownership: ProviderHookOwnership::Imperative,
+                }
             );
 
             let stale = String::from_utf8(edit.replacement.clone())
@@ -2006,7 +3108,10 @@ mod tests {
             std::fs::write(&edit.path, stale).unwrap();
             assert_eq!(
                 inspect_provider_hooks_at(provider, &home, &project),
-                ProviderHookInspection::Stale
+                ProviderHookInspection {
+                    state: ProviderHookState::Stale,
+                    ownership: ProviderHookOwnership::Imperative,
+                }
             );
 
             if provider != AgentProvider::Codex {
@@ -2016,14 +3121,20 @@ mod tests {
                 std::fs::write(&edit.path, providerless).unwrap();
                 assert_eq!(
                     inspect_provider_hooks_at(provider, &home, &project),
-                    ProviderHookInspection::Stale
+                    ProviderHookInspection {
+                        state: ProviderHookState::Stale,
+                        ownership: ProviderHookOwnership::Imperative,
+                    }
                 );
             }
 
             std::fs::write(&edit.path, b"[]").unwrap();
             assert_eq!(
                 inspect_provider_hooks_at(provider, &home, &project),
-                ProviderHookInspection::Invalid
+                ProviderHookInspection {
+                    state: ProviderHookState::Invalid,
+                    ownership: ProviderHookOwnership::Imperative,
+                }
             );
         }
     }
@@ -2044,7 +3155,10 @@ mod tests {
 
         assert_eq!(
             inspect_provider_hooks_at(AgentProvider::Claude, &home, &project),
-            ProviderHookInspection::Duplicate
+            ProviderHookInspection {
+                state: ProviderHookState::Duplicate,
+                ownership: ProviderHookOwnership::Imperative,
+            }
         );
     }
 
@@ -2071,7 +3185,13 @@ mod tests {
 
             let inspection = inspect_provider_hooks_at(provider, &home, &cwd);
 
-            assert_eq!(inspection, ProviderHookInspection::Current);
+            assert_eq!(
+                inspection,
+                ProviderHookInspection {
+                    state: ProviderHookState::Current,
+                    ownership: ProviderHookOwnership::Imperative,
+                }
+            );
             assert_eq!(std::fs::read(outside).unwrap(), secret);
             assert!(!format!("{inspection:?}").contains("SECRET_OUTSIDE_PROJECT"));
         }
@@ -2106,7 +3226,10 @@ mod tests {
 
                 assert_eq!(
                     inspection,
-                    ProviderHookInspection::Current,
+                    ProviderHookInspection {
+                        state: ProviderHookState::Current,
+                        ownership: ProviderHookOwnership::Imperative,
+                    },
                     "{provider} nested={nested}"
                 );
                 assert_eq!(std::fs::read(outside).unwrap(), secret);
