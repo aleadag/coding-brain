@@ -94,7 +94,7 @@ pub struct DecisionRecord {
     /// cache without an LLM call. None for records before the field existed.
     pub cache_hit: Option<bool>,
     /// True when the user has marked this decision as canonical training
-    /// material via `coding-brain --brain-review`. Canonical decisions get a
+    /// material via `cbrain --brain-review`. Canonical decisions get a
     /// large score boost in few-shot retrieval. None == not reviewed.
     pub canonical: Option<bool>,
 }

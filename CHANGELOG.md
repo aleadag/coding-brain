@@ -2,7 +2,7 @@
 
 > **Repository renamed (2026-07-21):** This project was renamed from `codexctl` to `coding-brain`. The repository moved from `aleadag/codexctl` to `aleadag/coding-brain`. Historical entries below reflect the original name.
 
-All notable changes to codexctl are documented here.
+All notable changes to Coding Brain are documented here.
 
 ## [Unreleased]
 
@@ -13,7 +13,7 @@ All notable changes to codexctl are documented here.
   read-only Diagnostics tab. Use `j`/`k` or the arrow keys to select events and
   PageUp/PageDown to scroll Evidence.
 - You can configure Codex, Claude Code, and Antigravity CLI together with
-  `coding-brain init codex|claude|antigravity|all`; bare interactive init
+  `cbrain init codex|claude|antigravity|all`; bare interactive init
   detects providers and asks which managed hooks to install.
 - Home Manager users can enable declarative provider hooks with
   `programs.coding-brain.claudeHooks.enable`,
@@ -24,7 +24,7 @@ All notable changes to codexctl are documented here.
   definition in `antigravityHooks.extraDefinitions`. Follow the
   [Home Manager configuration guide](docs/configuration.md#home-manager) to
   migrate existing Antigravity definitions, rebuild, restart providers, and
-  verify the result with `coding-brain doctor`.
+  verify the result with `cbrain doctor`.
 - Live now labels Brain activity by provider and preflights `x` action mode so
   only recognized allow, deny, or continue actions appear alongside bounded
   manual text. Dispatch revalidates exact live targets before guarded tmux
@@ -33,7 +33,7 @@ All notable changes to codexctl are documented here.
 
 ### Fixed
 
-- Home Manager users can now run `coding-brain doctor` against exact
+- Home Manager users can now run `cbrain doctor` against exact
   `home-manager-files` provider symlinks for Codex, Claude, and Antigravity.
   Current declarative definitions pass without an imperative init hint; stale
   definitions point back to Home Manager, while Codex runtime trust remains a
@@ -56,7 +56,7 @@ All notable changes to codexctl are documented here.
   concurrent Codex hooks with unpaired PreToolUse and PostToolUse IDs no longer
   create false orphan alerts when no Brain decision belongs to the batch.
   Genuine decision failures remain visible in Needs Attention.
-- `coding-brain doctor` now warns when current Antigravity hooks are paired
+- `cbrain doctor` now warns when current Antigravity hooks are paired
   with `agy` 1.1.5, which may ignore valid `PreToolUse` decisions. Live reports
   successful hook writes as `response emitted` and reserves execution claims
   for later lifecycle outcomes.
@@ -72,6 +72,15 @@ All notable changes to codexctl are documented here.
 
 ### Changed
 
+- **Breaking:** the sole installed executable is now `cbrain`; the crates.io,
+  Homebrew, AUR, and nixpkgs package identities remain `coding-brain`. Existing
+  `coding-brain` invocations stop working because no wrapper, symlink, or
+  compatibility executable is installed. For imperatively managed hooks, run
+  `cbrain init <provider>` for each configured provider, restart the provider,
+  and verify with `cbrain doctor`. Home Manager users should rebuild and
+  restart their providers. The raw installer stops before download or
+  installation while `${INSTALL_DIR}/coding-brain` exists; inspect and remove
+  that old path explicitly before rerunning it.
 - **Breaking:** removed the unused legacy outcome pipeline and its public
   `--record-outcome`, `--reap-outcomes`, `--brain-outcomes`,
   `--brain-baseline`, `--exit-code`, `--duration-ms`, `--stderr-tail`,
@@ -79,7 +88,7 @@ All notable changes to codexctl are documented here.
   outcomes continue through `--lifecycle-hook` and the activity ledger.
   Existing legacy outcome files are left untouched under the Coding Brain
   state directory and may contain historical command or stderr data.
-  `coding-brain init --purge` remains the existing broad, explicit state
+  `cbrain init --purge` remains the existing broad, explicit state
   deletion mechanism.
 - Removed the dormant `[brain].test_runners` heuristic and
   `DecisionOutcome::TestFailed`; configuration validation now tells users to
@@ -104,16 +113,16 @@ All notable changes to codexctl are documented here.
 - PostToolUse telemetry now records hook receipt independently and correlates
   current Codex Bash executions when PermissionRequest omits `tool_use_id`.
   Opaque unified-exec responses produce a neutral Completed outcome, not a
-  success result, and `coding-brain doctor` advises when runtime or attribution
+  success result, and `cbrain doctor` advises when runtime or attribution
   coverage remains zero. New activity rows and lifecycle snapshots use schema
   v3 while older supported schemas remain readable; the upgrade performs no
   backfill or destructive migration. Downgrading after v3 state is written is
   unsupported, so back up
   `~/.local/state/coding-brain/activity.jsonl` before upgrading if rollback
   matters.
-- **Breaking:** the installed executable is now `coding-brain`; the crates.io
-  package and internal Rust crates use the `coding-brain` namespace. No compatibility
-  executable is installed.
+- **Breaking:** the crates.io package and internal Rust crates now use the
+  `coding-brain` namespace. No `codexctl` compatibility package or executable
+  is installed.
 - Coding Brain is now the only TUI. Its Live, Review, Scorecard, and Diagnostics
   views focus on immediate judgment, learning, session navigation, and
   read-only diagnostic evidence; the dashboard, mailbox, and session-management
@@ -122,12 +131,12 @@ All notable changes to codexctl are documented here.
   `~/.local/state/coding-brain/`, project config is `.coding-brain.toml`, and
   stable project identity lives in `.coding-brain/project.toml`.
 - Provider lifecycle, permission, and recovery hooks now record bounded activity
-  before richer discovery catches up. `coding-brain doctor` reports Codex,
+  before richer discovery catches up. `cbrain doctor` reports Codex,
   Claude, and Antigravity setup separately, with distinct navigation and guarded
   terminal capability rows.
-- Existing codexctl data is not migrated or read. Run `coding-brain init` to
+- Existing codexctl data is not migrated or read. Run `cbrain init` to
   replace exact managed hooks, restart Codex, and use confirmed
-  `coding-brain init --purge` only after the old data is no longer needed for
+  `cbrain init --purge` only after the old data is no longer needed for
   rollback.
 
 ## [0.58.0] - 2026-07-15

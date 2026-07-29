@@ -25,18 +25,19 @@ Current paths:
 
 Install and activate:
 - cargo install coding-brain
-- coding-brain init codex (or claude, antigravity, several names, or all)
+- the package is coding-brain; its sole executable is cbrain
+- cbrain init codex (or claude, antigravity, several names, or all)
 - bare interactive init detects providers and asks; provider-less non-interactive init is deprecated Codex compatibility
-- coding-brain doctor
+- cbrain doctor
 - restart configured agents; inspect /hooks for Codex
-- coding-brain
+- cbrain
 
 Managed provider paths:
 - Codex: project .codex/hooks.json or user ~/.codex/hooks.json
 - Claude Code: ~/.claude/settings.json
 - Antigravity CLI: ~/.gemini/config/hooks.json
 
-The crates.io package, executable, and internal Rust crates use the coding-brain namespace. There is no automatic migration or compatibility executable. Confirmed purge is irreversible; old global data remains available for rollback until purge.
+The crates.io package and internal Rust crates use the coding-brain namespace; the sole executable is cbrain. Imperatively managed hooks must be repaired after the executable rename with cbrain init <provider>. The raw installer stops before download or installation while ${INSTALL_DIR:-/usr/local/bin}/coding-brain exists; inspect and remove the old executable explicitly before rerunning it. There is no automatic migration or compatibility executable. Confirmed purge is irreversible; old global data remains available for rollback until purge.
 
 Documentation:
 - https://aleadag.github.io/coding-brain/

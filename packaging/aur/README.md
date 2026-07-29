@@ -16,4 +16,7 @@ keep the package definition reproducible from the main repo.
 ```
 
 4. Copy `packaging/aur/coding-brain-bin/PKGBUILD` and `.SRCINFO` into the AUR repo.
-5. Commit and push the AUR repo update.
+5. Build and install the package in a clean test environment, then run
+   `cbrain --version`. The AUR package remains `coding-brain-bin`; it installs
+   only the `cbrain` executable.
+6. Commit and push the AUR repo update.

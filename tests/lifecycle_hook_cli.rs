@@ -45,7 +45,7 @@ fn run_provider_hook_with_event(
             serde_json::to_vec(&value).unwrap()
         })
         .unwrap_or_else(|_| input.to_vec());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command.arg("--lifecycle-hook");
     if let Some(provider) = provider {
         command.args(["--provider", provider]);
@@ -82,7 +82,7 @@ fn assert_antigravity_rejected(event: Option<&str>, payload: &serde_json::Value,
     assert!(output.stdout.is_empty(), "{label}");
     let diagnostic = String::from_utf8(output.stderr).unwrap();
     assert!(
-        diagnostic.starts_with("coding-brain lifecycle hook:"),
+        diagnostic.starts_with("cbrain lifecycle hook:"),
         "{label}: {diagnostic:?}"
     );
     assert!(diagnostic.len() < 256, "{label}");
@@ -560,7 +560,7 @@ fn provider_hook_rejects_oversized_missing_and_unknown_input_without_activity() 
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
         let diagnostic = String::from_utf8(output.stderr).unwrap();
-        assert!(diagnostic.starts_with("coding-brain lifecycle hook:"));
+        assert!(diagnostic.starts_with("cbrain lifecycle hook:"));
         assert!(diagnostic.len() < 256);
         assert!(!diagnostic.contains("secret"));
         assert!(!home.path().join(".local/state/coding-brain/activity.jsonl").exists());
@@ -569,7 +569,7 @@ fn provider_hook_rejects_oversized_missing_and_unknown_input_without_activity() 
 }
 
 fn run_cli(home: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+    Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .args(args)
         .env("HOME", home)
         .current_dir(home)
@@ -578,7 +578,7 @@ fn run_cli(home: &std::path::Path, args: &[&str]) -> Output {
 }
 
 fn run_init_check(home: &std::path::Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+    Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .args(["init", "--check"])
         .env("HOME", home)
         .env("PATH", "")
@@ -676,7 +676,7 @@ fn init_legacy_noninteractive_and_plugin_only_print_exact_replacements() {
             .lines()
             .next(),
         Some(
-            "warning: provider-less --non-interactive is deprecated; use `coding-brain init codex --non-interactive` instead"
+            "warning: provider-less --non-interactive is deprecated; use `cbrain init codex --non-interactive` instead"
         )
     );
 
@@ -687,7 +687,7 @@ fn init_legacy_noninteractive_and_plugin_only_print_exact_replacements() {
             .unwrap()
             .lines()
             .next(),
-        Some("warning: --plugin-only is deprecated; use `coding-brain init codex` instead")
+        Some("warning: --plugin-only is deprecated; use `cbrain init codex` instead")
     );
 }
 
@@ -1226,7 +1226,7 @@ fn run_permission_hook(home: &std::path::Path, input: &[u8]) -> Output {
         paths.extend(std::env::split_paths(&existing));
     }
     let path = std::env::join_paths(paths).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .arg("--permission-hook")
         .env("HOME", home)
         .env("PATH", path)
@@ -1315,7 +1315,7 @@ fn lifecycle_hook_binary_fails_open_with_empty_stdout() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     let diagnostic = String::from_utf8(output.stderr).unwrap();
-    assert!(diagnostic.starts_with("coding-brain lifecycle hook:"));
+    assert!(diagnostic.starts_with("cbrain lifecycle hook:"));
     assert!(!diagnostic.contains("secret"));
     assert!(
         !home

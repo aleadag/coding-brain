@@ -8,7 +8,7 @@ coding-brain -> coding-brain-tui -> coding-brain-core
 
 - `coding-brain-core` owns session evidence, transcript discovery, health checks, Coding Brain paths, project identity, terminal backends, and runtime contracts.
 - `coding-brain-tui` owns the Live, Review, Scorecard, and Diagnostics application and terminal suspend/restore behavior.
-- the root package owns local Brain evaluation, persistence, config parsing, onboarding, hooks, and the `coding-brain` CLI.
+- the root `coding-brain` package owns local Brain evaluation, persistence, config parsing, onboarding, hooks, and the `cbrain` CLI.
 
 Core must not import root-package modules. The TUI communicates with the binary through runtime traits in `coding-brain-core`; optional Agent Deck navigation is represented as a navigation plan rather than a direct dependency on binary internals.
 

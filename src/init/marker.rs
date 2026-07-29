@@ -3,11 +3,11 @@
 //!
 //! The marker exists so:
 //!
-//! * `coding-brain init` (no args) on an already-onboarded environment can skip
+//! * `cbrain init` (no args) on an already-onboarded environment can skip
 //!   the wizard and report status instead of re-prompting.
-//! * `coding-brain init --check` has a baseline to diff against environment
+//! * `cbrain init --check` has a baseline to diff against environment
 //!   detection (drift = recorded as installed but no longer detected).
-//! * `coding-brain init --remove` knows exactly which artifacts to clean up.
+//! * `cbrain init --remove` knows exactly which artifacts to clean up.
 //!
 //! Lives outside the SQLite stores (coord, bus, history) so it's
 //! human-readable and trivially deletable when someone wants to factory-reset

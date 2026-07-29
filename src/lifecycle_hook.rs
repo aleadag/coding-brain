@@ -79,7 +79,7 @@ fn write_diagnostic(stderr: &mut impl Write, diagnostic: impl fmt::Display) {
         diagnostic.truncate(boundary);
         diagnostic.push('…');
     }
-    let _ = writeln!(stderr, "coding-brain lifecycle hook: {diagnostic}");
+    let _ = writeln!(stderr, "cbrain lifecycle hook: {diagnostic}");
 }
 
 pub(crate) fn run_with<R: Read, W: Write, E: Write>(
@@ -1915,7 +1915,7 @@ mod tests {
             run_with(Cursor::new(input), &mut stdout, &mut stderr, &store);
             assert!(stdout.is_empty());
             let diagnostic = String::from_utf8(stderr).unwrap();
-            assert!(diagnostic.starts_with("coding-brain lifecycle hook:"));
+            assert!(diagnostic.starts_with("cbrain lifecycle hook:"));
             assert!(diagnostic.len() < 256);
             assert!(!diagnostic.contains("secret"));
             assert!(!store.snapshot_path().exists());

@@ -38,7 +38,7 @@
             description = "Local brain for supervising and learning from coding-agent activity.";
             homepage = "https://github.com/aleadag/coding-brain";
             license = licenses.mit;
-            mainProgram = "coding-brain";
+            mainProgram = "cbrain";
             platforms = platforms.unix;
           };
         };

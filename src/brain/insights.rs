@@ -387,7 +387,7 @@ pub fn print_insights() {
     let decisions = super::decisions::read_learning_decisions();
     if decisions.is_empty() {
         println!(
-            "No decision history yet. Run `coding-brain config set mode on` to enable model evaluation and build history."
+            "No decision history yet. Run `cbrain config set mode on` to enable model evaluation and build history."
         );
         return;
     }
@@ -409,7 +409,7 @@ pub fn print_insights() {
     println!(
         "Insights mode: {mode}{}",
         if mode == "off" {
-            " (run coding-brain --insights on to enable auto-generation)"
+            " (run cbrain --insights on to enable auto-generation)"
         } else {
             ""
         }

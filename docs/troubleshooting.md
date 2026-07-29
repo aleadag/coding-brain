@@ -3,22 +3,22 @@
 Start with:
 
 ```bash
-coding-brain doctor
+cbrain doctor
 ```
 
 Doctor reports separate `Codex setup`, `Claude setup`, and `Antigravity setup` rows. An unselected provider with no executable is skipped. A selected provider whose executable disappeared is advisory, while invalid, unsafe, or stale managed definitions fail. The report also keeps Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback separate so focus is never mistaken for input authority.
 
 ## Hooks are missing or stale
 
-For hooks managed declaratively through Home Manager, rebuild Home Manager and restart the affected provider. For Codex, inspect `/hooks`, then run `coding-brain doctor`.
+For hooks managed declaratively through Home Manager, rebuild Home Manager and restart the affected provider. For Codex, inspect `/hooks`, then run `cbrain doctor`.
 
 For providers that are not managed declaratively, run the exact repair command in the provider row, for example:
 
 ```bash
-coding-brain init codex
-coding-brain init claude
-coding-brain init antigravity
-coding-brain doctor
+cbrain init codex
+cbrain init claude
+cbrain init antigravity
+cbrain doctor
 ```
 
 Restart the repaired provider. For Codex, inspect `/hooks`; Coding Brain cannot observe whether Codex trusts a command, so trust remains advisory even when every definition is current.
@@ -29,13 +29,13 @@ Managed files are `.codex/hooks.json` or `~/.codex/hooks.json` for Codex, `~/.cl
 
 ## Project identity is missing or malformed
 
-Identity resolution first uses the project-root `.coding-brain/project.toml`, then a canonical network `origin`, and finally a path-derived temporary identity. A normal Git clone with a usable network origin therefore has stable identity without `coding-brain init`. Local paths and `file:` origins are not network origins, so they use the temporary fallback unless a manifest overrides them.
+Identity resolution first uses the project-root `.coding-brain/project.toml`, then a canonical network `origin`, and finally a path-derived temporary identity. A normal Git clone with a usable network origin therefore has stable identity without `cbrain init`. Local paths and `file:` origins are not network origins, so they use the temporary fallback unless a manifest overrides them.
 
-Use `coding-brain init` to create an explicit override when the origin is unusable or when you want to pin identity independently of the remote. Fix malformed TOML in the project-root manifest rather than editing its UUID. If a fork should intentionally learn as a separate project, remove its project-root `.coding-brain/project.toml` and rerun init.
+Use `cbrain init` to create an explicit override when the origin is unusable or when you want to pin identity independently of the remote. Fix malformed TOML in the project-root manifest rather than editing its UUID. If a fork should intentionally learn as a separate project, remove its project-root `.coding-brain/project.toml` and rerun init.
 
 ## Provider activity does not appear in Live
 
-Live shows persisted Brain activity, not every idle process or a general session dashboard. Confirm the provider is running, then check its setup row in `coding-brain doctor`. Codex uses rollout evidence under `~/.codex/sessions/`; Claude prefers bounded `claude agents --json` inventory and falls back to its live process; Antigravity uses `agy` process evidence until hooks provide a conversation identity.
+Live shows persisted Brain activity, not every idle process or a general session dashboard. Confirm the provider is running, then check its setup row in `cbrain doctor`. Codex uses rollout evidence under `~/.codex/sessions/`; Claude prefers bounded `claude agents --json` inventory and falls back to its live process; Antigravity uses `agy` process evidence until hooks provide a conversation identity.
 
 Hook events may appear before Codex transcript or Claude inventory evidence can enrich the activity. Claude and Antigravity hook transcript paths are retained as lifecycle identity/status evidence, but their records are not parsed into `AgentSession` context. Run doctor from the same terminal environment as the agent. For terminal-specific setup, see the [navigation matrix](terminal-support.md#navigation-matrix).
 
@@ -43,7 +43,7 @@ Hook events may appear before Codex transcript or Claude inventory evidence can 
 
 Codex and Claude use their structured `PermissionRequest` responses for allow and deny. Antigravity uses structured `PreToolUse`; when Coding Brain abstains or cannot validate input, it returns `ask` and leaves the native prompt in control. Antigravity `Stop` can return structured `continue` after a validated automatic recovery decision.
 
-Antigravity CLI (`agy`) 1.1.5 has a confirmed provider-side contract failure: it can invoke the managed `PreToolUse` hook, receive a valid `{"decision":"allow"}` response with a successful exit, and still retain the native tool confirmation. `coding-brain doctor` reports `Antigravity hook contract` when it detects this exact affected version with current managed hooks. Keep the native prompt authoritative and upgrade `agy`; do not enable always-proceed or automatic terminal input as a workaround.
+Antigravity CLI (`agy`) 1.1.5 has a confirmed provider-side contract failure: it can invoke the managed `PreToolUse` hook, receive a valid `{"decision":"allow"}` response with a successful exit, and still retain the native tool confirmation. `cbrain doctor` reports `Antigravity hook contract` when it detects this exact affected version with current managed hooks. Keep the native prompt authoritative and upgrade `agy`; do not enable always-proceed or automatic terminal input as a workaround.
 
 Live's `response emitted` status proves that Coding Brain wrote the hook response successfully. It does not prove that the provider accepted the decision or that the tool ran. Only later lifecycle outcome evidence supports an execution claim.
 
@@ -67,12 +67,16 @@ Activity and preference files use bounded, repair-aware writes. If doctor report
 
 Agent Deck is optional. Confirm its command is on `PATH` and that it can reach the tmux session itself. Cancelling or failing an attach should restore Coding Brain; use the terminal-native switch path when Agent Deck does not own the selected session.
 
+## Raw installer stops before download
+
+The raw installer exits before downloading or writing when `${INSTALL_DIR:-/usr/local/bin}/coding-brain` exists, including as a broken symlink. Inspect that path and remove it only after confirming it is the old Coding Brain executable, then rerun the installer. The installer does not delete a path whose ownership it cannot prove.
+
 ## Rollback and purge
 
 Normal startup and doctor do not modify old data. Before purge, reinstall the old build and rerun its init command if you need to roll back.
 
-`coding-brain init --remove` removes managed hooks and the onboarding marker while preserving data. `coding-brain init --purge` previews the documented current and legacy global config/state targets, rechecks each target after confirmation, and deletes them. Purge is irreversible. It preserves project `.coding-brain.toml`, `.coding-brain/project.toml`, unrelated hooks, and sibling XDG files.
+`cbrain init --remove` removes managed hooks and the onboarding marker while preserving data. `cbrain init --purge` previews the documented current and legacy global config/state targets, rechecks each target after confirmation, and deletes them. Purge is irreversible. It preserves project `.coding-brain.toml`, `.coding-brain/project.toml`, unrelated hooks, and sibling XDG files.
 
-For declarative Codex or Claude hooks, disable the corresponding `programs.coding-brain` hook option and rebuild; other provider-module hooks remain. For declarative Antigravity hooks, disable `antigravityHooks.enable` and rebuild. To return Antigravity to mutable configuration, restore the migration backup, remove only its top-level `coding-brain` definition, run `coding-brain init antigravity` to install a fresh Coding Brain entry, and verify with `coding-brain doctor`. The targeted removal is required because the installer preserves a modified managed definition instead of overwriting it.
+For declarative Codex or Claude hooks, disable the corresponding `programs.coding-brain` hook option and rebuild; other provider-module hooks remain. For declarative Antigravity hooks, disable `antigravityHooks.enable` and rebuild. To return Antigravity to mutable configuration, restore the migration backup, remove only its top-level `coding-brain` definition, run `cbrain init antigravity` to install a fresh Coding Brain entry, and verify with `cbrain doctor`. The targeted removal is required because the installer preserves a modified managed definition instead of overwriting it.
 
-`coding-brain init --remove` is a full uninstall of all exact Coding Brain-managed provider hooks and the onboarding marker. Do not use it as a single-provider migration or rollback command.
+`cbrain init --remove` is a full uninstall of all exact Coding Brain-managed provider hooks and the onboarding marker. Do not use it as a single-provider migration or rollback command.

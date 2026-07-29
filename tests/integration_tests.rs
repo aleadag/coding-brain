@@ -12,7 +12,7 @@ use coding_brain_core::provider::AgentProvider;
 #[test]
 fn init_help_lists_all_provider_selectors() {
     let project = tempfile::tempdir().unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .args(["init", "--help"])
         .current_dir(project.path())
         .output()
@@ -33,7 +33,7 @@ fn init_provider_contract_covers_managed_paths_commands_and_compatibility_warnin
     let project = tempfile::tempdir().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .args([
             "init",
             "all",
@@ -68,7 +68,7 @@ fn init_provider_contract_covers_managed_paths_commands_and_compatibility_warnin
     let compatibility_home = tempfile::tempdir().unwrap();
     let compatibility_project = tempfile::tempdir().unwrap();
     std::fs::create_dir(compatibility_project.path().join(".git")).unwrap();
-    let compatibility = std::process::Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+    let compatibility = std::process::Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .args(["init", "--non-interactive", "--skip-brain", "--skip-skills"])
         .env("HOME", compatibility_home.path())
         .env_remove("XDG_STATE_HOME")
@@ -80,7 +80,7 @@ fn init_provider_contract_covers_managed_paths_commands_and_compatibility_warnin
     assert_eq!(
         compatibility_stderr.lines().next(),
         Some(
-            "warning: provider-less --non-interactive is deprecated; use `coding-brain init codex --non-interactive` instead"
+            "warning: provider-less --non-interactive is deprecated; use `cbrain init codex --non-interactive` instead"
         )
     );
     assert!(compatibility_home.path().join(".codex/hooks.json").exists());

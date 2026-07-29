@@ -17,6 +17,7 @@ pub mod config;
 
 pub mod brain;
 pub mod doctor;
+mod executable;
 pub mod init;
 mod lifecycle_hook;
 mod provider_hooks;

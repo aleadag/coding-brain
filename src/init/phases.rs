@@ -152,7 +152,7 @@ fn print_ollama_install_hint() {
     println!("  To enable the brain, install ollama and a small model:");
     println!("    brew install ollama && ollama serve &");
     println!("    ollama pull gemma4:e4b");
-    println!("  Then re-run `coding-brain init` to wire it up.");
+    println!("  Then re-run `cbrain init` to wire it up.");
 }
 
 // ===================== Codex hooks ======================================

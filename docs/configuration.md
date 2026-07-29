@@ -6,7 +6,7 @@ Coding Brain merges configuration in this order, with later values winning:
 2. project config at `.coding-brain.toml`
 3. CLI flags
 
-On a typical Linux system, the user file is `~/.config/coding-brain/config.toml`. Inspect effective values with `coding-brain config show`, print a template with `coding-brain config template`, and validate known config files with `coding-brain config validate`.
+On a typical Linux system, the user file is `~/.config/coding-brain/config.toml`. Inspect effective values with `cbrain config show`, print a template with `cbrain config template`, and validate known config files with `cbrain config validate`.
 
 Project config may tune model behavior, but it cannot select `brain.endpoint`. Endpoint choice is restricted to user config or an explicit CLI flag because it determines where transcript context is sent.
 
@@ -23,7 +23,7 @@ max_context_tokens = 4000
 few_shot_count = 5
 ```
 
-Brain mode is separate from TOML configuration. Set it with `coding-brain config set mode off|on|auto` and inspect it with `coding-brain config get mode`. The setting is global, persists under `$XDG_STATE_HOME/coding-brain/`, and takes effect after the settings command exits. New installs default to `off`; `on` enables advisory model evaluation, while `auto` permits high-confidence automatic decisions.
+Brain mode is separate from TOML configuration. Set it with `cbrain config set mode off|on|auto` and inspect it with `cbrain config get mode`. The setting is global, persists under `$XDG_STATE_HOME/coding-brain/`, and takes effect after the settings command exits. New installs default to `off`; `on` enables advisory model evaluation, while `auto` permits high-confidence automatic decisions.
 
 `off` disables model evaluation, not the safety system. Deterministic safety checks and lifecycle recording remain active in all three modes. Existing `brain.enabled` and `brain.auto` values are read only as a compatibility fallback when no explicit mode state exists; new templates and managed configuration do not emit them.
 
@@ -70,24 +70,24 @@ Before enabling declarative Antigravity hooks:
 2. Copy every top-level definition except `coding-brain` into `antigravityHooks.extraDefinitions`.
 3. Move the complete file to a timestamped backup.
 4. Rebuild Home Manager.
-5. Restart Antigravity CLI and run `coding-brain doctor`.
+5. Restart Antigravity CLI and run `cbrain doctor`.
 
 Do not set `force = true`. A Home Manager collision means the mutable file has not been migrated.
 
-Home Manager owns the read-only TOML settings above. Select the writable global mode separately with `coding-brain config set mode on`; an explicit mode state overrides legacy TOML mode fields without modifying the Home Manager file.
+Home Manager owns the read-only TOML settings above. Select the writable global mode separately with `cbrain config set mode on`; an explicit mode state overrides legacy TOML mode fields without modifying the Home Manager file.
 
 Nix-generated TOML and JSON pass through the world-readable Nix store. Do not put tokens, credentials, token-bearing URLs, or token-bearing hook commands in `settings` or `antigravityHooks.extraDefinitions`.
 
-After changing the package, rebuild Home Manager, restart every configured provider, inspect Codex `/hooks`, and run `coding-brain doctor`. Run imperative init after a package change only for providers that are not managed declaratively.
+After changing the package, rebuild Home Manager, restart every configured provider, inspect Codex `/hooks`, and run `cbrain doctor`. For providers that are not managed declaratively, repair imperative hooks with `cbrain init <provider>` before restarting them.
 
 ## Managed hooks
 
 Imperative setup names the providers to configure:
 
 ```bash
-coding-brain init codex
-coding-brain init claude antigravity
-coding-brain init all
+cbrain init codex
+cbrain init claude antigravity
+cbrain init all
 ```
 
 Use these commands only for providers that are not managed declaratively through Home Manager.
@@ -102,7 +102,7 @@ Hook activity is bounded status evidence, not authorization by itself. Permissio
 
 Coding Brain first checks the Git project root for `.coding-brain/project.toml`. Without that explicit override, it derives a stable identity from a canonical network `origin`; if the origin is missing, local, `file:`, or otherwise unusable, it falls back to a path-derived temporary identity.
 
-For a normal Git clone with a usable network origin, `coding-brain init` is optional for identity. Run it when you want an explicit manifest override or need stable identity despite an unusable origin; imperative setup also uses init to install managed hooks.
+For a normal Git clone with a usable network origin, `cbrain init` is optional for identity. Run it when you want an explicit manifest override or need stable identity despite an unusable origin; imperative setup also uses init to install managed hooks.
 
 ## Paths
 

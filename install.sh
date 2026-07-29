@@ -6,6 +6,13 @@ set -e
 
 REPO="aleadag/coding-brain"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+OLD_DESTINATION="${INSTALL_DIR}/coding-brain"
+DESTINATION="${INSTALL_DIR}/cbrain"
+
+if [ -e "${OLD_DESTINATION}" ] || [ -L "${OLD_DESTINATION}" ]; then
+    echo "error: remove the existing coding-brain executable at ${OLD_DESTINATION}, then rerun this installer" >&2
+    exit 1
+fi
 
 if command -v shasum >/dev/null 2>&1; then
     verify_checksum() {
@@ -69,11 +76,11 @@ curl -fsSL -o "${TMP_DIR}/${ARCHIVE}" "$URL"
 tar xzf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR"
 
 if [ -w "$INSTALL_DIR" ]; then
-    install -m 0755 "${TMP_DIR}/coding-brain" "${INSTALL_DIR}/coding-brain"
+    install -m 0755 "${TMP_DIR}/cbrain" "${DESTINATION}"
 else
     echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-    sudo install -m 0755 "${TMP_DIR}/coding-brain" "${INSTALL_DIR}/coding-brain"
+    sudo install -m 0755 "${TMP_DIR}/cbrain" "${DESTINATION}"
 fi
 
-echo "Coding Brain ${LATEST} installed to ${INSTALL_DIR}/coding-brain"
-echo "Run 'coding-brain init' to get started."
+echo "Coding Brain ${LATEST} installed to ${DESTINATION}"
+echo "Run 'cbrain init' to get started."

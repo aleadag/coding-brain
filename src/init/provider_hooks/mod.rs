@@ -13,6 +13,8 @@ use coding_brain_core::provider::AgentProvider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::executable::{CURRENT_PROGRAM, is_managed_program};
+
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_TRANSACTION_BYTES: usize = 3 * MAX_FILE_BYTES;
 const NIX_STORE_ROOT: &str = "/nix/store";
@@ -1399,21 +1401,20 @@ fn merge_nested_hooks(
                     .and_then(serde_json::Value::as_array_mut)
                     .expect("shape validated");
                 handlers.retain(|handler| {
-                    let managed = handler
-                        .get("command")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|command| {
-                            command_targets_provider(command, provider, accept_legacy)
-                                && command.split_whitespace().any(is_managed_hook_flag)
-                        });
-                    if !managed {
+                    let Some(command) = handler.get("command").and_then(serde_json::Value::as_str)
+                    else {
+                        return true;
+                    };
+                    if !provider_hook_candidate(command, provider, accept_legacy) {
                         return true;
                     }
+                    let managed = command_targets_provider(command, provider, accept_legacy);
                     let exact = matcher_is_exact
+                        && managed
                         && handler_is_exact(handler, provider, definition, accept_legacy);
                     if !exact {
-                        collision = true;
                         preserved.push(format!("{provider}:{}", definition.event));
+                        collision |= managed;
                     } else {
                         removed_exact = true;
                     }
@@ -1524,11 +1525,11 @@ fn handler_is_exact(
 }
 #[cfg(not(test))]
 fn managed_executable() -> PathBuf {
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("coding-brain"))
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from(CURRENT_PROGRAM))
 }
 #[cfg(test)]
 fn managed_executable() -> PathBuf {
-    PathBuf::from("coding-brain")
+    PathBuf::from(CURRENT_PROGRAM)
 }
 fn command_targets_provider(command: &str, provider: &str, accept_legacy: bool) -> bool {
     let words = command.split_whitespace().collect::<Vec<_>>();
@@ -1543,16 +1544,19 @@ fn command_targets_provider(command: &str, provider: &str, accept_legacy: bool) 
         None => accept_legacy,
     }
 }
+fn provider_hook_candidate(command: &str, provider: &str, accept_legacy: bool) -> bool {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    if words.is_empty() || !words.iter().copied().any(is_managed_hook_flag) {
+        return false;
+    }
+    match words.windows(2).find(|pair| pair[0] == "--provider") {
+        Some(pair) => pair[1] == provider,
+        None => accept_legacy,
+    }
+}
 fn exact_command(command: &str, arguments: &[&str]) -> bool {
     let mut words = command.split_whitespace();
     words.next().is_some_and(is_managed_program) && words.eq(arguments.iter().copied())
-}
-fn is_managed_program(program: &str) -> bool {
-    matches!(program, "coding-brain" | "codexctl")
-        || Path::new(program)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| matches!(name, "coding-brain" | "codexctl"))
 }
 
 #[cfg(test)]
@@ -1564,6 +1568,16 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    fn claude_stop(program: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": format!("{program} --recovery-hook --provider claude"),
+                "timeout": 30
+            }]
+        })
+    }
 
     #[test]
     fn stages_all_provider_files_before_applying() {
@@ -1723,6 +1737,79 @@ mod tests {
             serde_json::to_vec_pretty(&value).unwrap()
         );
         assert!(!plans[0].preserved_modified_entries.is_empty());
+    }
+
+    #[test]
+    fn claude_replaces_only_exact_current_and_stale_programs() {
+        for program in ["coding-brain", "codexctl"] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let path = home.join(".claude/settings.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "hooks": {"Stop": [claude_stop(program)]}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let plans = stage_provider_hooks_at(
+                &[AgentProvider::Claude],
+                HookScope::Global,
+                &home,
+                &project,
+            )
+            .unwrap();
+
+            assert_eq!(
+                replacement_json(&plans, AgentProvider::Claude)["hooks"]["Stop"][0]["hooks"][0]["command"],
+                "cbrain --recovery-hook --provider claude"
+            );
+            assert!(plans[0].preserved_modified_entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn claude_preserves_lookalike_programs_as_modified() {
+        for program in ["coding-brain-wrapper", "my-codexctl"] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let path = home.join(".claude/settings.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "hooks": {"Stop": [claude_stop(program)]}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let plans = stage_provider_hooks_at(
+                &[AgentProvider::Claude],
+                HookScope::Global,
+                &home,
+                &project,
+            )
+            .unwrap();
+            let replacement = replacement_json(&plans, AgentProvider::Claude);
+
+            assert!(
+                replacement["hooks"]["Stop"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&claude_stop(program))
+            );
+            assert!(
+                plans[0]
+                    .preserved_modified_entries
+                    .contains(&"claude:Stop".to_owned())
+            );
+        }
     }
 
     #[test]

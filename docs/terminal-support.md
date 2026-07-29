@@ -1,6 +1,6 @@
 # Terminal support
 
-Run `coding-brain doctor` inside the same terminal environment that launches Codex, Claude Code, or Antigravity CLI. The report separates Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback.
+Run `cbrain doctor` inside the same terminal environment that launches Codex, Claude Code, or Antigravity CLI. The report separates Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback.
 
 Terminal focus and terminal input are different capabilities. Focus requires an exact source target. Input additionally requires a current provider process identity and unique pane; automatic semantic input also requires a complete versioned prompt, immediate recapture, and post-action verification.
 
@@ -36,4 +36,4 @@ Press `x` in Live to preflight the selected exact provider session, pane, and cu
 
 When selected Live activity has an exact Agent Deck target, the TUI can attach through Agent Deck's tmux workflow. Matching is provider-qualified; a same-named session from another provider is not a fallback. Agent Deck is optional, and a missing installation or cancelled attach leaves the Brain TUI usable.
 
-Use `coding-brain doctor` for concrete setup advice when a supported terminal cannot be reached.
+Use `cbrain doctor` for concrete setup advice when a supported terminal cannot be reached.

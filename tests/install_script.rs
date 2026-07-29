@@ -70,7 +70,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 printf '%s\n' tar >> "$COMMAND_LOG"
-printf '%s\n' binary > "$destination/coding-brain""#,
+printf '%s\n' binary > "$destination/cbrain""#,
         );
         fixture.write_stub(
             "install",
@@ -81,6 +81,7 @@ printf '%s\n' binary > "$destination/coding-brain""#,
 } >> "$COMMAND_LOG"
 destination=
 for argument in "$@"; do destination=$argument; done
+[ -f "$3" ]
 : > "$destination""#,
         );
         fixture.write_stub(
@@ -157,6 +158,31 @@ fn refuses_to_download_without_a_checksum_verifier() {
 }
 
 #[test]
+fn refuses_regular_or_broken_symlink_old_binary_before_download_or_install() {
+    for broken_symlink in [false, true] {
+        let fixture = Fixture::new();
+        fixture.add_verifier("shasum");
+        let old = fixture.install_dir.join("coding-brain");
+        if broken_symlink {
+            symlink(fixture.root.path().join("missing"), &old).unwrap();
+        } else {
+            fs::write(&old, b"old").unwrap();
+        }
+
+        let output = fixture.run();
+
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("remove the existing coding-brain executable")
+        );
+        assert!(fixture.log().is_empty());
+        assert!(fs::symlink_metadata(&old).is_ok());
+        assert!(!fixture.install_dir.join("cbrain").exists());
+    }
+}
+
+#[test]
 fn refuses_a_missing_checksum_asset() {
     let fixture = Fixture::new();
     fixture.add_verifier("shasum");
@@ -202,6 +228,13 @@ fn verifies_with_shasum_and_installs_with_the_final_mode() {
     assert!(log.contains("github.com/aleadag/coding-brain/releases/download/v0.58.0/"));
     assert!(log.contains("shasum <-a> <256> <-c> <checksum.sha256>"));
     assert!(log.contains("install <-m> <0755>"));
+    assert!(log.lines().any(|line| {
+        line.starts_with("install <-m> <0755>")
+            && line.contains("/cbrain>")
+            && line.ends_with("/install/cbrain>")
+    }));
+    assert!(!fixture.install_dir.join("coding-brain").exists());
+    assert!(fixture.install_dir.join("cbrain").exists());
 }
 
 #[test]
@@ -222,6 +255,8 @@ fn verifies_with_sha256sum_and_uses_one_privileged_install() {
     let log = fixture.log();
     assert!(log.contains("sha256sum <-c> <checksum.sha256>"));
     assert!(log.contains("sudo <install> <-m> <0755>"));
+    assert!(log.contains("/cbrain>"));
+    assert!(log.ends_with("/missing/cbrain>\n"));
     assert!(!log.contains("<mv>"));
     assert!(!log.contains("<chmod>"));
 }

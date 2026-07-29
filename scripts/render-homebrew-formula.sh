@@ -43,11 +43,14 @@ class CodingBrain < Formula
   end
 
   def install
-    bin.install "coding-brain"
+    bin.install "cbrain"
+
+    generate_completions_from_executable(bin/"cbrain", "completions")
+    (man1/"cbrain.1").write Utils.safe_popen_read(bin/"cbrain", "man")
   end
 
   test do
-    assert_match "coding-brain", shell_output("#{bin}/coding-brain --version 2>&1", 0)
+    assert_match "cbrain", shell_output("#{bin}/cbrain --version 2>&1", 0)
   end
 end
 EOF

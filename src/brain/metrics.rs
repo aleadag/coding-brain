@@ -78,7 +78,7 @@ pub fn print_learning_curve() {
     if total < 10 {
         println!("  Not enough decisions yet ({total}). Need at least 10.");
         println!(
-            "  Run `coding-brain config set mode on`, then accept or reject suggestions to build history."
+            "  Run `cbrain config set mode on`, then accept or reject suggestions to build history."
         );
         return;
     }
@@ -1309,7 +1309,7 @@ pub fn print_impact() {
 
     if total < 5 {
         println!("Not enough decisions yet ({total}). Need at least 5.");
-        println!("Run `coding-brain config set mode on` to build history.");
+        println!("Run `cbrain config set mode on` to build history.");
         return;
     }
 
@@ -1539,7 +1539,7 @@ pub fn print_evolution() {
 
     if total < 10 {
         println!("Not enough decisions yet ({total}). Need at least 10.");
-        println!("Run `coding-brain config set mode on` to build history.");
+        println!("Run `cbrain config set mode on` to build history.");
         return;
     }
 
@@ -2236,10 +2236,7 @@ pub fn print_counterfactuals() {
             }
             println!("    outcome: {}", cf.outcome_summary);
             if let Some(id) = &cf.decision_id {
-                println!(
-                    "    mark canonical: coding-brain --brain-mark-canonical {}",
-                    id
-                );
+                println!("    mark canonical: cbrain --brain-mark-canonical {}", id);
             }
             println!();
         }
@@ -2416,7 +2413,7 @@ pub fn print_scorecard() {
     );
     println!();
 
-    println!("→ Run `coding-brain --brain-review` to triage the highest-value cases.");
+    println!("→ Run `cbrain --brain-review` to triage the highest-value cases.");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2456,7 +2453,7 @@ fn print_help() {
     println!("Brain Statistics & Metrics");
     println!("==========================");
     println!();
-    println!("Usage: coding-brain --brain-stats <subcommand>");
+    println!("Usage: cbrain --brain-stats <subcommand>");
     println!();
     println!("Subcommands:");
     println!("  evolution        Learning trajectory with sparkline charts");

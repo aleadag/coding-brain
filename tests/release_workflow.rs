@@ -27,4 +27,9 @@ fn tag_release_runs_the_release_critical_quality_suite_before_building() {
         .unwrap()
         .0;
     assert!(build.contains("needs: verify"), "build bypasses verify");
+    assert!(
+        workflow
+            .contains("tar czf ../../../coding-brain-${TAG}-${{ matrix.target }}.tar.gz cbrain")
+    );
+    assert!(!workflow.contains(".tar.gz coding-brain\n"));
 }

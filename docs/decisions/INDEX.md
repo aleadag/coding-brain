@@ -6,3 +6,4 @@
 | [ADR-0002](ADR-0002-coding-brain-product-boundary.md) | Accepted | Make Brain the sole Coding Brain TUI, remove session management, and adopt the `coding-brain` public namespace. |
 | [ADR-0003](ADR-0003-fail-safe-hook-and-learning-persistence.md) | Accepted | Separate model proposals, committed hook decisions, delivery, and execution while publishing learning state atomically. |
 | [ADR-0004](ADR-0004-provider-aware-guards-and-terminal-actuation.md) | Accepted | Use provider-qualified identity, structured permission and recovery hooks, and guarded terminal fallback for process-only, manual, and unsupported prompts. |
+| [ADR-0005](ADR-0005-use-cbrain-as-the-sole-executable.md) | Accepted | Use `cbrain` as the sole executable while preserving all Coding Brain package, configuration, state, and project namespaces. |

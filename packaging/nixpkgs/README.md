@@ -34,7 +34,7 @@ rustPlatform.buildRustPackage rec {
     description = "Local brain for supervising and learning from coding-agent activity.";
     homepage = "https://github.com/aleadag/coding-brain";
     license = lib.licenses.mit;
-    mainProgram = "coding-brain";
+    mainProgram = "cbrain";
     platforms = lib.platforms.unix;
   };
 }
@@ -45,7 +45,7 @@ rustPlatform.buildRustPackage rec {
 1. Copy the package expression into a `nixpkgs` checkout.
 2. Build once with `lib.fakeHash` values to get the real `src.hash` and
    `cargoHash` suggestions from Nix.
-3. Replace the fake hashes, rebuild, and confirm `coding-brain --help` runs.
+3. Replace the fake hashes, rebuild, and confirm `cbrain --help` runs.
 4. Run the normal `nixpkgs` validation tools for the new package.
 5. Open the upstream `nixpkgs` PR and link it from issue `#82`.
 
