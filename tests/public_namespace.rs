@@ -8,7 +8,7 @@ fn isolated_command(temp: &tempfile::TempDir) -> Command {
     let state = temp.path().join("state");
     let project = temp.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command
         .current_dir(project)
         .env("HOME", home)
@@ -16,6 +16,103 @@ fn isolated_command(temp: &tempfile::TempDir) -> Command {
         .env("XDG_STATE_HOME", state)
         .env("CODING_BRAIN_SKIP_FIRST_RUN", "1");
     command
+}
+
+#[test]
+fn cli_is_cbrain_while_public_namespaces_remain_coding_brain() {
+    let temp = tempfile::tempdir().unwrap();
+    let help = isolated_command(&temp).arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("Usage: cbrain"));
+
+    let config = isolated_command(&temp)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&config.stdout).contains("coding-brain/config.toml"));
+}
+
+#[test]
+fn current_documentation_uses_cbrain_commands_and_preserves_namespaces() {
+    let launch_posts = include_str!("../LAUNCH_POSTS.md");
+    let contributing = include_str!("../docs/contributing.md");
+    let agents = include_str!("../AGENTS.md");
+    let current_docs = [
+        ("README", include_str!("../README.md")),
+        ("configuration", include_str!("../docs/configuration.md")),
+        ("quickstart", include_str!("../docs/quickstart.md")),
+        ("reference", include_str!("../docs/reference.md")),
+        (
+            "troubleshooting",
+            include_str!("../docs/troubleshooting.md"),
+        ),
+        ("launch posts", launch_posts),
+        ("contributing", contributing),
+        ("AGENTS", agents),
+    ];
+    for (name, document) in current_docs {
+        assert!(document.contains("cbrain"), "{name}");
+        assert!(!document.contains("Run `coding-brain"), "{name}");
+        assert!(
+            document.contains("coding-brain"),
+            "{name} must retain package or path context"
+        );
+    }
+
+    let stale_launch_block =
+        "cargo install coding-brain\ncoding-brain init all\ncoding-brain doctor\ncoding-brain";
+    let current_launch_block = "cargo install coding-brain\ncbrain init all\ncbrain doctor\ncbrain";
+    assert!(!launch_posts.contains(stale_launch_block), "launch posts");
+    assert!(launch_posts.contains(current_launch_block), "launch posts");
+    assert!(
+        !contributing.contains("the `coding-brain` CLI"),
+        "contributing"
+    );
+    assert!(contributing.contains("the `cbrain` CLI"), "contributing");
+    assert!(
+        !agents.contains("# coding-brain binary:"),
+        "AGENTS architecture"
+    );
+    assert!(agents.contains("# cbrain binary:"), "AGENTS architecture");
+}
+
+#[test]
+fn current_source_executable_surfaces_use_cbrain() {
+    let justfile = include_str!("../justfile");
+    assert!(justfile.contains("cargo run --bin cbrain -- {{args}}"));
+    assert!(!justfile.contains("cargo run --bin coding-brain"));
+
+    let terminals = include_str!("../crates/coding-brain-core/src/terminals/mod.rs");
+    assert!(terminals.contains("cbrain doctor"));
+    assert!(!terminals.contains("coding-brain doctor"));
+
+    let hooks = include_str!("../crates/coding-brain-core/src/hooks.rs");
+    assert!(hooks.contains("`cbrain --hooks`"));
+    assert!(!hooks.contains("`coding-brain --hooks`"));
+
+    for (name, source, current, stale) in [
+        (
+            "permission hook",
+            include_str!("../src/brain/permission_hook.rs"),
+            "cbrain permission hook:",
+            "coding-brain permission hook:",
+        ),
+        (
+            "recovery hook",
+            include_str!("../src/brain/recovery.rs"),
+            "cbrain recovery hook:",
+            "coding-brain recovery hook:",
+        ),
+        (
+            "lifecycle hook",
+            include_str!("../src/lifecycle_hook.rs"),
+            "cbrain lifecycle hook:",
+            "coding-brain lifecycle hook:",
+        ),
+    ] {
+        assert!(source.contains(current), "{name}");
+        assert!(!source.contains(stale), "{name}");
+    }
 }
 
 #[test]
@@ -46,7 +143,7 @@ fn ordinary_commands_ignore_and_preserve_legacy_namespace() {
     assert!(!config_stdout.contains("legacy-model"));
 
     let doctor = isolated_command(&temp).arg("doctor").output().unwrap();
-    assert!(String::from_utf8_lossy(&doctor.stdout).contains("coding-brain doctor"));
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("cbrain doctor"));
 
     let mut hook = isolated_command(&temp)
         .arg("--permission-hook")
@@ -103,6 +200,38 @@ fn front_door_metadata_is_provider_aware() {
         assert!(metadata.contains("aleadag/coding-brain"), "{name}");
         assert!(!metadata.contains("aleadag/codexctl"), "{name}");
     }
+    assert!(flake.contains("pname = \"coding-brain\""));
+    assert!(flake.contains("mainProgram = \"cbrain\""));
+    assert!(!flake.contains("mainProgram = \"coding-brain\""));
+
+    for (name, metadata) in [
+        ("Homebrew renderer", homebrew_renderer),
+        ("Homebrew formula", homebrew_formula),
+    ] {
+        assert!(metadata.contains("bin/\"cbrain\""), "{name}");
+        assert!(metadata.contains("man1/\"cbrain.1\""), "{name}");
+        assert!(metadata.contains("#{bin}/cbrain"), "{name}");
+        assert!(!metadata.contains("#{bin}/coding-brain"), "{name}");
+    }
+    assert!(homebrew_renderer.contains("bin.install \"cbrain\""));
+    assert!(!homebrew_renderer.contains("bin.install \"coding-brain\""));
+
+    let aur_install = r#"install -Dm755 "\${srcdir}/cbrain" "\${pkgdir}/usr/bin/cbrain""#;
+    assert!(aur_renderer.contains(aur_install));
+    assert!(aur_pkgbuild.contains(&aur_install.replace("\\$", "$")));
+    for (name, metadata) in [
+        ("AUR renderer", aur_renderer),
+        ("AUR PKGBUILD", aur_pkgbuild),
+    ] {
+        assert!(!metadata.contains("/usr/bin/coding-brain"), "{name}");
+        assert!(metadata.contains("provides=('coding-brain')"), "{name}");
+    }
+    assert!(aur_srcinfo.contains("pkgbase = coding-brain-bin"));
+    assert!(aur_srcinfo.contains("provides = coding-brain"));
+
+    assert!(nixpkgs_readme.contains("pname = \"coding-brain\""));
+    assert!(nixpkgs_readme.contains("mainProgram = \"cbrain\""));
+    assert!(nixpkgs_readme.contains("confirm `cbrain --help` runs"));
 }
 
 #[test]
@@ -197,70 +326,87 @@ fn production_source_has_no_usage_or_cost_surfaces() {
 
 #[test]
 fn stale_hooks_are_diagnostic_until_init() {
-    let temp = tempfile::tempdir().unwrap();
-    let hooks_path = temp.path().join("home/.codex/hooks.json");
-    std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
-    let mut hooks = serde_json::Map::new();
-    for (event, matcher, argument, timeout) in [
-        (
-            "SessionStart",
-            Some("startup|resume|clear|compact"),
-            "--lifecycle-hook",
-            2,
-        ),
-        ("UserPromptSubmit", None, "--lifecycle-hook", 2),
-        ("PreToolUse", Some("*"), "--lifecycle-hook", 2),
-        ("PermissionRequest", Some("*"), "--permission-hook", 30),
-        ("PostToolUse", Some("*"), "--lifecycle-hook", 2),
-        ("SubagentStart", Some("*"), "--lifecycle-hook", 2),
-        ("SubagentStop", Some("*"), "--lifecycle-hook", 2),
-        ("Stop", None, "--recovery-hook", 30),
-    ] {
-        let mut handler = serde_json::json!({
-            "type": "command",
-            "command": format!("codexctl {argument}"),
-            "timeout": timeout,
-        });
-        if event == "PermissionRequest" {
-            handler["statusMessage"] = serde_json::json!("Brain reviewing permission…");
+    for program in ["codexctl", "coding-brain"] {
+        let temp = tempfile::tempdir().unwrap();
+        let hooks_path = temp.path().join("home/.codex/hooks.json");
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        let mut hooks = serde_json::Map::new();
+        for (event, matcher, argument, timeout) in [
+            (
+                "SessionStart",
+                Some("startup|resume|clear|compact"),
+                "--lifecycle-hook",
+                2,
+            ),
+            ("UserPromptSubmit", None, "--lifecycle-hook", 2),
+            ("PreToolUse", Some("*"), "--lifecycle-hook", 2),
+            ("PermissionRequest", Some("*"), "--permission-hook", 30),
+            ("PostToolUse", Some("*"), "--lifecycle-hook", 2),
+            ("SubagentStart", Some("*"), "--lifecycle-hook", 2),
+            ("SubagentStop", Some("*"), "--lifecycle-hook", 2),
+            ("Stop", None, "--recovery-hook", 30),
+        ] {
+            let mut handler = serde_json::json!({
+                "type": "command",
+                "command": format!("{program} {argument}"),
+                "timeout": timeout,
+            });
+            if event == "PermissionRequest" {
+                handler["statusMessage"] = serde_json::json!("Brain reviewing permission…");
+            }
+            let mut entry = serde_json::json!({ "hooks": [handler] });
+            if let Some(matcher) = matcher {
+                entry["matcher"] = serde_json::json!(matcher);
+            }
+            hooks.insert(event.into(), serde_json::json!([entry]));
         }
-        let mut entry = serde_json::json!({ "hooks": [handler] });
-        if let Some(matcher) = matcher {
-            entry["matcher"] = serde_json::json!(matcher);
-        }
-        hooks.insert(event.into(), serde_json::json!([entry]));
-    }
-    hooks.insert(
-        "Notification".into(),
-        serde_json::json!([{ "hooks": [{ "type": "command", "command": "notify-send keep" }] }]),
-    );
-    std::fs::write(
-        &hooks_path,
-        serde_json::to_vec_pretty(&serde_json::json!({ "hooks": hooks })).unwrap(),
-    )
-    .unwrap();
-
-    let doctor = isolated_command(&temp).arg("doctor").output().unwrap();
-    assert!(String::from_utf8_lossy(&doctor.stdout).contains("definition stale"));
-    let unchanged = std::fs::read(&hooks_path).unwrap();
-
-    let init = isolated_command(&temp)
-        .args(["init", "--plugin-only"])
-        .output()
+        hooks
+            .get_mut("PermissionRequest")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "coding-brain-wrapper --permission-hook",
+                    "timeout": 30,
+                    "statusMessage": "Brain reviewing permission…"
+                }]
+            }));
+        hooks.insert(
+            "Notification".into(),
+            serde_json::json!([{ "hooks": [{ "type": "command", "command": "notify-send keep" }] }]),
+        );
+        std::fs::write(
+            &hooks_path,
+            serde_json::to_vec_pretty(&serde_json::json!({ "hooks": hooks })).unwrap(),
+        )
         .unwrap();
-    assert!(
-        init.status.success(),
-        "{}",
-        String::from_utf8_lossy(&init.stderr)
-    );
-    let rewritten = std::fs::read_to_string(&hooks_path).unwrap();
-    assert_ne!(rewritten.as_bytes(), unchanged);
-    assert!(rewritten.contains(&format!(
-        "{} --permission-hook",
-        env!("CARGO_BIN_EXE_coding-brain")
-    )));
-    assert!(!rewritten.contains("\"codexctl --permission-hook\""));
-    assert!(rewritten.contains("notify-send keep"));
+
+        let doctor = isolated_command(&temp).arg("doctor").output().unwrap();
+        assert!(String::from_utf8_lossy(&doctor.stdout).contains("definition stale"));
+        let unchanged = std::fs::read(&hooks_path).unwrap();
+
+        let init = isolated_command(&temp)
+            .args(["init", "--plugin-only"])
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let rewritten = std::fs::read_to_string(&hooks_path).unwrap();
+        assert_ne!(rewritten.as_bytes(), unchanged);
+        assert!(rewritten.contains(&format!(
+            "{} --permission-hook",
+            env!("CARGO_BIN_EXE_cbrain")
+        )));
+        assert!(!rewritten.contains(&format!("\"{program} --permission-hook\"")));
+        assert!(rewritten.contains("coding-brain-wrapper --permission-hook"));
+        assert!(rewritten.contains("notify-send keep"));
+    }
 }
 
 #[test]

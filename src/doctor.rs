@@ -1,10 +1,10 @@
-//! `coding-brain doctor` — install + runtime health check.
+//! `cbrain doctor` — install + runtime health check.
 //!
 //! Top-down checklist that answers "is everything wired up?" in one
 //! command. Replaces what was scattered across:
 //!
-//! * `coding-brain doctor` (complete install and runtime health)
-//! * `coding-brain init --check` (onboarding-marker drift only)
+//! * `cbrain doctor` (complete install and runtime health)
+//! * `cbrain init --check` (onboarding-marker drift only)
 //! * scattered "is X reachable?" probes the user had to chain manually
 //!
 //! Each check returns a `Check` with status + a fix hint. The renderer
@@ -120,7 +120,7 @@ fn provider_hook_recovery_check(
 /// indent, fixed-width name column so messages align.
 pub fn render_checks(checks: &[Check]) -> String {
     let mut out = String::new();
-    out.push_str("coding-brain doctor\n");
+    out.push_str("cbrain doctor\n");
     out.push_str("=================\n\n");
     let max_name = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
     for c in checks {
@@ -398,16 +398,16 @@ fn check_provider_setup(provider: AgentProvider, evidence: ProviderSetupEvidence
             if evidence.hooks.state == ProviderHookState::Current =>
         {
             Some(format!(
-                "Install or enable the {} provider executable; managed definitions are current, then rerun `coding-brain doctor`.",
+                "Install or enable the {} provider executable; managed definitions are current, then rerun `cbrain doctor`.",
                 provider.label()
             ))
         }
         (_, ProviderHookOwnership::HomeManager) => Some(format!(
-            "Repair the Home Manager-owned {} definitions in your Nix configuration, rebuild Home Manager, then rerun `coding-brain doctor`.",
+            "Repair the Home Manager-owned {} definitions in your Nix configuration, rebuild Home Manager, then rerun `cbrain doctor`.",
             provider.label()
         )),
         (_, ProviderHookOwnership::Mixed) => Some(format!(
-            "Remove the duplicate scope for {} from either Home Manager or the regular provider configuration, then rerun `coding-brain doctor`.",
+            "Remove the duplicate scope for {} from either Home Manager or the regular provider configuration, then rerun `cbrain doctor`.",
             provider.label()
         )),
         (_, ProviderHookOwnership::Unsupported) => Some(format!(
@@ -415,7 +415,7 @@ fn check_provider_setup(provider: AgentProvider, evidence: ProviderSetupEvidence
             provider.label()
         )),
         (_, ProviderHookOwnership::Imperative | ProviderHookOwnership::Absent) => Some(format!(
-            "Repair {} setup with `coding-brain init {}`.",
+            "Repair {} setup with `cbrain init {}`.",
             provider.label(),
             provider.as_str()
         )),
@@ -429,13 +429,13 @@ fn check_provider_setup(provider: AgentProvider, evidence: ProviderSetupEvidence
 }
 
 fn check_binary_on_path() -> Check {
-    // Compare the running binary against what `which coding-brain` resolves
+    // Compare the running binary against what `which cbrain` resolves
     // to. Mismatches mean the user is running one binary while their
     // hooks resolve a different one (typical after `cargo install` on top
     // of a previous `brew install`).
     let running = std::env::current_exe().ok();
     let on_path = std::process::Command::new("which")
-        .arg("coding-brain")
+        .arg("cbrain")
         .output()
         .ok()
         .and_then(|o| {
@@ -458,7 +458,7 @@ fn check_binary_on_path() -> Check {
             status: CheckStatus::Advisory,
             message: format!("running {}, PATH resolves {}", r.display(), p.display()),
             fix_hint: Some(
-                "Two installs detected. Re-run `coding-brain init` so hooks use the running immutable executable."
+                "Two installs detected. Re-run `cbrain init` so hooks use the running immutable executable."
                     .into(),
             ),
         },
@@ -467,7 +467,7 @@ fn check_binary_on_path() -> Check {
             status: CheckStatus::Fail,
             message: format!("{} not on PATH", r.display()),
             fix_hint: Some(
-                "Add the install dir to PATH so `coding-brain` is directly available.".into(),
+                "Add the install dir to PATH so `cbrain` is directly available.".into(),
             ),
         },
         _ => Check {
@@ -495,9 +495,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
             name: "Codex hooks".into(),
             status: CheckStatus::Fail,
             message: "managed lifecycle definitions missing".into(),
-            fix_hint: Some(
-                "Run `coding-brain init` (or `coding-brain init --plugin-only`).".into(),
-            ),
+            fix_hint: Some("Run `cbrain init` (or `cbrain init --plugin-only`).".into()),
         };
     }
 
@@ -525,9 +523,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                 name: "Codex hooks".into(),
                 status: CheckStatus::Fail,
                 message: format!("{} {} definition missing", scope.1, event.as_str()),
-                fix_hint: Some(
-                    "Run `coding-brain init`, restart Codex, and review `/hooks`.".into(),
-                ),
+                fix_hint: Some("Run `cbrain init`, restart Codex, and review `/hooks`.".into()),
             };
         }
         if state.unavailable {
@@ -536,8 +532,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                 status: CheckStatus::Fail,
                 message: format!("{} {} executable unavailable", scope.1, event.as_str()),
                 fix_hint: Some(
-                    "Reinstall Coding Brain or rerun `coding-brain init`, then review `/hooks`."
-                        .into(),
+                    "Reinstall Coding Brain or rerun `cbrain init`, then review `/hooks`.".into(),
                 ),
             };
         }
@@ -557,7 +552,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                 status: CheckStatus::Advisory,
                 message: format!("{} {} definition stale", scope.1, event.as_str()),
                 fix_hint: Some(
-                    "Run `coding-brain init`, restart Codex, and review the changed definition with `/hooks`."
+                    "Run `cbrain init`, restart Codex, and review the changed definition with `/hooks`."
                         .into(),
                 ),
             };
@@ -750,7 +745,7 @@ fn check_outcome_telemetry_with_store(store: &ActivityStore) -> Check {
             status: CheckStatus::Advisory,
             message: format!("no PostToolUse evidence across {pre_count} recent invocations"),
             fix_hint: Some(
-                "Upgrade or restart Codex, review `/hooks`, complete local tools, and rerun `coding-brain doctor`."
+                "Upgrade or restart Codex, review `/hooks`, complete local tools, and rerun `cbrain doctor`."
                     .into(),
             ),
         };
@@ -900,7 +895,7 @@ fn check_project_identity_at(
             status: CheckStatus::Advisory,
             message: "no manifest or usable Git origin; memory is temporary".into(),
             fix_hint: Some(
-                "Run `coding-brain init` to create an explicit identity override at the project-root `.coding-brain/project.toml`. Removing the project-root `.coding-brain/project.toml` before rerunning init deliberately creates a new identity."
+                "Run `cbrain init` to create an explicit identity override at the project-root `.coding-brain/project.toml`. Removing the project-root `.coding-brain/project.toml` before rerunning init deliberately creates a new identity."
                     .into(),
             ),
         },
@@ -909,7 +904,7 @@ fn check_project_identity_at(
             status: CheckStatus::Advisory,
             message: format!("project manifest is malformed: {error}"),
             fix_hint: Some(
-                "Fix the project-root `.coding-brain/project.toml`, or remove it before `coding-brain init` to deliberately create a new identity."
+                "Fix the project-root `.coding-brain/project.toml`, or remove it before `cbrain init` to deliberately create a new identity."
                     .into(),
             ),
         },
@@ -987,9 +982,7 @@ fn check_session_discovery_for(sessions: &[coding_brain_core::session::AgentSess
             name: "session discovery".into(),
             status: CheckStatus::Advisory,
             message,
-            fix_hint: Some(
-                "Start a selected provider session and re-run `coding-brain doctor`.".into(),
-            ),
+            fix_hint: Some("Start a selected provider session and re-run `cbrain doctor`.".into()),
         }
     } else {
         Check {
@@ -1415,7 +1408,7 @@ mod tests {
             "no manifest or usable Git origin; memory is temporary"
         );
         let hint = check.fix_hint.unwrap();
-        assert!(hint.contains("coding-brain init"));
+        assert!(hint.contains("cbrain init"));
         assert!(hint.contains("project-root `.coding-brain/project.toml`"));
     }
 
@@ -1436,13 +1429,13 @@ mod tests {
         assert!(check.message.contains("project manifest is malformed"));
         let hint = check.fix_hint.unwrap();
         assert!(hint.contains("Fix the project-root `.coding-brain/project.toml`"));
-        assert!(hint.contains("coding-brain init"));
+        assert!(hint.contains("cbrain init"));
     }
 
     #[test]
     fn render_handles_empty_check_list() {
         let out = render_checks(&[]);
-        assert!(out.contains("coding-brain doctor"));
+        assert!(out.contains("cbrain doctor"));
         assert!(out.contains("0 passed"));
     }
 
@@ -1605,14 +1598,14 @@ mod tests {
     fn current_hooks() -> serde_json::Value {
         serde_json::json!({
             "hooks": {
-                "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
-                "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
-                "PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
-                "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --permission-hook", "timeout": 30, "statusMessage": "Brain reviewing permission…" }] }],
-                "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
-                "SubagentStart": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
-                "SubagentStop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "coding-brain --lifecycle-hook", "timeout": 2 }] }],
-                "Stop": [{ "hooks": [{ "type": "command", "command": "coding-brain --recovery-hook", "timeout": 30 }] }]
+                "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [{ "type": "command", "command": "cbrain --lifecycle-hook", "timeout": 2 }] }],
+                "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "cbrain --lifecycle-hook", "timeout": 2 }] }],
+                "PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "cbrain --lifecycle-hook", "timeout": 2 }] }],
+                "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "cbrain --permission-hook", "timeout": 30, "statusMessage": "Brain reviewing permission…" }] }],
+                "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "cbrain --lifecycle-hook", "timeout": 2 }] }],
+                "SubagentStart": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "cbrain --lifecycle-hook", "timeout": 2 }] }],
+                "SubagentStop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "cbrain --lifecycle-hook", "timeout": 2 }] }],
+                "Stop": [{ "hooks": [{ "type": "command", "command": "cbrain --recovery-hook", "timeout": 30 }] }]
             }
         })
     }
@@ -1705,7 +1698,7 @@ mod tests {
 
         let mut unavailable = current_hooks();
         unavailable["hooks"]["SessionStart"][0]["hooks"][0]["command"] =
-            serde_json::json!("/definitely/missing/coding-brain --lifecycle-hook");
+            serde_json::json!("/definitely/missing/cbrain --lifecycle-hook");
         write_hooks(&path, &unavailable);
         let check = check_codex_hooks_at(Some(&home), &cwd);
         assert_eq!(check.status, CheckStatus::Fail);
@@ -1825,9 +1818,7 @@ mod tests {
                         );
                         if let Some(hint) = check.fix_hint {
                             assert!(hint.contains(provider.label()));
-                            assert!(
-                                hint.contains(&format!("coding-brain init {}", provider.as_str()))
-                            );
+                            assert!(hint.contains(&format!("cbrain init {}", provider.as_str())));
                         }
                     }
                 }
@@ -1982,7 +1973,7 @@ mod tests {
                 (None, None) => {}
                 (Some(hint), Some(phrase)) => {
                     assert!(hint.contains(phrase));
-                    assert!(!hint.contains("coding-brain init"));
+                    assert!(!hint.contains("cbrain init"));
                     if !expects_definition_repair {
                         assert!(!hint.contains("rebuild Home Manager"));
                     }
@@ -2012,7 +2003,7 @@ mod tests {
             .fix_hint
             .expect("missing Home Manager setup needs repair");
         assert!(hint.contains("Home Manager"));
-        assert!(!hint.contains("coding-brain init"));
+        assert!(!hint.contains("cbrain init"));
     }
 
     #[test]
@@ -2037,7 +2028,7 @@ mod tests {
         assert!(hint.contains("provider executable"));
         assert!(hint.contains("definitions are current"));
         assert!(!hint.contains("rebuild Home Manager"));
-        assert!(!hint.contains("coding-brain init"));
+        assert!(!hint.contains("cbrain init"));
     }
 
     #[test]

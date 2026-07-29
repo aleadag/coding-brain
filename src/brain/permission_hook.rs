@@ -384,7 +384,7 @@ fn antigravity_ask() -> ProviderPermissionResponse {
 
 fn write_diagnostic(stderr: &mut impl Write, diagnostic: impl fmt::Display) {
     let diagnostic = bounded_redacted_activity_text(&diagnostic.to_string());
-    let _ = writeln!(stderr, "coding-brain permission hook: {diagnostic}");
+    let _ = writeln!(stderr, "cbrain permission hook: {diagnostic}");
 }
 
 fn record_permission(
@@ -2176,6 +2176,7 @@ mod tests {
 
         assert!(stdout.is_empty());
         let diagnostic = String::from_utf8(stderr).unwrap();
+        assert!(diagnostic.starts_with("cbrain permission hook:"));
         assert!(!diagnostic.contains("sk-secret-value"));
         assert!(diagnostic.contains("[REDACTED]"));
         assert!(diagnostic.len() <= MAX_ACTIVITY_FIELD_BYTES + 64);

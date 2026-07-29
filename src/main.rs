@@ -14,6 +14,7 @@ mod brain;
 mod commands;
 mod config;
 mod doctor;
+mod executable;
 mod init;
 mod lifecycle_hook;
 mod provider_hooks;
@@ -177,7 +178,7 @@ pub(crate) enum Command {
 
 #[derive(Parser)]
 #[command(
-    name = "coding-brain",
+    name = "cbrain",
     version,
     about = "Supervise coding-agent activity with a local brain that learns from you."
 )]
@@ -376,13 +377,15 @@ fn is_first_run() -> bool {
     let settings = home.join(".codex").join("hooks.json");
     let onboarded = marker.exists();
     let hooked = std::fs::read_to_string(&settings)
-        .map(|s| s.contains("coding-brain"))
+        .map(|s| s.contains("cbrain"))
         .unwrap_or(false);
     !onboarded && !hooked
 }
 
 const FIRST_RUN_PROVIDER_MESSAGE: &str =
     "Set up at least one provider before expecting Brain activity.";
+const FIRST_RUN_INIT_ROW: &str =
+    "│    cbrain init          Interactive setup wizard                │";
 
 /// One-screen banner shown above Brain when the user hasn't
 /// onboarded yet (#322). Goes to stderr so it doesn't pollute stdout
@@ -395,7 +398,7 @@ fn print_first_run_banner() {
     eprintln!("│  {FIRST_RUN_PROVIDER_MESSAGE:<63}│");
     eprintln!("│  Quit and run:                                                   │");
     eprintln!("│                                                                 │");
-    eprintln!("│    coding-brain init    Interactive setup wizard                │");
+    eprintln!("{FIRST_RUN_INIT_ROW}");
     eprintln!("│                                                                 │");
     eprintln!("│  Silence this with CODING_BRAIN_SKIP_FIRST_RUN=1.             │");
     eprintln!("└─────────────────────────────────────────────────────────────────┘");
@@ -610,14 +613,14 @@ fn run_main(cli: Cli) -> io::Result<()> {
                     // entries. The other three wizard phases stay where
                     // the previous run left them (no marker rewrite).
                     eprintln!(
-                        "warning: --plugin-only is deprecated; use `coding-brain init codex` instead"
+                        "warning: --plugin-only is deprecated; use `cbrain init codex` instead"
                     );
                     return init::phases::install_plugin_now();
                 }
                 if *non_interactive {
                     let providers = if providers.is_empty() {
                         eprintln!(
-                            "warning: provider-less --non-interactive is deprecated; use `coding-brain init codex --non-interactive` instead"
+                            "warning: provider-less --non-interactive is deprecated; use `cbrain init codex --non-interactive` instead"
                         );
                         vec![AgentProvider::Codex]
                     } else {
@@ -789,14 +792,14 @@ mod default_brain_cli_tests {
 
     #[test]
     fn no_mode_selects_brain_tui() {
-        let cli = Cli::try_parse_from(["coding-brain"]).unwrap();
+        let cli = Cli::try_parse_from(["cbrain"]).unwrap();
 
         assert_eq!(select_mode(&cli), RunMode::BrainTui);
     }
 
     #[test]
     fn headless_is_the_only_continuous_non_tui_mode() {
-        let cli = Cli::try_parse_from(["coding-brain", "--headless", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["cbrain", "--headless", "--json"]).unwrap();
 
         assert_eq!(select_mode(&cli), RunMode::Headless { json: true });
     }
@@ -804,8 +807,8 @@ mod default_brain_cli_tests {
     #[test]
     fn endpoint_and_model_overrides_do_not_enable_the_brain() {
         for args in [
-            ["coding-brain", "--url", "http://localhost:9999"],
-            ["coding-brain", "--brain-model", "local-model"],
+            ["cbrain", "--url", "http://localhost:9999"],
+            ["cbrain", "--brain-model", "local-model"],
         ] {
             let cli = Cli::try_parse_from(args).unwrap();
             let mut config = config::Config::default();
@@ -818,7 +821,7 @@ mod default_brain_cli_tests {
 
     #[test]
     fn config_subcommand_is_selected_ahead_of_brain_actions() {
-        let cli = Cli::try_parse_from(["coding-brain", "--brain-eval", "config", "show"]).unwrap();
+        let cli = Cli::try_parse_from(["cbrain", "--brain-eval", "config", "show"]).unwrap();
 
         assert!(matches!(
             early_config_action(&cli),
@@ -833,8 +836,7 @@ mod provider_init_cli_tests {
 
     #[test]
     fn init_accepts_and_normalizes_positional_provider_selectors() {
-        let cli =
-            Cli::try_parse_from(["coding-brain", "init", "claude", "codex", "claude"]).unwrap();
+        let cli = Cli::try_parse_from(["cbrain", "init", "claude", "codex", "claude"]).unwrap();
         let Some(Command::Init { providers, .. }) = cli.command else {
             panic!("expected init command");
         };
@@ -877,7 +879,7 @@ mod provider_init_cli_tests {
             "--plugin-only",
         ] {
             assert!(
-                Cli::try_parse_from(["coding-brain", "init", "claude", mode]).is_err(),
+                Cli::try_parse_from(["cbrain", "init", "claude", mode]).is_err(),
                 "provider selector unexpectedly accepted with {mode}"
             );
         }
@@ -889,9 +891,9 @@ mod brain_only_cli_tests {
     use super::*;
 
     #[test]
-    fn clap_and_cargo_expose_only_coding_brain() {
-        assert_eq!(Cli::command().get_name(), "coding-brain");
-        assert_eq!(env!("CARGO_BIN_NAME"), "coding-brain");
+    fn clap_and_cargo_expose_only_cbrain() {
+        assert_eq!(Cli::command().get_name(), "cbrain");
+        assert_eq!(env!("CARGO_BIN_NAME"), "cbrain");
     }
 
     const REMOVED_ARGS: &[&str] = &[
@@ -974,7 +976,7 @@ mod brain_only_cli_tests {
     fn removed_args_fail_and_retained_args_are_in_long_help() {
         let help = Cli::command().render_long_help().to_string();
         for arg in REMOVED_ARGS {
-            assert!(Cli::try_parse_from(["coding-brain", arg]).is_err(), "{arg}");
+            assert!(Cli::try_parse_from(["cbrain", arg]).is_err(), "{arg}");
             assert!(!help_has_long_flag(&help, arg), "{arg}");
         }
         for arg in RETAINED_ARGS {
@@ -985,16 +987,16 @@ mod brain_only_cli_tests {
     #[test]
     fn removed_outcome_pipeline_arguments_are_rejected_with_values() {
         for args in [
-            vec!["coding-brain", "--record-outcome"],
-            vec!["coding-brain", "--exit-code", "0"],
-            vec!["coding-brain", "--duration-ms", "5"],
-            vec!["coding-brain", "--stderr-tail", "failure"],
-            vec!["coding-brain", "--session-id", "session-1"],
-            vec!["coding-brain", "--tool-use-id", "call-1"],
-            vec!["coding-brain", "--reap-outcomes"],
-            vec!["coding-brain", "--brain-outcomes"],
-            vec!["coding-brain", "--brain-baseline"],
-            vec!["coding-brain", "--top", "10"],
+            vec!["cbrain", "--record-outcome"],
+            vec!["cbrain", "--exit-code", "0"],
+            vec!["cbrain", "--duration-ms", "5"],
+            vec!["cbrain", "--stderr-tail", "failure"],
+            vec!["cbrain", "--session-id", "session-1"],
+            vec!["cbrain", "--tool-use-id", "call-1"],
+            vec!["cbrain", "--reap-outcomes"],
+            vec!["cbrain", "--brain-outcomes"],
+            vec!["cbrain", "--brain-baseline"],
+            vec!["cbrain", "--top", "10"],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
@@ -1022,14 +1024,14 @@ mod brain_only_cli_tests {
             "ingest",
         ] {
             assert!(
-                Cli::try_parse_from(["coding-brain", command]).is_err(),
+                Cli::try_parse_from(["cbrain", command]).is_err(),
                 "{command}"
             );
         }
 
-        assert!(Cli::try_parse_from(["coding-brain", "--run", "tasks.json"]).is_err());
-        assert!(Cli::try_parse_from(["coding-brain", "--parallel"]).is_err());
-        assert!(Cli::try_parse_from(["coding-brain", "--decompose", "split this work"]).is_err());
+        assert!(Cli::try_parse_from(["cbrain", "--run", "tasks.json"]).is_err());
+        assert!(Cli::try_parse_from(["cbrain", "--parallel"]).is_err());
+        assert!(Cli::try_parse_from(["cbrain", "--decompose", "split this work"]).is_err());
     }
 
     #[test]
@@ -1062,7 +1064,7 @@ mod brain_only_cli_tests {
 
     #[test]
     fn persistent_mode_uses_config_subcommand() {
-        let cli = Cli::try_parse_from(["coding-brain", "config", "set", "mode", "auto"]).unwrap();
+        let cli = Cli::try_parse_from(["cbrain", "config", "set", "mode", "auto"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Config {
@@ -1082,10 +1084,7 @@ mod brain_only_cli_tests {
             "--config-validate",
             "--config-init",
         ] {
-            assert!(
-                Cli::try_parse_from(["coding-brain", flag]).is_err(),
-                "{flag}"
-            );
+            assert!(Cli::try_parse_from(["cbrain", flag]).is_err(), "{flag}");
         }
     }
 }
@@ -1118,6 +1117,10 @@ mod first_run_tests {
     fn banner_describes_provider_setup() {
         assert!(FIRST_RUN_PROVIDER_MESSAGE.contains("provider"));
         assert!(!FIRST_RUN_PROVIDER_MESSAGE.contains("Codex"));
+        assert_eq!(
+            FIRST_RUN_INIT_ROW,
+            "│    cbrain init          Interactive setup wizard                │"
+        );
     }
 
     #[test]
@@ -1148,7 +1151,7 @@ mod first_run_tests {
         fs::create_dir_all(tmp.path().join(".codex")).unwrap();
         fs::write(
             tmp.path().join(".codex").join("hooks.json"),
-            r#"{"hooks":{"PostToolUse":[{"hooks":[{"command":"coding-brain --lifecycle-hook"}]}]}}"#,
+            r#"{"hooks":{"PostToolUse":[{"hooks":[{"command":"cbrain --lifecycle-hook"}]}]}}"#,
         )
         .unwrap();
         set_home(tmp.path());
@@ -1179,7 +1182,7 @@ mod permission_hook_cli_tests {
 
     #[test]
     fn permission_hook_flag_is_hidden() {
-        let cli = Cli::try_parse_from(["coding-brain", "--permission-hook"]).unwrap();
+        let cli = Cli::try_parse_from(["cbrain", "--permission-hook"]).unwrap();
         assert!(cli.permission_hook);
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--permission-hook"));
@@ -1188,7 +1191,7 @@ mod permission_hook_cli_tests {
     #[test]
     fn lifecycle_hook_flag_is_hidden() {
         let cli = Cli::try_parse_from([
-            "coding-brain",
+            "cbrain",
             "--lifecycle-hook",
             "--provider",
             "antigravity",
@@ -1211,7 +1214,7 @@ mod permission_hook_cli_tests {
     #[test]
     fn recovery_hook_flag_is_hidden_and_provider_scoped() {
         let cli = Cli::try_parse_from([
-            "coding-brain",
+            "cbrain",
             "--recovery-hook",
             "--provider",
             "antigravity",
@@ -1235,7 +1238,7 @@ mod permission_hook_cli_tests {
 
     #[test]
     fn distill_once_flag_is_hidden() {
-        let cli = Cli::try_parse_from(["coding-brain", "--distill-once"]).unwrap();
+        let cli = Cli::try_parse_from(["cbrain", "--distill-once"]).unwrap();
         assert!(cli.distill_once);
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--distill-once"));

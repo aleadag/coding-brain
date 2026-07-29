@@ -1,4 +1,4 @@
-//! `coding-brain init` — opinionated onboarding wizard.
+//! `cbrain init` — opinionated onboarding wizard.
 //!
 //! Tracking issue: <https://github.com/aleadag/codexctl/issues/257>.
 //!
@@ -8,7 +8,7 @@
 //!
 //! Public surface:
 //!
-//! * [`run_wizard`] — interactive flow. The default `coding-brain init`.
+//! * [`run_wizard`] — interactive flow. The default `cbrain init`.
 //! * [`run_non_interactive`] — same flow with pre-filled answers. For CI and
 //!   dotfile automation.
 //! * [`run_check`] — drift report comparing the recorded marker against
@@ -90,9 +90,7 @@ pub fn run_wizard(providers: &[AgentProvider]) -> io::Result<()> {
     ensure_project_identity()?;
     persist_marker(new_records, &stamp)?;
     println!();
-    println!(
-        "Onboarding complete. Re-run with `coding-brain init --check` any time to inspect drift."
-    );
+    println!("Onboarding complete. Re-run with `cbrain init --check` any time to inspect drift.");
     Ok(())
 }
 
@@ -214,12 +212,12 @@ pub fn run_check() -> io::Result<()> {
     let recorded = marker::load(&marker::default_path())?;
 
     if recorded.is_none() {
-        println!("Coding Brain has not been onboarded — run `coding-brain init` to begin.");
+        println!("Coding Brain has not been onboarded — run `cbrain init` to begin.");
         return Err(io::Error::other("not onboarded"));
     }
     let recorded = recorded.unwrap();
 
-    println!("coding-brain init --check");
+    println!("cbrain init --check");
     println!(
         "  recorded version : {}",
         if recorded.version.is_empty() {
@@ -274,9 +272,7 @@ pub fn run_check() -> io::Result<()> {
     if drift_count > 0 {
         println!();
         println!("⚠  {drift_count} phase(s) have drifted from the recorded onboarding.");
-        println!(
-            "   Run `coding-brain init` to re-apply, or `coding-brain init --reset` to start over."
-        );
+        println!("   Run `cbrain init` to re-apply, or `cbrain init --reset` to start over.");
         return Err(io::Error::other(format!("{drift_count} phase(s) drifted")));
     }
     println!();
@@ -323,12 +319,12 @@ pub fn run_remove() -> io::Result<()> {
 pub fn run_reset() -> io::Result<()> {
     recover_pending_hook_transaction()?;
     marker::clear(&marker::default_path())?;
-    println!("Cleared onboarding marker — `coding-brain init` will start from scratch next run.");
+    println!("Cleared onboarding marker — `cbrain init` will start from scratch next run.");
     Ok(())
 }
 
 /// Re-sync everything the previous `init` wrote so it tracks the current
-/// binary (#327). Used after upgrading or reinstalling `coding-brain` — the
+/// binary (#327). Used after upgrading or reinstalling `cbrain` — the
 /// new binary may expect a different schema and might
 /// have a fresher marker version, but the on-disk artifacts were written by
 /// the old binary.
@@ -346,7 +342,7 @@ pub fn run_upgrade() -> io::Result<()> {
     let providers = marker::load(&marker::default_path())?
         .map(|marker| marker.upgrade_providers())
         .unwrap_or_default();
-    println!("coding-brain init upgrade");
+    println!("cbrain init upgrade");
     println!("======================");
     println!();
 
@@ -379,10 +375,10 @@ pub fn run_upgrade() -> io::Result<()> {
     println!();
     if had_error {
         return Err(io::Error::other(
-            "one or more upgrade steps failed — run `coding-brain doctor` for details",
+            "one or more upgrade steps failed — run `cbrain doctor` for details",
         ));
     }
-    println!("Upgrade complete. Run `coding-brain doctor` to verify.");
+    println!("Upgrade complete. Run `cbrain doctor` to verify.");
     Ok(())
 }
 
@@ -453,7 +449,7 @@ pub fn run_purge(assume_yes: bool) -> io::Result<()> {
 
     if errors.is_empty() {
         println!();
-        println!("Purge complete. `coding-brain init` will start fresh.");
+        println!("Purge complete. `cbrain init` will start fresh.");
         Ok(())
     } else {
         Err(io::Error::other(format!(
@@ -600,7 +596,7 @@ fn remove_managed_hooks_silent() -> io::Result<()> {
 fn print_banner(phase_count: usize) {
     println!();
     println!(
-        "coding-brain init — opinionated onboarding ({} phases)",
+        "cbrain init — opinionated onboarding ({} phases)",
         phase_count
     );
     println!("══════════════════════════════════════════════════════════════");

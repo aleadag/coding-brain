@@ -6,7 +6,7 @@
 
 let
   inherit (pkgs) lib;
-  testPackage = pkgs.writeShellScriptBin "coding-brain" "exit 0";
+  testPackage = pkgs.writeShellScriptBin "cbrain" "exit 0";
   legacyGeminiPackage = pkgs.writeShellScriptBin "gemini-cli" "exit 0";
   expectedExe = lib.getExe testPackage;
   existingStop = {
@@ -458,6 +458,7 @@ let
   '';
 in
 assert builtins.elem testPackage cfg.home.packages;
+assert lib.hasSuffix "/bin/cbrain" expectedExe;
 assert aliasConfigured.config.programs.coding-brain.enable;
 assert cfg.programs.coding-brain.claudeHooks.enable;
 assert cfg.programs.coding-brain.antigravityHooks.enable;
@@ -642,7 +643,7 @@ pkgs.runCommand "coding-brain-home-manager-module-check"
     grep -F '/hooks' ${configured.activationPackage}/activate
     grep -F 'Coding Brain provider hooks use ${expectedExe}' ${configured.activationPackage}/activate
     grep -F 'restart Claude Code or Antigravity CLI' ${configured.activationPackage}/activate
-    grep -F 'coding-brain doctor' ${configured.activationPackage}/activate
+    grep -F 'cbrain doctor' ${configured.activationPackage}/activate
     jq -e '."external".enabled == false' \
       ${cfg.home.file.".gemini/config/hooks.json".source}
     jq -e --arg exe "${expectedExe}" '
@@ -708,7 +709,7 @@ pkgs.runCommand "coding-brain-home-manager-module-check"
 
     cd "$TMPDIR"
     doctor_status=0
-    coding-brain doctor --json > "$TMPDIR/doctor.json" \
+    cbrain doctor --json > "$TMPDIR/doctor.json" \
       || doctor_status="$?"
     test "$doctor_status" -eq 0 -o "$doctor_status" -eq 1
 
@@ -728,7 +729,7 @@ pkgs.runCommand "coding-brain-home-manager-module-check"
     jq -e '
       all(.[];
         if (.name | endswith(" setup"))
-        then ((.fix_hint // "") | contains("coding-brain init") | not)
+        then ((.fix_hint // "") | contains("cbrain init") | not)
         else true
         end
       )

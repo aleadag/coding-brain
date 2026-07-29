@@ -36,7 +36,7 @@ fn write_decisions(home: &Path, count: usize) {
 }
 
 fn command(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command
         .arg("--distill-once")
         .env("HOME", home)

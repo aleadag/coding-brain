@@ -30,4 +30,4 @@ clippy:
 
 # Run Coding Brain, forwarding optional CLI arguments.
 run *args:
-    cargo run --bin coding-brain -- {{args}}
+    cargo run --bin cbrain -- {{args}}

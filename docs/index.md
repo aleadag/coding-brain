@@ -13,17 +13,17 @@ Coding Brain can switch from selected Live activity to its exact source session.
 
 ## Start here
 
-The Cargo package and installed command are both named `coding-brain`:
+Install the `coding-brain` package, then run `cbrain`:
 
 ```bash
 cargo install coding-brain
-coding-brain init codex              # or: claude, antigravity, several names, all
-coding-brain doctor
+cbrain init codex              # or: claude, antigravity, several names, all
+cbrain doctor
 # Restart the configured agents after doctor reports current managed hooks.
-coding-brain
+cbrain
 ```
 
-Bare interactive `coding-brain init` detects installed providers and asks which ones to configure. Explicit selectors install that provider set without the picker. Init installs lifecycle, permission, and recovery hooks and creates `.coding-brain/project.toml`; see the [quick start](quickstart.md) for managed paths and non-interactive setup.
+Bare interactive `cbrain init` detects installed providers and asks which ones to configure. Explicit selectors install that provider set without the picker. Init installs lifecycle, permission, and recovery hooks and creates `.coding-brain/project.toml`; see the [quick start](quickstart.md) for managed paths and non-interactive setup.
 
 ## Local model
 
@@ -32,8 +32,8 @@ Deterministic rules work without a model. For local-model evaluation:
 ```bash
 ollama pull gemma4:e4b
 ollama serve
-coding-brain config set mode on
-coding-brain
+cbrain config set mode on
+cbrain
 ```
 
 Mode is global and persistent. New installs start in `off`; choose `on` for advisory model evaluation or `auto` for high-confidence automatic decisions. Deterministic safety checks and lifecycle recording stay active in every mode.

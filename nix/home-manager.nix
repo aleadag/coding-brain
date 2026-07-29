@@ -351,7 +351,7 @@ in
       })
       (lib.mkIf (cfg.claudeHooks.enable || cfg.antigravityHooks.enable) {
         home.activation.codingBrainProviderHookNotice = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-          echo "Coding Brain provider hooks use ${executable}; restart Claude Code or Antigravity CLI and run coding-brain doctor after package changes."
+          echo "Coding Brain provider hooks use ${executable}; restart Claude Code or Antigravity CLI and run cbrain doctor after package changes."
         '';
       })
     ]

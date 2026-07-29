@@ -15,21 +15,21 @@ Press `x` in Live to preflight the selected exact provider session, pane, and cu
 
 ## Install and activate
 
-The crates.io package and its executable are both named `coding-brain`:
+Install the `coding-brain` package, then run its sole executable, `cbrain`:
 
 ```bash
 cargo install coding-brain
-coding-brain init codex              # or: claude, antigravity, several names, all
-coding-brain doctor
+cbrain init codex              # or: claude, antigravity, several names, all
+cbrain doctor
 # Restart the configured agents after doctor reports current managed hooks.
-coding-brain
+cbrain
 ```
 
 From this repository, use `cargo install --path .`. Nix users can install the default flake package; Home Manager users can enable `programs.coding-brain`.
 
-Project identity resolves in this order: a project-root `.coding-brain/project.toml` override, the canonical network `origin`, then a path-derived temporary identity. A normal Git clone with a usable network origin does not need `coding-brain init` for identity.
+Project identity resolves in this order: a project-root `.coding-brain/project.toml` override, the canonical network `origin`, then a path-derived temporary identity. A normal Git clone with a usable network origin does not need `cbrain init` for identity.
 
-Bare interactive `coding-brain init` detects installed provider executables and asks what to configure, with detected providers selected by default. Explicit selectors skip that picker: `coding-brain init codex claude` configures both providers, while `all` is exclusive shorthand for all three. New automation should always provide a selector, for example `coding-brain init claude --non-interactive`.
+Bare interactive `cbrain init` detects installed provider executables and asks what to configure, with detected providers selected by default. Explicit selectors skip that picker: `cbrain init codex claude` configures both providers, while `all` is exclusive shorthand for all three. New automation should always provide a selector, for example `cbrain init claude --non-interactive`.
 
 Init stages and validates the complete selected set before replacing provider files. It preserves unrelated entries and user-modified former managed entries, and its recovery journal uses file evidence to avoid overwriting concurrent edits. Managed paths are `.codex/hooks.json` or `~/.codex/hooks.json` for Codex, `~/.claude/settings.json` for Claude, and `~/.gemini/config/hooks.json` for Antigravity. Init also creates an explicit project identity override when needed.
 
@@ -38,8 +38,8 @@ To enable local-model evaluation with Ollama:
 ```bash
 ollama pull gemma4:e4b
 ollama serve
-coding-brain config set mode on
-coding-brain
+cbrain config set mode on
+cbrain
 ```
 
 Mode is global and persists after `config set` exits. New installs default to `off`; use `on` for advisory model evaluation or `auto` for high-confidence automatic decisions. Deterministic safety checks and lifecycle recording remain active in every mode, including `off`.
@@ -58,9 +58,9 @@ Project config cannot select `brain.endpoint`; that choice must come from the CL
 Useful non-TUI commands include:
 
 ```bash
-coding-brain --brain-review list
-coding-brain --brain-stats scorecard
-coding-brain --brain-briefing --project my-project
+cbrain --brain-review list
+cbrain --brain-stats scorecard
+cbrain --brain-briefing --project my-project
 ```
 
 ## Product boundary
@@ -69,13 +69,19 @@ Coding Brain owns immediate judgment, learning evidence, review, recovery, and s
 
 Durable tasks, dependency graphs, claims, blockers, and cross-session handoffs belong in an external tool such as [Beads](https://github.com/steveyegge/beads). Beads and Agent Deck are both optional; neither is a runtime dependency.
 
+## Upgrade from the old executable
+
+Upgrading from a build that installed the `coding-brain` executable is breaking; no compatibility command is installed. If you manage hooks imperatively, run `cbrain init <provider>` for each configured provider, restart those providers, and confirm the result with `cbrain doctor`. Home Manager users should rebuild instead, then restart their configured providers and run doctor.
+
+The raw installer refuses to download or write anything while `${INSTALL_DIR:-/usr/local/bin}/coding-brain` exists. Inspect that path, remove it only after confirming it is the old Coding Brain executable, then rerun the installer.
+
 ## Breaking cutover from codexctl
 
-There is no automatic data migration or compatibility executable. Normal startup and `coding-brain doctor` diagnose exact stale managed hooks but do not modify old hooks or read old config/state. Run `coding-brain init` to replace those managed hook entries atomically, then restart Codex.
+There is no automatic data migration or compatibility executable. Normal startup and `cbrain doctor` diagnose exact stale managed hooks but do not modify old hooks or read old config/state. Run `cbrain init` to replace those managed hook entries atomically, then restart Codex.
 
-Old data remains available for rollback until you purge it. Before purge, rollback means reinstalling the old build and rerunning its init command. When you no longer need that option, `coding-brain init --purge` removes the documented current and legacy global config/state targets after confirmation. Purge is irreversible and does not delete project `.coding-brain.toml` or `.coding-brain/project.toml` files.
+Old data remains available for rollback until you purge it. Before purge, rollback means reinstalling the old build and rerunning its init command. When you no longer need that option, `cbrain init --purge` removes the documented current and legacy global config/state targets after confirmation. Purge is irreversible and does not delete project `.coding-brain.toml` or `.coding-brain/project.toml` files.
 
-To make a fork learn independently, remove `.coding-brain/project.toml` in that fork and rerun `coding-brain init`. Do not edit the UUID by hand.
+To make a fork learn independently, remove `.coding-brain/project.toml` in that fork and rerun `cbrain init`. Do not edit the UUID by hand.
 
 ## Architecture
 
@@ -87,7 +93,7 @@ coding-brain -> coding-brain-tui -> coding-brain-core
 crates/
 ├── coding-brain-core/    # session evidence, paths, project identity, runtime contracts
 └── coding-brain-tui/     # Live, Review, Scorecard, and Diagnostics terminal UI
-src/                   # coding-brain binary wiring, local brain, config, init
+src/                   # cbrain binary wiring, local brain, config, init
 ```
 
 Provider integration prefers structured evidence: Codex rollouts and hooks, bounded `claude agents --json` inventory and Claude hooks, and Antigravity tool/invocation/Stop hooks. Process discovery and exact-target terminal handling provide bounded fallback evidence. See the [capability matrix](docs/reference.md#provider-capabilities) for the limits of each path.

@@ -4,6 +4,10 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use crate::executable::CURRENT_PROGRAM;
+use crate::executable::{is_current_program, is_managed_program};
+
 /// One managed Codex hook definition.
 struct HookSpec {
     event: &'static str,
@@ -510,7 +514,7 @@ fn build_hooks_value() -> serde_json::Value {
 
 #[cfg(test)]
 fn managed_executable() -> PathBuf {
-    PathBuf::from("coding-brain")
+    PathBuf::from(CURRENT_PROGRAM)
 }
 
 #[cfg(test)]
@@ -571,19 +575,6 @@ fn has_codexctl_hooks(existing: &serde_json::Value) -> bool {
         }
     }
     false
-}
-
-fn is_current_program(program: &str) -> bool {
-    program == "coding-brain"
-        || (Path::new(program).is_absolute() && program.ends_with("/coding-brain"))
-}
-
-fn is_legacy_program(program: &str) -> bool {
-    program == "codexctl" || (Path::new(program).is_absolute() && program.ends_with("/codexctl"))
-}
-
-fn is_managed_program(program: &str) -> bool {
-    is_current_program(program) || is_legacy_program(program)
 }
 
 fn is_exact_command(command: &str, expected_args: &[&str], predicate: fn(&str) -> bool) -> bool {
@@ -855,7 +846,7 @@ fn print_success(path: &Path) {
     println!();
     println!("Restart Codex, then open `/hooks` to review and trust the command.");
     println!("Codex will then report lifecycle changes and ask the brain to review Bash requests.");
-    println!("Run `coding-brain` to open the Brain TUI.");
+    println!("Run `cbrain` to open the Brain TUI.");
 }
 
 #[cfg(test)]
@@ -867,7 +858,7 @@ mod tests {
         let permission = serde_json::json!({
             "hooks": {"PermissionRequest": [{"matcher":"*","hooks":[{
                 "type":"command",
-                "command":"coding-brain --permission-hook --provider codex",
+                "command":"cbrain --permission-hook --provider codex",
                 "timeout":30,
                 "statusMessage":"Brain reviewing permission…"
             }]}]}
@@ -879,7 +870,7 @@ mod tests {
         let lifecycle = serde_json::json!({
             "hooks": {"Stop": [{"hooks":[{
                 "type":"command",
-                "command":"coding-brain --recovery-hook --provider codex",
+                "command":"cbrain --recovery-hook --provider codex",
                 "timeout":30
             }]}]}
         });
@@ -916,7 +907,7 @@ mod tests {
                 matcher
             );
             let handler = &entry["hooks"][0];
-            assert_eq!(handler["command"], format!("coding-brain {argument}"));
+            assert_eq!(handler["command"], format!("cbrain {argument}"));
             assert_eq!(handler["timeout"], timeout);
         }
     }
@@ -1208,7 +1199,7 @@ mod tests {
         assert_eq!(hooks["PermissionRequest"][0]["matcher"], "*");
         let handler = &hooks["PermissionRequest"][0]["hooks"][0];
 
-        assert_eq!(handler["command"], "coding-brain --permission-hook");
+        assert_eq!(handler["command"], "cbrain --permission-hook");
         assert_eq!(handler["timeout"], 30);
         assert_eq!(handler["statusMessage"], "Brain reviewing permission…");
     }
@@ -1239,7 +1230,7 @@ mod tests {
         assert_eq!(permission.len(), 2);
         assert_eq!(
             permission[1]["hooks"][0]["command"],
-            "coding-brain --permission-hook"
+            "cbrain --permission-hook"
         );
     }
 
@@ -1288,7 +1279,7 @@ mod tests {
         assert_eq!(settings, once);
         assert_eq!(
             settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-            "coding-brain --lifecycle-hook"
+            "cbrain --lifecycle-hook"
         );
         assert_eq!(
             settings["hooks"]["Stop"][0]["hooks"],
@@ -1296,11 +1287,11 @@ mod tests {
         );
         assert_eq!(
             settings["hooks"]["Stop"][1]["hooks"][0]["command"],
-            "coding-brain --recovery-hook"
+            "cbrain --recovery-hook"
         );
         assert_eq!(
             settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
-            "coding-brain --permission-hook"
+            "cbrain --permission-hook"
         );
     }
 
@@ -1327,7 +1318,7 @@ mod tests {
         assert_eq!(settings, once);
         assert_eq!(
             settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-            "coding-brain --lifecycle-hook"
+            "cbrain --lifecycle-hook"
         );
     }
 
@@ -1353,7 +1344,7 @@ mod tests {
         assert_eq!(permission[0]["hooks"], serde_json::json!([custom]));
         assert_eq!(
             permission[1]["hooks"][0]["command"],
-            "coding-brain --permission-hook"
+            "cbrain --permission-hook"
         );
     }
 
@@ -1607,7 +1598,7 @@ mod tests {
                     "matcher": "*",
                     "hooks": [{
                         "type": "command",
-                        "command": "/nix/store/test-coding-brain/bin/coding-brain --permission-hook",
+                        "command": "/nix/store/test-coding-brain/bin/cbrain --permission-hook",
                         "timeout": 30,
                         "statusMessage": "Brain reviewing permission…"
                     }]
@@ -1719,7 +1710,7 @@ mod tests {
                     "matcher": "*",
                     "hooks": [{
                         "type": "command",
-                        "command": "coding-brain --permission-hook",
+                        "command": "cbrain --permission-hook",
                         "timeout": 30,
                         "statusMessage": "Brain reviewing permission…"
                     }]

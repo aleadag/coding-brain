@@ -1,6 +1,6 @@
 //! Interactive review of brain decisions.
 //!
-//! `coding-brain --brain-review` surfaces the highest-value decisions to triage:
+//! `cbrain --brain-review` surfaces the highest-value decisions to triage:
 //! brain-was-right counterfactuals, Critical-tier safety hits, and
 //! high-confidence calibration misses. The user marks each as canonical
 //! (teaching material) or skips. Canonical marks are stored in
@@ -110,7 +110,7 @@ pub fn run_interactive() -> usize {
         println!("  - The brain has been right on every confident call (great).");
         println!("  - Outcome attribution hasn't kicked in yet (try after more usage).");
         println!();
-        println!("Run `coding-brain --brain-stats scorecard` to see overall health.");
+        println!("Run `cbrain --brain-stats scorecard` to see overall health.");
         return 0;
     }
 

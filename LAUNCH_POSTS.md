@@ -29,9 +29,9 @@ It reads structured hooks and process evidence from Codex, Claude Code, and Anti
 
 ```bash
 cargo install coding-brain
-coding-brain init all
-coding-brain doctor
-coding-brain
+cbrain init all
+cbrain doctor
+cbrain
 ```
 
 Repo: https://github.com/aleadag/coding-brain
@@ -44,9 +44,9 @@ It can switch to sessions through native terminal support or optional Agent Deck
 
 ```bash
 cargo install coding-brain
-coding-brain init all
-coding-brain doctor
-coding-brain
+cbrain init all
+cbrain doctor
+cbrain
 ```
 
 https://github.com/aleadag/coding-brain

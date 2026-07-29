@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn command(temp: &tempfile::TempDir) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command
         .current_dir(temp.path())
         .env("HOME", temp.path())
@@ -21,7 +21,7 @@ fn run(temp: &tempfile::TempDir, args: &[&str]) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|error| panic!("failed to spawn coding-brain {}: {error}", args.join(" ")));
+        .unwrap_or_else(|error| panic!("failed to spawn cbrain {}: {error}", args.join(" ")));
     let deadline = Instant::now() + PROCESS_TIMEOUT;
 
     loop {
@@ -29,7 +29,7 @@ fn run(temp: &tempfile::TempDir, args: &[&str]) -> Output {
             Ok(Some(_)) => {
                 return child.wait_with_output().unwrap_or_else(|error| {
                     panic!(
-                        "failed to collect coding-brain {} output: {error}",
+                        "failed to collect cbrain {} output: {error}",
                         args.join(" ")
                     )
                 });
@@ -38,12 +38,12 @@ fn run(temp: &tempfile::TempDir, args: &[&str]) -> Output {
                 let _ = child.kill();
                 let output = child.wait_with_output().unwrap_or_else(|error| {
                     panic!(
-                        "coding-brain {} timed out and output collection failed: {error}",
+                        "cbrain {} timed out and output collection failed: {error}",
                         args.join(" ")
                     )
                 });
                 panic!(
-                    "coding-brain {} timed out after {:?}\nstdout:\n{}\nstderr:\n{}",
+                    "cbrain {} timed out after {:?}\nstdout:\n{}\nstderr:\n{}",
                     args.join(" "),
                     PROCESS_TIMEOUT,
                     String::from_utf8_lossy(&output.stdout),
@@ -54,7 +54,7 @@ fn run(temp: &tempfile::TempDir, args: &[&str]) -> Output {
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("failed to poll coding-brain {}: {error}", args.join(" "));
+                panic!("failed to poll cbrain {}: {error}", args.join(" "));
             }
         }
     }
@@ -191,7 +191,7 @@ fn corrupt_explicit_mode_fails_closed_and_is_not_overwritten() {
     assert_success(&get);
     let output = stdout(&get);
     assert!(output.starts_with("mode: off\nwarning: "), "{output}");
-    assert!(output.contains("coding-brain config set mode <off|on|auto>"));
+    assert!(output.contains("cbrain config set mode <off|on|auto>"));
     assert_eq!(std::fs::read_to_string(path).unwrap(), "automatic\n");
 }
 

@@ -27,7 +27,7 @@ The workspace crates are `coding-brain-core` and `coding-brain-tui`; runtime int
 crates/
 ├── coding-brain-core/    # session types, Codex transcript discovery, monitor, runtime traits
 └── coding-brain-tui/     # Live/Review/Scorecard/Diagnostics UI, terminal suspend/restore
-src/                   # coding-brain binary: brain, config, init, runtime
+src/                   # cbrain binary: brain, config, init, runtime
 ```
 
 `coding-brain-core` must not depend on binary-only modules. The TUI communicates with the binary through runtime traits in `crates/coding-brain-core/src/runtime.rs`.

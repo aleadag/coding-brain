@@ -22,11 +22,16 @@ cargo install coding-brain                # crates.io
 curl -fsSL https://raw.githubusercontent.com/aleadag/coding-brain/main/install.sh | sh
 ```
 
+All three routes install only `cbrain`. Before using the raw installer for an
+upgrade, inspect `${INSTALL_DIR:-/usr/local/bin}/coding-brain` if it exists and
+remove it only after confirming it is the old Coding Brain executable; the
+installer exits before downloading or writing until that path is gone.
+
 For hooks managed declaratively through Home Manager, rebuild Home Manager,
 restart every configured provider, inspect `/hooks` when Codex is configured,
-and run `coding-brain doctor`. For imperatively managed hooks, rerun
-`coding-brain init <provider>` for the exact providers you manage, restart
-them, and run `coding-brain doctor`.
+and run `cbrain doctor`. For imperatively managed hooks, rerun
+`cbrain init <provider>` for the exact providers you manage, restart them, and
+run `cbrain doctor`.
 
 ## Changelog
 

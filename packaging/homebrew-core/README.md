@@ -21,7 +21,9 @@ and is what `brew install coding-brain` resolves to once accepted.
    brew test coding-brain
    brew audit --strict --new --online coding-brain
    ```
-   All three must pass cleanly before opening the PR.
+   All three must pass cleanly before opening the PR. `brew test coding-brain`
+   is the formula test command; the installed executable it exercises is
+   `cbrain`.
 3. Fork `Homebrew/homebrew-core`, drop the file at `Formula/c/coding-brain.rb`,
    and open a PR following the
    [Adding Software to Homebrew](https://docs.brew.sh/Adding-Software-to-Homebrew)
@@ -33,7 +35,7 @@ and is what `brew install coding-brain` resolves to once accepted.
 | --------------------- | -------------------------------- | -------------------------------------- |
 | Source                | Prebuilt release tarballs        | GitHub source tarball, built via Cargo |
 | Bottles               | None                             | Built by Homebrew CI                   |
-| Test                  | `--version` smoke test           | Version, help, and man page            |
+| Test                  | `cbrain --version` smoke test    | `cbrain` version, help, and man page    |
 | Auto-version tracking | Manual via `release.yml`         | `livecheck` block (`:github_latest`)   |
 | Completions / man     | Not installed                    | Installed for bash/zsh/fish + `man1`   |
 

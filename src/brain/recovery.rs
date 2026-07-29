@@ -971,7 +971,7 @@ fn append_recovery_diagnostic_cached(
 }
 
 fn write_recovery_diagnostic(stderr: &mut impl Write, message: &str) {
-    let _ = writeln!(stderr, "coding-brain recovery hook: {message}");
+    let _ = writeln!(stderr, "cbrain recovery hook: {message}");
 }
 
 fn epoch_ms() -> u64 {

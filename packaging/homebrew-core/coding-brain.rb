@@ -16,13 +16,13 @@ class CodingBrain < Formula
   def install
     system "cargo", "install", *std_cargo_args(path: ".")
 
-    generate_completions_from_executable(bin/"coding-brain", "completions")
-    (man1/"coding-brain.1").write Utils.safe_popen_read(bin/"coding-brain", "man")
+    generate_completions_from_executable(bin/"cbrain", "completions")
+    (man1/"cbrain.1").write Utils.safe_popen_read(bin/"cbrain", "man")
   end
 
   test do
-    assert_match "coding-brain", shell_output("#{bin}/coding-brain --version")
-    assert_match "coding-brain", shell_output("#{bin}/coding-brain --help")
-    assert_match ".TH coding-brain 1", shell_output("#{bin}/coding-brain man")
+    assert_match "cbrain", shell_output("#{bin}/cbrain --version")
+    assert_match "cbrain", shell_output("#{bin}/cbrain --help")
+    assert_match ".TH cbrain 1", shell_output("#{bin}/cbrain man")
   end
 end

@@ -111,7 +111,7 @@ impl HookRegistry {
         }
     }
 
-    /// List all configured hooks (for `coding-brain --hooks`).
+    /// List all configured hooks (for `cbrain --hooks`).
     pub fn print_list(&self) {
         if self.hooks.is_empty() {
             println!("No hooks configured.");

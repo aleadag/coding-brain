@@ -76,7 +76,7 @@ pub(crate) fn write_config_init() -> io::Result<()> {
     let template = config::Config::template_string();
     std::fs::write(&path, template).map_err(|e| io::Error::other(format!("write: {e}")))?;
     println!("Created .coding-brain.toml with annotated defaults.");
-    println!("Edit the file to customize, then run `coding-brain config validate` to check.");
+    println!("Edit the file to customize, then run `cbrain config validate` to check.");
     Ok(())
 }
 
@@ -108,7 +108,7 @@ fn mode_report_at(path: &std::path::Path, brain_config: Option<&config::BrainCon
     let mut report = format!("mode: {}\n", resolution.mode);
     if let Some(warning) = resolution.warning {
         report.push_str(&format!(
-            "warning: {warning}\ncorrect with: coding-brain config set mode <off|on|auto>\n"
+            "warning: {warning}\ncorrect with: cbrain config set mode <off|on|auto>\n"
         ));
     }
     report
@@ -425,14 +425,12 @@ pub(crate) fn run_insights(cfg: &config::Config, arg: &str) -> io::Result<()> {
             let _ = brain::insights::write_insights_mode("on");
             println!("Insights mode: on");
             println!("  Auto-generating insights every 10 decisions during brain distillation.");
-            println!("  Run `coding-brain --insights` to view.");
+            println!("  Run `cbrain --insights` to view.");
         }
         "off" => {
             let _ = brain::insights::write_insights_mode("off");
             println!("Insights mode: off");
-            println!(
-                "  Auto-generation disabled. Run `coding-brain --insights` to generate on demand."
-            );
+            println!("  Auto-generation disabled. Run `cbrain --insights` to generate on demand.");
         }
         "status" => {
             let mode = brain::insights::read_insights_mode();
@@ -474,7 +472,7 @@ fn digest_from_hook_payload(
 
 /// Try to parse a `DiffDigest` from stdin (the raw Codex hook payload).
 ///
-/// Hook scripts can pipe full tool call JSON to `coding-brain --brain-query`.
+/// Hook scripts can pipe full tool call JSON to `cbrain --brain-query`.
 /// We only read when stdin is not a TTY — otherwise `read_to_string` would
 /// block waiting for EOF. Failures here are not fatal: missing stdin just
 /// means we degrade to pre-#237 behaviour.

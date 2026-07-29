@@ -224,7 +224,7 @@ fn run_provider_permission_hook(
     antigravity_event: Option<&str>,
     payload: &[u8],
 ) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command.args(["--permission-hook", "--provider", provider]);
     if let Some(event) = antigravity_event {
         command.args(["--antigravity-hook-event", event]);
@@ -250,7 +250,7 @@ fn run_provider_lifecycle_hook(
     antigravity_event: Option<&str>,
     payload: &[u8],
 ) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command.args(["--lifecycle-hook", "--provider", provider]);
     if let Some(event) = antigravity_event {
         command.args(["--antigravity-hook-event", event]);
@@ -352,7 +352,7 @@ fn antigravity_post_payload(cwd: &Path, step: u64) -> Vec<u8> {
 }
 
 fn spawn_permission_hook(home: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+    Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .arg("--permission-hook")
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -375,7 +375,7 @@ fn isolated_path(home: &Path) -> OsString {
 }
 
 fn run_lifecycle_hook(home: &Path, payload: &[u8]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_coding-brain"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .arg("--lifecycle-hook")
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -396,7 +396,7 @@ fn run_provider_recovery_hook(
     antigravity_event: Option<&str>,
     payload: &[u8],
 ) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coding-brain"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command.args(["--recovery-hook", "--provider", provider]);
     if let Some(event) = antigravity_event {
         command.args(["--antigravity-hook-event", event]);
@@ -434,7 +434,7 @@ fn recovery_hook_without_trusted_live_link_persists_stop_without_recovery() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "coding-brain recovery hook: Stop persistence failed\n"
+        "cbrain recovery hook: Stop persistence failed\n"
     );
     let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
     let view = lifecycle.read().unwrap();

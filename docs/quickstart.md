@@ -4,26 +4,26 @@
 
 ```bash
 cargo install coding-brain
-coding-brain init codex              # or: claude, antigravity, several names, all
-coding-brain doctor
+cbrain init codex              # or: claude, antigravity, several names, all
+cbrain doctor
 # Restart the configured agents after doctor reports current managed hooks.
-coding-brain
+cbrain
 ```
 
-The crates.io package and installed executable are both named `coding-brain`.
+The crates.io package is named `coding-brain`; its sole executable is `cbrain`.
 
-An explicit selector skips provider detection. Bare interactive `coding-brain init` detects installed executables, selects them by default, and lets you choose providers you plan to install later. `all` selects Codex, Claude Code, and Antigravity CLI and cannot be combined with another selector.
+An explicit selector skips provider detection. Bare interactive `cbrain init` detects installed executables, selects them by default, and lets you choose providers you plan to install later. `all` selects Codex, Claude Code, and Antigravity CLI and cannot be combined with another selector.
 
 Init detects a local model endpoint, installs the selected managed hooks, offers optional skill suggestions, and creates `.coding-brain/project.toml`. Restart the configured agents after setup. For non-interactive setup, name at least one provider:
 
 ```bash
-coding-brain init codex claude --non-interactive --skip-brain --skip-skills
+cbrain init codex claude --non-interactive --skip-brain --skip-skills
 ```
 
 The provider-less non-interactive form remains a deprecated Codex-only compatibility path and prints:
 
 ```text
-warning: provider-less --non-interactive is deprecated; use `coding-brain init codex --non-interactive` instead
+warning: provider-less --non-interactive is deprecated; use `cbrain init codex --non-interactive` instead
 ```
 
 Managed provider files are:
@@ -38,7 +38,7 @@ Init validates and stages every selected file before replacement. Unrelated and 
 
 ## Use the TUI
 
-Run `coding-brain` to open Live. Press the view keys shown in the footer to move between Live, Review, Scorecard, and Diagnostics. Live presents provider-tagged Brain activity and attention; Review concentrates decisions worth correcting or retaining; Scorecard summarizes decision quality. Diagnostics shows metadata-only safe categories for hooks, correlation, rejected or uncertain session actions and recovery, and activity-store integrity. It is not ordinary command output and never stores captured terminal content or manual text. These are Brain views, not a general session dashboard.
+Run `cbrain` to open Live. Press the view keys shown in the footer to move between Live, Review, Scorecard, and Diagnostics. Live presents provider-tagged Brain activity and attention; Review concentrates decisions worth correcting or retaining; Scorecard summarizes decision quality. Diagnostics shows metadata-only safe categories for hooks, correlation, rejected or uncertain session actions and recovery, and activity-store integrity. It is not ordinary command output and never stores captured terminal content or manual text. These are Brain views, not a general session dashboard.
 
 Coding Brain does not collect or display token usage or cost. Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it. Only that bounded percentage is retained. The percentage uses provider-supplied context capacity when available and otherwise a known-model fallback; it is not raw usage or cost accounting.
 
@@ -53,29 +53,33 @@ Press `x` in Live to preflight the selected exact provider session, pane, and cu
 ```bash
 ollama pull gemma4:e4b
 ollama serve
-coding-brain config set mode on
-coding-brain
+cbrain config set mode on
+cbrain
 ```
 
 The mode setting is global and persists after the command exits. New installs default to `off`, which disables model evaluation while keeping deterministic safety checks and lifecycle recording active. Use `on` for advisory model evaluation, review its suggestions and corrections, then choose `auto` if you want high-confidence automatic decisions:
 
 ```bash
-coding-brain --brain-review list
-coding-brain --brain-stats scorecard
-coding-brain config set mode auto
+cbrain --brain-review list
+cbrain --brain-stats scorecard
+cbrain config set mode auto
 ```
 
 ## Cutover from an older build
 
-Coding Brain does not read the old config/state namespace and does not install a `codexctl` compatibility executable. Normal startup and doctor can diagnose exact stale managed hooks, but only init changes them:
+Coding Brain does not install a `coding-brain` or `codexctl` compatibility executable. Normal startup and doctor can diagnose exact stale managed hooks, but only init changes them. After upgrading, repair each imperatively managed provider before restarting it:
 
 ```bash
 cargo install coding-brain
-coding-brain init codex
-coding-brain doctor
+cbrain init codex
+cbrain doctor
 # Restart Codex and review /hooks.
 ```
 
-Old global data remains untouched so you can roll back by reinstalling the old build and rerunning its init. Once rollback is no longer needed, `coding-brain init --purge` previews the exact current and legacy global targets and asks for confirmation. Purge is irreversible; it does not remove `.coding-brain.toml` or `.coding-brain/project.toml` from projects.
+Use `cbrain init <provider>` for every imperatively managed provider. Declarative Home Manager hooks are repaired by rebuilding Home Manager instead.
 
-For a fork that should learn independently, remove its `.coding-brain/project.toml` and rerun `coding-brain init`. Do not edit the stored UUID.
+The raw installer refuses to download or write anything while `${INSTALL_DIR:-/usr/local/bin}/coding-brain` exists. Inspect that path, remove it only after confirming it is the old Coding Brain executable, then rerun the installer.
+
+Old global data remains untouched so you can roll back by reinstalling the old build and rerunning its init. Once rollback is no longer needed, `cbrain init --purge` previews the exact current and legacy global targets and asks for confirmation. Purge is irreversible; it does not remove `.coding-brain.toml` or `.coding-brain/project.toml` from projects.
+
+For a fork that should learn independently, remove its `.coding-brain/project.toml` and rerun `cbrain init`. Do not edit the stored UUID.

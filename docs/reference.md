@@ -1,14 +1,14 @@
 # Command reference
 
-`coding-brain --help` is the canonical option list. This page groups the main workflows.
+`cbrain --help` is the canonical option list. This page groups the main workflows.
 
 ## TUI and headless runtime
 
 ```bash
-coding-brain
-coding-brain --theme dark
-coding-brain --headless
-coding-brain --headless --json
+cbrain
+cbrain --theme dark
+cbrain --headless
+cbrain --headless --json
 ```
 
 The default command opens the Live, Review, Scorecard, and Diagnostics tabs. `--headless` keeps evaluation and context-rot prevention active without taking over a terminal; activity remains visible to a Brain TUI running elsewhere.
@@ -24,10 +24,10 @@ Diagnostics is a read-only viewer for metadata-only safe categories covering hoo
 ## Brain evaluation
 
 ```bash
-coding-brain config get mode
-coding-brain config set mode off|on|auto
-coding-brain --url <endpoint> --brain-model <model>
-coding-brain --brain-query --tool Bash --tool-input "cargo test"
+cbrain config get mode
+cbrain config set mode off|on|auto
+cbrain --url <endpoint> --brain-model <model>
+cbrain --brain-query --tool Bash --tool-input "cargo test"
 ```
 
 The mode is global, persists after the settings command exits, and defaults to `off` on a new install. `off` disables model evaluation, `on` enables advisory evaluation, and `auto` allows high-confidence automatic decisions. Deterministic safety checks and lifecycle recording remain active in every mode. `--brain-query` is the non-interactive permission-hook path and normally receives structured hook input rather than being typed manually.
@@ -35,13 +35,13 @@ The mode is global, persists after the settings command exits, and defaults to `
 ## Learning and diagnostics
 
 ```bash
-coding-brain --brain-review [list]
-coding-brain --brain-mark-canonical <decision-id>
-coding-brain --brain-stats <report>
-coding-brain --insights [on|off|status]
-coding-brain --brain-garden [--apply]
-coding-brain --brain-briefing --project <name>
-coding-brain --autopsy [--session <id>]
+cbrain --brain-review [list]
+cbrain --brain-mark-canonical <decision-id>
+cbrain --brain-stats <report>
+cbrain --insights [on|off|status]
+cbrain --brain-garden [--apply]
+cbrain --brain-briefing --project <name>
+cbrain --autopsy [--session <id>]
 ```
 
 The `Review` and `Scorecard` TUI tabs are the primary surfaces. These commands expose the same records for scripts, focused reports, or markdown output.
@@ -49,30 +49,30 @@ The `Review` and `Scorecard` TUI tabs are the primary surfaces. These commands e
 ## Setup and health
 
 ```bash
-coding-brain init
-coding-brain init codex
-coding-brain init claude antigravity
-coding-brain init all
-coding-brain init --check
-coding-brain init --upgrade
-coding-brain init --remove
-coding-brain init --purge
-coding-brain doctor [--json]
-coding-brain completions <shell>
-coding-brain man
+cbrain init
+cbrain init codex
+cbrain init claude antigravity
+cbrain init all
+cbrain init --check
+cbrain init --upgrade
+cbrain init --remove
+cbrain init --purge
+cbrain doctor [--json]
+cbrain completions <shell>
+cbrain man
 ```
 
 - Bare interactive `init` detects provider executables and asks which providers to configure. Detected providers are selected by default, but any listed provider can be selected for later installation.
 - Positional selectors are `codex`, `claude`, `antigravity`, and exclusive shorthand `all`. Multiple provider names are accepted and deduplicated; `all` cannot be combined with another selector.
 - Explicit selectors skip the provider picker and run the normal provider-neutral Brain onboarding.
-- New non-interactive setup must name a provider, such as `coding-brain init claude --non-interactive`. Provider-less `--non-interactive` is a deprecated Codex-only compatibility path.
-- `--plugin-only` is a deprecated Codex-only alias for `coding-brain init codex`.
+- New non-interactive setup must name a provider, such as `cbrain init claude --non-interactive`. Provider-less `--non-interactive` is a deprecated Codex-only compatibility path.
+- `--plugin-only` is a deprecated Codex-only alias for `cbrain init codex`.
 - `--check` compares onboarding records with current state.
 - `--upgrade` refreshes the installed or drifted providers recorded by prior onboarding and updates the marker version.
 - `--remove` removes all exact Coding Brain-managed provider hooks and the onboarding marker but preserves data and unrelated entries.
 - `--purge` additionally removes the previewed current and legacy global config/state targets after confirmation. It is irreversible.
 - `doctor` checks the executable, hook definitions, affected provider compatibility, trust visibility, project identity, lifecycle state, outcome telemetry, endpoint privacy, transcript discovery, and terminal integration.
-- `doctor` emits one setup row for Codex, Claude, and Antigravity, plus separate compatibility, Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback rows. With current managed Antigravity hooks, exact `agy` 1.1.5 produces an `Antigravity hook contract` advisory because that version may retain the native prompt after a valid hook decision. Other versions remain unverified. An unselected absent provider is skipped, while a selected provider with a missing executable is advisory. For invalid or stale declaratively managed hooks, rebuild Home Manager and restart the affected provider; for Codex, also inspect `/hooks` before rerunning `coding-brain doctor`. For imperatively managed providers, run the `coding-brain init <provider>` repair command shown in the provider row.
+- `doctor` emits one setup row for Codex, Claude, and Antigravity, plus separate compatibility, Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback rows. With current managed Antigravity hooks, exact `agy` 1.1.5 produces an `Antigravity hook contract` advisory because that version may retain the native prompt after a valid hook decision. Other versions remain unverified. An unselected absent provider is skipped, while a selected provider with a missing executable is advisory. For invalid or stale declaratively managed hooks, rebuild Home Manager and restart the affected provider; for Codex, also inspect `/hooks` before rerunning `cbrain doctor`. For imperatively managed providers, run the `cbrain init <provider>` repair command shown in the provider row.
 
 Managed setup paths are:
 
@@ -103,13 +103,13 @@ Automatic terminal input revalidates provider process identity, a unique pane, a
 ## Configuration helpers
 
 ```bash
-coding-brain config show
-coding-brain config get mode
-coding-brain config set mode on
-coding-brain config template
-coding-brain config validate
-coding-brain config init
-coding-brain --hooks
+cbrain config show
+cbrain config get mode
+cbrain config set mode on
+cbrain config template
+cbrain config validate
+cbrain config init
+cbrain --hooks
 ```
 
 Current config uses `.coding-brain.toml` and `$XDG_CONFIG_HOME/coding-brain/config.toml`. Old config and state are never read during ordinary operation.

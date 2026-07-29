@@ -20,7 +20,7 @@ categories = ["command-line-utilities", "development-tools"]
 exclude = ["*.gif", "*.cast", "codex-demo.*", ".github/"]
 
 [[bin]]
-name = "coding-brain"
+name = "cbrain"
 path = "src/main.rs"
 
 [lib]
