@@ -7,7 +7,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{
-    Arc,
+    Arc, Condvar, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::thread;
@@ -51,6 +51,10 @@ pub struct ActivityStore {
     now_ms: Option<u64>,
     #[cfg(test)]
     lock_acquisitions: Option<Arc<AtomicUsize>>,
+    #[cfg(test)]
+    read_parse_gate: Option<Arc<ReadParseGate>>,
+    #[cfg(test)]
+    lock_contention_probe: Option<Arc<LockContentionProbe>>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +176,71 @@ struct LockGuard<'a> {
     file: &'a File,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ReadParseGate {
+    state: Mutex<ReadParseGateState>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct LockContentionProbe {
+    contended: Mutex<bool>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl LockContentionProbe {
+    fn notify(&self) {
+        *self.contended.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn wait_until_contended(&self, timeout: Duration) -> bool {
+        let contended = self.contended.lock().unwrap();
+        let (contended, _) = self
+            .changed
+            .wait_timeout_while(contended, timeout, |contended| !*contended)
+            .unwrap();
+        *contended
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ReadParseGateState {
+    reached: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl ReadParseGate {
+    fn pause(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.reached = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    pub(crate) fn wait_until_reached(&self, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.reached)
+            .unwrap();
+        state.reached
+    }
+
+    pub(crate) fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LockKind {
     Shared,
@@ -195,11 +264,20 @@ impl ActivityStore {
             now_ms: None,
             #[cfg(test)]
             lock_acquisitions: None,
+            #[cfg(test)]
+            read_parse_gate: None,
+            #[cfg(test)]
+            lock_contention_probe: None,
         }
     }
 
     pub fn with_limits(mut self, limits: ActivityLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    pub(crate) fn with_lock_timeout_ms(mut self, lock_timeout_ms: u64) -> Self {
+        self.limits.lock_timeout_ms = lock_timeout_ms;
         self
     }
 
@@ -214,6 +292,18 @@ impl ActivityStore {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_read_parse_gate(mut self, gate: Arc<ReadParseGate>) -> Self {
+        self.read_parse_gate = Some(gate);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lock_contention_probe(mut self, probe: Arc<LockContentionProbe>) -> Self {
+        self.lock_contention_probe = Some(probe);
+        self
+    }
+
     pub fn append(&self, event: ActivityEvent) -> Result<(), ActivityStoreError> {
         if event.schema_version != ACTIVITY_SCHEMA_VERSION {
             return Err(ActivityStoreError::UnsupportedSchema(event.schema_version));
@@ -223,12 +313,25 @@ impl ActivityStore {
 
     pub(crate) fn append_batch(&self, events: &[ActivityEvent]) -> Result<(), ActivityStoreError> {
         let lock = self.open_lock()?;
-        let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Exclusive)?;
+        let _guard = self.lock_for_append(&lock)?;
         #[cfg(test)]
         if let Some(counter) = &self.lock_acquisitions {
             counter.fetch_add(1, Ordering::SeqCst);
         }
         self.append_events_unlocked(events)
+    }
+
+    fn lock_for_append<'a>(&self, lock: &'a File) -> Result<LockGuard<'a>, ActivityStoreError> {
+        #[cfg(test)]
+        if let Some(probe) = &self.lock_contention_probe {
+            return lock_with_timeout_observed(
+                lock,
+                self.limits.lock_timeout_ms,
+                LockKind::Exclusive,
+                || probe.notify(),
+            );
+        }
+        lock_with_timeout(lock, self.limits.lock_timeout_ms, LockKind::Exclusive)
     }
 
     pub(crate) fn append_from_snapshot<F>(&self, build: F) -> Result<(), ActivityStoreError>
@@ -416,9 +519,16 @@ impl ActivityStore {
     }
 
     pub fn read(&self) -> Result<ActivityLog, ActivityStoreError> {
-        let lock = self.open_lock()?;
-        let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Shared)?;
-        self.read_unlocked()
+        let contents = {
+            let lock = self.open_lock()?;
+            let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Shared)?;
+            self.read_bytes_unlocked()?
+        };
+        #[cfg(test)]
+        if let Some(gate) = &self.read_parse_gate {
+            gate.pause();
+        }
+        parse_activity_log(&contents)
     }
 
     pub fn snapshot(&self, limits: SnapshotLimits) -> Result<ActivitySnapshot, ActivityStoreError> {
@@ -573,53 +683,59 @@ impl ActivityStore {
     }
 
     fn read_unlocked(&self) -> Result<ActivityLog, ActivityStoreError> {
+        let contents = self.read_bytes_unlocked()?;
+        parse_activity_log(&contents)
+    }
+
+    fn read_bytes_unlocked(&self) -> Result<Vec<u8>, ActivityStoreError> {
         let mut contents = Vec::new();
         match File::open(&self.path) {
             Ok(mut file) => {
                 file.read_to_end(&mut contents)?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(ActivityLog::default());
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-
-        let mut log = ActivityLog::default();
-        let mut activity_kinds = HashMap::<String, ActivityKind>::new();
-        let mut offset = 0_u64;
-        for raw_line in contents.split_inclusive(|byte| *byte == b'\n') {
-            let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
-            if !line.is_empty() {
-                if let Ok(event) = serde_json::from_slice::<ActivityEvent>(line) {
-                    let kind_was_absent = serde_json::from_slice::<serde_json::Value>(line)?
-                        .get("kind")
-                        .is_none();
-                    let mut event = event;
-                    if kind_was_absent && event.activity_id.starts_with("lifecycle_") {
-                        event.kind = ActivityKind::Lifecycle;
-                    }
-                    if !supported_activity_schema(event.schema_version)
-                        || !event.has_consistent_payload()
-                        || activity_kinds
-                            .get(&event.activity_id)
-                            .is_some_and(|kind| *kind != event.kind)
-                    {
-                        record_malformed(&mut log.diagnostics, offset);
-                    } else {
-                        activity_kinds.insert(event.activity_id.clone(), event.kind);
-                        log.events.push(event);
-                    }
-                } else if let Ok(row) = serde_json::from_slice::<DiagnosticRow>(line) {
-                    apply_diagnostic(&mut log.diagnostics, row);
-                } else {
-                    record_malformed(&mut log.diagnostics, offset);
-                }
-            }
-            offset = offset.saturating_add(raw_line.len() as u64);
-        }
-        log.diagnostics.duplicate_terminal_states = duplicate_terminal_count(&log.events);
-        Ok(log)
+        Ok(contents)
     }
+}
+
+fn parse_activity_log(contents: &[u8]) -> Result<ActivityLog, ActivityStoreError> {
+    let mut log = ActivityLog::default();
+    let mut activity_kinds = HashMap::<String, ActivityKind>::new();
+    let mut offset = 0_u64;
+    for raw_line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        if !line.is_empty() {
+            if let Ok(event) = serde_json::from_slice::<ActivityEvent>(line) {
+                let kind_was_absent = serde_json::from_slice::<serde_json::Value>(line)?
+                    .get("kind")
+                    .is_none();
+                let mut event = event;
+                if kind_was_absent && event.activity_id.starts_with("lifecycle_") {
+                    event.kind = ActivityKind::Lifecycle;
+                }
+                if !supported_activity_schema(event.schema_version)
+                    || !event.has_consistent_payload()
+                    || activity_kinds
+                        .get(&event.activity_id)
+                        .is_some_and(|kind| *kind != event.kind)
+                {
+                    record_malformed(&mut log.diagnostics, offset);
+                } else {
+                    activity_kinds.insert(event.activity_id.clone(), event.kind);
+                    log.events.push(event);
+                }
+            } else if let Ok(row) = serde_json::from_slice::<DiagnosticRow>(line) {
+                apply_diagnostic(&mut log.diagnostics, row);
+            } else {
+                record_malformed(&mut log.diagnostics, offset);
+            }
+        }
+        offset = offset.saturating_add(raw_line.len() as u64);
+    }
+    log.diagnostics.duplicate_terminal_states = duplicate_terminal_count(&log.events);
+    Ok(log)
 }
 
 fn supported_activity_schema(version: u32) -> bool {
@@ -631,6 +747,18 @@ fn lock_with_timeout(
     timeout_ms: u64,
     kind: LockKind,
 ) -> Result<LockGuard<'_>, ActivityStoreError> {
+    lock_with_timeout_observed(file, timeout_ms, kind, || {})
+}
+
+fn lock_with_timeout_observed<F>(
+    file: &File,
+    timeout_ms: u64,
+    kind: LockKind,
+    mut on_contention: F,
+) -> Result<LockGuard<'_>, ActivityStoreError>
+where
+    F: FnMut(),
+{
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut first_attempt = true;
     loop {
@@ -645,6 +773,7 @@ fn lock_with_timeout(
         match attempt {
             Ok(()) => return Ok(LockGuard { file }),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                on_contention();
                 if Instant::now() >= deadline {
                     return Err(ActivityStoreError::LockTimeout);
                 }
@@ -1048,6 +1177,14 @@ mod tests {
         (root, store)
     }
 
+    #[test]
+    fn lock_timeout_builder_changes_only_the_derived_store() {
+        let (_root, store) = fixture_store();
+        let permission = store.clone().with_lock_timeout_ms(500);
+        assert_eq!(store.limits.lock_timeout_ms, 100);
+        assert_eq!(permission.limits.lock_timeout_ms, 500);
+    }
+
     fn event_at(activity_id: &str, state: ActivityState, recorded_at_ms: u64) -> ActivityEvent {
         ActivityEvent {
             schema_version: ACTIVITY_SCHEMA_VERSION,
@@ -1078,6 +1215,61 @@ mod tests {
 
     fn event(activity_id: &str, state: ActivityState) -> ActivityEvent {
         event_at(activity_id, state, 100)
+    }
+
+    fn realistically_sized_events() -> Vec<ActivityEvent> {
+        (0..32_448)
+            .map(|index| {
+                let mut event = event_at(&format!("scale-{index}"), ActivityState::Denied, index);
+                event.reasoning = Some("x".repeat(512));
+                event
+            })
+            .collect()
+    }
+
+    #[test]
+    fn public_read_releases_lock_before_parsing_captured_snapshot() {
+        let (root, store) = fixture_store();
+        store.append_batch(&realistically_sized_events()).unwrap();
+        assert!(
+            fs::metadata(root.path().join("activity.jsonl"))
+                .unwrap()
+                .len()
+                >= 20 * 1024 * 1024
+        );
+
+        let gate = Arc::new(ReadParseGate::default());
+        let reader = store.clone().with_read_parse_gate(Arc::clone(&gate));
+        let (read_tx, read_rx) = std::sync::mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            read_tx.send(reader.read()).unwrap();
+        });
+
+        assert!(gate.wait_until_reached(Duration::from_secs(5)));
+        let append_result = store.append(event_at("after-capture", ActivityState::Denied, 40_000));
+        gate.release();
+
+        let captured = read_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        handle.join().unwrap();
+        append_result.unwrap();
+        assert_eq!(captured.events().len(), 32_448);
+        assert!(
+            !captured
+                .events()
+                .iter()
+                .any(|event| event.activity_id == "after-capture")
+        );
+        assert!(
+            store
+                .read()
+                .unwrap()
+                .events()
+                .iter()
+                .any(|event| event.activity_id == "after-capture")
+        );
     }
 
     #[test]
