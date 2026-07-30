@@ -53,6 +53,8 @@ pub struct ActivityStore {
     lock_acquisitions: Option<Arc<AtomicUsize>>,
     #[cfg(test)]
     read_parse_gate: Option<Arc<ReadParseGate>>,
+    #[cfg(test)]
+    lock_contention_probe: Option<Arc<LockContentionProbe>>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +185,30 @@ pub(crate) struct ReadParseGate {
 
 #[cfg(test)]
 #[derive(Debug, Default)]
+pub(crate) struct LockContentionProbe {
+    contended: Mutex<bool>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl LockContentionProbe {
+    fn notify(&self) {
+        *self.contended.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn wait_until_contended(&self, timeout: Duration) -> bool {
+        let contended = self.contended.lock().unwrap();
+        let (contended, _) = self
+            .changed
+            .wait_timeout_while(contended, timeout, |contended| !*contended)
+            .unwrap();
+        *contended
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
 struct ReadParseGateState {
     reached: bool,
     released: bool,
@@ -240,11 +266,18 @@ impl ActivityStore {
             lock_acquisitions: None,
             #[cfg(test)]
             read_parse_gate: None,
+            #[cfg(test)]
+            lock_contention_probe: None,
         }
     }
 
     pub fn with_limits(mut self, limits: ActivityLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    pub(crate) fn with_lock_timeout_ms(mut self, lock_timeout_ms: u64) -> Self {
+        self.limits.lock_timeout_ms = lock_timeout_ms;
         self
     }
 
@@ -265,6 +298,12 @@ impl ActivityStore {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_lock_contention_probe(mut self, probe: Arc<LockContentionProbe>) -> Self {
+        self.lock_contention_probe = Some(probe);
+        self
+    }
+
     pub fn append(&self, event: ActivityEvent) -> Result<(), ActivityStoreError> {
         if event.schema_version != ACTIVITY_SCHEMA_VERSION {
             return Err(ActivityStoreError::UnsupportedSchema(event.schema_version));
@@ -274,12 +313,25 @@ impl ActivityStore {
 
     pub(crate) fn append_batch(&self, events: &[ActivityEvent]) -> Result<(), ActivityStoreError> {
         let lock = self.open_lock()?;
-        let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Exclusive)?;
+        let _guard = self.lock_for_append(&lock)?;
         #[cfg(test)]
         if let Some(counter) = &self.lock_acquisitions {
             counter.fetch_add(1, Ordering::SeqCst);
         }
         self.append_events_unlocked(events)
+    }
+
+    fn lock_for_append<'a>(&self, lock: &'a File) -> Result<LockGuard<'a>, ActivityStoreError> {
+        #[cfg(test)]
+        if let Some(probe) = &self.lock_contention_probe {
+            return lock_with_timeout_observed(
+                lock,
+                self.limits.lock_timeout_ms,
+                LockKind::Exclusive,
+                || probe.notify(),
+            );
+        }
+        lock_with_timeout(lock, self.limits.lock_timeout_ms, LockKind::Exclusive)
     }
 
     pub(crate) fn append_from_snapshot<F>(&self, build: F) -> Result<(), ActivityStoreError>
@@ -695,6 +747,18 @@ fn lock_with_timeout(
     timeout_ms: u64,
     kind: LockKind,
 ) -> Result<LockGuard<'_>, ActivityStoreError> {
+    lock_with_timeout_observed(file, timeout_ms, kind, || {})
+}
+
+fn lock_with_timeout_observed<F>(
+    file: &File,
+    timeout_ms: u64,
+    kind: LockKind,
+    mut on_contention: F,
+) -> Result<LockGuard<'_>, ActivityStoreError>
+where
+    F: FnMut(),
+{
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut first_attempt = true;
     loop {
@@ -709,6 +773,7 @@ fn lock_with_timeout(
         match attempt {
             Ok(()) => return Ok(LockGuard { file }),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                on_contention();
                 if Instant::now() >= deadline {
                     return Err(ActivityStoreError::LockTimeout);
                 }
@@ -1110,6 +1175,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = ActivityStore::at(root.path().join("activity.jsonl"));
         (root, store)
+    }
+
+    #[test]
+    fn lock_timeout_builder_changes_only_the_derived_store() {
+        let (_root, store) = fixture_store();
+        let permission = store.clone().with_lock_timeout_ms(500);
+        assert_eq!(store.limits.lock_timeout_ms, 100);
+        assert_eq!(permission.limits.lock_timeout_ms, 500);
     }
 
     fn event_at(activity_id: &str, state: ActivityState, recorded_at_ms: u64) -> ActivityEvent {

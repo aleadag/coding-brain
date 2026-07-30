@@ -35,6 +35,7 @@ use crate::provider_hooks::{
 };
 
 const HOOK_INFERENCE_TIMEOUT_MS: u64 = 25_000;
+const PERMISSION_ACTIVITY_LOCK_TIMEOUT_MS: u64 = 500;
 static ACTIVITY_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug)]
@@ -563,6 +564,10 @@ fn run_provider_with_gate_and_stores_and_safety<R, W, E, S, F>(
     S: FnOnce(Option<&ShellCommandInput>) -> super::safety::SafetyEvaluation,
     F: FnOnce(&BrainConfig, &str) -> Result<BrainSuggestion, String>,
 {
+    let permission_activity_store = activity_store
+        .cloned()
+        .map(|store| store.with_lock_timeout_ms(PERMISSION_ACTIVITY_LOCK_TIMEOUT_MS));
+    let activity_store = permission_activity_store.as_ref();
     let input = match read_bounded_hook_input(stdin) {
         Ok(input) => input,
         Err(error) => {
@@ -1076,20 +1081,21 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Cursor;
     use std::panic::AssertUnwindSafe;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, mpsc};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::*;
-    use crate::brain::activity::{ActivityLimits, ActivityStore};
+    use crate::brain::activity::{ActivityStore, LockContentionProbe, ReadParseGate};
     use crate::brain::client::BrainSuggestion;
     use crate::brain::decisions::decisions_dir;
     use crate::config::BrainConfig;
     use crate::rules::RuleAction;
     use coding_brain_core::brain_activity::{
-        ActivityKind, ActivityState, MAX_ACTIVITY_FIELD_BYTES, bounded_redacted_activity_text,
+        ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState,
+        MAX_ACTIVITY_FIELD_BYTES, ProjectEvidence, bounded_redacted_activity_text,
     };
     use coding_brain_core::lifecycle::{LifecycleEventKind, LifecycleStore, ProjectedStatus};
     use fs2::FileExt;
@@ -1183,6 +1189,40 @@ mod tests {
             "tool_input": { "command": command }
         })
         .to_string()
+    }
+
+    fn realistic_activity_event(index: u64) -> ActivityEvent {
+        ActivityEvent {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            kind: ActivityKind::Decision,
+            activity_id: format!("scale-{index}"),
+            recorded_at_ms: index,
+            project: ProjectEvidence {
+                project_id: coding_brain_core::project::ProjectId::Temporary(
+                    "scale-project".into(),
+                ),
+                cwd: PathBuf::from("/work/scale-project"),
+                label: Some("scale-project".into()),
+            },
+            session: None,
+            state: ActivityState::Denied,
+            tool: Some("Bash".into()),
+            normalized_command: Some(format!("command-{index}")),
+            fingerprint: Some(format!("fingerprint-{index}")),
+            rule_id: Some("scale".into()),
+            confidence: Some(0.9),
+            threshold: Some(0.8),
+            reasoning: Some("x".repeat(512)),
+            decision_id: Some(format!("decision-{index}")),
+            outcome: None,
+            correction: None,
+            note: None,
+            supersedes: None,
+        }
+    }
+
+    fn realistically_sized_permission_events() -> Vec<ActivityEvent> {
+        (0..32_448).map(realistic_activity_event).collect()
     }
 
     fn permission_payload_for_provider(provider: AgentProvider, provider_deny: bool) -> Vec<u8> {
@@ -1950,26 +1990,32 @@ mod tests {
             .open(activity_path.with_extension("lock"))
             .unwrap();
         lock.lock_exclusive().unwrap();
-        let calls = AtomicUsize::new(0);
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let started = Instant::now();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_worker = Arc::clone(&calls);
+        let lifecycle_for_worker = lifecycle.clone();
+        let activity_for_worker = activity.clone();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            run_with_gate_and_stores(
+                Cursor::new(payload()),
+                &mut stdout,
+                &mut stderr,
+                Some(&enabled_config()),
+                BrainGateMode::Auto,
+                &lifecycle_for_worker,
+                Some(&activity_for_worker),
+                |_, _| {
+                    calls_for_worker.fetch_add(1, Ordering::SeqCst);
+                    panic!("locked activity store must not invoke the model")
+                },
+            );
+            result_tx.send((stdout, stderr)).unwrap();
+        });
 
-        run_with_gate_and_stores(
-            Cursor::new(payload()),
-            &mut stdout,
-            &mut stderr,
-            Some(&enabled_config()),
-            BrainGateMode::Auto,
-            &lifecycle,
-            Some(&activity),
-            |_, _| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                panic!("locked activity store must not invoke the model")
-            },
-        );
-
-        assert!(started.elapsed() < Duration::from_secs(1));
+        let (stdout, stderr) = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
         assert!(stdout.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(
@@ -1983,6 +2029,161 @@ mod tests {
         );
         assert!(!activity_path.exists());
         FileExt::unlock(&lock).unwrap();
+    }
+
+    #[test]
+    fn transient_cross_project_writer_outlasting_default_bound_reaches_normal_permission_decision()
+    {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore_home = set_test_home(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity_path = temp.path().join("activity.jsonl");
+        let probe = Arc::new(LockContentionProbe::default());
+        let activity =
+            ActivityStore::at(&activity_path).with_lock_contention_probe(Arc::clone(&probe));
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(activity_path.with_extension("lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_worker = Arc::clone(&calls);
+        let lifecycle_for_worker = lifecycle.clone();
+        let activity_for_worker = activity.clone();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            run_with_gate_and_stores(
+                Cursor::new(payload()),
+                &mut stdout,
+                &mut stderr,
+                Some(&enabled_config()),
+                BrainGateMode::Auto,
+                &lifecycle_for_worker,
+                Some(&activity_for_worker),
+                |_, _| {
+                    calls_for_worker.fetch_add(1, Ordering::SeqCst);
+                    Ok(suggestion(RuleAction::Approve, 0.9))
+                },
+            );
+            result_tx.send((stdout, stderr)).unwrap();
+        });
+
+        assert!(probe.wait_until_contended(Duration::from_secs(1)));
+        assert!(result_rx.recv_timeout(Duration::from_millis(200)).is_err());
+        FileExt::unlock(&lock).unwrap();
+        let (stdout, stderr) = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stdout).unwrap()["hookSpecificOutput"]["decision"]
+                ["behavior"],
+            "allow"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events = activity.read().unwrap().events().to_vec();
+        let activity_ids = events
+            .iter()
+            .map(|event| event.activity_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(activity_ids.len(), 1);
+        let activity_id = activity_ids.into_iter().next().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.activity_id == activity_id)
+                .map(|event| event.state)
+                .collect::<Vec<_>>(),
+            [
+                ActivityState::Observed,
+                ActivityState::Evaluating,
+                ActivityState::Allowed,
+                ActivityState::Delivered,
+            ]
+        );
+    }
+
+    #[test]
+    fn large_log_reader_parsing_does_not_block_permission_lifecycle() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore_home = set_test_home(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity_path = temp.path().join("activity.jsonl");
+        let activity = ActivityStore::at(&activity_path);
+        activity
+            .append_batch(&realistically_sized_permission_events())
+            .unwrap();
+        assert!(std::fs::metadata(&activity_path).unwrap().len() >= 20 * 1024 * 1024);
+
+        let gate = Arc::new(ReadParseGate::default());
+        let reader = activity.clone().with_read_parse_gate(Arc::clone(&gate));
+        let (read_tx, read_rx) = mpsc::sync_channel(1);
+        let reader_thread = std::thread::spawn(move || {
+            read_tx.send(reader.read()).unwrap();
+        });
+        assert!(gate.wait_until_reached(Duration::from_secs(5)));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run_with_gate_and_stores(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            |_, _| Ok(suggestion(RuleAction::Approve, 0.9)),
+        );
+
+        gate.release();
+        read_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        reader_thread.join().unwrap();
+
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stdout).unwrap()["hookSpecificOutput"]["decision"]
+                ["behavior"],
+            "allow"
+        );
+        let events = activity.read().unwrap().events().to_vec();
+        let permission_activity_ids = events
+            .iter()
+            .filter(|event| !event.activity_id.starts_with("scale-"))
+            .map(|event| event.activity_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(permission_activity_ids.len(), 1);
+        let activity_id = permission_activity_ids.into_iter().next().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.activity_id == activity_id)
+                .map(|event| event.state)
+                .collect::<Vec<_>>(),
+            [
+                ActivityState::Observed,
+                ActivityState::Evaluating,
+                ActivityState::Allowed,
+                ActivityState::Delivered,
+            ]
+        );
     }
 
     #[test]
@@ -2625,10 +2826,6 @@ mod tests {
         let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
         let initial_lock_acquisitions = Arc::new(AtomicUsize::new(0));
         let activity = ActivityStore::at(temp.path().join("activity.jsonl"))
-            .with_limits(ActivityLimits {
-                lock_timeout_ms: 5_000,
-                ..ActivityLimits::default()
-            })
             .with_lock_acquisition_counter(Arc::clone(&initial_lock_acquisitions));
         let config = enabled_config();
         let payloads = (0..15)
