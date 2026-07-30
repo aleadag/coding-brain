@@ -961,27 +961,126 @@ fn home_alias_field_splitting_is_denied_before_model_inference_for_every_provide
         AgentProvider::Claude,
         AgentProvider::Antigravity,
     ] {
-        for case in ["reported root cwd", "shell changes cwd"] {
+        for case in [
+            "root cwd exact HOME",
+            "root cwd descendant",
+            "root cwd append descendant",
+            "root cwd shared-parent sibling",
+            "root cwd ancestor pattern",
+            "root cwd single-field ancestor pattern",
+            "root cwd globstar HOME pattern",
+            "root cwd globstar HOME-ancestor pattern",
+            "root cwd nocase HOME pattern",
+            "HOME-parent cwd normalized relative pattern",
+            "HOME-parent cwd descendant",
+            "shell changes to HOME parent",
+        ] {
             let home = tempfile::tempdir().unwrap();
             let fake_model = install_model_fixture(home.path(), "approve");
             if provider == AgentProvider::Antigravity {
                 seed_antigravity_invocation(home.path(), 5);
             }
             let home_text = home.path().to_str().unwrap();
-            let split = home_text
-                .char_indices()
-                .next_back()
-                .expect("temporary HOME must not be empty")
-                .0;
-            let assignment = format!("X='{}'; X+='{}'", &home_text[..split], &home_text[split..]);
+            let home_parent = home
+                .path()
+                .parent()
+                .expect("temporary HOME must have a parent");
+            let descendant = home.path().join("safe");
+            let sibling = home_parent.join("xa99-sibling");
+            let home_name = home
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("temporary HOME must end with a UTF-8 component");
+            let home_root_component = home
+                .path()
+                .components()
+                .find_map(|component| match component {
+                    std::path::Component::Normal(part) => part.to_str(),
+                    _ => None,
+                })
+                .expect("temporary HOME must start with a UTF-8 component");
+            let root_pattern = format!(
+                "{}*",
+                home_root_component
+                    .chars()
+                    .next()
+                    .expect("temporary HOME component must not be empty")
+            );
+            let mut globstar_home_parts = home_text
+                .trim_start_matches('/')
+                .split('/')
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            globstar_home_parts
+                .last_mut()
+                .expect("temporary HOME must contain a component")
+                .push('*');
+            let globstar_home_pattern = format!("/**/**/{}", globstar_home_parts.join("/"));
+            let globstar_ancestor_pattern = format!("/**/**/{home_root_component}");
+            let nocase_home_pattern = format!("{}*", home_text.to_uppercase());
             let (command, command_cwd, hook_cwd) = match case {
-                "reported root cwd" => (
-                    format!("IFS=/; {assignment}; rm -rf $X"),
+                "root cwd exact HOME" => (
+                    format!("IFS=/; X='{home_text}'; rm -rf $X"),
                     Path::new("/"),
                     Path::new("/"),
                 ),
-                "shell changes cwd" => (
-                    format!("cd /; IFS=/; {assignment}; rm -rf $X"),
+                "root cwd descendant" => (
+                    format!("IFS=/; X='{}'; rm -rf $X", descendant.display()),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "root cwd append descendant" => (
+                    format!("IFS=/; X='{home_text}'; X+=/safe; rm -rf $X"),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "root cwd shared-parent sibling" => (
+                    format!("IFS=/; X='{}'; rm -rf $X", sibling.display()),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "root cwd ancestor pattern" => (
+                    format!("IFS=/; X='/{root_pattern}/safe'; rm -rf $X"),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "root cwd single-field ancestor pattern" => (
+                    format!("IFS=/; X='{root_pattern}'; rm -rf $X"),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "root cwd globstar HOME pattern" => (
+                    format!("shopt -s globstar; IFS=:; X='{globstar_home_pattern}'; rm -rf $X"),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "root cwd globstar HOME-ancestor pattern" => (
+                    format!("shopt -s globstar; IFS=:; X='{globstar_ancestor_pattern}'; rm -rf $X"),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "root cwd nocase HOME pattern" => (
+                    format!("shopt -s nocaseglob; IFS=:; X='{nocase_home_pattern}'; rm -rf $X"),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "HOME-parent cwd normalized relative pattern" => (
+                    format!("IFS=,; X='./{home_name}*'; rm -rf $X"),
+                    home_parent,
+                    home_parent,
+                ),
+                "HOME-parent cwd descendant" => (
+                    format!("IFS=/; X='{}'; rm -rf $X", descendant.display()),
+                    home_parent,
+                    home_parent,
+                ),
+                "shell changes to HOME parent" => (
+                    format!(
+                        "cd '{}'; IFS=/; X='{}'; rm -rf $X",
+                        home_parent.display(),
+                        descendant.display()
+                    ),
                     home.path(),
                     home.path(),
                 ),
@@ -1010,7 +1109,82 @@ fn home_alias_field_splitting_is_denied_before_model_inference_for_every_provide
                 (Some("deny"), 0),
                 "{provider:?}: {case}: {command}"
             );
-            assert_safety_deny(home.path(), "irreversible-home-delete");
+            let expected_rule_id = if matches!(
+                case,
+                "root cwd globstar HOME pattern" | "root cwd nocase HOME pattern"
+            ) {
+                "unsafe-recursive-delete-expansion"
+            } else {
+                "irreversible-home-delete"
+            };
+            assert_safety_deny(home.path(), expected_rule_id);
+        }
+
+        for case in [
+            "quoted descendant",
+            "unrelated split path",
+            "unrelated split pattern",
+            "unrelated single-field split pattern",
+            "shared-prefix split pattern suffix mismatch",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let fake_model = install_model_fixture(home.path(), "approve");
+            if provider == AgentProvider::Antigravity {
+                seed_antigravity_invocation(home.path(), 5);
+            }
+            let command = match case {
+                "quoted descendant" => {
+                    format!("X='{}/safe'; rm -rf \"$X\"", home.path().display())
+                }
+                "unrelated split path" => {
+                    "IFS=/; X=/xa99-safe-control/target; rm -rf $X".to_string()
+                }
+                "unrelated split pattern" | "unrelated single-field split pattern" => {
+                    let longest_component = home
+                        .path()
+                        .components()
+                        .filter_map(|component| match component {
+                            std::path::Component::Normal(part) => part.to_str().map(str::len),
+                            _ => None,
+                        })
+                        .max()
+                        .expect("temporary HOME must contain a UTF-8 component");
+                    let unrelated_pattern = "x".repeat(longest_component + 1);
+                    if case == "unrelated split pattern" {
+                        format!("IFS=/; X='/{unrelated_pattern}*/safe'; rm -rf $X")
+                    } else {
+                        format!("IFS=/; X='{unrelated_pattern}*'; rm -rf $X")
+                    }
+                }
+                "shared-prefix split pattern suffix mismatch" => {
+                    let home_root_component = home
+                        .path()
+                        .components()
+                        .find_map(|component| match component {
+                            std::path::Component::Normal(part) => part.to_str(),
+                            _ => None,
+                        })
+                        .expect("temporary HOME must start with a UTF-8 component");
+                    format!("IFS=:; X='{home_root_component}*/safe'; rm -rf $X")
+                }
+                _ => unreachable!(),
+            };
+            let (provider_name, event, payload) =
+                shell_permission_payload(home.path(), provider, &command, None);
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+            assert!(output.status.success(), "{provider:?}: {case}: {command}");
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let decision = if provider == AgentProvider::Antigravity {
+                response["decision"].as_str()
+            } else {
+                response["hookSpecificOutput"]["decision"]["behavior"].as_str()
+            };
+            assert_eq!(
+                (decision, fake_model.request_count()),
+                (Some("allow"), 1),
+                "{provider:?}: {case}: {command}"
+            );
         }
     }
 }
