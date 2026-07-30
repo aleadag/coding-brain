@@ -1196,26 +1196,47 @@ fn literal_home_delete_denies_before_model_inference_for_every_provider() {
         AgentProvider::Claude,
         AgentProvider::Antigravity,
     ] {
-        let home = tempfile::tempdir().unwrap();
-        let fake_model = install_model_fixture(home.path(), "approve");
-        let command = format!("rm -rf \"{}\"", home.path().display());
-        let (provider_name, event, payload) =
-            shell_permission_payload(home.path(), provider, &command, None);
+        for case in ["exact HOME", "literal ancestor", "resolved ancestor"] {
+            let home = tempfile::tempdir().unwrap();
+            let fake_model = install_model_fixture(home.path(), "approve");
+            let home_parent = home
+                .path()
+                .parent()
+                .expect("temporary HOME must have a parent");
+            assert_ne!(home_parent, Path::new("/"));
+            let command = match case {
+                "exact HOME" => format!("rm -rf \"{}\"", home.path().display()),
+                "literal ancestor" => format!("rm -rf \"{}\"", home_parent.display()),
+                "resolved ancestor" => {
+                    format!("X='{}'; rm -rf \"$X\"", home_parent.display())
+                }
+                _ => unreachable!(),
+            };
+            let (provider_name, event, payload) =
+                shell_permission_payload(home.path(), provider, &command, None);
 
-        let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
 
-        assert!(output.status.success(), "{provider:?}: {command}");
-        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        if provider == AgentProvider::Antigravity {
-            assert_eq!(response["decision"], "deny", "{provider:?}: {command}");
-        } else {
+            assert!(output.status.success(), "{provider:?}: {case}: {command}");
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(
+                    response["decision"], "deny",
+                    "{provider:?}: {case}: {command}"
+                );
+            } else {
+                assert_eq!(
+                    response["hookSpecificOutput"]["decision"]["behavior"], "deny",
+                    "{provider:?}: {case}: {command}"
+                );
+            }
             assert_eq!(
-                response["hookSpecificOutput"]["decision"]["behavior"], "deny",
-                "{provider:?}: {command}"
+                fake_model.request_count(),
+                0,
+                "{provider:?}: {case}: {command}"
             );
+            assert_safety_deny(home.path(), "irreversible-home-delete");
         }
-        assert_eq!(fake_model.request_count(), 0, "{provider:?}: {command}");
-        assert_safety_deny(home.path(), "irreversible-home-delete");
     }
 }
 

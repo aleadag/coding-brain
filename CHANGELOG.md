@@ -52,9 +52,11 @@ All notable changes to Coding Brain are documented here.
   construction or spawn and clears its environment. Its two-second execution
   timeout is followed by at most 250 ms of synchronous process cleanup. A
   process-wide bounded reaper owns any still-unreaped child; saturated or
-  disconnected handoff falls back to synchronous waiting. Unsupported syntax
-  preserves provider-native confirmation. Nested `sh -c` and `eval` inspection
-  remains tracked separately.
+  disconnected handoff falls back to synchronous waiting. Literal and resolved
+  deletion targets that are lexical ancestors of the trusted home are also
+  denied before model inference. Unsupported syntax preserves provider-native
+  confirmation. Nested `sh -c` and `eval` inspection remains tracked
+  separately.
 - Release tags now rerun formatting, Clippy, and all-target tests before
   publishing. The curl installer now requires a valid release checksum and a
   supported verifier before extracting or installing the binary.
