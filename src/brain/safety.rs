@@ -420,7 +420,7 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
                 if is_root_target(target) {
                     return canonical_deny("irreversible-root-delete");
                 }
-                if literal_home_target(target) {
+                if literal_home_or_ancestor_target(target) {
                     return canonical_deny("irreversible-home-delete");
                 }
                 continue;
@@ -429,7 +429,7 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
                 return canonical_deny("irreversible-home-delete");
             }
             if resolve_word(target, &command_assignments)
-                .is_some_and(|resolved| literal_home_target(&resolved))
+                .is_some_and(|resolved| literal_home_or_ancestor_target(&resolved))
             {
                 return canonical_deny("irreversible-home-delete");
             }
@@ -478,6 +478,22 @@ fn is_recursive_flag(argument: &str) -> bool {
 
 fn is_root_target(target: &str) -> bool {
     lexical_absolute_parts(Path::new(target)).is_some_and(|parts| parts.is_empty())
+}
+
+fn path_is_home_or_ancestor(target: &Path, home: &Path) -> bool {
+    let Some(target) = lexical_absolute_parts(target) else {
+        return false;
+    };
+    if target.is_empty() {
+        return false;
+    }
+    lexical_absolute_parts(home)
+        .is_some_and(|home| target.len() <= home.len() && home.starts_with(&target))
+}
+
+fn literal_home_or_ancestor_target(target: &str) -> bool {
+    std::env::var_os("HOME")
+        .is_some_and(|home| path_is_home_or_ancestor(Path::new(target), Path::new(&home)))
 }
 
 fn literal_home_target(target: &str) -> bool {
@@ -1629,6 +1645,31 @@ mod tests {
                 })
                 .all(|component| !component.starts_with(&prefix))
         );
+    }
+
+    #[test]
+    fn lexical_home_or_ancestor_classification_excludes_root_and_descendants() {
+        let home = Path::new("/home/alexander");
+
+        for target in ["/home", "/home/./alexander", "/home/alexander"] {
+            assert!(
+                path_is_home_or_ancestor(Path::new(target), home),
+                "{target}"
+            );
+        }
+        for target in [
+            "/",
+            "/hom",
+            "/home/alex",
+            "/home/alexander/safe",
+            "/srv",
+            "home/alexander",
+        ] {
+            assert!(
+                !path_is_home_or_ancestor(Path::new(target), home),
+                "{target}"
+            );
+        }
     }
 
     #[test]
