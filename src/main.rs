@@ -1102,10 +1102,21 @@ mod first_run_tests {
     use super::*;
     use std::fs;
 
+    struct HomeEnvGuard(Option<std::ffi::OsString>);
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: each guard is created while HOME_ENV_LOCK is held.
+            unsafe {
+                match self.0.take() {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
     fn set_home(p: &std::path::Path) {
-        // Cargo's test harness shares a process; reset HOME after each test
-        // by calling this with the original value (we just leak temp dirs
-        // since they're under /tmp anyway).
         // SAFETY: tests are serialized via HOME_ENV_LOCK; nothing else
         // here races on env reads inside the lock window.
         unsafe { std::env::set_var("HOME", p) };
@@ -1117,6 +1128,7 @@ mod first_run_tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeEnvGuard(std::env::var_os("HOME"));
         set_home(tmp.path());
         assert!(is_first_run(), "fresh home should be first-run");
     }
@@ -1143,6 +1155,7 @@ mod first_run_tests {
             "{}",
         )
         .unwrap();
+        let _home = HomeEnvGuard(std::env::var_os("HOME"));
         set_home(tmp.path());
         assert!(
             !is_first_run(),
@@ -1162,6 +1175,7 @@ mod first_run_tests {
             r#"{"hooks":{"PostToolUse":[{"hooks":[{"command":"cbrain --lifecycle-hook"}]}]}}"#,
         )
         .unwrap();
+        let _home = HomeEnvGuard(std::env::var_os("HOME"));
         set_home(tmp.path());
         assert!(
             !is_first_run(),
@@ -1174,6 +1188,7 @@ mod first_run_tests {
         let _g = config::HOME_ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let _home = HomeEnvGuard(std::env::var_os("HOME"));
         // SAFETY: serialized via HOME_ENV_LOCK; nothing else reads HOME inside
         // this critical section.
         unsafe { std::env::remove_var("HOME") };

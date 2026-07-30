@@ -1644,6 +1644,9 @@ mod tests {
 
     #[test]
     fn dynamic_flag_ambiguity_respects_known_targets_and_option_terminator() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for command in [
             "rm -rf $UNKNOWN /",
             "FLAG=-rf; rm -f $FLAG /",
@@ -1772,6 +1775,9 @@ mod tests {
 
     #[test]
     fn unquoted_parameter_pathname_expansion_can_reach_the_trusted_home() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = std::env::var("HOME").expect("test requires UTF-8 HOME");
         let last = home
             .char_indices()
@@ -1794,6 +1800,9 @@ mod tests {
 
     #[test]
     fn resolved_fields_classify_patterns_after_complete_concatenation() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = std::env::var("HOME").expect("test requires UTF-8 HOME");
         let last = home
             .char_indices()
@@ -1855,6 +1864,9 @@ mod tests {
 
     #[test]
     fn adjacent_unquoted_pathname_pattern_can_complete_the_trusted_home() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = std::env::var("HOME").expect("test requires UTF-8 HOME");
         let last = home
             .char_indices()
@@ -1888,6 +1900,9 @@ mod tests {
 
     #[test]
     fn normalized_unquoted_parameter_pathname_expansion_can_reach_the_trusted_home() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = std::env::var("HOME").expect("test requires UTF-8 HOME");
         let home = Path::new(&home);
         let name = home
