@@ -1694,6 +1694,9 @@ mod tests {
 
     #[test]
     fn append_assignments_preserve_destructive_values() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for command in [
             "X=-; X+=rf; rm --no-preserve-root -f $X /",
             "X=-; X+=; X+=r; X+=f; rm --no-preserve-root -f $X /",
