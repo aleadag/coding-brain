@@ -283,8 +283,22 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
             for assignment in &command.assignments {
                 match command.context {
                     shell::ExecutionContext::TopLevel => {
-                        if let Some(value) = &assignment.value.literal {
-                            assignments.insert(assignment.name.clone(), value.clone());
+                        let value_known = match assignment.value.literal.as_deref() {
+                            Some(value) if assignment.append => {
+                                if let Some(current) = assignments.get_mut(&assignment.name) {
+                                    current.push_str(value);
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            Some(value) => {
+                                assignments.insert(assignment.name.clone(), value.to_string());
+                                true
+                            }
+                            None => false,
+                        };
+                        if value_known {
                             if assignment.name == "IFS" {
                                 ifs_unknown = false;
                             }
@@ -408,6 +422,11 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
                 continue;
             }
             if word_is_home_target(target, &command_assignments) {
+                return canonical_deny("irreversible-home-delete");
+            }
+            if resolve_word(target, &command_assignments)
+                .is_some_and(|resolved| literal_home_target(&resolved))
+            {
                 return canonical_deny("irreversible-home-delete");
             }
             if dynamic_target_is_dangerous(target, &command_assignments, command_ifs_unknown) {
@@ -1668,6 +1687,35 @@ mod tests {
         ] {
             assert!(evaluate_command(command).is_none(), "{command}");
         }
+    }
+
+    #[test]
+    fn append_assignments_preserve_destructive_values() {
+        for command in [
+            "X=-; X+=rf; rm --no-preserve-root -f $X /",
+            "X=-; X+=; X+=r; X+=f; rm --no-preserve-root -f $X /",
+            "X+=-rf; rm --no-preserve-root -f $X /",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+
+        let home = std::env::var("HOME").expect("test requires UTF-8 HOME");
+        let split = home
+            .char_indices()
+            .next_back()
+            .expect("HOME must not be empty")
+            .0;
+        let command = format!(
+            "X='{}'; X+='{}'; rm -rf \"$X\"",
+            &home[..split],
+            &home[split..]
+        );
+        let deny = evaluate_command(&command).unwrap_or_else(|| panic!("{command}"));
+        assert_eq!(deny.rule_id, "irreversible-home-delete", "{command}");
     }
 
     #[test]

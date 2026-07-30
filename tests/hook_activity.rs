@@ -885,6 +885,66 @@ fn reopened_shell_safety_corpus_denies_before_model_inference_for_every_provider
 }
 
 #[test]
+fn append_assignment_bypasses_are_denied_before_model_inference_for_every_provider() {
+    for provider in [
+        AgentProvider::Codex,
+        AgentProvider::Claude,
+        AgentProvider::Antigravity,
+    ] {
+        for case in ["recursive flag", "trusted home"] {
+            let home = tempfile::tempdir().unwrap();
+            let fake_model = install_model_fixture(home.path(), "approve");
+            let command = match case {
+                "recursive flag" => "X=-; X+=rf; rm --no-preserve-root -f $X /".to_string(),
+                "trusted home" => {
+                    let home_text = home.path().to_str().unwrap();
+                    let split = home_text
+                        .char_indices()
+                        .next_back()
+                        .expect("temporary HOME must not be empty")
+                        .0;
+                    format!(
+                        "X='{}'; X+='{}'; rm -rf \"$X\"",
+                        &home_text[..split],
+                        &home_text[split..]
+                    )
+                }
+                _ => unreachable!(),
+            };
+            let expected_rule_id = match case {
+                "recursive flag" => "unsafe-recursive-delete-expansion",
+                "trusted home" => "irreversible-home-delete",
+                _ => unreachable!(),
+            };
+            let (provider_name, event, payload) =
+                shell_permission_payload(home.path(), provider, &command, None);
+
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+            assert!(output.status.success(), "{provider:?}: {case}: {command}");
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(
+                    response["decision"], "deny",
+                    "{provider:?}: {case}: {command}"
+                );
+            } else {
+                assert_eq!(
+                    response["hookSpecificOutput"]["decision"]["behavior"], "deny",
+                    "{provider:?}: {case}: {command}"
+                );
+            }
+            assert_eq!(
+                fake_model.request_count(),
+                0,
+                "{provider:?}: {case}: {command}"
+            );
+            assert_safety_deny(home.path(), expected_rule_id);
+        }
+    }
+}
+
+#[test]
 fn literal_home_delete_denies_before_model_inference_for_every_provider() {
     for provider in [
         AgentProvider::Codex,

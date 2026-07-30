@@ -91,6 +91,7 @@ pub(super) enum CompoundKind {
 pub(super) struct ShellAssignment {
     pub name: String,
     pub value: ShellWord,
+    pub append: bool,
 }
 
 #[derive(Debug)]
@@ -596,7 +597,11 @@ impl Analyzer {
                 return Err(ShellAnalysisError::UnsupportedSyntax);
             }
         };
-        Ok(ShellAssignment { name, value })
+        Ok(ShellAssignment {
+            name,
+            value,
+            append: assignment.append,
+        })
     }
 
     fn push_inert_command(&mut self, context: ExecutionContext) -> usize {
@@ -1995,6 +2000,18 @@ mod tests {
         );
         assert_eq!(literal(command.command.as_ref()), Some("rm"));
         assert_eq!(literals(&command.arguments), ["-rf", "/"]);
+    }
+
+    #[test]
+    fn structure_preserves_scalar_append_assignment_semantics() {
+        let program = analyze("X=-; X+=rf").expect("scalar assignments");
+
+        assert!(!program.commands[0].assignments[0].append);
+        assert!(program.commands[1].assignments[0].append);
+        assert_eq!(
+            program.commands[1].assignments[0].value.literal.as_deref(),
+            Some("rf")
+        );
     }
 
     #[test]
