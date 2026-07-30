@@ -64,27 +64,45 @@ their current locking semantics. In particular, compaction and
 snapshot-dependent append/reservation paths must not release their exclusive
 lock between reading state and writing the derived result.
 
-### Give only initial permission persistence a larger bound
+### Give permission-hook activity persistence a larger bound
 
 `ActivityStore` will expose a narrowly scoped way for the permission hook to
-perform its atomic initial batch with a 500 ms lock-acquisition bound. The
-ordinary `ActivityLimits::default().lock_timeout_ms` remains 100 ms.
+perform its activity appends with a 500 ms lock-acquisition bound. The ordinary
+`ActivityLimits::default().lock_timeout_ms` remains 100 ms.
 
-The 500 ms bound applies only while acquiring the exclusive lock for the
-initial `Observed` plus `Evaluating` batch. Once acquired, the existing append,
-tail-repair, flush, and `sync_data` sequence is unchanged. No allow response is
-emitted until that durable append succeeds.
+The bound is a private permission-hook constant, not CLI or TOML
+configuration. A `pub(crate)` `ActivityStore` builder applies the bound when
+constructing the permission hook's store, avoiding duplicated append methods
+and ensuring later permission rows cannot accidentally fall back to 100 ms.
+
+The 500 ms bound applies to blocking activity-store acquisitions for the
+permission hook's initial, terminal, error, and delivery rows. Permission-
+triggered compaction retains its existing non-blocking `try_lock_exclusive`
+behavior. The bound does not apply to lifecycle hooks, TUI reads, recovery, or
+other activity-store users. Once acquired, the existing append, tail-repair,
+flush, and `sync_data` sequence is unchanged. No allow response is emitted
+until the required pre-response audit rows succeed.
 
 The managed permission hook has a 30-second provider timeout, so a worst-case
 500 ms persistence wait consumes a small, explicit part of its latency budget.
 Lifecycle hooks retain their two-second provider timeout and their existing
 100 ms activity-store lock behavior.
 
-This is one bounded acquisition, not an unbounded retry loop. If the lock
-remains unavailable for 500 ms, the hook retains the exact
-`ActivityStoreError`, skips model inference, records `NeedsInput` where
-possible, emits no executable allow decision, and leaves the provider's native
-confirmation path authoritative.
+Each operation makes one bounded acquisition, not an unbounded retry loop. If
+the lock remains unavailable for 500 ms before an executable response, the
+hook retains the exact `ActivityStoreError`, skips or abandons model execution
+as appropriate, records `NeedsInput` where possible, emits no executable allow
+decision, and leaves the provider's native confirmation path authoritative.
+Post-response delivery persistence remains bounded and reports its existing
+diagnostic if it cannot complete.
+
+On the initial-failure path, the existing best-effort error-row append may make
+a second 500 ms acquisition attempt. This preserves a diagnostic when
+contention clears immediately after the first timeout. Continuous contention
+therefore has an activity-store wait of roughly one second on that path, still
+well inside the managed 30-second permission-hook timeout; tests use a
+two-second outer deadline to allow scheduler overhead without changing either
+production bound.
 
 ### Permission data flow
 
@@ -99,16 +117,17 @@ The permission path remains:
 7. durably append the terminal decision before emitting it; and
 8. append delivery evidence after the response write.
 
-Only step 3 receives the permission-specific bound. Later activity appends keep
-their existing behavior; this change does not weaken proposal, terminal, or
-delivery ordering.
+All blocking activity-store acquisitions in this permission flow receive the
+permission-specific bound; non-blocking compaction remains non-blocking.
+Decision-proposal and lifecycle stores retain their own existing bounds. This
+change does not weaken proposal, terminal, or delivery ordering.
 
 ## Error and safety behavior
 
 - A malformed, unsupported, oversized, or unwritable initial batch fails
   closed with its existing concrete error.
-- A continuously held lock fails closed after the 500 ms initial-persistence
-  bound and does not invoke the model.
+- A continuously held lock fails closed after the applicable 500 ms
+  pre-response persistence bound and does not emit an executable allow.
 - A public read that cannot acquire its shared lock within 100 ms still returns
   `LockTimeout`, preserving TUI busy/stale behavior.
 - A read whose byte capture succeeds completes parsing outside the lock and
@@ -123,19 +142,23 @@ Tests will use synchronization channels or barriers rather than scheduler
 timing to establish holder and waiter states.
 
 1. Build a realistically sized activity log comparable to the reported
-   production row count and byte size.
+   production row count and byte size in one durable batch so fixture setup
+   does not perform thousands of unrelated `sync_data` calls.
 2. Prove a public reader releases its shared lock after byte capture and before
    parsing by pausing parsing through test-only synchronization, then
    successfully appending while parsing remains paused.
 3. Run the permission path against the large log while one transient shared
    reader overlaps it; assert normal inference and the complete
    `Observed -> Evaluating -> terminal -> Delivered` lifecycle.
-4. Hold the activity lock exclusively beyond 100 ms but below 500 ms to model
-   one transient lifecycle writer; assert the permission path reaches its
-   normal decision with a complete lifecycle.
+4. Hold the activity lock exclusively to model one transient lifecycle writer.
+   Use test-only lock-attempt signaling to prove the permission writer has
+   encountered the held lock, keep it held beyond 100 ms but below 500 ms, then
+   release it. Assert the permission path reaches its normal decision with a
+   complete lifecycle.
 5. Hold the lock continuously past 500 ms; assert bounded completion, no model
    call, native-confirmation/`NeedsInput` behavior, and the exact
-   `activity store lock timed out` cause.
+   `activity store lock timed out` cause. Use a two-second per-result deadline
+   rather than an unbounded thread join.
 6. Keep the `codexctl-rcdi` parallel-burst and atomic-initial-row regressions
    passing.
 7. Run focused activity-store, permission-hook, runtime/TUI contention, repair,
@@ -145,14 +168,67 @@ timing to establish holder and waiter states.
 ## Expected files
 
 - `src/brain/activity.rs`: split coherent capture from parsing and add the
-  narrow permission-bound append entry point.
-- `src/brain/permission_hook.rs`: use the permission-specific bound for only
-  the initial atomic activity batch and add end-to-end regressions.
+  narrow permission-hook lock-bound mechanism.
+- `src/brain/permission_hook.rs`: use the permission-specific bound for its
+  activity-store operations and add end-to-end regressions.
 
 No user-facing configuration or documentation changes are expected.
 
 ## Rollback
 
-The change is local to activity read locking and the initial permission append
-call. Reverting those call-path changes restores the prior 100 ms behavior
-without a data migration or state-format change.
+The change is local to activity read locking and the permission hook's activity
+store construction or calls. Reverting those call-path changes restores the
+prior 100 ms behavior without a data migration or state-format change.
+
+No runtime feature flag is added. The read-lock refactor and permission timeout
+policy remain separable code paths so either implementation commit can be
+reverted independently.
+
+## Stress Test Results: activity-store permission contention
+
+### Resolved Decisions
+
+- Apply 500 ms to all blocking activity-store acquisitions made by the
+  permission hook, not only the initial batch, so contention cannot move to
+  terminal or delivery persistence. Keep compaction non-blocking.
+- Keep 500 ms as a private, fixed permission latency class; all other
+  activity-store instances retain the 100 ms default.
+- Apply the policy through a scoped store builder rather than duplicated
+  permission append APIs or public configuration.
+- Capture owned bytes coherently under the shared lock and perform public-read
+  parsing after releasing it. Transactional readers keep parsing under their
+  existing exclusive guard.
+- Preserve the compensating error append, making the initial-failure path
+  bounded at roughly one second across two acquisitions.
+- Keep the current single ledger and advisory lock. Do not add a daemon,
+  process-local mutex, writer queue, or separate permission ledger.
+- Preserve audit-before-allow, exact errors, file permissions, tail repair,
+  `sync_data`, and deterministic fail-closed behavior.
+- Use no runtime flag or state migration; rollback is by reverting the two
+  separable code paths.
+- Use large realistic fixtures plus test-only synchronization instead of
+  inferring lock ownership from wall-clock timing alone.
+
+### Changes Made
+
+- Expanded the 500 ms policy from the initial batch to every permission-hook
+  activity-store operation.
+- Made the private builder boundary and per-acquisition worst-case latency
+  explicit.
+- Tightened the deterministic testing protocol and rollback design.
+
+### Deferred / Parking Lot
+
+- A far-over-threshold activity log remains degraded abnormal state. The
+  existing 32 MB compaction policy bounds normal scale; no new snapshot
+  mechanism is introduced.
+- Decision-proposal and lifecycle stores retain their independent lock
+  policies. Their failures already remain fail-closed and are not implicated by
+  the lifecycle/TUI contention addressed here.
+
+### Confidence Assessment
+
+- Overall: High.
+- Areas of concern: advisory-lock fairness under sustained cross-process churn
+  is platform-dependent; exhaustion of the explicit 500 ms bound intentionally
+  remains a fail-closed native-confirmation path.
