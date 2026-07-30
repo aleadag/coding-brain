@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use super::{
     HookInputError, ParsedLifecycleHook, PermissionHookRequest, ProviderPermissionPolicy,
-    event_kind, identity, normalized_outcome, optional_command, optional_id, permission_request,
-    permission_request_key, require_tool_use_id, required,
+    ShellCommandInput, ShellDialect, event_kind, identity, normalized_outcome, optional_command,
+    optional_id, permission_request, permission_request_key, require_tool_use_id, required,
 };
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +89,10 @@ pub(crate) fn parse_permission(raw: &[u8]) -> Result<PermissionHookRequest, Hook
             .ok_or(HookInputError::Missing("tool_input.command"))
         })
         .transpose()?;
+    let command = command.map(|source| ShellCommandInput {
+        dialect: ShellDialect::Bash,
+        source,
+    });
     let provider_policy = input.permission_suggestions.iter().fold(
         ProviderPermissionPolicy::PermitsBrainDecision,
         |policy, suggestion| match suggestion.behavior.as_deref() {
@@ -171,5 +175,27 @@ mod tests {
         assert_eq!(first.request_key.len(), 64);
         assert!(!first.request_key.contains("cargo test"));
         assert_ne!(first.request_key, changed.request_key);
+    }
+
+    #[test]
+    fn permission_normalizes_bash_authority_only_for_bash() {
+        let mut payload: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/hooks/claude-permission-request.json"
+        ))
+        .unwrap();
+
+        let parsed = parse_permission(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(
+            parsed.command,
+            Some(ShellCommandInput {
+                dialect: ShellDialect::Bash,
+                source: "cargo test".into(),
+            })
+        );
+
+        payload["tool_name"] = "Read".into();
+        payload["tool_input"] = serde_json::json!({ "file_path": "/tmp/example" });
+        let parsed = parse_permission(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert!(parsed.command.is_none());
     }
 }

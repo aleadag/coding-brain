@@ -51,6 +51,17 @@ pub(crate) enum ProviderPermissionPolicy {
     Denies,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShellDialect {
+    Bash,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ShellCommandInput {
+    pub dialect: ShellDialect,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PermissionHookRequest {
     pub provider: AgentProvider,
@@ -59,7 +70,7 @@ pub(crate) struct PermissionHookRequest {
     pub project: String,
     pub tool_name: String,
     /// Shell command extracted only for a provider's recognized command tool.
-    pub command: Option<String>,
+    pub command: Option<ShellCommandInput>,
     pub tool_use_id: Option<String>,
     pub provider_policy: ProviderPermissionPolicy,
 }
@@ -161,7 +172,7 @@ pub(super) fn permission_request(
     lifecycle: LifecycleIdentity,
     request_key: String,
     tool_name: String,
-    command: Option<String>,
+    command: Option<ShellCommandInput>,
     tool_use_id: Option<String>,
     provider_policy: ProviderPermissionPolicy,
 ) -> PermissionHookRequest {
@@ -344,6 +355,12 @@ const MAX_PARENT_DEPTH: usize = 16;
 const MAX_PARENT_RECORD_BYTES: usize = 4 * 1024;
 #[cfg(unix)]
 const PARENT_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(unix)]
+const CHILD_REAPER_QUEUE_CAPACITY: usize = 16;
+#[cfg(unix)]
+static BOUNDED_CHILD_REAPER: std::sync::OnceLock<
+    Option<std::sync::mpsc::SyncSender<std::process::Child>>,
+> = std::sync::OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct ParentProcessEvidence {
@@ -521,6 +538,7 @@ pub(crate) fn run_bounded_process(
     use std::process::Stdio;
     use std::time::Instant;
 
+    let child_reaper = bounded_child_reaper()?;
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     unsafe {
         command.pre_exec(|| {
@@ -535,7 +553,7 @@ pub(crate) fn run_bounded_process(
     let mut stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            terminate_process_group(&mut child);
+            terminate_process_group(child, child_reaper);
             return None;
         }
     };
@@ -543,7 +561,7 @@ pub(crate) fn run_bounded_process(
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
     {
-        terminate_process_group(&mut child);
+        terminate_process_group(child, child_reaper);
         return None;
     }
 
@@ -561,14 +579,14 @@ pub(crate) fn run_bounded_process(
                 Ok(read) => {
                     output.extend_from_slice(&chunk[..read]);
                     if output.len() > output_limit {
-                        terminate_process_group(&mut child);
+                        terminate_process_group(child, child_reaper);
                         return None;
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => {
-                    terminate_process_group(&mut child);
+                    terminate_process_group(child, child_reaper);
                     return None;
                 }
             }
@@ -578,12 +596,12 @@ pub(crate) fn run_bounded_process(
             Ok(Some(status)) if eof => return status.success().then_some(output),
             Ok(_) => {}
             Err(_) => {
-                terminate_process_group(&mut child);
+                terminate_process_group(child, child_reaper);
                 return None;
             }
         }
         if started.elapsed() >= timeout {
-            terminate_process_group(&mut child);
+            terminate_process_group(child, child_reaper);
             return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -591,7 +609,29 @@ pub(crate) fn run_bounded_process(
 }
 
 #[cfg(unix)]
-fn terminate_process_group(child: &mut std::process::Child) {
+fn bounded_child_reaper() -> Option<&'static std::sync::mpsc::SyncSender<std::process::Child>> {
+    BOUNDED_CHILD_REAPER
+        .get_or_init(|| {
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<std::process::Child>(CHILD_REAPER_QUEUE_CAPACITY);
+            std::thread::Builder::new()
+                .name("coding-brain-child-reaper".into())
+                .spawn(move || {
+                    while let Ok(mut child) = receiver.recv() {
+                        let _ = child.wait();
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+#[cfg(unix)]
+fn terminate_process_group(
+    mut child: std::process::Child,
+    child_reaper: &std::sync::mpsc::SyncSender<std::process::Child>,
+) {
     if let Ok(process_group) = i32::try_from(child.id()) {
         unsafe {
             libc::kill(-process_group, libc::SIGKILL);
@@ -604,6 +644,23 @@ fn terminate_process_group(child: &mut std::process::Child) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    handoff_or_wait(child, child_reaper);
+}
+
+#[cfg(unix)]
+fn handoff_or_wait(
+    child: std::process::Child,
+    child_reaper: &std::sync::mpsc::SyncSender<std::process::Child>,
+) {
+    match child_reaper.try_send(child) {
+        Ok(()) => {}
+        Err(
+            std::sync::mpsc::TrySendError::Full(mut child)
+            | std::sync::mpsc::TrySendError::Disconnected(mut child),
+        ) => {
+            let _ = child.wait();
+        }
     }
 }
 
@@ -839,5 +896,64 @@ mod tests {
             run_bounded_process(&mut command, Duration::from_millis(100), 4),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_reaper_is_process_wide_and_reaps() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let first = bounded_child_reaper().expect("reaper worker");
+        let second = bounded_child_reaper().expect("same reaper worker");
+        assert!(std::ptr::eq(first, second));
+
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        handoff_or_wait(child, first);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaper_handoff_failure_waits_instead_of_dropping_the_child() {
+        use std::process::Command;
+        use std::sync::mpsc;
+
+        for disconnected in [false, true] {
+            let (sender, receiver) = mpsc::sync_channel(0);
+            let receiver = if disconnected {
+                drop(receiver);
+                None
+            } else {
+                Some(receiver)
+            };
+            let child = Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap();
+            let pid = i32::try_from(child.id()).unwrap();
+
+            handoff_or_wait(child, &sender);
+
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            drop(receiver);
+        }
     }
 }

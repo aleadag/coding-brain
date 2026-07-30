@@ -6,9 +6,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    HookInputError, ParsedLifecycleHook, PermissionHookRequest, ProviderPermissionPolicy, identity,
-    linked_identity, normalized_outcome, optional_command, optional_id, permission_request,
-    permission_request_key,
+    HookInputError, ParsedLifecycleHook, PermissionHookRequest, ProviderPermissionPolicy,
+    ShellCommandInput, ShellDialect, identity, linked_identity, normalized_outcome,
+    optional_command, optional_id, permission_request, permission_request_key,
 };
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +65,10 @@ pub(crate) fn parse_permission(raw: &[u8]) -> Result<PermissionHookRequest, Hook
             .ok_or(HookInputError::Missing("tool_input.command"))
         })
         .transpose()?;
+    let command = command.map(|source| ShellCommandInput {
+        dialect: ShellDialect::Bash,
+        source,
+    });
     let lifecycle = match optional_id(input.agent_id, "agent_id")? {
         Some(agent_id) => linked_identity(
             AgentProvider::Codex,
@@ -191,6 +195,30 @@ mod tests {
             parse_permission(&serde_json::to_vec(&other_without_id).unwrap()).unwrap();
 
         assert_eq!(without_id.request_key, other_without_id.request_key);
+    }
+
+    #[test]
+    fn permission_normalizes_bash_authority_only_for_bash() {
+        let mut payload: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/hooks/permission-request.json"
+        ))
+        .unwrap();
+        payload["tool_name"] = "Bash".into();
+        payload["tool_input"] = serde_json::json!({ "command": "cargo test" });
+
+        let parsed = parse_permission(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(
+            parsed.command,
+            Some(ShellCommandInput {
+                dialect: ShellDialect::Bash,
+                source: "cargo test".into(),
+            })
+        );
+
+        payload["tool_name"] = "apply_patch".into();
+        payload["tool_input"] = serde_json::json!({ "patch": "*** Begin Patch" });
+        let parsed = parse_permission(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert!(parsed.command.is_none());
     }
 
     #[test]

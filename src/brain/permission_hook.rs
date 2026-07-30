@@ -30,7 +30,9 @@ use super::query::{self, BrainDecision, BrainDecisionRequest};
 use super::safety::SafetyDeny;
 use crate::config::BrainConfig;
 use crate::lifecycle_hook::read_bounded_hook_input;
-use crate::provider_hooks::{PermissionHookRequest, ProviderPermissionPolicy, parse_permission};
+use crate::provider_hooks::{
+    PermissionHookRequest, ProviderPermissionPolicy, ShellCommandInput, parse_permission,
+};
 
 const HOOK_INFERENCE_TIMEOUT_MS: u64 = 25_000;
 static ACTIVITY_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -160,11 +162,13 @@ impl HookActivity {
             tool: request.tool_name.clone(),
             command: request
                 .command
-                .as_deref()
+                .as_ref()
+                .map(|command| command.source.as_str())
                 .map(bounded_redacted_activity_text),
             terminal_command: request
                 .command
-                .as_deref()
+                .as_ref()
+                .map(|command| command.source.as_str())
                 .and_then(lossless_redacted_activity_text),
         })
     }
@@ -302,6 +306,14 @@ where
         },
         brain: Some(brain),
         reason,
+    }
+}
+
+fn abstain_without_brain(reason: &str) -> HookEvaluation {
+    HookEvaluation::Abstain {
+        brain: None,
+        reason: reason.into(),
+        terminal_state: ActivityState::Abstained,
     }
 }
 
@@ -497,8 +509,8 @@ fn run_with_gate_and_stores<R, W, E, F>(
 #[allow(clippy::too_many_arguments)]
 fn run_provider_with_gate_and_stores<R, W, E, F>(
     stdin: R,
-    mut stdout: W,
-    mut stderr: E,
+    stdout: W,
+    stderr: E,
     config: Option<&BrainConfig>,
     gate_mode: BrainGateMode,
     lifecycle_store: &LifecycleStore,
@@ -510,6 +522,45 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
     R: Read,
     W: Write,
     E: Write,
+    F: FnOnce(&BrainConfig, &str) -> Result<BrainSuggestion, String>,
+{
+    #[cfg(not(test))]
+    let safety_evaluator = super::safety::evaluate_isolated;
+    #[cfg(test)]
+    let safety_evaluator = super::safety::evaluate_in_process;
+    run_provider_with_gate_and_stores_and_safety(
+        stdin,
+        stdout,
+        stderr,
+        config,
+        gate_mode,
+        lifecycle_store,
+        activity_store,
+        provider,
+        antigravity_event,
+        safety_evaluator,
+        infer,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_provider_with_gate_and_stores_and_safety<R, W, E, S, F>(
+    stdin: R,
+    mut stdout: W,
+    mut stderr: E,
+    config: Option<&BrainConfig>,
+    gate_mode: BrainGateMode,
+    lifecycle_store: &LifecycleStore,
+    activity_store: Option<&ActivityStore>,
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+    safety_evaluator: S,
+    infer: F,
+) where
+    R: Read,
+    W: Write,
+    E: Write,
+    S: FnOnce(Option<&ShellCommandInput>) -> super::safety::SafetyEvaluation,
     F: FnOnce(&BrainConfig, &str) -> Result<BrainSuggestion, String>,
 {
     let input = match read_bounded_hook_input(stdin) {
@@ -562,43 +613,51 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
     let brain_request = BrainDecisionRequest {
         project: request.project.clone(),
         tool_name: request.tool_name.clone(),
-        tool_input: request.command.clone().unwrap_or_default(),
+        tool_input: request
+            .command
+            .as_ref()
+            .map(|command| command.source.clone())
+            .unwrap_or_default(),
         diff_digest: None,
     };
     // This is the authoritative deterministic safety and provider-policy
     // boundary; evaluate_request performs model evaluation only.
-    let evaluation = if let Some(safety) = super::safety::evaluate(request.command.as_deref()) {
-        HookEvaluation::Deny {
+    let safety_evaluation = safety_evaluator(request.command.as_ref());
+    let evaluation = match safety_evaluation {
+        super::safety::SafetyEvaluation::Deny(safety) => HookEvaluation::Deny {
             brain: None,
             deterministic: true,
             safety: Some(safety),
             terminal_state: ActivityState::Denied,
-        }
-    } else if request.provider_policy == ProviderPermissionPolicy::Denies {
-        HookEvaluation::Deny {
+        },
+        _ if request.provider_policy == ProviderPermissionPolicy::Denies => HookEvaluation::Deny {
             brain: None,
             deterministic: true,
             safety: None,
             terminal_state: ActivityState::Denied,
+        },
+        super::safety::SafetyEvaluation::Indeterminate(error) => {
+            abstain_without_brain(error.reason())
         }
-    } else {
-        let model_evaluation = evaluate_request(
-            &brain_request,
-            config,
-            gate_mode,
-            persistence_error.as_deref(),
-            request.command.is_some(),
-            infer,
-        );
-        match (request.provider_policy, model_evaluation) {
-            (ProviderPermissionPolicy::RequiresAsk, HookEvaluation::Allow { brain, .. }) => {
-                HookEvaluation::Abstain {
-                    brain: Some(brain),
-                    reason: "provider permission policy requires confirmation".into(),
-                    terminal_state: ActivityState::Abstained,
+        super::safety::SafetyEvaluation::NoDeterministicDecision => {
+            let model_evaluation = evaluate_request(
+                &brain_request,
+                config,
+                gate_mode,
+                persistence_error.as_deref(),
+                request.command.is_some(),
+                infer,
+            );
+            match (request.provider_policy, model_evaluation) {
+                (ProviderPermissionPolicy::RequiresAsk, HookEvaluation::Allow { brain, .. }) => {
+                    HookEvaluation::Abstain {
+                        brain: Some(brain),
+                        reason: "provider permission policy requires confirmation".into(),
+                        terminal_state: ActivityState::Abstained,
+                    }
                 }
+                (_, evaluation) => evaluation,
             }
-            (_, evaluation) => evaluation,
         }
     };
     if let HookEvaluation::Deny {
@@ -1126,6 +1185,33 @@ mod tests {
         .to_string()
     }
 
+    fn permission_payload_for_provider(provider: AgentProvider, provider_deny: bool) -> Vec<u8> {
+        let cwd = std::env::current_dir().unwrap();
+        let mut payload: serde_json::Value = match provider {
+            AgentProvider::Codex => serde_json::from_str(&payload()).unwrap(),
+            AgentProvider::Claude => serde_json::from_slice(include_bytes!(
+                "../../tests/fixtures/hooks/claude-permission-request.json"
+            ))
+            .unwrap(),
+            AgentProvider::Antigravity => serde_json::from_slice(include_bytes!(
+                "../../tests/fixtures/hooks/antigravity-pre-tool-use.json"
+            ))
+            .unwrap(),
+        };
+        match provider {
+            AgentProvider::Codex | AgentProvider::Claude => {
+                payload["cwd"] = serde_json::json!(cwd);
+            }
+            AgentProvider::Antigravity => {
+                payload["workspacePaths"] = serde_json::json!([cwd]);
+            }
+        }
+        if provider_deny {
+            payload["permission_suggestions"] = serde_json::json!([{ "behavior": "deny" }]);
+        }
+        serde_json::to_vec(&payload).unwrap()
+    }
+
     fn suggestion(action: RuleAction, confidence: f64) -> BrainSuggestion {
         BrainSuggestion {
             action,
@@ -1187,7 +1273,13 @@ mod tests {
         assert_eq!(request.lifecycle.turn_id(), Some("turn-1"));
         assert_eq!(request.lifecycle.cwd(), std::env::current_dir().unwrap());
         assert_eq!(request.tool_name, "Bash");
-        assert_eq!(request.command.as_deref(), Some("cargo test"));
+        assert_eq!(
+            request
+                .command
+                .as_ref()
+                .map(|command| command.source.as_str()),
+            Some("cargo test")
+        );
         assert_eq!(request.project, expected_project());
     }
 
@@ -1433,7 +1525,13 @@ mod tests {
 
         let request = parse_request(&input.to_string()).unwrap();
 
-        assert_eq!(request.command.as_deref(), Some("  cargo test --lib  "));
+        assert_eq!(
+            request
+                .command
+                .as_ref()
+                .map(|command| command.source.as_str()),
+            Some("  cargo test --lib  ")
+        );
     }
 
     #[test]
@@ -1653,6 +1751,135 @@ mod tests {
         let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         assert_eq!(output["hookSpecificOutput"]["decision"]["behavior"], "deny");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn every_indeterminate_shell_analysis_preserves_native_confirmation_without_inference() {
+        for error in [
+            super::super::safety::ShellAnalysisError::UnsupportedDialect,
+            super::super::safety::ShellAnalysisError::UnsupportedSyntax,
+            super::super::safety::ShellAnalysisError::ResourceLimit,
+            super::super::safety::ShellAnalysisError::HelperFailure,
+        ] {
+            for provider in [
+                AgentProvider::Codex,
+                AgentProvider::Claude,
+                AgentProvider::Antigravity,
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+                let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+                let input = permission_payload_for_provider(provider, false);
+                if provider == AgentProvider::Antigravity {
+                    let identity = LifecycleIdentity::try_new(
+                        AgentProvider::Antigravity,
+                        "agy-conversation-1".into(),
+                        Some("invocation-1".into()),
+                        Some("/tmp/agy-conversation-1/transcript.jsonl".into()),
+                        std::env::current_dir().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        lifecycle
+                            .record(
+                                LifecycleEvent::from_parts_with_turn_initial_step(
+                                    identity,
+                                    LifecycleEventKind::UserPromptSubmit,
+                                    Some(5),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap(),
+                        ApplyOutcome::Applied
+                    );
+                }
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+
+                run_provider_with_gate_and_stores_and_safety(
+                    Cursor::new(input),
+                    &mut stdout,
+                    &mut stderr,
+                    Some(&enabled_config()),
+                    BrainGateMode::Auto,
+                    &lifecycle,
+                    Some(&activity),
+                    provider,
+                    (provider == AgentProvider::Antigravity).then_some("PreToolUse"),
+                    |_| super::super::safety::SafetyEvaluation::Indeterminate(error),
+                    |_, _| panic!("indeterminate shell analysis must not invoke the model"),
+                );
+
+                if provider == AgentProvider::Antigravity {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&stdout).unwrap()["decision"],
+                        "ask",
+                        "{error:?}"
+                    );
+                } else {
+                    assert!(stdout.is_empty(), "{provider:?}: {error:?}");
+                }
+                assert!(
+                    stderr.is_empty(),
+                    "{provider:?}: {error:?}: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+                assert!(
+                    activity
+                        .read()
+                        .unwrap()
+                        .events()
+                        .iter()
+                        .any(|event| event.state == ActivityState::Abstained),
+                    "{provider:?}: {error:?}"
+                );
+                let session_id = match provider {
+                    AgentProvider::Codex => "session-1",
+                    AgentProvider::Claude => "claude-session-1",
+                    AgentProvider::Antigravity => "agy-conversation-1",
+                };
+                let key =
+                    coding_brain_core::provider::AgentSessionKey::native(provider, session_id)
+                        .storage_key();
+                assert_eq!(
+                    lifecycle.read().unwrap().snapshot.unwrap().sessions[&key].projected_status,
+                    Some(ProjectedStatus::NeedsInput),
+                    "{provider:?}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_policy_deny_precedes_indeterminate_shell_analysis() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+        let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let input = permission_payload_for_provider(AgentProvider::Claude, true);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_provider_with_gate_and_stores_and_safety(
+            Cursor::new(input),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            AgentProvider::Claude,
+            None,
+            |_| {
+                super::super::safety::SafetyEvaluation::Indeterminate(
+                    super::super::safety::ShellAnalysisError::UnsupportedSyntax,
+                )
+            },
+            |_, _| panic!("provider deny must not invoke the model"),
+        );
+
+        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert!(stderr.is_empty());
     }
 
     #[test]
@@ -2225,13 +2452,12 @@ mod tests {
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            let mut releases = Vec::new();
+            let mut workers = Vec::new();
             for payload in payloads {
                 let ready_tx = ready_tx.clone();
                 let (release_tx, release_rx) = mpsc::sync_channel(0);
-                releases.push(release_tx);
-                handles.push(scope.spawn(move || {
+                let (result_tx, result_rx) = mpsc::sync_channel(0);
+                let handle = scope.spawn(move || {
                     let mut stdout = Vec::new();
                     let mut stderr = Vec::new();
                     run_with_gate_and_stores(
@@ -2248,20 +2474,21 @@ mod tests {
                             Ok(suggestion(RuleAction::Approve, 0.9))
                         },
                     );
-                    (stdout, stderr)
-                }));
+                    result_tx.send((stdout, stderr)).unwrap();
+                });
+                workers.push((release_tx, result_rx, handle));
             }
             drop(ready_tx);
             for _ in payloads {
                 ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             }
-            for release in releases {
+            let mut results = Vec::with_capacity(workers.len());
+            for (release, result, handle) in workers {
                 release.send(()).unwrap();
+                results.push(result.recv_timeout(Duration::from_secs(5)).unwrap());
+                handle.join().unwrap();
             }
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect()
+            results
         })
     }
 

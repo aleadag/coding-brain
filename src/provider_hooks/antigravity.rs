@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use super::{HookInputError, ParsedLifecycleHook, identity, optional_id, required};
 use super::{
-    PermissionHookRequest, ProviderPermissionPolicy, optional_command, permission_request,
-    permission_request_key,
+    PermissionHookRequest, ProviderPermissionPolicy, ShellCommandInput, ShellDialect,
+    optional_command, permission_request, permission_request_key,
 };
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +100,10 @@ pub(crate) fn parse_permission(
             .ok_or(HookInputError::Missing("toolCall.args.CommandLine"))
         })
         .transpose()?;
+    let command = command.map(|source| ShellCommandInput {
+        dialect: ShellDialect::Bash,
+        source,
+    });
     let overrides_require_ask = overrides_present
         && !input
             .permission_overrides
@@ -401,5 +405,26 @@ mod tests {
         assert_eq!(first.request_key.len(), 64);
         assert!(!first.request_key.contains("cargo test"));
         assert_ne!(first.request_key, changed.request_key);
+    }
+
+    #[test]
+    fn permission_normalizes_bash_authority_only_for_run_command() {
+        let mut payload: Value = serde_json::from_slice(PRE_TOOL_USE).unwrap();
+
+        let parsed =
+            parse_permission(Some("PreToolUse"), &serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(
+            parsed.command,
+            Some(ShellCommandInput {
+                dialect: ShellDialect::Bash,
+                source: "cargo test".into(),
+            })
+        );
+
+        payload["toolCall"]["name"] = "view_file".into();
+        payload["toolCall"]["args"] = serde_json::json!({ "path": "/tmp/example" });
+        let parsed =
+            parse_permission(Some("PreToolUse"), &serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert!(parsed.command.is_none());
     }
 }
