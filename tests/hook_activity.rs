@@ -945,6 +945,62 @@ fn append_assignment_bypasses_are_denied_before_model_inference_for_every_provid
 }
 
 #[test]
+fn home_alias_field_splitting_is_respected_for_every_provider() {
+    for provider in [
+        AgentProvider::Codex,
+        AgentProvider::Claude,
+        AgentProvider::Antigravity,
+    ] {
+        for quoted in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let fake_model = install_model_fixture(home.path(), "approve");
+            if provider == AgentProvider::Antigravity {
+                seed_antigravity_invocation(home.path(), 5);
+            }
+            let home_text = home.path().to_str().unwrap();
+            let split = home_text
+                .char_indices()
+                .next_back()
+                .expect("temporary HOME must not be empty")
+                .0;
+            let target = if quoted { "\"$X\"" } else { "$X" };
+            let command = format!(
+                "IFS=/; X='{}'; X+='{}'; rm -rf {target}",
+                &home_text[..split],
+                &home_text[split..]
+            );
+            let (provider_name, event, payload) =
+                shell_permission_payload(home.path(), provider, &command, None);
+
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+            assert!(output.status.success(), "{provider:?}: {command}");
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let expected_decision = if quoted { "deny" } else { "allow" };
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(
+                    response["decision"], expected_decision,
+                    "{provider:?}: {command}"
+                );
+            } else {
+                assert_eq!(
+                    response["hookSpecificOutput"]["decision"]["behavior"], expected_decision,
+                    "{provider:?}: {command}"
+                );
+            }
+            assert_eq!(
+                fake_model.request_count(),
+                u64::from(!quoted),
+                "{provider:?}: {command}"
+            );
+            if quoted {
+                assert_safety_deny(home.path(), "irreversible-home-delete");
+            }
+        }
+    }
+}
+
+#[test]
 fn literal_home_delete_denies_before_model_inference_for_every_provider() {
     for provider in [
         AgentProvider::Codex,

@@ -424,8 +424,9 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
             if word_is_home_target(target, &command_assignments) {
                 return canonical_deny("irreversible-home-delete");
             }
-            if resolve_word(target, &command_assignments)
-                .is_some_and(|resolved| literal_home_target(&resolved))
+            if !target.can_split_fields
+                && resolve_word(target, &command_assignments)
+                    .is_some_and(|resolved| literal_home_target(&resolved))
             {
                 return canonical_deny("irreversible-home-delete");
             }
@@ -1722,6 +1723,31 @@ mod tests {
         );
         let deny = evaluate_command(&command).unwrap_or_else(|| panic!("{command}"));
         assert_eq!(deny.rule_id, "irreversible-home-delete", "{command}");
+    }
+
+    #[test]
+    fn home_alias_classification_respects_field_splitting() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = std::env::var("HOME").expect("test requires UTF-8 HOME");
+        let split = home
+            .char_indices()
+            .next_back()
+            .expect("HOME must not be empty")
+            .0;
+        let assignment = format!("X='{}'; X+='{}'", &home[..split], &home[split..]);
+
+        let split_alias = format!("IFS=/; {assignment}; rm -rf $X");
+        assert!(evaluate_command(&split_alias).is_none(), "{split_alias}");
+
+        for command in [
+            format!("{assignment}; rm -rf \"$X\""),
+            "rm -rf $HOME".to_string(),
+        ] {
+            let deny = evaluate_command(&command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(deny.rule_id, "irreversible-home-delete", "{command}");
+        }
     }
 
     #[test]
