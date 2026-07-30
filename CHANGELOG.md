@@ -45,14 +45,16 @@ All notable changes to Coding Brain are documented here.
   model inference. Parameter-origin absolute pathname patterns with lexical `.`
   or `..` components, or bracket expressions assembled across an unquoted
   parameter and adjacent literal fragments, fail closed when they could reach
-  the trusted home directory; quoted values and literal-suffix controls remain
-  literal. The helper requires explicit, bounded UTF-8 home-directory context
-  before construction or spawn and clears its environment. Its two-second
-  execution timeout is followed by at most 250 ms of synchronous process
-  cleanup. A process-wide bounded reaper owns any still-unreaped child;
-  saturated or disconnected handoff falls back to synchronous waiting.
-  Unsupported syntax preserves provider-native confirmation. Nested `sh -c`
-  and `eval` inspection remains tracked separately.
+  the trusted home directory. Scalar `+=` assignments now retain known prior
+  values, and resolved variable aliases of the trusted home are denied before
+  model inference; quoted values and literal-suffix controls remain literal.
+  The helper requires explicit, bounded UTF-8 home-directory context before
+  construction or spawn and clears its environment. Its two-second execution
+  timeout is followed by at most 250 ms of synchronous process cleanup. A
+  process-wide bounded reaper owns any still-unreaped child; saturated or
+  disconnected handoff falls back to synchronous waiting. Unsupported syntax
+  preserves provider-native confirmation. Nested `sh -c` and `eval` inspection
+  remains tracked separately.
 - Release tags now rerun formatting, Clippy, and all-target tests before
   publishing. The curl installer now requires a valid release checksum and a
   supported verifier before extracting or installing the binary.
