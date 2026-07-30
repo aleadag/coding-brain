@@ -224,6 +224,16 @@ fn run_provider_permission_hook(
     antigravity_event: Option<&str>,
     payload: &[u8],
 ) -> Output {
+    run_provider_permission_hook_from(home, home, provider, antigravity_event, payload)
+}
+
+fn run_provider_permission_hook_from(
+    home: &Path,
+    cwd: &Path,
+    provider: &str,
+    antigravity_event: Option<&str>,
+    payload: &[u8],
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command.args(["--permission-hook", "--provider", provider]);
     if let Some(event) = antigravity_event {
@@ -234,7 +244,7 @@ fn run_provider_permission_hook(
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_STATE_HOME", home.join(".local/state"))
         .env("PATH", isolated_path(home))
-        .current_dir(home)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -945,13 +955,13 @@ fn append_assignment_bypasses_are_denied_before_model_inference_for_every_provid
 }
 
 #[test]
-fn home_alias_field_splitting_is_respected_for_every_provider() {
+fn home_alias_field_splitting_is_denied_before_model_inference_for_every_provider() {
     for provider in [
         AgentProvider::Codex,
         AgentProvider::Claude,
         AgentProvider::Antigravity,
     ] {
-        for quoted in [false, true] {
+        for case in ["reported root cwd", "shell changes cwd"] {
             let home = tempfile::tempdir().unwrap();
             let fake_model = install_model_fixture(home.path(), "approve");
             if provider == AgentProvider::Antigravity {
@@ -963,39 +973,44 @@ fn home_alias_field_splitting_is_respected_for_every_provider() {
                 .next_back()
                 .expect("temporary HOME must not be empty")
                 .0;
-            let target = if quoted { "\"$X\"" } else { "$X" };
-            let command = format!(
-                "IFS=/; X='{}'; X+='{}'; rm -rf {target}",
-                &home_text[..split],
-                &home_text[split..]
-            );
+            let assignment = format!("X='{}'; X+='{}'", &home_text[..split], &home_text[split..]);
+            let (command, command_cwd, hook_cwd) = match case {
+                "reported root cwd" => (
+                    format!("IFS=/; {assignment}; rm -rf $X"),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "shell changes cwd" => (
+                    format!("cd /; IFS=/; {assignment}; rm -rf $X"),
+                    home.path(),
+                    home.path(),
+                ),
+                _ => unreachable!(),
+            };
             let (provider_name, event, payload) =
-                shell_permission_payload(home.path(), provider, &command, None);
+                shell_permission_payload(command_cwd, provider, &command, None);
 
-            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
-
-            assert!(output.status.success(), "{provider:?}: {command}");
-            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            let expected_decision = if quoted { "deny" } else { "allow" };
-            if provider == AgentProvider::Antigravity {
-                assert_eq!(
-                    response["decision"], expected_decision,
-                    "{provider:?}: {command}"
-                );
-            } else {
-                assert_eq!(
-                    response["hookSpecificOutput"]["decision"]["behavior"], expected_decision,
-                    "{provider:?}: {command}"
-                );
-            }
-            assert_eq!(
-                fake_model.request_count(),
-                u64::from(!quoted),
-                "{provider:?}: {command}"
+            let output = run_provider_permission_hook_from(
+                home.path(),
+                hook_cwd,
+                provider_name,
+                event,
+                &payload,
             );
-            if quoted {
-                assert_safety_deny(home.path(), "irreversible-home-delete");
-            }
+
+            assert!(output.status.success(), "{provider:?}: {case}: {command}");
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let decision = if provider == AgentProvider::Antigravity {
+                response["decision"].as_str()
+            } else {
+                response["hookSpecificOutput"]["decision"]["behavior"].as_str()
+            };
+            assert_eq!(
+                (decision, fake_model.request_count()),
+                (Some("deny"), 0),
+                "{provider:?}: {case}: {command}"
+            );
+            assert_safety_deny(home.path(), "irreversible-home-delete");
         }
     }
 }

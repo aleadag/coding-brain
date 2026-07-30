@@ -424,9 +424,8 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
             if word_is_home_target(target, &command_assignments) {
                 return canonical_deny("irreversible-home-delete");
             }
-            if !target.can_split_fields
-                && resolve_word(target, &command_assignments)
-                    .is_some_and(|resolved| literal_home_target(&resolved))
+            if resolve_word(target, &command_assignments)
+                .is_some_and(|resolved| literal_home_target(&resolved))
             {
                 return canonical_deny("irreversible-home-delete");
             }
@@ -1739,7 +1738,8 @@ mod tests {
         let assignment = format!("X='{}'; X+='{}'", &home[..split], &home[split..]);
 
         let split_alias = format!("IFS=/; {assignment}; rm -rf $X");
-        assert!(evaluate_command(&split_alias).is_none(), "{split_alias}");
+        let deny = evaluate_command(&split_alias).unwrap_or_else(|| panic!("{split_alias}"));
+        assert_eq!(deny.rule_id, "irreversible-home-delete", "{split_alias}");
 
         for command in [
             format!("{assignment}; rm -rf \"$X\""),
