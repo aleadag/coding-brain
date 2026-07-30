@@ -104,3 +104,153 @@ documentation, version, commit, or publication change is included.
 - Overall: High
 - Areas of concern: conservative false denial remains intentional until cwd and
   directory changes can be modeled soundly.
+
+## Reopened Descendant-Path Amendment
+
+### Context
+
+The exact-HOME guard merged in `d9775909` still allows a recursively deleted,
+field-splittable alias that resolves below trusted `HOME`. For example, with
+`HOME=/home/alexander`, `IFS=/; X=/home/alexander/safe; rm -rf $X` produces
+relative fields. From `/`, `home` resolves to the trusted HOME parent `/home`;
+from `/home`, `alexander` resolves to trusted HOME itself. The evaluator has no
+trusted cwd or shell directory-state model, so it cannot prove either execution
+safe.
+
+### Decision
+
+Keep exact-HOME denial unchanged. Additionally, when a dynamic target can split
+fields, classify the executed fields against trusted `HOME` and its lexical
+ancestors before model inference.
+
+An absolute field is dangerous when it is trusted `HOME` or a lexical ancestor
+of trusted `HOME`. A relative field is dangerous when its normalized component
+sequence can complete a lexical prefix of trusted `HOME` to trusted `HOME` or
+one of its ancestors. For `HOME=/home/alexander`, this includes `home`,
+`alexander`, and `home/alexander`. Cwd-dependent parent traversal that cannot be
+proven safe retains the existing unresolved-expansion denial.
+
+Do not deny a quoted alias merely because it resolves to a HOME descendant:
+without field splitting, recursively deleting that descendant does not imply
+deleting HOME or its parent. Preserve unrelated splittable-path controls such
+as `/tmp/safe`.
+
+Do not add cwd to provider schemas, `ShellCommandInput`, or the isolated-helper
+protocol. Full cwd and shell-state modeling remains outside this fix.
+
+### Code and Tests
+
+- Add one bounded lexical helper or equivalent comparison that classifies
+  already-resolved fields without filesystem access or hypothetical cwd
+  enumeration.
+- Apply the executed-field reachability check only to field-splittable targets;
+  retain the existing exact-HOME guard for all resolved targets and the
+  existing fail-closed result for unresolved fields.
+- Extend the safety unit regression with assignment and append-assignment HOME
+  descendants, a non-descendant value whose split field can target a HOME
+  ancestor, plus quoted-descendant and non-HOME controls.
+- Extend the real Codex, Claude, and Antigravity permission-hook regression with
+  exact-HOME, descendant, append-built descendant, and non-descendant
+  ancestor-reaching aliases executed from `/` and `/home`.
+- Assert every unsafe case denies before model inference and records
+  `irreversible-home-delete`.
+
+### Verification
+
+Use RED-GREEN TDD. First add the executed-field unit and provider regressions
+and confirm the current implementation reaches no deterministic decision and
+the approving model. Then add only the bounded lexical field classification,
+rerun the focused tests, the prior shell-safety corpus, and the full serial
+formatting, test, Clippy-with-warnings-denied, and build gates.
+
+### Scope
+
+Production and regression changes remain limited to `src/brain/safety.rs` and
+`tests/hook_activity.rs`. This amendment does not change configuration,
+provider payloads, helper protocols, public documentation, versions, commits,
+or publication.
+
+## Stress Test Results: XA99 Executed Split-Field Reachability
+
+### Resolved Decisions
+
+- Use lexical normalization without filesystem canonicalization or symlink
+  resolution.
+- Classify executed split fields rather than only the unsplit resolved word;
+  this covers HOME descendants and non-descendant values that yield a HOME
+  ancestor field.
+- Gate the new reachability analysis on field splitting. Preserve quoted alias
+  behavior and every existing non-splitting classification.
+- Reuse the existing assignment map and field resolver for direct and append
+  assignments.
+- Preserve fail-closed unresolved-field behavior and do not fall back to model
+  inference.
+- Keep cwd and provider/helper protocols unchanged; initial cwd alone cannot
+  safely model shell directory changes.
+- Require exact, descendant, append-built, ancestor-reaching, quoted, and safe
+  non-HOME cases at the unit and all-provider boundaries.
+- Treat absolute HOME/ancestor fields, relative HOME-prefix completions, and
+  unprovable parent traversal as unsafe.
+- Keep analysis bounded to existing fields and lexical HOME components.
+
+### Changes Made
+
+- Replaced the descendant-only full-word guard with an executed-field
+  reachability invariant.
+- Added the non-descendant shared-ancestor bypass to the required regression
+  matrix.
+- Made the resource-bound and unresolved-field behavior explicit.
+
+### Deferred / Parking Lot
+
+- Complete cwd-aware shell-state modeling remains separate work.
+- Filesystem-dependent path and symlink interpretation remains outside the
+  isolated lexical evaluator.
+
+### Confidence Assessment
+
+- Overall: High
+- Areas of concern: conservative false denial remains intentional for relative
+  parent traversal because the evaluator has no trusted cwd.
+
+## Final-Review Pathname Normalization Amendment
+
+### Context
+
+The first executed-field implementation normalized candidate path components
+but compared active pathname patterns using their original spelling. From
+trusted HOME's parent, `./alex*` can expand to `./alexander`, yet comparing the
+former with normalized candidate `alexander` misses the HOME target. Repeated
+separators have the same mismatch. The whole-path conservative envelope also
+treated a suffix beginning with `/` as automatically compatible, falsely
+denying a multi-component control such as `home*/safe`.
+
+The isolated boundary also accepted empty or relative UTF-8 HOME values even
+though every HOME ancestry predicate requires an absolute path.
+
+### Decision
+
+- Normalize pathname patterns and candidate paths into lexical components
+  before comparison. Compare ordinary pattern components only with their
+  corresponding candidate components.
+- Because trusted shell-option state is unavailable, conservatively account for
+  `globstar` by allowing an active `**` component to consume zero or more
+  candidate components, and account for `nocaseglob` by accepting either
+  case-sensitive or case-folded component compatibility.
+- Test absolute patterns against every non-root HOME prefix and relative
+  patterns against every nonempty contiguous suffix of those prefixes. Do not
+  use the textual pattern component count to exclude a candidate before
+  `globstar` matching.
+- Preserve fail-closed parent-traversal handling and avoid filesystem access,
+  canonicalization, or cwd inference.
+- Require the trusted HOME context to be nonempty, absolute, bounded, and UTF-8
+  before constructing the isolated helper.
+- Add RED-GREEN unit coverage for `./` and repeated-separator patterns, relative
+  HOME validation, and the shared-prefix/suffix-mismatch control. Exercise the
+  normalized relative pattern and safe suffix control through Codex, Claude,
+  and Antigravity with model-request assertions. Cover option-modified
+  `globstar` and `nocaseglob` HOME patterns, including a `globstar` match of
+  HOME's ancestor, at the same boundary.
+
+No provider payload, helper protocol, configuration, public documentation, or
+version change is included.

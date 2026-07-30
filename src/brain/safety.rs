@@ -122,7 +122,11 @@ fn validate_trusted_home_context(home: Option<OsString>) -> Result<OsString, She
     use std::os::unix::ffi::OsStrExt;
 
     let home = home.ok_or(ShellAnalysisError::HelperFailure)?;
-    if home.as_os_str().as_bytes().len() > MAX_TRUSTED_HOME_BYTES || home.to_str().is_none() {
+    if home.as_os_str().is_empty()
+        || !Path::new(&home).is_absolute()
+        || home.as_os_str().as_bytes().len() > MAX_TRUSTED_HOME_BYTES
+        || home.to_str().is_none()
+    {
         return Err(ShellAnalysisError::HelperFailure);
     }
     Ok(home)
@@ -429,6 +433,13 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
             {
                 return canonical_deny("irreversible-home-delete");
             }
+            if split_target_may_reach_home_or_ancestor(
+                target,
+                &command_assignments,
+                command_ifs_unknown,
+            ) {
+                return canonical_deny("irreversible-home-delete");
+            }
             if dynamic_target_is_dangerous(target, &command_assignments, command_ifs_unknown) {
                 return expansion_target_deny();
             }
@@ -478,6 +489,120 @@ fn literal_home_target(target: &str) -> bool {
         .is_some_and(|home| target == home)
 }
 
+fn split_target_may_reach_home_or_ancestor(
+    target: &shell::ShellWord,
+    assignments: &HashMap<String, String>,
+    ifs_unknown: bool,
+) -> bool {
+    if !target.can_split_fields {
+        return false;
+    }
+    resolve_word_fields(target, assignments, ifs_unknown).is_some_and(|fields| {
+        fields.iter().any(|field| {
+            !parameter_pattern_may_match_home(field)
+                && split_field_may_reach_home_or_ancestor(field)
+        })
+    })
+}
+
+fn split_field_may_reach_home_or_ancestor(field: &ResolvedField) -> bool {
+    let Some(home) =
+        std::env::var_os("HOME").and_then(|home| lexical_absolute_parts(Path::new(&home)))
+    else {
+        return false;
+    };
+    let path = Path::new(&field.value);
+    if let Some(parts) = lexical_absolute_parts(path) {
+        return !parts.is_empty()
+            && ((parts.len() <= home.len() && home.starts_with(&parts))
+                || (1..=home.len()).any(|ancestor_len| {
+                    split_field_pattern_may_match_parts(field, &home[..ancestor_len], true)
+                }));
+    }
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_os_string()),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    !parts.is_empty()
+        && ((1..=home.len()).any(|ancestor_len| {
+            let ancestor = &home[..ancestor_len];
+            parts.len() <= ancestor.len() && ancestor.ends_with(&parts)
+        }) || (1..=home.len()).any(|ancestor_len| {
+            (0..ancestor_len).any(|start| {
+                split_field_pattern_may_match_parts(field, &home[start..ancestor_len], false)
+            })
+        }))
+}
+
+fn split_field_pattern_may_match_parts(
+    field: &ResolvedField,
+    parts: &[OsString],
+    absolute: bool,
+) -> bool {
+    if !field.parameter_pathname_pattern {
+        return false;
+    }
+    let Some(candidate_parts) = parts
+        .iter()
+        .map(|part| part.to_str())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let Some((pattern_absolute, pattern_parts)) = lexical_pattern_parts(&field.value) else {
+        return false;
+    };
+    pattern_absolute == absolute && pattern_components_may_match(&pattern_parts, &candidate_parts)
+}
+
+fn lexical_pattern_parts(pattern: &str) -> Option<(bool, Vec<String>)> {
+    let mut absolute = false;
+    let mut parts = Vec::new();
+    for component in Path::new(pattern).components() {
+        match component {
+            Component::RootDir => absolute = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::Normal(part) => parts.push(part.to_str()?.to_string()),
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some((absolute, parts))
+}
+
+fn pattern_components_may_match(patterns: &[String], candidates: &[&str]) -> bool {
+    let Some(first_globstar) = patterns.iter().position(|part| part == "**") else {
+        return patterns.len() == candidates.len()
+            && patterns
+                .iter()
+                .zip(candidates)
+                .all(|(pattern, candidate)| pattern_may_match_literal(pattern, candidate));
+    };
+    let last_globstar = patterns
+        .iter()
+        .rposition(|part| part == "**")
+        .unwrap_or(first_globstar);
+    let prefix = &patterns[..first_globstar];
+    let suffix = &patterns[last_globstar + 1..];
+    prefix.len() + suffix.len() <= candidates.len()
+        && prefix
+            .iter()
+            .zip(candidates)
+            .all(|(pattern, candidate)| pattern_may_match_literal(pattern, candidate))
+        && suffix
+            .iter()
+            .rev()
+            .zip(candidates.iter().rev())
+            .all(|(pattern, candidate)| pattern_may_match_literal(pattern, candidate))
+}
+
 fn lexical_absolute_parts(path: &Path) -> Option<Vec<OsString>> {
     let mut absolute = false;
     let mut parts = Vec::new();
@@ -506,6 +631,10 @@ fn dynamic_target_is_dangerous(
                 is_root_target(&field.value)
                     || literal_home_target(&field.value)
                     || parameter_pattern_may_match_home(field)
+                    || (!Path::new(&field.value).is_absolute()
+                        && Path::new(&field.value)
+                            .components()
+                            .any(|component| component == Component::ParentDir))
             })
         });
     }
@@ -668,10 +797,15 @@ fn append_quoted_pathname_text(syntax: &mut String, text: &str) {
 }
 
 fn parameter_pattern_may_match_home(field: &ResolvedField) -> bool {
-    field.parameter_pathname_pattern
-        && std::env::var("HOME")
-            .ok()
-            .is_some_and(|home| pattern_may_match_literal(&field.value, &home))
+    if !field.parameter_pathname_pattern {
+        return false;
+    }
+    let Some(home) =
+        std::env::var_os("HOME").and_then(|home| lexical_absolute_parts(Path::new(&home)))
+    else {
+        return false;
+    };
+    split_field_pattern_may_match_parts(field, &home, true)
 }
 
 fn parameter_pattern_may_supply_flag(field: &ResolvedField) -> bool {
@@ -683,15 +817,17 @@ fn parameter_pattern_may_supply_flag(field: &ResolvedField) -> bool {
 }
 
 fn pattern_may_match_literal(pattern: &str, literal: &str) -> bool {
+    pattern_may_match_literal_case(pattern, literal)
+        || pattern_may_match_literal_case(&pattern.to_lowercase(), &literal.to_lowercase())
+}
+
+fn pattern_may_match_literal_case(pattern: &str, literal: &str) -> bool {
     let (prefix, suffix) = conservative_pattern_envelope(pattern);
-    let suffix_may_match =
-        suffix.is_empty() || suffix.starts_with('/') || literal.ends_with(suffix);
-    suffix_may_match
-        && (literal.starts_with(prefix)
-            || (Path::new(pattern).is_absolute()
-                && pattern
-                    .split('/')
-                    .any(|component| matches!(component, "." | ".."))))
+    if prefix.len() == pattern.len() {
+        return pattern == literal;
+    }
+    let suffix_may_match = suffix.is_empty() || literal.ends_with(suffix);
+    suffix_may_match && literal.starts_with(prefix)
 }
 
 fn conservative_pattern_envelope(pattern: &str) -> (&str, &str) {
@@ -1237,6 +1373,13 @@ mod tests {
             validate_trusted_home_context(Some(OsString::from("/home/alexander"))),
             Ok(OsString::from("/home/alexander"))
         );
+        for invalid in ["", ".", "home/alexander"] {
+            assert_eq!(
+                validate_trusted_home_context(Some(OsString::from(invalid))),
+                Err(ShellAnalysisError::HelperFailure),
+                "{invalid:?}"
+            );
+        }
         assert_eq!(
             validate_trusted_home_context(Some(OsString::from("x".repeat(4_097)))),
             Err(ShellAnalysisError::HelperFailure)
@@ -1460,6 +1603,32 @@ mod tests {
             SafetyEvaluation::NoDeterministicDecision => None,
             SafetyEvaluation::Indeterminate(error) => panic!("{command:?}: {error:?}"),
         }
+    }
+
+    fn unrelated_pattern_prefix(home: &Path) -> String {
+        let longest_component = home
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => part.to_str().map(str::len),
+                _ => None,
+            })
+            .max()
+            .expect("HOME must contain a UTF-8 component");
+        "x".repeat(longest_component + 1)
+    }
+
+    #[test]
+    fn unrelated_pattern_prefix_avoids_every_lexical_home_component() {
+        let prefix = unrelated_pattern_prefix(Path::new("/home/xavier"));
+        assert!(
+            Path::new("/home/xavier")
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(part) => part.to_str(),
+                    _ => None,
+                })
+                .all(|component| !component.starts_with(&prefix))
+        );
     }
 
     #[test]
@@ -1730,6 +1899,43 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = std::env::var("HOME").expect("test requires UTF-8 HOME");
+        let home_path = Path::new(&home);
+        let home_parent = home_path.parent().expect("HOME must have a parent");
+        let home_name = home_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("HOME must end with a UTF-8 component");
+        let descendant = home_path.join("safe");
+        let sibling = home_parent.join("xa99-sibling");
+        let home_root_component = home_path
+            .components()
+            .find_map(|component| match component {
+                Component::Normal(part) => part.to_str(),
+                _ => None,
+            })
+            .expect("HOME must start with a UTF-8 component");
+        let root_pattern = format!(
+            "{}*",
+            home_root_component
+                .chars()
+                .next()
+                .expect("HOME component must not be empty")
+        );
+        let unrelated_pattern = unrelated_pattern_prefix(home_path);
+        let repeated_home_pattern =
+            format!("//{}*", home.trim_start_matches('/').replace('/', "//"));
+        let mut globstar_home_parts = home
+            .trim_start_matches('/')
+            .split('/')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        globstar_home_parts
+            .last_mut()
+            .expect("HOME must contain a component")
+            .push('*');
+        let globstar_home_pattern = format!("/**/**/{}", globstar_home_parts.join("/"));
+        let globstar_ancestor_pattern = format!("/**/**/{home_root_component}");
+        let nocase_home_pattern = format!("{}*", home.to_uppercase());
         let split = home
             .char_indices()
             .next_back()
@@ -1742,11 +1948,67 @@ mod tests {
         assert_eq!(deny.rule_id, "irreversible-home-delete", "{split_alias}");
 
         for command in [
+            format!("IFS=/; X='{}'; rm -rf $X", descendant.display()),
+            format!("IFS=/; X='{home}'; X+=/safe; rm -rf $X"),
+            format!("IFS=/; X='{}'; rm -rf $X", sibling.display()),
+            format!("IFS=/; X='/{root_pattern}/safe'; rm -rf $X"),
+            format!("IFS=/; X='{root_pattern}'; rm -rf $X"),
+            format!("IFS=,; X='./{home_name}*'; rm -rf $X"),
+        ] {
+            let deny = evaluate_command(&command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(deny.rule_id, "irreversible-home-delete", "{command}");
+        }
+
+        let parent_traversal = "IFS=,; X='../safe'; rm -rf $X";
+        let deny =
+            evaluate_command(parent_traversal).unwrap_or_else(|| panic!("{parent_traversal}"));
+        assert_eq!(
+            deny.rule_id, "unsafe-recursive-delete-expansion",
+            "{parent_traversal}"
+        );
+
+        let repeated_separator_pattern = format!("IFS=,; X='{repeated_home_pattern}'; rm -rf $X");
+        let deny = evaluate_command(&repeated_separator_pattern)
+            .unwrap_or_else(|| panic!("{repeated_separator_pattern}"));
+        assert_eq!(
+            deny.rule_id, "unsafe-recursive-delete-expansion",
+            "{repeated_separator_pattern}"
+        );
+        for command in [
+            format!("shopt -s globstar; IFS=:; X='{globstar_home_pattern}'; rm -rf $X"),
+            format!("shopt -s nocaseglob; IFS=:; X='{nocase_home_pattern}'; rm -rf $X"),
+        ] {
+            let deny = evaluate_command(&command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+        let globstar_ancestor =
+            format!("shopt -s globstar; IFS=:; X='{globstar_ancestor_pattern}'; rm -rf $X");
+        let deny =
+            evaluate_command(&globstar_ancestor).unwrap_or_else(|| panic!("{globstar_ancestor}"));
+        assert_eq!(
+            deny.rule_id, "irreversible-home-delete",
+            "{globstar_ancestor}"
+        );
+
+        for command in [
             format!("{assignment}; rm -rf \"$X\""),
             "rm -rf $HOME".to_string(),
         ] {
             let deny = evaluate_command(&command).unwrap_or_else(|| panic!("{command}"));
             assert_eq!(deny.rule_id, "irreversible-home-delete", "{command}");
+        }
+
+        for command in [
+            format!("X='{}'; rm -rf \"$X\"", descendant.display()),
+            "IFS=/; X=/xa99-safe-control/target; rm -rf $X".to_string(),
+            format!("IFS=/; X='/{unrelated_pattern}*/safe'; rm -rf $X"),
+            format!("IFS=/; X='{unrelated_pattern}*'; rm -rf $X"),
+            format!("IFS=:; X='{home_root_component}*/safe'; rm -rf $X"),
+        ] {
+            assert!(evaluate_command(&command).is_none(), "{command}");
         }
     }
 
