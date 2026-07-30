@@ -34,6 +34,7 @@ path = "src/lib.rs"
 # crates change.
 coding-brain-core = { path = "crates/coding-brain-core", version = "0.53.0" }
 coding-brain-tui = { path = "crates/coding-brain-tui", version = "0.53.0" }
+brush-parser = "0.4.0"
 ratatui = "0.29"
 crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }

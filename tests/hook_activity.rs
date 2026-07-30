@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
 use coding_brain::brain::activity::ActivityStore;
@@ -521,15 +521,68 @@ fn seed_ignored_permission(home: &Path, provider: AgentProvider, ignored_reason:
     }
 }
 
-fn install_model_fixture(home: &Path, action: &str) {
-    install_model_fixture_with_confidence(home, action, 0.9);
+struct FakeModel {
+    script: PathBuf,
 }
 
-fn install_model_fixture_with_confidence(home: &Path, action: &str, confidence: f64) {
-    install_model_fixture_full(home, action, confidence, None);
+#[test]
+fn fake_model_request_count_only_treats_a_missing_counter_as_zero() {
+    let home = tempfile::tempdir().unwrap();
+    let fake_model = FakeModel {
+        script: home.path().join("bin/curl"),
+    };
+    let counter = fake_model.script.with_extension("count");
+
+    assert_eq!(fake_model.request_count(), 0);
+
+    fs::create_dir_all(&counter).unwrap();
+    assert!(
+        std::panic::catch_unwind(|| fake_model.request_count()).is_err(),
+        "an unreadable counter must fail the test"
+    );
+    fs::remove_dir(&counter).unwrap();
+
+    fs::write(&counter, "not-a-number").unwrap();
+    assert!(
+        std::panic::catch_unwind(|| fake_model.request_count()).is_err(),
+        "a malformed counter must fail the test"
+    );
 }
 
-fn install_model_fixture_full(home: &Path, action: &str, confidence: f64, message: Option<&str>) {
+impl FakeModel {
+    fn request_count(&self) -> u64 {
+        let counter = self.script.with_extension("count");
+        let count = match fs::read_to_string(&counter) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(error) => panic!(
+                "failed to read fake-model request counter {}: {error}",
+                counter.display()
+            ),
+        };
+        count.parse().unwrap_or_else(|error| {
+            panic!(
+                "invalid fake-model request counter {}: {error}",
+                counter.display()
+            )
+        })
+    }
+}
+
+fn install_model_fixture(home: &Path, action: &str) -> FakeModel {
+    install_model_fixture_with_confidence(home, action, 0.9)
+}
+
+fn install_model_fixture_with_confidence(home: &Path, action: &str, confidence: f64) -> FakeModel {
+    install_model_fixture_full(home, action, confidence, None)
+}
+
+fn install_model_fixture_full(
+    home: &Path,
+    action: &str,
+    confidence: f64,
+    message: Option<&str>,
+) -> FakeModel {
     let config = home.join(".config/coding-brain/config.toml");
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     fs::write(
@@ -538,12 +591,12 @@ fn install_model_fixture_full(home: &Path, action: &str, confidence: f64, messag
     )
     .unwrap();
     install_gate_mode_fixture(home, "auto");
-    install_fake_model(home, action, confidence, message);
+    install_fake_model(home, action, confidence, message)
 }
 
-fn install_default_model_fixture(home: &Path, mode: &str, action: &str) {
+fn install_default_model_fixture(home: &Path, mode: &str, action: &str) -> FakeModel {
     install_gate_mode_fixture(home, mode);
-    install_fake_model(home, action, 0.9, None);
+    install_fake_model(home, action, 0.9, None)
 }
 
 fn install_gate_mode_fixture(home: &Path, mode: &str) {
@@ -552,7 +605,12 @@ fn install_gate_mode_fixture(home: &Path, mode: &str) {
     fs::write(gate_mode, format!("{mode}\n")).unwrap();
 }
 
-fn install_fake_model(home: &Path, action: &str, confidence: f64, message: Option<&str>) {
+fn install_fake_model(
+    home: &Path,
+    action: &str,
+    confidence: f64,
+    message: Option<&str>,
+) -> FakeModel {
     let suggestion = serde_json::json!({
         "action": action,
         "message": message,
@@ -567,11 +625,12 @@ fn install_fake_model(home: &Path, action: &str, confidence: f64, message: Optio
     fs::write(
         &curl,
         format!(
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"${{0}}.args\"\ndd of=\"${{0}}.stdin\" 2>/dev/null\nprintf '%s' '{response}'\n"
+            "#!/bin/sh\nset -eu\ncount=0\nif [ -r \"${{0}}.count\" ]; then\n  IFS= read -r count < \"${{0}}.count\" || true\nfi\ncount=$((count + 1))\nprintf '%s' \"$count\" > \"${{0}}.count\"\nprintf '%s\\n' \"$@\" > \"${{0}}.args\"\ndd of=\"${{0}}.stdin\" 2>/dev/null\nprintf '%s' '{response}'\n"
         ),
     )
     .unwrap();
-    fs::set_permissions(curl, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o700)).unwrap();
+    FakeModel { script: curl }
 }
 
 fn assert_default_model_request(home: &Path) {
@@ -669,6 +728,476 @@ fn assert_safety_deny(home: &Path, expected_rule_id: &str) {
             .iter()
             .all(|event| event.state != ActivityState::Allowed)
     );
+}
+
+fn shell_permission_payload(
+    home: &Path,
+    provider: AgentProvider,
+    command: &str,
+    policy: Option<&str>,
+) -> (&'static str, Option<&'static str>, Vec<u8>) {
+    match provider {
+        AgentProvider::Codex => ("codex", None, permission_payload(home, command)),
+        AgentProvider::Claude => {
+            let mut payload: serde_json::Value =
+                serde_json::from_slice(&claude_permission_payload(home, policy)).unwrap();
+            payload["tool_input"]["command"] = serde_json::json!(command);
+            ("claude", None, serde_json::to_vec(&payload).unwrap())
+        }
+        AgentProvider::Antigravity => {
+            let mut payload: serde_json::Value =
+                serde_json::from_slice(&antigravity_permission_payload(home, policy)).unwrap();
+            payload["toolCall"]["args"]["CommandLine"] = serde_json::json!(command);
+            (
+                "antigravity",
+                Some("PreToolUse"),
+                serde_json::to_vec(&payload).unwrap(),
+            )
+        }
+    }
+}
+
+fn assert_needs_input(home: &Path, provider: AgentProvider, session_id: &str) {
+    let events = activity(home).read().unwrap().events().to_vec();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state == ActivityState::Abstained),
+        "{provider:?}: missing abstained activity"
+    );
+    let lifecycle = LifecycleStore::at(home.join(".local/state/coding-brain"));
+    let key =
+        coding_brain_core::provider::AgentSessionKey::native(provider, session_id).storage_key();
+    assert_eq!(
+        lifecycle.read().unwrap().snapshot.unwrap().sessions[&key].projected_status,
+        Some(ProjectedStatus::NeedsInput),
+        "{provider:?}"
+    );
+}
+
+#[test]
+fn reopened_shell_safety_corpus_denies_before_model_inference_for_every_provider() {
+    for (command, expected_rule_id) in [
+        (
+            "/bin/r[]m] --no-preserve-root -rf /",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "/bin/r[\\m] --no-preserve-root -rf /",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "/bin/r[m] --no-preserve-root -rf /",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "rm>/dev/null --no-preserve-root -rf /",
+            "irreversible-root-delete",
+        ),
+        (
+            ">'>' rm --no-preserve-root -rf /",
+            "irreversible-root-delete",
+        ),
+        (
+            "rm --no-preserve-root -rf /{,}",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "FLAGS=-rf; rm $FLAGS /",
+            "unsafe-recursive-delete-expansion",
+        ),
+        ("rm -rf $'\\x2f'", "unsafe-recursive-delete-expansion"),
+        (
+            "env $'-\\x53' 'rm -rf /'",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "cat <(rm --no-preserve-root -rf /)",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "{ rm --no-preserve-root -rf /; }",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "/bin/r[\"m\"] --no-preserve-root -rf /",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "/bin/r[!]] --no-preserve-root -rf /",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "/bin/r[^]] --no-preserve-root -rf /",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "rm --no-preserve-root -rf /{'',}",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "X='safe -rf'; rm -f $X /",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "IFS=e; X=safe-rf; rm -f $X /",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "ROOT=/tmp; export ROOT=/; rm -rf \"$ROOT\"",
+            "unsafe-recursive-delete-expansion",
+        ),
+        ("HOME=-rf; rm -f ~ /", "unsafe-recursive-delete-expansion"),
+        ("PWD=-Rf; rm -f ~+ /", "unsafe-recursive-delete-expansion"),
+        ("rm --rec --no-preserve-root /", "irreversible-root-delete"),
+        ("exec -ca display rm -rf /", "irreversible-root-delete"),
+        (
+            "/usr/bin/time --out log rm -rf /",
+            "irreversible-root-delete",
+        ),
+    ] {
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let fake_model = install_model_fixture(home.path(), "approve");
+            let (provider_name, event, payload) =
+                shell_permission_payload(home.path(), provider, command, None);
+
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+            assert!(output.status.success(), "{provider:?}: {command}");
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(response["decision"], "deny", "{provider:?}: {command}");
+            } else {
+                assert_eq!(
+                    response["hookSpecificOutput"]["decision"]["behavior"], "deny",
+                    "{provider:?}: {command}"
+                );
+            }
+            assert_eq!(fake_model.request_count(), 0, "{provider:?}: {command}");
+            assert_safety_deny(home.path(), expected_rule_id);
+        }
+    }
+}
+
+#[test]
+fn literal_home_delete_denies_before_model_inference_for_every_provider() {
+    for provider in [
+        AgentProvider::Codex,
+        AgentProvider::Claude,
+        AgentProvider::Antigravity,
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let fake_model = install_model_fixture(home.path(), "approve");
+        let command = format!("rm -rf \"{}\"", home.path().display());
+        let (provider_name, event, payload) =
+            shell_permission_payload(home.path(), provider, &command, None);
+
+        let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+        assert!(output.status.success(), "{provider:?}: {command}");
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if provider == AgentProvider::Antigravity {
+            assert_eq!(response["decision"], "deny", "{provider:?}: {command}");
+        } else {
+            assert_eq!(
+                response["hookSpecificOutput"]["decision"]["behavior"], "deny",
+                "{provider:?}: {command}"
+            );
+        }
+        assert_eq!(fake_model.request_count(), 0, "{provider:?}: {command}");
+        assert_safety_deny(home.path(), "irreversible-home-delete");
+    }
+}
+
+#[test]
+fn review_state_and_parameter_glob_cases_use_the_real_provider_boundary() {
+    for provider in [
+        AgentProvider::Codex,
+        AgentProvider::Claude,
+        AgentProvider::Antigravity,
+    ] {
+        for case in [
+            "expanded HOME",
+            "tilde HOME",
+            "unquoted HOME glob",
+            "adjacent unquoted HOME glob",
+            "printf percent-n mutation",
+            "assignment arithmetic mutation",
+            "parameter arithmetic mutation",
+            "lastpipe parent mutation",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let fake_model = install_model_fixture(home.path(), "approve");
+            if provider == AgentProvider::Antigravity {
+                seed_antigravity_invocation(home.path(), 5);
+            }
+            let command = match case {
+                "expanded HOME" => "HOME=/tmp; export HOME=-rf; rm -f \"$HOME\" /".into(),
+                "tilde HOME" => "HOME=/tmp; export HOME=-rf; rm -f ~ /".into(),
+                "unquoted HOME glob" => {
+                    let home = home.path().to_str().unwrap();
+                    let last = home
+                        .char_indices()
+                        .next_back()
+                        .expect("temporary HOME must not be empty")
+                        .0;
+                    format!("X='{}?'; rm -rf $X", &home[..last])
+                }
+                "adjacent unquoted HOME glob" => {
+                    let home = home.path().to_str().unwrap();
+                    let last = home
+                        .char_indices()
+                        .next_back()
+                        .expect("temporary HOME must not be empty")
+                        .0;
+                    format!("X='{}['; rm -rf ${{X}}{}]", &home[..last], &home[last..])
+                }
+                "printf percent-n mutation" => "X=; printf %n X; rm -f \"${X:+-rf}\" /".into(),
+                "assignment arithmetic mutation" => "X=; Y=$((X=1)); rm -f \"${X:+-rf}\" /".into(),
+                "parameter arithmetic mutation" => {
+                    "X=; VALUE=abc; Y=\"${OUTER:-${VALUE:X=1}}\"; rm -f \"${X:+-rf}\" /".into()
+                }
+                "lastpipe parent mutation" => {
+                    "shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /".into()
+                }
+                _ => unreachable!(),
+            };
+            let (provider_name, event, payload) =
+                shell_permission_payload(home.path(), provider, &command, None);
+
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+            assert!(output.status.success(), "{provider:?}: {case}: {command}");
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(response["decision"], "deny", "{provider:?}: {case}");
+            } else {
+                assert_eq!(
+                    response["hookSpecificOutput"]["decision"]["behavior"], "deny",
+                    "{provider:?}: {case}"
+                );
+            }
+            assert_eq!(fake_model.request_count(), 0, "{provider:?}: {case}");
+            assert_safety_deny(home.path(), "unsafe-recursive-delete-expansion");
+        }
+
+        for quoted in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let fake_model = install_model_fixture(home.path(), "approve");
+            if provider == AgentProvider::Antigravity {
+                seed_antigravity_invocation(home.path(), 5);
+            }
+            let home_text = home.path().to_str().unwrap();
+            let last = home_text
+                .char_indices()
+                .next_back()
+                .expect("temporary HOME must not be empty")
+                .0;
+            let pattern = format!("{}?", &home_text[..last]);
+            let command = if quoted {
+                format!("X='{pattern}'; rm -rf \"$X\"")
+            } else {
+                format!("X='{pattern}'; rm -rf $X-suffix")
+            };
+            let (provider_name, event, payload) =
+                shell_permission_payload(home.path(), provider, &command, None);
+
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+            assert!(output.status.success(), "{provider:?}: {command}");
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(response["decision"], "allow", "{provider:?}: {command}");
+            } else {
+                assert_eq!(
+                    response["hookSpecificOutput"]["decision"]["behavior"], "allow",
+                    "{provider:?}: {command}"
+                );
+            }
+            assert_eq!(fake_model.request_count(), 1, "{provider:?}: {command}");
+        }
+
+        for control in [
+            "quoted closing fragment",
+            "escaped closing bracket",
+            "nonmatching suffix",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let fake_model = install_model_fixture(home.path(), "approve");
+            if provider == AgentProvider::Antigravity {
+                seed_antigravity_invocation(home.path(), 5);
+            }
+            let home_text = home.path().to_str().unwrap();
+            let last = home_text
+                .char_indices()
+                .next_back()
+                .expect("temporary HOME must not be empty")
+                .0;
+            let final_character = &home_text[last..];
+            let suffix = match control {
+                "quoted closing fragment" => format!("\"{final_character}]\""),
+                "escaped closing bracket" => format!("{final_character}\\]"),
+                "nonmatching suffix" => format!("{final_character}]-suffix"),
+                _ => unreachable!(),
+            };
+            let command = format!("X='{}['; rm -rf ${{X}}{suffix}", &home_text[..last]);
+            let (provider_name, event, payload) =
+                shell_permission_payload(home.path(), provider, &command, None);
+
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+            assert!(
+                output.status.success(),
+                "{provider:?}: {control}: {command}"
+            );
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(
+                    response["decision"], "allow",
+                    "{provider:?}: {control}: {command}"
+                );
+            } else {
+                assert_eq!(
+                    response["hookSpecificOutput"]["decision"]["behavior"], "allow",
+                    "{provider:?}: {control}: {command}"
+                );
+            }
+            assert_eq!(
+                fake_model.request_count(),
+                1,
+                "{provider:?}: {control}: {command}"
+            );
+        }
+    }
+}
+
+#[test]
+fn real_shell_safety_indeterminate_corpus_preserves_native_confirmation_without_model_inference() {
+    let mut nested = "literal".to_string();
+    for _ in 0..80 {
+        nested = format!("${{VALUE:-{nested}}}");
+    }
+    let cases = [
+        ("malformed Bash", "if true; then".to_string()),
+        (
+            "continued command substitution",
+            "$\\\n(printf rm) -rf /".to_string(),
+        ),
+        (
+            "continued arithmetic expansion",
+            "$\\\n((1+1)) -rf /".to_string(),
+        ),
+        (
+            "quoted parameter depth limit",
+            format!("printf '%s' \"{nested}\""),
+        ),
+    ];
+
+    for (case, command) in cases {
+        for (provider, session_id) in [
+            (AgentProvider::Codex, "session-1"),
+            (AgentProvider::Claude, "claude-session-1"),
+            (AgentProvider::Antigravity, "agy-conversation-1"),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let fake_model = install_model_fixture(home.path(), "approve");
+            if provider == AgentProvider::Antigravity {
+                seed_antigravity_invocation(home.path(), 5);
+            }
+            let (provider_name, event, payload) =
+                shell_permission_payload(home.path(), provider, &command, None);
+
+            let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+            assert!(output.status.success(), "{provider:?}: {case}");
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+                    serde_json::json!({
+                        "decision": "ask",
+                        "reason": "Coding Brain abstained"
+                    }),
+                    "{case}"
+                );
+            } else {
+                assert!(output.stdout.is_empty(), "{provider:?}: {case}");
+            }
+            assert_eq!(fake_model.request_count(), 0, "{provider:?}: {case}");
+            assert_needs_input(home.path(), provider, session_id);
+        }
+    }
+}
+
+#[test]
+fn deeply_nested_shell_input_is_contained_by_the_isolated_helper() {
+    let home = tempfile::tempdir().unwrap();
+    let fake_model = install_model_fixture(home.path(), "approve");
+    let depth = 8_192;
+    let command = format!(
+        "printf '%s' \"$(({}1{}))\"",
+        "(".repeat(depth),
+        ")".repeat(depth)
+    );
+    let (provider, event, payload) =
+        shell_permission_payload(home.path(), AgentProvider::Codex, &command, None);
+
+    let output = run_provider_permission_hook(home.path(), provider, event, &payload);
+
+    assert!(output.status.success());
+    let events = activity(home.path()).read().unwrap().events().to_vec();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.state != ActivityState::Denied),
+        "deep nesting must not become a deterministic safety deny"
+    );
+    if output.stdout.is_empty() {
+        assert_eq!(fake_model.request_count(), 0);
+        assert_needs_input(home.path(), AgentProvider::Codex, "session-1");
+    } else {
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            response["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        assert_eq!(fake_model.request_count(), 1);
+    }
+}
+
+#[test]
+fn provider_policy_deny_precedes_real_shell_safety_parser_indeterminate() {
+    let home = tempfile::tempdir().unwrap();
+    let fake_model = install_model_fixture(home.path(), "approve");
+    let (provider_name, event, payload) = shell_permission_payload(
+        home.path(),
+        AgentProvider::Claude,
+        "if true; then",
+        Some("deny"),
+    );
+
+    let output = run_provider_permission_hook(home.path(), provider_name, event, &payload);
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response["hookSpecificOutput"]["decision"]["behavior"],
+        "deny"
+    );
+    assert_eq!(fake_model.request_count(), 0);
+    let terminal = activity(home.path())
+        .read()
+        .unwrap()
+        .events()
+        .iter()
+        .find(|event| event.state == ActivityState::Denied)
+        .cloned()
+        .expect("missing provider-policy deny activity");
+    assert!(terminal.rule_id.is_none());
 }
 
 #[test]

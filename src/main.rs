@@ -238,6 +238,10 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) permission_hook: bool,
 
+    /// Internal isolated shell safety evaluator.
+    #[arg(long, hide = true)]
+    pub(crate) shell_safety_helper: bool,
+
     /// Internal Codex lifecycle hook adapter.
     #[arg(long, hide = true)]
     pub(crate) lifecycle_hook: bool,
@@ -332,6 +336,10 @@ fn select_mode(cli: &Cli) -> RunMode {
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
+    if cli.shell_safety_helper {
+        brain::safety::run_helper()?;
+        return Ok(());
+    }
     let is_internal_hook =
         cli.permission_hook || cli.lifecycle_hook || cli.recovery_hook || cli.distill_once;
     let result = run_main(cli);
@@ -1184,8 +1192,11 @@ mod permission_hook_cli_tests {
     fn permission_hook_flag_is_hidden() {
         let cli = Cli::try_parse_from(["cbrain", "--permission-hook"]).unwrap();
         assert!(cli.permission_hook);
+        let helper = Cli::try_parse_from(["cbrain", "--shell-safety-helper"]).unwrap();
+        assert!(helper.shell_safety_helper);
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--permission-hook"));
+        assert!(!help.contains("--shell-safety-helper"));
     }
 
     #[test]
