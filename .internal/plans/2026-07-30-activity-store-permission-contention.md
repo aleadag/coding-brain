@@ -96,6 +96,22 @@ pub(crate) fn with_read_parse_gate(mut self, gate: Arc<ReadParseGate>) -> Self {
 }
 ```
 
+For the red test only, call the gate immediately before the current
+`self.read_unlocked()` while `_guard` is still in scope:
+
+```rust
+pub fn read(&self) -> Result<ActivityLog, ActivityStoreError> {
+    let lock = self.open_lock()?;
+    let _guard =
+        lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Shared)?;
+    #[cfg(test)]
+    if let Some(gate) = &self.read_parse_gate {
+        gate.pause();
+    }
+    self.read_unlocked()
+}
+```
+
 - [ ] **Step 2: Write the failing realistic-size lock-scope regression**
 
 In `src/brain/activity.rs` tests, add a helper that creates 32,448 valid rows in one `append_batch` call. Pad `reasoning` to 512 bytes and assert the resulting fixture is at least 20 MiB so the test cannot silently regress to an empty-log fixture:
@@ -129,9 +145,8 @@ fn public_read_releases_lock_before_parsing_captured_snapshot() {
     });
 
     assert!(gate.wait_until_reached(Duration::from_secs(5)));
-    store
-        .append(event_at("after-capture", ActivityState::Denied, 40_000))
-        .unwrap();
+    let append_result =
+        store.append(event_at("after-capture", ActivityState::Denied, 40_000));
     gate.release();
 
     let captured = read_rx
@@ -139,6 +154,7 @@ fn public_read_releases_lock_before_parsing_captured_snapshot() {
         .unwrap()
         .unwrap();
     handle.join().unwrap();
+    append_result.unwrap();
     assert_eq!(captured.events().len(), 32_448);
     assert!(!captured.events().iter().any(|event| event.activity_id == "after-capture"));
     assert!(store
@@ -160,7 +176,10 @@ nix develop path:. --command cargo test --bin cbrain \
   -- --exact
 ```
 
-Expected: FAIL before the refactor because the paused public reader still owns the shared guard and `append` returns `ActivityStoreError::LockTimeout`.
+Expected: the gate is reached, then FAIL at the test's `.unwrap()` on `append`
+with `ActivityStoreError::LockTimeout` because the paused public reader still
+owns the shared guard. A failure saying the gate was not reached is invalid red
+evidence and must be fixed before proceeding.
 
 - [ ] **Step 4: Split byte capture from parsing and scope the public guard**
 
@@ -263,7 +282,7 @@ Run:
 
 ```bash
 nix develop path:. --command cargo fmt --all
-git diff --check
+git -c core.whitespace=-indent-with-non-tab diff --check
 git diff -- src/brain/activity.rs
 ```
 
@@ -285,7 +304,7 @@ Expected: one commit containing only Task 1.
 ### Task 2: Apply bounded permission activity persistence and verify both contention paths
 
 **Files:**
-- Modify: `src/brain/activity.rs:187-217`
+- Modify: `src/brain/activity.rs:1-675`
 - Modify: `src/brain/permission_hook.rs:20-30`
 - Modify: `src/brain/permission_hook.rs:517-565`
 - Modify: `src/brain/permission_hook.rs:1910-1990`
@@ -294,6 +313,7 @@ Expected: one commit containing only Task 1.
 **Interfaces:**
 - Consumes: Task 1 `ReadParseGate`, `ActivityStore::with_read_parse_gate`, and public parsing outside the lock.
 - Produces: `ActivityStore::with_lock_timeout_ms(u64) -> Self`.
+- Produces for tests only: `LockContentionProbe` and `ActivityStore::with_lock_contention_probe(Arc<LockContentionProbe>)`.
 - Produces: private `PERMISSION_ACTIVITY_LOCK_TIMEOUT_MS: u64 = 500`.
 - Changes: `run_provider_with_gate_and_stores_and_safety` clones and scopes its provided `ActivityStore` to the permission timeout before any blocking activity append.
 
@@ -319,6 +339,126 @@ fn lock_timeout_builder_changes_only_the_derived_store() {
 }
 ```
 
+Add the complete test-only probe:
+
+```rust
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct LockContentionProbe {
+    contended: Mutex<bool>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl LockContentionProbe {
+    fn notify(&self) {
+        *self.contended.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn wait_until_contended(&self, timeout: Duration) -> bool {
+        let contended = self.contended.lock().unwrap();
+        let (contended, _) = self
+            .changed
+            .wait_timeout_while(contended, timeout, |contended| !*contended)
+            .unwrap();
+        *contended
+    }
+}
+```
+
+Store it as another `#[cfg(test)] Option<Arc<_>>` on `ActivityStore`, initialize
+it to `None` in `ActivityStore::at`, preserve it through `Clone`, and add:
+
+```rust
+#[cfg(test)]
+pub(crate) fn with_lock_contention_probe(
+    mut self,
+    probe: Arc<LockContentionProbe>,
+) -> Self {
+    self.lock_contention_probe = Some(probe);
+    self
+}
+```
+
+Refactor only the append lock helper so tests can observe the first
+`WouldBlock`. Production still calls the same no-observer loop:
+
+```rust
+fn lock_with_timeout(
+    file: &File,
+    timeout_ms: u64,
+    kind: LockKind,
+) -> Result<LockGuard<'_>, ActivityStoreError> {
+    lock_with_timeout_observed(file, timeout_ms, kind, || {})
+}
+
+fn lock_with_timeout_observed<F>(
+    file: &File,
+    timeout_ms: u64,
+    kind: LockKind,
+    mut on_contention: F,
+) -> Result<LockGuard<'_>, ActivityStoreError>
+where
+    F: FnMut(),
+{
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut first_attempt = true;
+    loop {
+        if !first_attempt && Instant::now() >= deadline {
+            return Err(ActivityStoreError::LockTimeout);
+        }
+        first_attempt = false;
+        let attempt = match kind {
+            LockKind::Shared => FileExt::try_lock_shared(file),
+            LockKind::Exclusive => file.try_lock_exclusive(),
+        };
+        match attempt {
+            Ok(()) => return Ok(LockGuard { file }),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                on_contention();
+                if Instant::now() >= deadline {
+                    return Err(ActivityStoreError::LockTimeout);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ActivityStoreError::LockTimeout);
+                }
+                thread::sleep(LOCK_RETRY.min(remaining));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+```
+
+Add an `ActivityStore::lock_for_append` method that calls
+`lock_with_timeout_observed` with `probe.notify()` only when the test-only probe
+is present; otherwise it calls `lock_with_timeout`. Change `append_batch` to use
+`self.lock_for_append(&lock)` and leave all other lock call sites unchanged:
+
+```rust
+fn lock_for_append<'a>(
+    &self,
+    lock: &'a File,
+) -> Result<LockGuard<'a>, ActivityStoreError> {
+    #[cfg(test)]
+    if let Some(probe) = &self.lock_contention_probe {
+        return lock_with_timeout_observed(
+            lock,
+            self.limits.lock_timeout_ms,
+            LockKind::Exclusive,
+            || probe.notify(),
+        );
+    }
+    lock_with_timeout(
+        lock,
+        self.limits.lock_timeout_ms,
+        LockKind::Exclusive,
+    )
+}
+```
+
 In `src/brain/permission_hook.rs`, update
 `locked_activity_store_fails_closed_with_specific_bounded_diagnostic` to use a
 result channel and a two-second deadline. Keep the lock held until the result
@@ -336,11 +476,14 @@ assert_eq!(projected_status(&lifecycle), Some(ProjectedStatus::NeedsInput));
 - [ ] **Step 2: Write the failing transient-exclusive-holder regression**
 
 Add `transient_cross_project_writer_outlasting_default_bound_reaches_normal_permission_decision`.
-Acquire the activity lock before starting the worker, signal immediately before
-the worker enters the permission path, and use the result channel itself to
-hold beyond the old bound without an unbounded join:
+Acquire the activity lock before starting the worker, configure the activity
+store with `LockContentionProbe`, and use the result channel itself to hold
+beyond the old bound without an unbounded join:
 
 ```rust
+let probe = Arc::new(LockContentionProbe::default());
+let activity = ActivityStore::at(&activity_path)
+    .with_lock_contention_probe(Arc::clone(&probe));
 let lock = OpenOptions::new()
     .create(true)
     .read(true)
@@ -350,10 +493,8 @@ let lock = OpenOptions::new()
     .unwrap();
 lock.lock_exclusive().unwrap();
 
-let (started_tx, started_rx) = mpsc::sync_channel(0);
 let (result_tx, result_rx) = mpsc::sync_channel(1);
 let worker = std::thread::spawn(move || {
-    started_tx.send(()).unwrap();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     run_with_gate_and_stores(
@@ -369,7 +510,7 @@ let worker = std::thread::spawn(move || {
     result_tx.send((stdout, stderr)).unwrap();
 });
 
-started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+assert!(probe.wait_until_contended(Duration::from_secs(1)));
 assert!(result_rx.recv_timeout(Duration::from_millis(200)).is_err());
 FileExt::unlock(&lock).unwrap();
 let (stdout, stderr) = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -380,11 +521,53 @@ Assert empty stderr, Codex `allow`, one inference call, and the exact four-state
 
 - [ ] **Step 3: Write the failing large-log reader-overlap permission regression**
 
-Add `large_log_reader_parsing_does_not_block_permission_lifecycle`. Reuse Task
-1's `realistically_sized_events` logic through a local helper in the permission
-tests, write all 32,448 rows through one `append_batch`, then pause a reader
-through `ReadParseGate`. While parsing remains paused, run one Codex permission
-request and assert it completes normally before releasing the reader:
+Add these isolated permission-test fixture helpers:
+
+```rust
+fn realistic_activity_event(index: u64) -> ActivityEvent {
+    ActivityEvent {
+        schema_version: ACTIVITY_SCHEMA_VERSION,
+        kind: ActivityKind::Decision,
+        activity_id: format!("scale-{index}"),
+        recorded_at_ms: index,
+        project: ProjectEvidence {
+            project_id: coding_brain_core::project::ProjectId::Temporary(
+                "scale-project".into(),
+            ),
+            cwd: PathBuf::from("/work/scale-project"),
+            label: Some("scale-project".into()),
+        },
+        session: None,
+        state: ActivityState::Denied,
+        tool: Some("Bash".into()),
+        normalized_command: Some(format!("command-{index}")),
+        fingerprint: Some(format!("fingerprint-{index}")),
+        rule_id: Some("scale".into()),
+        confidence: Some(0.9),
+        threshold: Some(0.8),
+        reasoning: Some("x".repeat(512)),
+        decision_id: Some(format!("decision-{index}")),
+        outcome: None,
+        correction: None,
+        note: None,
+        supersedes: None,
+    }
+}
+
+fn realistically_sized_permission_events() -> Vec<ActivityEvent> {
+    (0..32_448).map(realistic_activity_event).collect()
+}
+```
+
+Import `LockContentionProbe` and `ReadParseGate` beside `ActivityStore`;
+`ActivityEvent`, `ProjectEvidence`, and `PathBuf` are already visible through
+the parent module.
+
+Add `large_log_reader_parsing_does_not_block_permission_lifecycle`. Write all
+32,448 rows through one `append_batch`, assert the log is at least 20 MiB, then
+pause a reader through `ReadParseGate`. While parsing remains paused, run one
+Codex permission request and assert it completes normally before releasing the
+reader:
 
 ```rust
 let gate = Arc::new(ReadParseGate::default());
@@ -463,6 +646,18 @@ append, and `compact_if_needed` call sites unchanged so every permission
 activity operation uses the same derived store. Do not change decision-proposal
 or lifecycle-store lock policies.
 
+In `parallel_codex_permission_burst_preserves_complete_initial_lifecycles`,
+remove the custom 5,000 ms `ActivityLimits` wrapper:
+
+```rust
+let activity = ActivityStore::at(temp.path().join("activity.jsonl"))
+    .with_lock_acquisition_counter(Arc::clone(&initial_lock_acquisitions));
+```
+
+Remove `ActivityLimits` from the permission test module import when it becomes
+unused. The wrapper under test must be the only source of the 500 ms permission
+policy.
+
 - [ ] **Step 6: Run all focused contention and permission tests**
 
 Run:
@@ -485,7 +680,7 @@ nix develop path:. --command cargo test --workspace
 nix develop path:. --command cargo clippy --workspace --all-targets -- -D warnings
 nix develop path:. --command cargo fmt --all --check
 nix develop path:. --command cargo build --workspace
-git diff --check
+git -c core.whitespace=-indent-with-non-tab diff --check
 ```
 
 Expected: every command exits 0. Run Cargo/Nix gates serially to avoid shared target and Nix-store contention.
@@ -528,3 +723,48 @@ git status --short
 
 Expected: all acceptance criteria have fresh test evidence, no unrelated files
 are modified, and `codexctl-3a4i` is ready to close. Do not push or publish.
+
+## Stress Test Results: activity-store permission contention implementation plan
+
+### Resolved Decisions
+
+- Keep two sequential implementation tasks and commits so the read-lock change
+  and permission timeout policy remain independently testable and revertible.
+- Wire the parse gate into the old locked path before running the red test, then
+  move the same gate outside the guard for the green implementation.
+- Keep realistic fixture builders local to each test module; both generate
+  exactly 32,448 valid rows in one durable batch and assert at least 20 MiB.
+- Use a test-only contention probe that fires on the first `WouldBlock`; do not
+  infer lock waiting from thread startup or platform-specific lock inspection.
+- Use structural timeout evidence and bounded result channels rather than
+  flaky elapsed lower bounds or unbounded joins.
+- Remove the burst test's 5,000 ms fixture override so the production 500 ms
+  wrapper is the only permission latency policy under test.
+- Preserve permission control flow and audit-before-allow; only the derived
+  store's blocking acquisition bound changes.
+- Run normalized whitespace checks plus focused and serial full Cargo/Nix
+  quality gates.
+- Keep code commits separate and authorization-gated; close tracker work only
+  after fresh full evidence, and do not push or publish.
+
+### Changes Made
+
+- Corrected the Task 1 red phase so it reproduces lock timeout and always
+  releases/joins the paused reader before asserting the expected failure.
+- Added the complete `LockContentionProbe`, observed retry loop, and scoped
+  append-lock helper code to the plan.
+- Removed the misleading 5,000 ms burst fixture policy.
+- Normalized repository whitespace checks.
+
+### Deferred / Parking Lot
+
+- No platform-specific lock introspection or far-over-threshold snapshot
+  mechanism is added.
+- Code commit authorization and any push/PR remain separate execution choices.
+
+### Confidence Assessment
+
+- Overall: High.
+- Areas of concern: the realistic fixtures are intentionally expensive; full
+  gates must remain serial, and the transient regression must retain its
+  contention probe if later refactored.
