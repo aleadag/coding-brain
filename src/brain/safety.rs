@@ -1858,6 +1858,37 @@ mod tests {
         }
     }
 
+    struct ProcessContextGuard {
+        home: Option<OsString>,
+        cwd: std::path::PathBuf,
+    }
+
+    impl ProcessContextGuard {
+        fn set(home: &Path, cwd: &Path) -> Self {
+            let guard = Self {
+                home: std::env::var_os("HOME"),
+                cwd: std::env::current_dir().expect("test requires a current directory"),
+            };
+            std::env::set_current_dir(cwd).expect("test fixture cwd must exist");
+            // SAFETY: callers hold HOME_ENV_LOCK for the guard's lifetime.
+            unsafe { std::env::set_var("HOME", home) };
+            guard
+        }
+    }
+
+    impl Drop for ProcessContextGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers hold HOME_ENV_LOCK for the guard's lifetime.
+            unsafe {
+                match self.home.take() {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+            std::env::set_current_dir(&self.cwd).expect("original test cwd must remain available");
+        }
+    }
+
     fn unrelated_pattern_prefix(home: &Path) -> String {
         let longest_component = home
             .components()
@@ -2173,9 +2204,42 @@ mod tests {
 
     #[test]
     fn home_alias_classification_respects_field_splitting() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("test executable must be available"),
+        )
+        .args([
+            "--ignored",
+            "--exact",
+            "brain::safety::tests::home_alias_classification_field_splitting_subprocess_helper",
+            "--nocapture",
+        ])
+        .env("CODING_BRAIN_TJNX_SUBPROCESS", "1")
+        .output()
+        .expect("field-splitting subprocess must run");
+        assert!(
+            output.status.success(),
+            "field-splitting subprocess failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn home_alias_classification_field_splitting_subprocess_helper() {
+        if std::env::var_os("CODING_BRAIN_TJNX_SUBPROCESS").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
         let _guard = crate::config::HOME_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = tempfile::tempdir().expect("test fixture root must be created");
+        let home = fixture.path().join("home").join("developer");
+        let cwd = home.join("project");
+        std::fs::create_dir_all(&cwd).expect("test fixture cwd must be created");
+        let _context = ProcessContextGuard::set(&home, &cwd);
         let home = std::env::var("HOME").expect("test requires UTF-8 HOME");
         let home_path = Path::new(&home);
         let home_parent = home_path.parent().expect("HOME must have a parent");
@@ -2183,6 +2247,10 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("HOME must end with a UTF-8 component");
+        let home_parent_name = home_parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("HOME parent must end with a UTF-8 component");
         let descendant = home_path.join("safe");
         let sibling = home_parent.join("xa99-sibling");
         let home_root_component = home_path
@@ -2278,7 +2346,7 @@ mod tests {
             home_parent.display()
         );
         let globstar_parent_chained = format!(
-            "shopt -s globstar; IFS=:; X='{home}/**/../../{home_root_component}/{home_name}'; rm -rf $X"
+            "shopt -s globstar; IFS=:; X='{home}/**/../../{home_parent_name}/{home_name}'; rm -rf $X"
         );
         let wildcard_parent = format!(
             "IFS=:; X='{}/{home_name}*/../{home_name}'; rm -rf $X",
