@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Component, Path};
 
@@ -15,6 +15,53 @@ const MAX_HELPER_OUTPUT_BYTES: usize = 512;
 const MAX_SHELL_COMMAND_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
 const MAX_TRUSTED_HOME_BYTES: usize = 4_096;
+const MAX_PATTERN_MATCH_STATES: usize = 16_384;
+const MAX_PATTERN_MATCH_COMPONENTS: usize = 65_536;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternMatchKind {
+    DirectExpansion,
+    ExpansionThenTraversal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternReachability {
+    Reachable(PatternMatchKind),
+    Unreachable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitTargetRisk {
+    None,
+    Root,
+    HomeOrAncestor,
+    UnsafeExpansion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PatternComponent {
+    Literal(String),
+    Globstar,
+    Parent,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum ResolvedPatternComponent {
+    Literal(usize),
+    Any,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct PatternMatchState {
+    pattern_index: usize,
+    resolved: Vec<ResolvedPatternComponent>,
+}
+
+struct PatternMatchBudget {
+    remaining_states: usize,
+    remaining_components: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SafetyDeny {
@@ -264,6 +311,10 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
         assignments.insert("HOME".into(), home);
     }
     let mut ifs_unknown = false;
+    let mut pattern_match_budget = PatternMatchBudget {
+        remaining_states: MAX_PATTERN_MATCH_STATES,
+        remaining_components: MAX_PATTERN_MATCH_COMPONENTS,
+    };
     for command in &program.commands {
         if matches!(
             command.context,
@@ -433,12 +484,20 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
             {
                 return canonical_deny("irreversible-home-delete");
             }
-            if split_target_may_reach_home_or_ancestor(
+            match split_target_risk(
                 target,
                 &command_assignments,
                 command_ifs_unknown,
+                &mut pattern_match_budget,
             ) {
-                return canonical_deny("irreversible-home-delete");
+                SplitTargetRisk::Root => {
+                    return canonical_deny("irreversible-root-delete");
+                }
+                SplitTargetRisk::HomeOrAncestor => {
+                    return canonical_deny("irreversible-home-delete");
+                }
+                SplitTargetRisk::UnsafeExpansion => return expansion_target_deny(),
+                SplitTargetRisk::None => {}
             }
             if dynamic_target_is_dangerous(target, &command_assignments, command_ifs_unknown) {
                 return expansion_target_deny();
@@ -505,78 +564,132 @@ fn literal_home_target(target: &str) -> bool {
         .is_some_and(|home| target == home)
 }
 
-fn split_target_may_reach_home_or_ancestor(
+fn split_target_risk(
     target: &shell::ShellWord,
     assignments: &HashMap<String, String>,
     ifs_unknown: bool,
-) -> bool {
+    budget: &mut PatternMatchBudget,
+) -> SplitTargetRisk {
     if !target.can_split_fields {
-        return false;
+        return SplitTargetRisk::None;
     }
-    resolve_word_fields(target, assignments, ifs_unknown).is_some_and(|fields| {
-        fields.iter().any(|field| {
-            !parameter_pattern_may_match_home(field)
-                && split_field_may_reach_home_or_ancestor(field)
-        })
-    })
-}
-
-fn split_field_may_reach_home_or_ancestor(field: &ResolvedField) -> bool {
+    let Some(fields) = resolve_word_fields(target, assignments, ifs_unknown) else {
+        return SplitTargetRisk::UnsafeExpansion;
+    };
     let Some(home) =
         std::env::var_os("HOME").and_then(|home| lexical_absolute_parts(Path::new(&home)))
     else {
-        return false;
+        return SplitTargetRisk::UnsafeExpansion;
     };
-    let path = Path::new(&field.value);
-    if let Some(parts) = lexical_absolute_parts(path) {
-        return !parts.is_empty()
-            && ((parts.len() <= home.len() && home.starts_with(&parts))
-                || (1..=home.len()).any(|ancestor_len| {
-                    split_field_pattern_may_match_parts(field, &home[..ancestor_len], true)
-                }));
-    }
 
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(part) => parts.push(part.to_os_string()),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+    for field in &fields {
+        match pattern_reachability(field, &[], true, budget) {
+            PatternReachability::Reachable(PatternMatchKind::ExpansionThenTraversal) => {
+                return SplitTargetRisk::Root;
+            }
+            PatternReachability::Reachable(PatternMatchKind::DirectExpansion)
+            | PatternReachability::Unknown => return SplitTargetRisk::UnsafeExpansion,
+            PatternReachability::Unreachable => {}
+        }
+        match pattern_reachability(field, &home, true, budget) {
+            PatternReachability::Reachable(PatternMatchKind::DirectExpansion) => {
+                return SplitTargetRisk::UnsafeExpansion;
+            }
+            PatternReachability::Reachable(PatternMatchKind::ExpansionThenTraversal) => {
+                return SplitTargetRisk::HomeOrAncestor;
+            }
+            PatternReachability::Unknown => return SplitTargetRisk::UnsafeExpansion,
+            PatternReachability::Unreachable => {}
+        }
+        for ancestor_len in 1..home.len() {
+            match pattern_reachability(field, &home[..ancestor_len], true, budget) {
+                PatternReachability::Reachable(_) => {
+                    return SplitTargetRisk::HomeOrAncestor;
+                }
+                PatternReachability::Unknown => return SplitTargetRisk::UnsafeExpansion,
+                PatternReachability::Unreachable => {}
+            }
+        }
+
+        let path = Path::new(&field.value);
+        if let Some(parts) = lexical_absolute_parts(path) {
+            if !parts.is_empty() && parts.len() <= home.len() && home.starts_with(&parts) {
+                return SplitTargetRisk::HomeOrAncestor;
+            }
+            continue;
+        }
+
+        let mut parts = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => parts.push(part.to_os_string()),
+                Component::ParentDir => return SplitTargetRisk::UnsafeExpansion,
+                Component::RootDir | Component::Prefix(_) => {
+                    return SplitTargetRisk::UnsafeExpansion;
+                }
+            }
+        }
+        if !parts.is_empty()
+            && (1..=home.len()).any(|ancestor_len| {
+                let ancestor = &home[..ancestor_len];
+                parts.len() <= ancestor.len() && ancestor.ends_with(&parts)
+            })
+        {
+            return SplitTargetRisk::HomeOrAncestor;
+        }
+        for ancestor_len in 1..=home.len() {
+            for start in 0..ancestor_len {
+                match pattern_reachability(field, &home[start..ancestor_len], false, budget) {
+                    PatternReachability::Reachable(_) => {
+                        return SplitTargetRisk::HomeOrAncestor;
+                    }
+                    PatternReachability::Unknown => {
+                        return SplitTargetRisk::UnsafeExpansion;
+                    }
+                    PatternReachability::Unreachable => {}
+                }
+            }
         }
     }
-    !parts.is_empty()
-        && ((1..=home.len()).any(|ancestor_len| {
-            let ancestor = &home[..ancestor_len];
-            parts.len() <= ancestor.len() && ancestor.ends_with(&parts)
-        }) || (1..=home.len()).any(|ancestor_len| {
-            (0..ancestor_len).any(|start| {
-                split_field_pattern_may_match_parts(field, &home[start..ancestor_len], false)
-            })
-        }))
+
+    SplitTargetRisk::None
 }
 
-fn split_field_pattern_may_match_parts(
+fn pattern_reachability(
     field: &ResolvedField,
     parts: &[OsString],
     absolute: bool,
-) -> bool {
+    budget: &mut PatternMatchBudget,
+) -> PatternReachability {
     if !field.parameter_pathname_pattern {
-        return false;
+        return PatternReachability::Unreachable;
     }
     let Some(candidate_parts) = parts
         .iter()
         .map(|part| part.to_str())
         .collect::<Option<Vec<_>>>()
     else {
-        return false;
+        return PatternReachability::Unknown;
     };
-    let Some((pattern_absolute, pattern_parts)) = lexical_pattern_parts(&field.value) else {
-        return false;
+    let Some((direct_absolute, direct_parts)) = direct_pattern_parts(&field.value) else {
+        return PatternReachability::Unknown;
     };
-    pattern_absolute == absolute && pattern_components_may_match(&pattern_parts, &candidate_parts)
+    if direct_absolute == absolute
+        && direct_pattern_components_may_match(&direct_parts, &candidate_parts)
+    {
+        return PatternReachability::Reachable(PatternMatchKind::DirectExpansion);
+    }
+    let Some((pattern_absolute, pattern_parts)) = pattern_parts(&field.value) else {
+        return PatternReachability::Unknown;
+    };
+    if pattern_absolute != absolute {
+        return PatternReachability::Unreachable;
+    }
+    pattern_components_may_normalize_to(&pattern_parts, &candidate_parts, absolute, budget)
 }
 
-fn lexical_pattern_parts(pattern: &str) -> Option<(bool, Vec<String>)> {
+fn direct_pattern_parts(pattern: &str) -> Option<(bool, Vec<String>)> {
     let mut absolute = false;
     let mut parts = Vec::new();
     for component in Path::new(pattern).components() {
@@ -593,7 +706,7 @@ fn lexical_pattern_parts(pattern: &str) -> Option<(bool, Vec<String>)> {
     Some((absolute, parts))
 }
 
-fn pattern_components_may_match(patterns: &[String], candidates: &[&str]) -> bool {
+fn direct_pattern_components_may_match(patterns: &[String], candidates: &[&str]) -> bool {
     let Some(first_globstar) = patterns.iter().position(|part| part == "**") else {
         return patterns.len() == candidates.len()
             && patterns
@@ -617,6 +730,143 @@ fn pattern_components_may_match(patterns: &[String], candidates: &[&str]) -> boo
             .rev()
             .zip(candidates.iter().rev())
             .all(|(pattern, candidate)| pattern_may_match_literal(pattern, candidate))
+}
+
+fn pattern_parts(pattern: &str) -> Option<(bool, Vec<PatternComponent>)> {
+    let mut absolute = false;
+    let mut parts = Vec::new();
+    for component in Path::new(pattern).components() {
+        match component {
+            Component::RootDir => absolute = true,
+            Component::CurDir => {}
+            Component::ParentDir => parts.push(PatternComponent::Parent),
+            Component::Normal(part) => {
+                let part = part.to_str()?;
+                parts.push(if part == "**" {
+                    PatternComponent::Globstar
+                } else {
+                    PatternComponent::Literal(part.to_string())
+                });
+            }
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some((absolute, parts))
+}
+
+fn enqueue_pattern_state(
+    state: PatternMatchState,
+    seen: &mut HashSet<PatternMatchState>,
+    work: &mut VecDeque<PatternMatchState>,
+    budget: &mut PatternMatchBudget,
+) -> bool {
+    if seen.contains(&state) {
+        return true;
+    }
+    let stored_components = state.resolved.len().saturating_mul(2);
+    if budget.remaining_states == 0 || budget.remaining_components < stored_components {
+        return false;
+    }
+    budget.remaining_states -= 1;
+    budget.remaining_components -= stored_components;
+    seen.insert(state.clone());
+    work.push_back(state);
+    true
+}
+
+fn pattern_components_may_normalize_to(
+    patterns: &[PatternComponent],
+    candidates: &[&str],
+    absolute: bool,
+    budget: &mut PatternMatchBudget,
+) -> PatternReachability {
+    let parent_count = patterns
+        .iter()
+        .filter(|part| matches!(part, PatternComponent::Parent))
+        .count();
+    let max_resolved = candidates
+        .len()
+        .saturating_add(parent_count)
+        .saturating_add(patterns.len());
+    let initial = PatternMatchState {
+        pattern_index: 0,
+        resolved: Vec::new(),
+    };
+    let mut work = VecDeque::new();
+    let mut seen = HashSet::new();
+    let mut unknown = false;
+    if !enqueue_pattern_state(initial, &mut seen, &mut work, budget) {
+        return PatternReachability::Unknown;
+    }
+
+    while let Some(state) = work.pop_front() {
+        if state.pattern_index == patterns.len() {
+            if state.resolved.len() == candidates.len()
+                && state
+                    .resolved
+                    .iter()
+                    .zip(candidates)
+                    .all(|(part, candidate)| match part {
+                        ResolvedPatternComponent::Literal(index) => match &patterns[*index] {
+                            PatternComponent::Literal(pattern) => {
+                                pattern_may_match_literal(pattern, candidate)
+                            }
+                            _ => unreachable!("literal state points to a literal pattern"),
+                        },
+                        ResolvedPatternComponent::Any => true,
+                    })
+            {
+                return PatternReachability::Reachable(PatternMatchKind::ExpansionThenTraversal);
+            }
+            continue;
+        }
+
+        match &patterns[state.pattern_index] {
+            PatternComponent::Literal(_) => {
+                let mut next = state;
+                let literal_index = next.pattern_index;
+                next.pattern_index += 1;
+                next.resolved
+                    .push(ResolvedPatternComponent::Literal(literal_index));
+                if next.resolved.len() <= max_resolved
+                    && !enqueue_pattern_state(next, &mut seen, &mut work, budget)
+                {
+                    return PatternReachability::Unknown;
+                }
+            }
+            PatternComponent::Parent => {
+                let mut next = state;
+                next.pattern_index += 1;
+                if next.resolved.pop().is_some() {
+                    if !enqueue_pattern_state(next, &mut seen, &mut work, budget) {
+                        return PatternReachability::Unknown;
+                    }
+                } else if absolute {
+                    unknown = true;
+                } else {
+                    return PatternReachability::Unknown;
+                }
+            }
+            PatternComponent::Globstar => {
+                let available = max_resolved.saturating_sub(state.resolved.len());
+                for consumed in 0..=available {
+                    let mut next = state.clone();
+                    next.pattern_index += 1;
+                    next.resolved
+                        .extend(std::iter::repeat_n(ResolvedPatternComponent::Any, consumed));
+                    if !enqueue_pattern_state(next, &mut seen, &mut work, budget) {
+                        return PatternReachability::Unknown;
+                    }
+                }
+            }
+        }
+    }
+
+    if unknown {
+        PatternReachability::Unknown
+    } else {
+        PatternReachability::Unreachable
+    }
 }
 
 fn lexical_absolute_parts(path: &Path) -> Option<Vec<OsString>> {
@@ -646,7 +896,6 @@ fn dynamic_target_is_dangerous(
             fields.iter().any(|field| {
                 is_root_target(&field.value)
                     || literal_home_target(&field.value)
-                    || parameter_pattern_may_match_home(field)
                     || (!Path::new(&field.value).is_absolute()
                         && Path::new(&field.value)
                             .components()
@@ -810,18 +1059,6 @@ fn append_quoted_pathname_text(syntax: &mut String, text: &str) {
         syntax.push('\\');
         syntax.push(character);
     }
-}
-
-fn parameter_pattern_may_match_home(field: &ResolvedField) -> bool {
-    if !field.parameter_pathname_pattern {
-        return false;
-    }
-    let Some(home) =
-        std::env::var_os("HOME").and_then(|home| lexical_absolute_parts(Path::new(&home)))
-    else {
-        return false;
-    };
-    split_field_pattern_may_match_parts(field, &home, true)
 }
 
 fn parameter_pattern_may_supply_flag(field: &ResolvedField) -> bool {
@@ -2034,6 +2271,64 @@ mod tests {
             "{globstar_ancestor}"
         );
 
+        let globstar_parent_zero =
+            format!("shopt -s globstar; IFS=:; X='{home}/**/../{home_name}'; rm -rf $X");
+        let globstar_parent_nonzero = format!(
+            "shopt -s globstar; IFS=:; X='{}/**/../{home_name}'; rm -rf $X",
+            home_parent.display()
+        );
+        let globstar_parent_chained = format!(
+            "shopt -s globstar; IFS=:; X='{home}/**/../../{home_root_component}/{home_name}'; rm -rf $X"
+        );
+        let wildcard_parent = format!(
+            "IFS=:; X='{}/{home_name}*/../{home_name}'; rm -rf $X",
+            home_parent.display()
+        );
+
+        let confirmed_bypass = evaluate_command(&globstar_parent_zero)
+            .unwrap_or_else(|| panic!("{globstar_parent_zero}"));
+        assert_eq!(
+            confirmed_bypass.rule_id, "irreversible-home-delete",
+            "{globstar_parent_zero}"
+        );
+        for command in [
+            globstar_parent_nonzero,
+            globstar_parent_chained,
+            wildcard_parent,
+        ] {
+            assert!(evaluate_command(&command).is_some(), "{command}");
+        }
+
+        let quoted_globstar_parent = format!("X='{home}/**/../{home_name}'; rm -rf \"$X\"");
+        assert!(
+            evaluate_command(&quoted_globstar_parent).is_none(),
+            "{quoted_globstar_parent}"
+        );
+
+        let unrelated_globstar_parent =
+            "shopt -s globstar; IFS=:; X='/xa99-unrelated/**/../safe'; rm -rf $X";
+        assert!(
+            evaluate_command(unrelated_globstar_parent).is_none(),
+            "{unrelated_globstar_parent}"
+        );
+
+        for command in [
+            "shopt -s globstar; IFS=:; X='/xa99-unrelated/**/..'; rm -rf $X",
+            "shopt -s globstar; IFS=:; X='/xa99-unrelated/**/**/..'; rm -rf $X",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+
+        let conservative_direct_root =
+            "shopt -s globstar; IFS=:; X='/**/xa99-unrelated/**'; rm -rf $X";
+        let deny = evaluate_command(conservative_direct_root)
+            .unwrap_or_else(|| panic!("{conservative_direct_root}"));
+        assert_eq!(
+            deny.rule_id, "unsafe-recursive-delete-expansion",
+            "{conservative_direct_root}"
+        );
+
         for command in [
             format!("{assignment}; rm -rf \"$X\""),
             "rm -rf $HOME".to_string(),
@@ -2051,6 +2346,59 @@ mod tests {
         ] {
             assert!(evaluate_command(&command).is_none(), "{command}");
         }
+    }
+
+    #[test]
+    fn pathname_parent_match_budgets_are_shared_and_fail_closed() {
+        let patterns = vec![
+            PatternComponent::Literal("base".into()),
+            PatternComponent::Parent,
+            PatternComponent::Literal("safe".into()),
+        ];
+        let mut state_budget = PatternMatchBudget {
+            remaining_states: 5,
+            remaining_components: MAX_PATTERN_MATCH_COMPONENTS,
+        };
+
+        assert_eq!(
+            pattern_components_may_normalize_to(&patterns, &["safe"], true, &mut state_budget),
+            PatternReachability::Reachable(PatternMatchKind::ExpansionThenTraversal)
+        );
+        assert_eq!(state_budget.remaining_states, 1);
+        assert_eq!(
+            pattern_components_may_normalize_to(&patterns, &["safe"], true, &mut state_budget),
+            PatternReachability::Unknown
+        );
+        assert_eq!(state_budget.remaining_states, 0);
+
+        let mut component_budget = PatternMatchBudget {
+            remaining_states: MAX_PATTERN_MATCH_STATES,
+            remaining_components: 4,
+        };
+        assert_eq!(
+            pattern_components_may_normalize_to(&patterns, &["safe"], true, &mut component_budget),
+            PatternReachability::Reachable(PatternMatchKind::ExpansionThenTraversal)
+        );
+        assert_eq!(component_budget.remaining_components, 0);
+        assert_eq!(
+            pattern_components_may_normalize_to(&patterns, &["safe"], true, &mut component_budget),
+            PatternReachability::Unknown
+        );
+
+        let safe_pattern = "/xa99z*/**/**/**/zz";
+        let safe_command = format!("IFS=:; X='{safe_pattern}'; rm -rf $X");
+        assert!(evaluate_command(&safe_command).is_none(), "{safe_command}");
+
+        let fields = std::iter::repeat_n(safe_pattern, 500)
+            .collect::<Vec<_>>()
+            .join(":");
+        let exhausting_command = format!("IFS=:; X='{fields}'; rm -rf $X");
+        let deny = evaluate_command(&exhausting_command)
+            .unwrap_or_else(|| panic!("aggregate pattern budget was not exhausted"));
+        assert_eq!(
+            deny.rule_id, "unsafe-recursive-delete-expansion",
+            "aggregate pattern budget exhaustion must fail closed"
+        );
     }
 
     #[test]
