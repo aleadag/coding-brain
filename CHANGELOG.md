@@ -55,8 +55,23 @@ All notable changes to Coding Brain are documented here.
   disconnected handoff falls back to synchronous waiting. Literal and resolved
   deletion targets that are lexical ancestors of the trusted home are also
   denied before model inference. Unsupported syntax preserves provider-native
-  confirmation. Nested `sh -c` and `eval` inspection remains tracked
-  separately.
+  confirmation. Literal programs passed through the registered `bash`, `sh`,
+  `dash`, and `ash` interpreters (including absolute paths), BusyBox `sh`/`ash`
+  and Toybox `sh` applets, and the `time`, `exec`, `sudo`, `command`, and `env`
+  wrapper families are recursively scanned at supported `-c` and `eval`
+  boundaries under shared resource limits. Exact `eval [--]` and
+  `builtin [--]` dispatch through
+  `eval`, `exec`, `command`, and repeated `builtin` are enforced: caller
+  `eval` updates caller state, while child-shell state remains isolated.
+  Exact current-shell `source`/`.` loads preserve provider-native confirmation
+  without reading external content; literal `trap` actions and Bash
+  `mapfile`/`readarray -C` callbacks are recursively scanned, while inert
+  query, reset, and no-callback controls retain normal inference.
+  Proven destructive programs deny before inference; dynamic or malformed
+  payloads and startup, environment, argv, shell, dialect, or option ambiguity
+  preserve provider-native confirmation without model inference. Coverage is
+  limited to this explicit interpreter, multicall applet, wrapper, and builtin
+  registry.
 - Release tags now rerun formatting, Clippy, and all-target tests before
   publishing. The curl installer now requires a valid release checksum and a
   supported verifier before extracting or installing the binary.

@@ -25,6 +25,7 @@ pub(super) struct ExecutionFeatures {
 #[allow(dead_code)] // Structural context is asserted by adapter tests; policy consumes words.
 pub(super) struct ShellCommand {
     pub context: ExecutionContext,
+    pub timed_pipeline_head: bool,
     pub assignments: Vec<ShellAssignment>,
     pub invalidated_assignments: Vec<String>,
     pub command: Option<ShellWord>,
@@ -176,32 +177,55 @@ pub(super) enum ParameterTest {
     UnsetOrNull,
 }
 
-#[derive(Default)]
-struct AnalysisBudget {
+#[derive(Debug)]
+pub(super) struct AnalysisBudget {
     visited: usize,
+    limit: usize,
+}
+
+impl Default for AnalysisBudget {
+    fn default() -> Self {
+        Self::with_limit(MAX_ANALYSIS_NODES)
+    }
 }
 
 impl AnalysisBudget {
+    pub(super) fn with_limit(limit: usize) -> Self {
+        Self { visited: 0, limit }
+    }
+
+    #[cfg(test)]
+    fn visited(&self) -> usize {
+        self.visited
+    }
+
     fn visit(&mut self) -> Result<(), ShellAnalysisError> {
         self.visited = self
             .visited
             .checked_add(1)
             .ok_or(ShellAnalysisError::ResourceLimit)?;
-        if self.visited > MAX_ANALYSIS_NODES {
+        if self.visited > self.limit {
             return Err(ShellAnalysisError::ResourceLimit);
         }
         Ok(())
     }
 }
 
-struct Analyzer {
+struct Analyzer<'a> {
     options: ParserOptions,
-    budget: AnalysisBudget,
+    budget: &'a mut AnalysisBudget,
     nesting: usize,
     result: ShellProgram,
 }
 
 pub(super) fn analyze(input: &str) -> Result<ShellProgram, ShellAnalysisError> {
+    analyze_with_budget(input, &mut AnalysisBudget::default())
+}
+
+pub(super) fn analyze_with_budget(
+    input: &str,
+    budget: &mut AnalysisBudget,
+) -> Result<ShellProgram, ShellAnalysisError> {
     let options = ParserOptions::default();
     let mut parser = Parser::new(Cursor::new(input), &options);
     let program = parser
@@ -209,7 +233,7 @@ pub(super) fn analyze(input: &str) -> Result<ShellProgram, ShellAnalysisError> {
         .map_err(|_| ShellAnalysisError::UnsupportedSyntax)?;
     let mut analyzer = Analyzer {
         options,
-        budget: AnalysisBudget::default(),
+        budget,
         nesting: 0,
         result: ShellProgram {
             commands: Vec::new(),
@@ -221,7 +245,7 @@ pub(super) fn analyze(input: &str) -> Result<ShellProgram, ShellAnalysisError> {
     Ok(analyzer.result)
 }
 
-impl Analyzer {
+impl Analyzer<'_> {
     fn nested<T>(
         &mut self,
         analyze: impl FnOnce(&mut Self) -> Result<T, ShellAnalysisError>,
@@ -290,8 +314,8 @@ impl Analyzer {
         } else {
             context
         };
-        for command in &pipeline.seq {
-            self.visit_command(command, context)?;
+        for (index, command) in pipeline.seq.iter().enumerate() {
+            self.visit_command(command, context, index == 0 && pipeline.timed.is_some())?;
         }
         Ok(())
     }
@@ -300,10 +324,13 @@ impl Analyzer {
         &mut self,
         command: &ast::Command,
         context: ExecutionContext,
+        timed_pipeline_head: bool,
     ) -> Result<(), ShellAnalysisError> {
         self.budget.visit()?;
         match command {
-            ast::Command::Simple(simple) => self.visit_simple_command(simple, context),
+            ast::Command::Simple(simple) => {
+                self.visit_simple_command(simple, context, timed_pipeline_head)
+            }
             ast::Command::Compound(compound, redirects) => {
                 let redirects = redirects
                     .as_ref()
@@ -314,6 +341,7 @@ impl Analyzer {
                     if !invalidated_assignments.is_empty() {
                         self.result.commands.push(ShellCommand {
                             context,
+                            timed_pipeline_head: false,
                             assignments: Vec::new(),
                             invalidated_assignments,
                             command: None,
@@ -419,6 +447,7 @@ impl Analyzer {
                 if !invalidated_assignments.is_empty() {
                     self.result.commands.push(ShellCommand {
                         context,
+                        timed_pipeline_head: false,
                         assignments: Vec::new(),
                         invalidated_assignments,
                         command: None,
@@ -434,7 +463,6 @@ impl Analyzer {
                 self.nested(|analyzer| analyzer.visit_compound_list(&command.list, context))
             }
             ast::CompoundCommand::Subshell(command) => {
-                self.result.features.executable_group = true;
                 let context = restrict_context(context, ExecutionContext::Subshell);
                 self.nested(|analyzer| analyzer.visit_compound_list(&command.list, context))
             }
@@ -452,6 +480,7 @@ impl Analyzer {
                 }
                 self.result.commands.push(ShellCommand {
                     context,
+                    timed_pipeline_head: false,
                     assignments: Vec::new(),
                     invalidated_assignments,
                     command: None,
@@ -492,7 +521,7 @@ impl Analyzer {
                     self.project_word(name)?;
                 }
                 let context = restrict_context(context, ExecutionContext::Group);
-                self.nested(|analyzer| analyzer.visit_command(&command.body, context))
+                self.nested(|analyzer| analyzer.visit_command(&command.body, context, false))
             }
         }
     }
@@ -501,10 +530,12 @@ impl Analyzer {
         &mut self,
         command: &ast::SimpleCommand,
         context: ExecutionContext,
+        timed_pipeline_head: bool,
     ) -> Result<(), ShellAnalysisError> {
         self.budget.visit()?;
         let mut projected = ShellCommand {
             context,
+            timed_pipeline_head,
             assignments: Vec::new(),
             invalidated_assignments: Vec::new(),
             command: command
@@ -521,10 +552,25 @@ impl Analyzer {
                 self.visit_simple_item(item, &mut projected, true)?;
             }
         }
+        let adapt_timed_terminator = timed_pipeline_head
+            && projected
+                .command
+                .as_ref()
+                .is_some_and(|word| word.raw == "--");
+        if adapt_timed_terminator {
+            projected.command = None;
+        }
         if let Some(suffix) = &command.suffix {
             self.budget.visit()?;
-            for item in &suffix.0 {
-                self.visit_simple_item(item, &mut projected, false)?;
+            if adapt_timed_terminator {
+                let mut leading_negation = true;
+                for item in &suffix.0 {
+                    self.visit_timed_terminator_item(item, &mut projected, &mut leading_negation)?;
+                }
+            } else {
+                for item in &suffix.0 {
+                    self.visit_simple_item(item, &mut projected, false)?;
+                }
             }
         }
         if let Some(command) = &projected.command {
@@ -545,6 +591,52 @@ impl Analyzer {
             }
         }
         self.result.commands.push(projected);
+        Ok(())
+    }
+
+    fn visit_timed_terminator_item(
+        &mut self,
+        item: &ast::CommandPrefixOrSuffixItem,
+        command: &mut ShellCommand,
+        leading_negation: &mut bool,
+    ) -> Result<(), ShellAnalysisError> {
+        self.budget.visit()?;
+        match item {
+            ast::CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
+                command.redirects.push(self.project_redirect(redirect)?);
+            }
+            ast::CommandPrefixOrSuffixItem::Word(word) => {
+                let word = self.project_word(word)?;
+                if command.command.is_none() && *leading_negation && word.raw == "!" {
+                    return Ok(());
+                }
+                *leading_negation = false;
+                if command.command.is_none() {
+                    command.command = Some(word);
+                } else {
+                    command.arguments.push(word);
+                }
+            }
+            ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, word) => {
+                *leading_negation = false;
+                if command.command.is_none() {
+                    command
+                        .assignments
+                        .push(self.project_assignment(assignment)?);
+                } else {
+                    command.arguments.push(self.project_word(word)?);
+                }
+            }
+            ast::CommandPrefixOrSuffixItem::ProcessSubstitution(kind, subshell) => {
+                *leading_negation = false;
+                let word = self.project_process_substitution(kind, subshell)?;
+                if command.command.is_none() {
+                    command.command = Some(word);
+                } else {
+                    command.arguments.push(word);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -608,6 +700,7 @@ impl Analyzer {
         let index = self.result.commands.len();
         self.result.commands.push(ShellCommand {
             context,
+            timed_pipeline_head: false,
             assignments: Vec::new(),
             invalidated_assignments: Vec::new(),
             command: None,
@@ -1498,9 +1591,10 @@ mod tests {
     }
 
     fn project_test_word(raw: &str) -> Result<(ShellWord, ExecutionFeatures), ShellAnalysisError> {
+        let mut budget = AnalysisBudget::default();
         let mut analyzer = Analyzer {
             options: ParserOptions::default(),
-            budget: AnalysisBudget::default(),
+            budget: &mut budget,
             nesting: 0,
             result: ShellProgram {
                 commands: Vec::new(),
@@ -2003,6 +2097,32 @@ mod tests {
     }
 
     #[test]
+    fn structure_keeps_assignment_lookalikes_as_command_words() {
+        for (input, expected_command) in [
+            ("'FOO=bar' eval ':'", "FOO=bar"),
+            ("FOO\\=bar eval ':'", "FOO=bar"),
+            ("F'O'O=bar eval ':'", "FOO=bar"),
+            ("./FOO=bar eval ':'", "./FOO=bar"),
+            ("time 'FOO=bar' eval ':'", "FOO=bar"),
+        ] {
+            let program = analyze(input).expect(input);
+            let command = &program.commands[0];
+
+            assert!(command.assignments.is_empty(), "{input}");
+            assert_eq!(
+                literal(command.command.as_ref()),
+                Some(expected_command),
+                "{input}"
+            );
+            assert_eq!(
+                command.arguments[0].literal.as_deref(),
+                Some("eval"),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
     fn structure_preserves_scalar_append_assignment_semantics() {
         let program = analyze("X=-; X+=rf").expect("scalar assignments");
 
@@ -2131,7 +2251,7 @@ mod tests {
                 .any(|command| { literal(command.command.as_ref()) == Some("rm") })
         );
 
-        for input in ["{ rm -rf /; }", "(rm -rf /)", "coproc rm -rf /"] {
+        for input in ["{ rm -rf /; }", "coproc rm -rf /"] {
             let program = analyze(input).expect(input);
             assert!(program.features.executable_group, "{input}");
             assert!(
@@ -2141,6 +2261,10 @@ mod tests {
                     .any(|command| { literal(command.command.as_ref()) == Some("rm") })
             );
         }
+
+        let subshell = analyze("(rm -rf /)").expect("subshell");
+        assert!(!subshell.features.executable_group);
+        assert_eq!(subshell.commands[0].context, ExecutionContext::Subshell);
     }
 
     #[test]
@@ -2283,6 +2407,92 @@ mod tests {
             analyze(&input).expect_err("oversized AST"),
             ShellAnalysisError::ResourceLimit
         );
+    }
+
+    #[test]
+    fn timed_option_terminator_preserves_the_executed_command() {
+        for (input, expected_command) in [
+            ("time -- eval 'rm --no-preserve-root -rf /'", "eval"),
+            ("time -p -- sh -c 'rm --no-preserve-root -rf /'", "sh"),
+            ("time -- ! eval 'rm --no-preserve-root -rf /'", "eval"),
+            ("time -p -- ! ! sh -c 'rm --no-preserve-root -rf /'", "sh"),
+        ] {
+            let program = analyze(input).expect(input);
+            assert!(program.commands[0].timed_pipeline_head, "{input}");
+            assert_eq!(
+                program.commands[0]
+                    .command
+                    .as_ref()
+                    .and_then(|word| word.literal.as_deref()),
+                Some(expected_command),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn timed_option_terminator_preserves_prefix_assignments() {
+        let program = analyze("time -- SAFE=/tmp eval 'rm -rf \"$SAFE\"'").expect("timed eval");
+        let command = &program.commands[0];
+
+        assert!(command.timed_pipeline_head);
+        assert_eq!(command.assignments.len(), 1);
+        assert_eq!(command.assignments[0].name, "SAFE");
+        assert_eq!(
+            command.assignments[0].value.literal.as_deref(),
+            Some("/tmp")
+        );
+        assert_eq!(
+            command
+                .command
+                .as_ref()
+                .and_then(|word| word.literal.as_deref()),
+            Some("eval")
+        );
+    }
+
+    #[test]
+    fn timed_option_terminator_keeps_post_command_assignments_as_arguments() {
+        let program = analyze("time -- printf SAFE=/tmp").expect("timed printf");
+        let command = &program.commands[0];
+
+        assert!(command.assignments.is_empty());
+        assert_eq!(
+            command
+                .command
+                .as_ref()
+                .and_then(|word| word.literal.as_deref()),
+            Some("printf")
+        );
+        assert_eq!(command.arguments[0].literal.as_deref(), Some("SAFE=/tmp"));
+    }
+
+    #[test]
+    fn quoted_timed_double_dash_remains_the_command_name() {
+        let program = analyze("time '--' eval 'printf ok'").expect("quoted command");
+        let command = program.commands[0].command.as_ref().unwrap();
+        assert_eq!(command.raw, "'--'");
+        assert_eq!(command.literal.as_deref(), Some("--"));
+    }
+
+    #[test]
+    fn shared_analysis_budget_accumulates_across_programs() {
+        let mut probe = AnalysisBudget::with_limit(usize::MAX);
+        analyze_with_budget(":", &mut probe).unwrap();
+        let one_program = probe.visited();
+
+        let mut budget = AnalysisBudget::with_limit(one_program * 2 - 1);
+        assert!(analyze_with_budget(":", &mut budget).is_ok());
+        assert_eq!(
+            analyze_with_budget(":", &mut budget).expect_err("shared budget exhausted"),
+            ShellAnalysisError::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn fresh_analysis_keeps_an_independent_budget() {
+        assert!(analyze(":").is_ok());
+        assert!(analyze(":").is_ok());
     }
 
     #[test]

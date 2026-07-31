@@ -1252,6 +1252,20 @@ mod tests {
         serde_json::to_vec(&payload).unwrap()
     }
 
+    fn permission_payload_for_provider_command(provider: AgentProvider, command: &str) -> Vec<u8> {
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&permission_payload_for_provider(provider, false)).unwrap();
+        match provider {
+            AgentProvider::Codex | AgentProvider::Claude => {
+                payload["tool_input"]["command"] = serde_json::json!(command);
+            }
+            AgentProvider::Antigravity => {
+                payload["toolCall"]["args"]["CommandLine"] = serde_json::json!(command);
+            }
+        }
+        serde_json::to_vec(&payload).unwrap()
+    }
+
     fn suggestion(action: RuleAction, confidence: f64) -> BrainSuggestion {
         BrainSuggestion {
             action,
@@ -1886,6 +1900,525 @@ mod tests {
                     Some(ProjectedStatus::NeedsInput),
                     "{provider:?}: {error:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_shell_safety_precedes_inference_for_every_provider() {
+        for (command, proven_deny) in [
+            ("sh -c 'rm --no-preserve-root -rf /'", true),
+            ("time -- eval 'rm --no-preserve-root -rf /'", true),
+            ("time -p -- ! sh -c 'rm --no-preserve-root -rf /'", true),
+            ("eval -- 'rm --no-preserve-root -rf /'", true),
+            ("builtin -- eval 'rm --no-preserve-root -rf /'", true),
+            ("source /definitely/not-read-by-safety", false),
+            (". /dev/stdin", false),
+            ("builtin -- source \"$FILE\"", false),
+            ("trap 'rm --no-preserve-root -rf /' EXIT", true),
+            (
+                "TARGET=/; TARGET=/tmp/safe trap 'rm --no-preserve-root -rf \"$TARGET\"' EXIT",
+                true,
+            ),
+            (
+                "TARGET=/tmp/safe; TARGET=/ trap 'rm --no-preserve-root -rf \"$TARGET\"' EXIT",
+                false,
+            ),
+            ("builtin -- trap ':' EXIT", false),
+            ("trap \"$ACTION\" EXIT", false),
+            ("sh -c 'trap -p EXIT'", false),
+            ("mapfile -c1 -C 'rm --no-preserve-root -rf /'", true),
+            ("mapfile -c +1 -C 'rm --no-preserve-root -rf /'", true),
+            ("mapfile -C 'rm --no-preserve-root -rf /' -c 0", false),
+            (
+                "mapfile -C 'rm --no-preserve-root -rf /' -n 4294967296",
+                false,
+            ),
+            ("mapfile -C 'rm --no-preserve-root -rf /' -c '1\n'", false),
+            ("builtin -- readarray -c1 -C ':'", false),
+            ("mapfile -c1 -C \"$CALLBACK\"", false),
+            ("mapfile -c", false),
+            (
+                "bash --posix -c \"mapfile -c1 -C 'rm --no-preserve-root -rf /'\"",
+                true,
+            ),
+            (
+                "sh -c \"mapfile -c1 -C 'rm --no-preserve-root -rf /'\"",
+                false,
+            ),
+            (
+                "sh -c 'TARGET=/tmp/safe; TARGET=/ eval \":\"; rm --no-preserve-root -rf \"$TARGET\"'",
+                true,
+            ),
+            (
+                "bash --posix -c 'TARGET=/tmp/safe; TARGET=/ eval \":\"; rm --no-preserve-root -rf \"$TARGET\"'",
+                true,
+            ),
+            (
+                "set -o posix; TARGET=/tmp/safe; TARGET=/ eval ':'; rm --no-preserve-root -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "(set -o posix; TARGET=/tmp/safe; TARGET=/ eval ':'; rm --no-preserve-root -rf \"$TARGET\")",
+                true,
+            ),
+            (
+                "bash --posix -c 'alias wipe=\"rm --no-preserve-root -rf /\"\nwipe'",
+                false,
+            ),
+            (
+                "eval 'shopt -s expand_aliases\nalias wipe=\"rm --no-preserve-root -rf /\"\nwipe'",
+                false,
+            ),
+            (
+                "bash --posix -c 'alias load=source\nload /tmp/attacker-controlled-script'",
+                false,
+            ),
+            (
+                "eval 'shopt -s expand_aliases\nalias load=source\nload /tmp/attacker-controlled-script'",
+                false,
+            ),
+            (
+                "hash -p /tmp/attacker-controlled-executable wipe; wipe",
+                false,
+            ),
+            (
+                "enable -f /tmp/attacker-controlled-builtin.so wipe; wipe",
+                false,
+            ),
+            (
+                "dash -c 'TARGET=/; time eval \"TARGET=/tmp/safe\"; rm --no-preserve-root -rf \"$TARGET\"'",
+                true,
+            ),
+            (
+                "sh -c 'TARGET=/; builtin eval \"TARGET=/tmp/safe\"; rm --no-preserve-root -rf \"$TARGET\"'",
+                true,
+            ),
+            ("arbitrary_mutator; rm -f \"$HOME\" /", true),
+            ("sh -c \"$PROGRAM\"", false),
+            ("builtin exec sh -c \"$PROGRAM\"", false),
+            ("builtin command sh -c \"$PROGRAM\"", false),
+            ("builtin builtin eval \"$PROGRAM\"", false),
+            ("BASH_ENV=/tmp/attacker-startup bash -c 'printf ok'", false),
+            (
+                "env BASH_ENV=/tmp/attacker-startup bash -c 'printf ok'",
+                false,
+            ),
+            ("env -a displayed bash -c 'printf ok'", false),
+            (
+                "env --argv0=displayed /bin/bash -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            ("env --argv0", false),
+            ("exec -cla displayed bash -c 'printf ok'", false),
+            (
+                "exec -cla displayed /bin/bash -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            ("HOME=/tmp/safe; sh -c 'rm -rf \"$HOME\"'", true),
+            ("sudo bash -c 'rm --no-preserve-root -rf \"$HOME\"'", true),
+            ("sudo bash -c 'rm --no-preserve-root -rf /root'", false),
+            (
+                "sudo -H bash -c 'rm --no-preserve-root -rf \"$HOME\"'",
+                true,
+            ),
+            ("bash -cz 'rm --no-preserve-root -rf /'", false),
+            (
+                "shopt -s lastpipe; export BASHOPTS; bash -c 'TARGET=/tmp/safe; printf x | eval \"TARGET=/\"; rm --no-preserve-root -rf \"$TARGET\"'",
+                true,
+            ),
+            (
+                "shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+                true,
+            ),
+            (
+                "shopt -s lastpipe; env shopt -u lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+                true,
+            ),
+            (
+                "shopt -s lastpipe; sudo shopt -u lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+                true,
+            ),
+            (
+                "shopt -s lastpipe; /usr/bin/time shopt -u lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+                true,
+            ),
+            (
+                "shopt -s lastpipe; exec shopt -u lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+                true,
+            ),
+            (
+                "BASH_ENV=/dev/fd/3; export BASH_ENV; bash -c 'rm -rf /tmp/safe' 3<<<'rm(){ printf OVERRIDDEN; }'",
+                false,
+            ),
+            ("time -- BASH_ENV=/tmp/startup sh -c 'printf ok'", false),
+            (
+                "time -- BASH_ENV=/tmp/startup sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            ("eval \"$UNKNOWN\" | cat", false),
+            (
+                "sudo BASH_ENV=/tmp/attacker-startup bash -c 'printf ok'",
+                false,
+            ),
+            ("sudo X-Y=z sh -c 'rm --no-preserve-root -rf /'", true),
+            ("env /X=z sh -c 'rm --no-preserve-root -rf /'", true),
+            ("sudo -nE bash -c 'rm --no-preserve-root -rf /'", true),
+            ("sudo -E bash -c 'printf ok'", false),
+            ("sudo --preserve-env=BASH_ENV bash -c 'printf ok'", false),
+            ("sudo -ni bash -c 'printf ok'", false),
+            ("sudo --shell bash -c 'printf ok'", false),
+            ("sudo -i printf ok", false),
+            ("sudo -s '$DANGER'", false),
+            (
+                "sudo DANGER='rm --no-preserve-root -rf /' -s '$DANGER'",
+                false,
+            ),
+            (
+                "builtin exec sudo DANGER='rm --no-preserve-root -rf /' -s '$DANGER'",
+                false,
+            ),
+            ("sudo -E", false),
+            ("sudo --shell rm --no-preserve-root -rf /", true),
+            (
+                "builtin exec sudo --shell rm --no-preserve-root -rf /",
+                true,
+            ),
+            (
+                "TARGET=/; sudo eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; builtin exec sudo eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; env eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; /usr/bin/time eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; command time eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; FOO=bar time eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; 'time' eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; >/dev/null time eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; command -x eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; builtin command -P eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; command FOO=bar eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; 'FOO=bar' eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; time time FOO\\=bar eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; builtin command -- FOO=bar eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "TARGET=/; sudo -s eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+                true,
+            ),
+            (
+                "command sudo -s time eval 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "builtin command sudo -i time eval 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            ("sudo -s 'time' eval 'rm --no-preserve-root -rf /'", true),
+            (
+                "sudo -s -- FOO=bar eval 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            ("sudo --unknown bash -c 'printf ok'", true),
+            ("sudo --pre bash -c 'printf ok'", true),
+            ("sudo \"$OPTIONS\" bash -c 'printf ok'", true),
+            ("zsh -c 'printf ok'", false),
+        ] {
+            for provider in [
+                AgentProvider::Codex,
+                AgentProvider::Claude,
+                AgentProvider::Antigravity,
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+                let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+                if provider == AgentProvider::Antigravity {
+                    let identity = LifecycleIdentity::try_new(
+                        AgentProvider::Antigravity,
+                        "agy-conversation-1".into(),
+                        Some("invocation-1".into()),
+                        Some("/tmp/agy-conversation-1/transcript.jsonl".into()),
+                        std::env::current_dir().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        lifecycle
+                            .record(
+                                LifecycleEvent::from_parts_with_turn_initial_step(
+                                    identity,
+                                    LifecycleEventKind::UserPromptSubmit,
+                                    Some(5),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap(),
+                        ApplyOutcome::Applied
+                    );
+                }
+                let calls = AtomicUsize::new(0);
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+
+                run_provider_with_gate_and_stores(
+                    Cursor::new(permission_payload_for_provider_command(provider, command)),
+                    &mut stdout,
+                    &mut stderr,
+                    Some(&enabled_config()),
+                    BrainGateMode::Auto,
+                    &lifecycle,
+                    Some(&activity),
+                    provider,
+                    (provider == AgentProvider::Antigravity).then_some("PreToolUse"),
+                    |_, _| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        panic!("nested shell safety must not invoke the model")
+                    },
+                );
+
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "{provider:?}: {command}");
+                if provider == AgentProvider::Antigravity {
+                    let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                    assert_eq!(
+                        output["decision"],
+                        if proven_deny { "deny" } else { "ask" },
+                        "{provider:?}: {command}"
+                    );
+                } else if proven_deny {
+                    let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                    assert_eq!(
+                        output["hookSpecificOutput"]["decision"]["behavior"], "deny",
+                        "{provider:?}: {command}"
+                    );
+                } else {
+                    assert!(stdout.is_empty(), "{provider:?}: {command}");
+                }
+                assert!(
+                    stderr.is_empty(),
+                    "{provider:?}: {command}: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_shell_state_precedes_inference_for_every_provider() {
+        for (command, proven_deny, safety) in [
+            (
+                "printf ok",
+                false,
+                super::super::safety::evaluate_in_process_with_inherited_startup
+                    as fn(Option<&ShellCommandInput>) -> super::super::safety::SafetyEvaluation,
+            ),
+            (
+                "rm --no-preserve-root -rf /",
+                true,
+                super::super::safety::evaluate_in_process_with_inherited_startup,
+            ),
+            (
+                "bash -c 'TARGET=/tmp/safe; TARGET=/ eval \":\"; rm --no-preserve-root -rf \"$TARGET\"'",
+                true,
+                super::super::safety::evaluate_in_process_with_inherited_posix,
+            ),
+            (
+                "bash -pc 'TARGET=/tmp/safe; TARGET=/ eval \":\"; rm --no-preserve-root -rf \"$TARGET\"'",
+                false,
+                super::super::safety::evaluate_in_process_with_inherited_posix,
+            ),
+            (
+                "BASH_ENV=/tmp/attacker-startup set -o posix; bash -c 'printf ok'",
+                false,
+                super::super::safety::evaluate_in_process_with_inherited_posix,
+            ),
+            (
+                "BASH_ENV=/tmp/attacker-startup builtin set -o posix; bash -c 'printf ok'",
+                false,
+                super::super::safety::evaluate_in_process_with_inherited_posix,
+            ),
+            (
+                "BASH_ENV=/tmp/attacker-startup command set -o posix; bash -c 'printf ok'",
+                false,
+                super::super::safety::evaluate_in_process_with_inherited_posix,
+            ),
+            (
+                "BASH_ENV=/tmp/attacker-startup set -o posix; bash -c 'printf ok'; rm --no-preserve-root -rf /",
+                true,
+                super::super::safety::evaluate_in_process_with_inherited_posix,
+            ),
+        ] {
+            for provider in [
+                AgentProvider::Codex,
+                AgentProvider::Claude,
+                AgentProvider::Antigravity,
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+                let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+                if provider == AgentProvider::Antigravity {
+                    let identity = LifecycleIdentity::try_new(
+                        AgentProvider::Antigravity,
+                        "agy-conversation-1".into(),
+                        Some("invocation-1".into()),
+                        Some("/tmp/agy-conversation-1/transcript.jsonl".into()),
+                        std::env::current_dir().unwrap(),
+                    )
+                    .unwrap();
+                    lifecycle
+                        .record(
+                            LifecycleEvent::from_parts_with_turn_initial_step(
+                                identity,
+                                LifecycleEventKind::UserPromptSubmit,
+                                Some(5),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                }
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+
+                run_provider_with_gate_and_stores_and_safety(
+                    Cursor::new(permission_payload_for_provider_command(provider, command)),
+                    &mut stdout,
+                    &mut stderr,
+                    Some(&enabled_config()),
+                    BrainGateMode::Auto,
+                    &lifecycle,
+                    Some(&activity),
+                    provider,
+                    (provider == AgentProvider::Antigravity).then_some("PreToolUse"),
+                    safety,
+                    |_, _| panic!("inherited startup uncertainty must not invoke the model"),
+                );
+
+                if provider == AgentProvider::Antigravity {
+                    let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                    assert_eq!(
+                        output["decision"],
+                        if proven_deny { "deny" } else { "ask" },
+                        "{provider:?}: {command}"
+                    );
+                } else if proven_deny {
+                    let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                    assert_eq!(
+                        output["hookSpecificOutput"]["decision"]["behavior"], "deny",
+                        "{provider:?}: {command}"
+                    );
+                } else {
+                    assert!(stdout.is_empty(), "{provider:?}: {command}");
+                }
+                assert!(
+                    stderr.is_empty(),
+                    "{provider:?}: {command}: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn benign_literal_nested_shell_invokes_inference_once_for_every_provider() {
+        for command in [
+            "sh -c 'printf %s ok'",
+            "source",
+            ".",
+            "trap -p EXIT",
+            "trap - EXIT",
+            "trap '' EXIT",
+            "mapfile",
+            "readarray -c1 -- '-Cprintf DANGER'",
+        ] {
+            for provider in [
+                AgentProvider::Codex,
+                AgentProvider::Claude,
+                AgentProvider::Antigravity,
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
+                let activity = ActivityStore::at(temp.path().join("activity.jsonl"));
+                if provider == AgentProvider::Antigravity {
+                    let identity = LifecycleIdentity::try_new(
+                        AgentProvider::Antigravity,
+                        "agy-conversation-1".into(),
+                        Some("invocation-1".into()),
+                        Some("/tmp/agy-conversation-1/transcript.jsonl".into()),
+                        std::env::current_dir().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        lifecycle
+                            .record(
+                                LifecycleEvent::from_parts_with_turn_initial_step(
+                                    identity,
+                                    LifecycleEventKind::UserPromptSubmit,
+                                    Some(5),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap(),
+                        ApplyOutcome::Applied
+                    );
+                }
+                let calls = AtomicUsize::new(0);
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+
+                run_provider_with_gate_and_stores(
+                    Cursor::new(permission_payload_for_provider_command(provider, command)),
+                    &mut stdout,
+                    &mut stderr,
+                    Some(&enabled_config()),
+                    BrainGateMode::Auto,
+                    &lifecycle,
+                    Some(&activity),
+                    provider,
+                    (provider == AgentProvider::Antigravity).then_some("PreToolUse"),
+                    |_, _| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(suggestion(RuleAction::Approve, 0.9))
+                    },
+                );
+
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{provider:?}: {command}");
+                assert!(stderr.is_empty(), "{provider:?}: {command}");
             }
         }
     }
