@@ -13,10 +13,89 @@ const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(any(unix, test))]
 const MAX_HELPER_OUTPUT_BYTES: usize = 512;
 const MAX_SHELL_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_RECURSIVE_PARSE_BYTES: usize = MAX_SHELL_COMMAND_BYTES;
+const MAX_NESTED_EXECUTION_DEPTH: usize = 8;
 #[cfg(unix)]
 const MAX_TRUSTED_HOME_BYTES: usize = 4_096;
 const MAX_PATTERN_MATCH_STATES: usize = 16_384;
 const MAX_PATTERN_MATCH_COMPONENTS: usize = 65_536;
+const STARTUP_ENV_MARKER: &str = "CODING_BRAIN_SHELL_SAFETY_STARTUP_ENV_UNCERTAIN";
+const LASTPIPE_MARKER: &str = "CODING_BRAIN_SHELL_SAFETY_LASTPIPE_ENABLED";
+const POSIX_MODE_ENABLED_MARKER: &str = "CODING_BRAIN_SHELL_SAFETY_POSIX_MODE_ENABLED";
+const POSIX_MODE_UNCERTAIN_MARKER: &str = "CODING_BRAIN_SHELL_SAFETY_POSIX_MODE_UNCERTAIN";
+const POSIX_MODE_PROPAGATES_MARKER: &str = "CODING_BRAIN_SHELL_SAFETY_POSIX_MODE_PROPAGATES";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PosixMode {
+    Disabled,
+    Enabled,
+    Unknown,
+}
+
+#[derive(Clone, Copy)]
+struct InheritedShellState {
+    startup_environment_uncertain: bool,
+    lastpipe_enabled: bool,
+    posix_mode: PosixMode,
+    posix_mode_propagates: bool,
+}
+
+impl InheritedShellState {
+    fn from_parent_environment() -> Self {
+        let bashopts = std::env::var_os("BASHOPTS");
+        let lastpipe_enabled = bashopts.is_some_and(|bashopts| {
+            bashopts
+                .to_str()
+                .is_none_or(|bashopts| bashopts.split(':').any(|option| option == "lastpipe"))
+        });
+        let posixly_correct = std::env::var_os("POSIXLY_CORRECT");
+        let shellopts = std::env::var_os("SHELLOPTS");
+        let posix_mode_propagates = posixly_correct.is_some() || shellopts.is_some();
+        let posix_mode = if posixly_correct.is_some() {
+            PosixMode::Enabled
+        } else {
+            match shellopts {
+                None => PosixMode::Disabled,
+                Some(shellopts) => match shellopts.to_str() {
+                    Some(shellopts) if shellopts.split(':').any(|option| option == "posix") => {
+                        PosixMode::Enabled
+                    }
+                    Some(_) => PosixMode::Disabled,
+                    None => PosixMode::Unknown,
+                },
+            }
+        };
+        Self {
+            startup_environment_uncertain: std::env::var_os("BASH_ENV").is_some()
+                || std::env::var_os("ENV").is_some(),
+            lastpipe_enabled,
+            posix_mode,
+            posix_mode_propagates,
+        }
+    }
+
+    fn from_helper_environment() -> Self {
+        let parent = Self::from_parent_environment();
+        let posix_mode = if std::env::var_os(POSIX_MODE_UNCERTAIN_MARKER)
+            .is_some_and(|value| value == "1")
+        {
+            PosixMode::Unknown
+        } else if std::env::var_os(POSIX_MODE_ENABLED_MARKER).is_some_and(|value| value == "1") {
+            PosixMode::Enabled
+        } else {
+            parent.posix_mode
+        };
+        Self {
+            startup_environment_uncertain: parent.startup_environment_uncertain
+                || std::env::var_os(STARTUP_ENV_MARKER).is_some_and(|value| value == "1"),
+            lastpipe_enabled: parent.lastpipe_enabled
+                || std::env::var_os(LASTPIPE_MARKER).is_some_and(|value| value == "1"),
+            posix_mode,
+            posix_mode_propagates: parent.posix_mode_propagates
+                || std::env::var_os(POSIX_MODE_PROPAGATES_MARKER).is_some_and(|value| value == "1"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatternMatchKind {
@@ -63,6 +142,404 @@ struct PatternMatchBudget {
     remaining_components: usize,
 }
 
+#[derive(Clone)]
+struct EvaluationState {
+    trusted_home: Option<String>,
+    assignments: HashMap<String, String>,
+    ifs_unknown: bool,
+    lastpipe_may_be_enabled: bool,
+    posix_mode: PosixMode,
+    posix_mode_propagates: bool,
+    posix_child_mode: PosixMode,
+    current_program_startup_may_be_unsafe: bool,
+    child_environment_may_be_unsafe: bool,
+    mutation_version: u64,
+    assignment_mutations: HashMap<String, u64>,
+}
+
+impl EvaluationState {
+    fn trusted() -> Self {
+        Self::trusted_with_inherited(InheritedShellState::from_helper_environment())
+    }
+
+    fn trusted_with_inherited(inherited: InheritedShellState) -> Self {
+        let mut assignments = HashMap::new();
+        let trusted_home = std::env::var("HOME").ok();
+        if let Some(home) = &trusted_home {
+            assignments.insert("HOME".into(), home.clone());
+        }
+        Self {
+            trusted_home,
+            assignments,
+            ifs_unknown: false,
+            lastpipe_may_be_enabled: inherited.lastpipe_enabled,
+            posix_mode: inherited.posix_mode,
+            posix_mode_propagates: inherited.posix_mode_propagates,
+            posix_child_mode: if inherited.posix_mode_propagates {
+                inherited.posix_mode
+            } else {
+                PosixMode::Disabled
+            },
+            current_program_startup_may_be_unsafe: inherited.startup_environment_uncertain,
+            child_environment_may_be_unsafe: inherited.startup_environment_uncertain,
+            mutation_version: 0,
+            assignment_mutations: HashMap::new(),
+        }
+    }
+
+    fn child(
+        &self,
+        preserve_trusted_home: bool,
+        startup_may_be_unsafe: bool,
+        semantics: ShellSemantics,
+    ) -> Self {
+        let mut assignments = HashMap::new();
+        if preserve_trusted_home
+            && self
+                .trusted_home
+                .as_ref()
+                .is_some_and(|home| self.assignments.get("HOME") == Some(home))
+        {
+            let home = self
+                .trusted_home
+                .as_ref()
+                .expect("checked trusted HOME presence");
+            assignments.insert("HOME".into(), home.clone());
+        }
+        Self {
+            trusted_home: self.trusted_home.clone(),
+            assignments,
+            ifs_unknown: false,
+            lastpipe_may_be_enabled: self.lastpipe_may_be_enabled,
+            posix_mode: match semantics {
+                ShellSemantics::Bash
+                    if preserve_trusted_home
+                        && !startup_may_be_unsafe
+                        && self.posix_mode_propagates =>
+                {
+                    self.posix_child_mode
+                }
+                _ => semantics.initial_posix_mode(),
+            },
+            posix_mode_propagates: preserve_trusted_home
+                && !startup_may_be_unsafe
+                && self.posix_mode_propagates,
+            posix_child_mode: if preserve_trusted_home
+                && !startup_may_be_unsafe
+                && self.posix_mode_propagates
+            {
+                self.posix_child_mode
+            } else {
+                PosixMode::Disabled
+            },
+            current_program_startup_may_be_unsafe: startup_may_be_unsafe,
+            child_environment_may_be_unsafe: startup_may_be_unsafe,
+            mutation_version: 0,
+            assignment_mutations: HashMap::new(),
+        }
+    }
+
+    fn next_mutation(&mut self) -> u64 {
+        self.mutation_version = self.mutation_version.saturating_add(1);
+        self.mutation_version
+    }
+
+    fn mark_assignment_mutation(&mut self, name: &str) {
+        let version = self.next_mutation();
+        self.assignment_mutations.insert(name.to_string(), version);
+    }
+
+    fn assignment_mutated_since(&self, name: &str, version: u64) -> bool {
+        self.assignment_mutations
+            .get(name)
+            .is_some_and(|mutation| *mutation > version)
+    }
+
+    fn invalidate_mutable(&mut self) {
+        self.assignments.clear();
+        self.ifs_unknown = true;
+        self.child_environment_may_be_unsafe = true;
+    }
+
+    fn note_environment_assignment(&mut self, name: &str) {
+        if matches!(name, "BASH_ENV" | "ENV" | "POSIXLY_CORRECT" | "SHELLOPTS") {
+            self.child_environment_may_be_unsafe = true;
+        }
+    }
+}
+
+struct TemporaryAssignment {
+    name: String,
+    original_value: Option<String>,
+    original_ifs_unknown: bool,
+}
+
+struct AppliedEvalAssignments {
+    temporary: Vec<TemporaryAssignment>,
+    mutation_version: u64,
+    indeterminate: bool,
+}
+
+impl AppliedEvalAssignments {
+    fn restore(self, state: &mut EvaluationState) {
+        for assignment in self.temporary {
+            if state.assignment_mutated_since(&assignment.name, self.mutation_version) {
+                state.assignments.remove(&assignment.name);
+                if assignment.name == "IFS" {
+                    state.ifs_unknown = true;
+                }
+                continue;
+            }
+
+            match assignment.original_value {
+                Some(value) => {
+                    state.assignments.insert(assignment.name.clone(), value);
+                }
+                None => {
+                    state.assignments.remove(&assignment.name);
+                }
+            }
+            if assignment.name == "IFS" {
+                state.ifs_unknown = assignment.original_ifs_unknown;
+            }
+        }
+    }
+}
+
+fn apply_eval_assignments(
+    assignments: &[shell::ShellAssignment],
+    state: &mut EvaluationState,
+) -> AppliedEvalAssignments {
+    let mut temporary = Vec::new();
+    let mut indeterminate = false;
+
+    for assignment in assignments {
+        if !temporary
+            .iter()
+            .any(|saved: &TemporaryAssignment| saved.name == assignment.name)
+        {
+            temporary.push(TemporaryAssignment {
+                name: assignment.name.clone(),
+                original_value: state.assignments.get(&assignment.name).cloned(),
+                original_ifs_unknown: state.ifs_unknown,
+            });
+        }
+
+        let value = if assignment.value.may_mutate_shell_state {
+            state.invalidate_mutable();
+            indeterminate = true;
+            None
+        } else {
+            resolve_word(&assignment.value, &state.assignments)
+        };
+        let value = if assignment.append {
+            state
+                .assignments
+                .get(&assignment.name)
+                .cloned()
+                .zip(value)
+                .map(|(mut current, value)| {
+                    current.push_str(&value);
+                    current
+                })
+        } else {
+            value
+        };
+
+        match value {
+            Some(value) => {
+                state.assignments.insert(assignment.name.clone(), value);
+                if assignment.name == "IFS" {
+                    state.ifs_unknown = false;
+                }
+            }
+            None => {
+                state.assignments.remove(&assignment.name);
+                if assignment.name == "IFS" {
+                    state.ifs_unknown = true;
+                }
+                indeterminate = true;
+            }
+        }
+        state.note_environment_assignment(&assignment.name);
+        state.mark_assignment_mutation(&assignment.name);
+    }
+
+    AppliedEvalAssignments {
+        temporary,
+        mutation_version: state.mutation_version,
+        indeterminate,
+    }
+}
+
+struct EvaluationBudget {
+    remaining_bytes: usize,
+    remaining_nested: usize,
+    shell: shell::AnalysisBudget,
+    patterns: PatternMatchBudget,
+}
+
+impl EvaluationBudget {
+    fn new() -> Self {
+        Self::with_limits(
+            MAX_RECURSIVE_PARSE_BYTES,
+            MAX_NESTED_EXECUTION_DEPTH,
+            shell::AnalysisBudget::default(),
+        )
+    }
+
+    fn with_limits(
+        remaining_bytes: usize,
+        remaining_nested: usize,
+        shell: shell::AnalysisBudget,
+    ) -> Self {
+        Self {
+            remaining_bytes,
+            remaining_nested,
+            shell,
+            patterns: PatternMatchBudget {
+                remaining_states: MAX_PATTERN_MATCH_STATES,
+                remaining_components: MAX_PATTERN_MATCH_COMPONENTS,
+            },
+        }
+    }
+
+    fn charge_parse(&mut self, source: &str) -> Result<(), ShellAnalysisError> {
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(source.len())
+            .ok_or(ShellAnalysisError::ResourceLimit)?;
+        Ok(())
+    }
+
+    fn evaluate_nested(
+        &mut self,
+        source: &str,
+        state: &mut EvaluationState,
+        semantics: ShellSemantics,
+    ) -> SafetyEvaluation {
+        let Some(remaining) = self.remaining_nested.checked_sub(1) else {
+            return SafetyEvaluation::Indeterminate(ShellAnalysisError::ResourceLimit);
+        };
+        self.remaining_nested = remaining;
+        let result = evaluate_program(source, state, self, semantics);
+        self.remaining_nested += 1;
+        result
+    }
+}
+
+#[derive(Default)]
+struct EvaluationSummary {
+    indeterminate: Option<ShellAnalysisError>,
+}
+
+impl EvaluationSummary {
+    fn mark_indeterminate(&mut self, error: ShellAnalysisError) {
+        self.indeterminate.get_or_insert(error);
+    }
+
+    fn observe(&mut self, result: SafetyEvaluation) -> Option<SafetyEvaluation> {
+        match result {
+            SafetyEvaluation::Deny(deny) => Some(SafetyEvaluation::Deny(deny)),
+            SafetyEvaluation::Indeterminate(error) => {
+                self.indeterminate.get_or_insert(error);
+                None
+            }
+            SafetyEvaluation::NoDeterministicDecision => None,
+        }
+    }
+
+    fn finish(self) -> SafetyEvaluation {
+        self.indeterminate.map_or(
+            SafetyEvaluation::NoDeterministicDecision,
+            SafetyEvaluation::Indeterminate,
+        )
+    }
+}
+
+enum NestedExecution {
+    CurrentShellInert {
+        prefix_assignments_persist: bool,
+    },
+    ExternalSource {
+        context: EvalContext,
+        prefix_assignments_persist: bool,
+    },
+    DeferredLiteral {
+        program: String,
+        context: EvalContext,
+        semantics: ShellSemantics,
+        prefix_assignments_visible: bool,
+        prefix_assignments_persist: bool,
+    },
+    DeferredUnresolved {
+        error: ShellAnalysisError,
+        prefix_assignments_persist: bool,
+    },
+    Eval {
+        program: String,
+        context: EvalContext,
+        prefix_assignments_persist: bool,
+    },
+    EvalUnresolved(ShellAnalysisError),
+    ChildLiteral {
+        program: String,
+        semantics: ShellSemantics,
+        indeterminate_after_scan: bool,
+        preserve_trusted_home: bool,
+    },
+    ChildUnresolved(ShellAnalysisError),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EvalContext {
+    Caller,
+    Child,
+    External,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellSemantics {
+    Bash,
+    BashPosix,
+    Portable,
+}
+
+impl ShellSemantics {
+    fn initial_posix_mode(self) -> PosixMode {
+        match self {
+            Self::Bash => PosixMode::Disabled,
+            Self::BashPosix | Self::Portable => PosixMode::Enabled,
+        }
+    }
+
+    fn eval_prefix_assignments_persist(self, posix_mode: PosixMode) -> Option<bool> {
+        match self {
+            Self::Portable => Some(true),
+            Self::Bash | Self::BashPosix => match posix_mode {
+                PosixMode::Disabled => Some(false),
+                PosixMode::Enabled => Some(true),
+                PosixMode::Unknown => None,
+            },
+        }
+    }
+
+    fn supports_builtin_dispatch(self) -> bool {
+        self != Self::Portable
+    }
+
+    fn supports_time_keyword(self) -> bool {
+        self != Self::Portable
+    }
+}
+
+struct ClassifiedExecution<'a> {
+    words: &'a [&'a shell::ShellWord],
+    nested: Option<NestedExecution>,
+    indeterminate_after_scan: bool,
+    context: EvalContext,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SafetyDeny {
     pub rule_id: &'static str,
@@ -84,6 +561,8 @@ pub(crate) enum ShellAnalysisError {
     ResourceLimit,
     HelperFailure,
 }
+
+const _: fn(&str) -> Result<shell::ShellProgram, ShellAnalysisError> = shell::analyze;
 
 impl ShellAnalysisError {
     pub(crate) fn reason(self) -> &'static str {
@@ -191,6 +670,53 @@ fn evaluate_isolated_with_home(
     }
 }
 
+#[cfg(unix)]
+fn configure_isolated_helper_environment(
+    command: &mut std::process::Command,
+    trusted_home: OsString,
+    inherited: InheritedShellState,
+) {
+    command
+        .env_clear()
+        .env("HOME", trusted_home)
+        .env(
+            STARTUP_ENV_MARKER,
+            if inherited.startup_environment_uncertain {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            LASTPIPE_MARKER,
+            if inherited.lastpipe_enabled { "1" } else { "0" },
+        )
+        .env(
+            POSIX_MODE_ENABLED_MARKER,
+            if inherited.posix_mode == PosixMode::Enabled {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            POSIX_MODE_UNCERTAIN_MARKER,
+            if inherited.posix_mode == PosixMode::Unknown {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            POSIX_MODE_PROPAGATES_MARKER,
+            if inherited.posix_mode_propagates {
+                "1"
+            } else {
+                "0"
+            },
+        );
+}
+
 pub(crate) fn evaluate_isolated(command: Option<&ShellCommandInput>) -> SafetyEvaluation {
     let Some(input) = command else {
         return SafetyEvaluation::NoDeterministicDecision;
@@ -207,6 +733,7 @@ pub(crate) fn evaluate_isolated(command: Option<&ShellCommandInput>) -> SafetyEv
         use std::io::{Seek, Write};
         use std::process::{Command, Stdio};
 
+        let inherited = InheritedShellState::from_parent_environment();
         evaluate_isolated_with_home(input, std::env::var_os("HOME"), |input, trusted_home| {
             let mut helper_input = match tempfile::tempfile() {
                 Ok(input) => input,
@@ -228,9 +755,8 @@ pub(crate) fn evaluate_isolated(command: Option<&ShellCommandInput>) -> SafetyEv
             let mut command = Command::new(executable);
             command
                 .arg("--shell-safety-helper")
-                .stdin(Stdio::from(helper_input))
-                .env_clear()
-                .env("HOME", trusted_home);
+                .stdin(Stdio::from(helper_input));
+            configure_isolated_helper_environment(&mut command, trusted_home, inherited);
             evaluate_isolated_with(&mut command, HELPER_TIMEOUT)
         })
     }
@@ -251,9 +777,23 @@ fn helper_response(evaluation: SafetyEvaluation) -> HelperResponse {
     }
 }
 
-fn run_helper_with(
+fn run_helper_with(reader: impl std::io::Read, writer: impl std::io::Write) -> std::io::Result<()> {
+    run_helper_with_optional_inherited(reader, writer, None)
+}
+
+#[cfg(test)]
+fn run_helper_with_inherited(
+    reader: impl std::io::Read,
+    writer: impl std::io::Write,
+    inherited: InheritedShellState,
+) -> std::io::Result<()> {
+    run_helper_with_optional_inherited(reader, writer, Some(inherited))
+}
+
+fn run_helper_with_optional_inherited(
     mut reader: impl std::io::Read,
     mut writer: impl std::io::Write,
+    inherited: Option<InheritedShellState>,
 ) -> std::io::Result<()> {
     use std::io::Read as _;
 
@@ -270,10 +810,14 @@ fn run_helper_with(
     }
     let source = String::from_utf8(input)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8"))?;
-    let evaluation = evaluate_in_process(Some(&ShellCommandInput {
+    let input = ShellCommandInput {
         dialect: ShellDialect::Bash,
         source,
-    }));
+    };
+    let evaluation = inherited.map_or_else(
+        || evaluate_in_process(Some(&input)),
+        |inherited| evaluate_in_process_with_inherited(Some(&input), inherited),
+    );
     serde_json::to_writer(&mut writer, &helper_response(evaluation))
         .map_err(std::io::Error::other)?;
     writer.write_all(b"\n")
@@ -288,6 +832,50 @@ pub(crate) fn run_helper() -> std::io::Result<()> {
 
 #[allow(dead_code)] // The binary-only helper uses this through its duplicated module tree.
 pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> SafetyEvaluation {
+    evaluate_in_process_with_state(command, EvaluationState::trusted())
+}
+
+fn evaluate_in_process_with_inherited(
+    command: Option<&ShellCommandInput>,
+    inherited: InheritedShellState,
+) -> SafetyEvaluation {
+    evaluate_in_process_with_state(command, EvaluationState::trusted_with_inherited(inherited))
+}
+
+#[cfg(test)]
+pub(super) fn evaluate_in_process_with_inherited_startup(
+    command: Option<&ShellCommandInput>,
+) -> SafetyEvaluation {
+    evaluate_in_process_with_inherited(
+        command,
+        InheritedShellState {
+            startup_environment_uncertain: true,
+            lastpipe_enabled: false,
+            posix_mode: PosixMode::Disabled,
+            posix_mode_propagates: false,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(super) fn evaluate_in_process_with_inherited_posix(
+    command: Option<&ShellCommandInput>,
+) -> SafetyEvaluation {
+    evaluate_in_process_with_inherited(
+        command,
+        InheritedShellState {
+            startup_environment_uncertain: false,
+            lastpipe_enabled: false,
+            posix_mode: PosixMode::Enabled,
+            posix_mode_propagates: true,
+        },
+    )
+}
+
+fn evaluate_in_process_with_state(
+    command: Option<&ShellCommandInput>,
+    mut state: EvaluationState,
+) -> SafetyEvaluation {
     let Some(input) = command else {
         return SafetyEvaluation::NoDeterministicDecision;
     };
@@ -295,7 +883,84 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
         return SafetyEvaluation::Indeterminate(ShellAnalysisError::UnsupportedDialect);
     }
 
-    let program = match shell::analyze(&input.source) {
+    evaluate_program(
+        &input.source,
+        &mut state,
+        &mut EvaluationBudget::new(),
+        ShellSemantics::Bash,
+    )
+}
+
+struct EvalProgramResult {
+    evaluation: SafetyEvaluation,
+    invalidate_caller: bool,
+}
+
+fn evaluate_eval_program(
+    program: &str,
+    assignments: &[shell::ShellAssignment],
+    state: &mut EvaluationState,
+    budget: &mut EvaluationBudget,
+    semantics: ShellSemantics,
+    prefix_assignments_persist: bool,
+) -> EvalProgramResult {
+    let applied = apply_eval_assignments(assignments, state);
+    let indeterminate_assignment = applied.indeterminate;
+    let result = budget.evaluate_nested(program, state, semantics);
+    let invalidate_caller = matches!(result, SafetyEvaluation::Indeterminate(_));
+    if !prefix_assignments_persist {
+        applied.restore(state);
+    }
+
+    let evaluation = match result {
+        SafetyEvaluation::NoDeterministicDecision if indeterminate_assignment => {
+            SafetyEvaluation::Indeterminate(ShellAnalysisError::UnsupportedSyntax)
+        }
+        result => result,
+    };
+    EvalProgramResult {
+        evaluation,
+        invalidate_caller,
+    }
+}
+
+fn persist_prefix_assignments(
+    assignments: &[shell::ShellAssignment],
+    context: shell::ExecutionContext,
+    state: &mut EvaluationState,
+    persist: bool,
+) {
+    if !persist || assignments.is_empty() {
+        return;
+    }
+    match context {
+        shell::ExecutionContext::TopLevel => {
+            let _applied = apply_eval_assignments(assignments, state);
+        }
+        shell::ExecutionContext::Conditional | shell::ExecutionContext::Loop => {
+            state.invalidate_mutable();
+        }
+        shell::ExecutionContext::Pipeline if state.lastpipe_may_be_enabled => {
+            state.invalidate_mutable();
+        }
+        shell::ExecutionContext::Asynchronous
+        | shell::ExecutionContext::Pipeline
+        | shell::ExecutionContext::Group
+        | shell::ExecutionContext::Subshell
+        | shell::ExecutionContext::ProcessSubstitution => {}
+    }
+}
+
+fn evaluate_program(
+    source: &str,
+    state: &mut EvaluationState,
+    budget: &mut EvaluationBudget,
+    semantics: ShellSemantics,
+) -> SafetyEvaluation {
+    if let Err(error) = budget.charge_parse(source) {
+        return SafetyEvaluation::Indeterminate(error);
+    }
+    let program = match shell::analyze_with_budget(source, &mut budget.shell) {
         Ok(program) => program,
         Err(error) => return SafetyEvaluation::Indeterminate(error),
     };
@@ -306,15 +971,10 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
         return dynamic_execution_deny();
     }
 
-    let mut assignments = HashMap::new();
-    if let Ok(home) = std::env::var("HOME") {
-        assignments.insert("HOME".into(), home);
+    let mut summary = EvaluationSummary::default();
+    if state.current_program_startup_may_be_unsafe {
+        summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
     }
-    let mut ifs_unknown = false;
-    let mut pattern_match_budget = PatternMatchBudget {
-        remaining_states: MAX_PATTERN_MATCH_STATES,
-        remaining_components: MAX_PATTERN_MATCH_COMPONENTS,
-    };
     for command in &program.commands {
         if matches!(
             command.context,
@@ -323,11 +983,28 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
                 | shell::ExecutionContext::Loop
         ) {
             for name in &command.invalidated_assignments {
-                assignments.remove(name);
+                state.assignments.remove(name);
                 if name == "IFS" {
-                    ifs_unknown = true;
+                    state.ifs_unknown = true;
                 }
+                state.note_environment_assignment(name);
+                state.mark_assignment_mutation(name);
             }
+        }
+
+        if command.timed_pipeline_head && !semantics.supports_time_keyword() {
+            if matches!(
+                command.context,
+                shell::ExecutionContext::TopLevel
+                    | shell::ExecutionContext::Conditional
+                    | shell::ExecutionContext::Loop
+            ) || (command.context == shell::ExecutionContext::Pipeline
+                && state.lastpipe_may_be_enabled)
+            {
+                state.invalidate_mutable();
+            }
+            summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+            continue;
         }
 
         let Some(command_word) = &command.command else {
@@ -340,7 +1017,7 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
                     shell::ExecutionContext::TopLevel => {
                         let value_known = match assignment.value.literal.as_deref() {
                             Some(value) if assignment.append => {
-                                if let Some(current) = assignments.get_mut(&assignment.name) {
+                                if let Some(current) = state.assignments.get_mut(&assignment.name) {
                                     current.push_str(value);
                                     true
                                 } else {
@@ -348,27 +1025,33 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
                                 }
                             }
                             Some(value) => {
-                                assignments.insert(assignment.name.clone(), value.to_string());
+                                state
+                                    .assignments
+                                    .insert(assignment.name.clone(), value.to_string());
                                 true
                             }
                             None => false,
                         };
                         if value_known {
                             if assignment.name == "IFS" {
-                                ifs_unknown = false;
+                                state.ifs_unknown = false;
                             }
                         } else {
-                            assignments.remove(&assignment.name);
+                            state.assignments.remove(&assignment.name);
                             if assignment.name == "IFS" {
-                                ifs_unknown = true;
+                                state.ifs_unknown = true;
                             }
                         }
+                        state.mark_assignment_mutation(&assignment.name);
+                        state.note_environment_assignment(&assignment.name);
                     }
                     shell::ExecutionContext::Conditional | shell::ExecutionContext::Loop => {
-                        assignments.remove(&assignment.name);
+                        state.assignments.remove(&assignment.name);
                         if assignment.name == "IFS" {
-                            ifs_unknown = true;
+                            state.ifs_unknown = true;
                         }
+                        state.note_environment_assignment(&assignment.name);
+                        state.mark_assignment_mutation(&assignment.name);
                     }
                     shell::ExecutionContext::Pipeline
                     | shell::ExecutionContext::Asynchronous
@@ -391,44 +1074,330 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
                             | shell::ExecutionContext::Conditional
                             | shell::ExecutionContext::Loop
                     ))
-                || command.context == shell::ExecutionContext::Pipeline
+                || (command.context == shell::ExecutionContext::Pipeline
+                    && state.lastpipe_may_be_enabled)
             {
-                assignments.clear();
-                ifs_unknown = true;
+                state.invalidate_mutable();
             }
             continue;
         };
 
-        let command_assignments = assignments.clone();
-        let command_ifs_unknown = ifs_unknown;
+        let mut words = Vec::with_capacity(command.arguments.len() + 1);
+        words.push(command_word);
+        words.extend(&command.arguments);
+        let eval_prefix_assignments_persist =
+            semantics.eval_prefix_assignments_persist(state.posix_mode);
+        if eval_prefix_assignments_persist.is_none() {
+            summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+        }
+        let unwrapped = match unwrap_command(
+            &words,
+            command.assignments.is_empty() && command.redirects.is_empty(),
+            eval_prefix_assignments_persist.unwrap_or(false),
+        ) {
+            Ok(unwrapped) => unwrapped,
+            Err(()) => return dynamic_execution_deny(),
+        };
+        let classified = classify_nested_execution(
+            unwrapped.words,
+            unwrapped.indeterminate_child_context || !command.assignments.is_empty(),
+            unwrapped.indeterminate_after_scan,
+            unwrapped.eval_context,
+            unwrapped.time_keyword_allowed,
+            unwrapped.eval_prefix_assignments_persist,
+            semantics,
+        );
+        let wrapper_indeterminate_after_scan = classified.indeterminate_after_scan;
+        let execution_context = classified.context;
+        let words = classified.words;
+        let command_name_literal = if classified.nested.is_none() {
+            let Some(command_word) = words.first() else {
+                if wrapper_indeterminate_after_scan {
+                    summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+                }
+                continue;
+            };
+            let Some(command_name_literal) = command_word.literal.as_deref() else {
+                if word_can_select_command(command_word) {
+                    return dynamic_execution_deny();
+                }
+                if wrapper_indeterminate_after_scan {
+                    summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+                }
+                continue;
+            };
+            Some(command_name_literal)
+        } else {
+            None
+        };
+        if let Some(nested) = classified.nested {
+            let nested_result = match nested {
+                NestedExecution::Eval {
+                    program,
+                    context: EvalContext::Caller,
+                    prefix_assignments_persist,
+                } => {
+                    let result = if eval_prefix_assignments_persist.is_none() {
+                        let mut nested_state = state.clone();
+                        evaluate_eval_program(
+                            &program,
+                            &command.assignments,
+                            &mut nested_state,
+                            budget,
+                            semantics,
+                            prefix_assignments_persist,
+                        )
+                    } else {
+                        match command.context {
+                            shell::ExecutionContext::TopLevel => evaluate_eval_program(
+                                &program,
+                                &command.assignments,
+                                state,
+                                budget,
+                                semantics,
+                                prefix_assignments_persist,
+                            ),
+                            shell::ExecutionContext::Conditional
+                            | shell::ExecutionContext::Loop => {
+                                let mut nested_state = state.clone();
+                                let result = evaluate_eval_program(
+                                    &program,
+                                    &command.assignments,
+                                    &mut nested_state,
+                                    budget,
+                                    semantics,
+                                    prefix_assignments_persist,
+                                );
+                                state.invalidate_mutable();
+                                result
+                            }
+                            shell::ExecutionContext::Asynchronous
+                            | shell::ExecutionContext::Pipeline
+                            | shell::ExecutionContext::Group
+                            | shell::ExecutionContext::Subshell
+                            | shell::ExecutionContext::ProcessSubstitution => {
+                                let mut nested_state = state.clone();
+                                let result = evaluate_eval_program(
+                                    &program,
+                                    &command.assignments,
+                                    &mut nested_state,
+                                    budget,
+                                    semantics,
+                                    prefix_assignments_persist,
+                                );
+                                if command.context == shell::ExecutionContext::Pipeline
+                                    && state.lastpipe_may_be_enabled
+                                {
+                                    state.invalidate_mutable();
+                                }
+                                result
+                            }
+                        }
+                    };
+                    if eval_prefix_assignments_persist.is_some()
+                        && result.invalidate_caller
+                        && command.context == shell::ExecutionContext::TopLevel
+                    {
+                        state.invalidate_mutable();
+                    }
+                    result.evaluation
+                }
+                NestedExecution::Eval {
+                    program,
+                    context: EvalContext::Child,
+                    prefix_assignments_persist,
+                } => {
+                    let mut child_state = state.child(
+                        false,
+                        state.child_environment_may_be_unsafe,
+                        ShellSemantics::Bash,
+                    );
+                    evaluate_eval_program(
+                        &program,
+                        &command.assignments,
+                        &mut child_state,
+                        budget,
+                        ShellSemantics::Bash,
+                        prefix_assignments_persist,
+                    )
+                    .evaluation
+                }
+                NestedExecution::Eval {
+                    context: EvalContext::External,
+                    ..
+                } => unreachable!("external commands cannot dispatch shell eval"),
+                NestedExecution::CurrentShellInert {
+                    prefix_assignments_persist,
+                } => {
+                    persist_prefix_assignments(
+                        &command.assignments,
+                        command.context,
+                        state,
+                        prefix_assignments_persist,
+                    );
+                    SafetyEvaluation::NoDeterministicDecision
+                }
+                NestedExecution::ExternalSource {
+                    context: EvalContext::Caller,
+                    prefix_assignments_persist,
+                } => {
+                    persist_prefix_assignments(
+                        &command.assignments,
+                        command.context,
+                        state,
+                        prefix_assignments_persist,
+                    );
+                    if matches!(
+                        command.context,
+                        shell::ExecutionContext::TopLevel
+                            | shell::ExecutionContext::Conditional
+                            | shell::ExecutionContext::Loop
+                    ) || (command.context == shell::ExecutionContext::Pipeline
+                        && state.lastpipe_may_be_enabled)
+                    {
+                        state.invalidate_mutable();
+                    }
+                    SafetyEvaluation::Indeterminate(ShellAnalysisError::UnsupportedSyntax)
+                }
+                NestedExecution::ExternalSource {
+                    context: EvalContext::Child,
+                    ..
+                } => SafetyEvaluation::Indeterminate(ShellAnalysisError::UnsupportedSyntax),
+                NestedExecution::ExternalSource {
+                    context: EvalContext::External,
+                    ..
+                } => unreachable!("external commands cannot dispatch shell source"),
+                NestedExecution::DeferredLiteral {
+                    program,
+                    context,
+                    semantics,
+                    prefix_assignments_visible,
+                    prefix_assignments_persist,
+                } => {
+                    let mut nested_state = match context {
+                        EvalContext::Caller => state.clone(),
+                        EvalContext::Child => {
+                            state.child(false, state.child_environment_may_be_unsafe, semantics)
+                        }
+                        EvalContext::External => {
+                            unreachable!("external commands cannot dispatch shell builtins")
+                        }
+                    };
+                    if prefix_assignments_visible {
+                        apply_eval_assignments(&command.assignments, &mut nested_state);
+                    }
+                    persist_prefix_assignments(
+                        &command.assignments,
+                        command.context,
+                        state,
+                        prefix_assignments_persist,
+                    );
+                    match budget.evaluate_nested(&program, &mut nested_state, semantics) {
+                        SafetyEvaluation::NoDeterministicDecision => {
+                            SafetyEvaluation::Indeterminate(ShellAnalysisError::UnsupportedSyntax)
+                        }
+                        result => result,
+                    }
+                }
+                NestedExecution::DeferredUnresolved {
+                    error,
+                    prefix_assignments_persist,
+                } => {
+                    persist_prefix_assignments(
+                        &command.assignments,
+                        command.context,
+                        state,
+                        prefix_assignments_persist,
+                    );
+                    SafetyEvaluation::Indeterminate(error)
+                }
+                NestedExecution::EvalUnresolved(error) => {
+                    if matches!(
+                        command.context,
+                        shell::ExecutionContext::TopLevel
+                            | shell::ExecutionContext::Conditional
+                            | shell::ExecutionContext::Loop
+                    ) || (command.context == shell::ExecutionContext::Pipeline
+                        && state.lastpipe_may_be_enabled)
+                    {
+                        state.invalidate_mutable();
+                    }
+                    SafetyEvaluation::Indeterminate(error)
+                }
+                NestedExecution::ChildLiteral {
+                    program,
+                    semantics,
+                    indeterminate_after_scan,
+                    preserve_trusted_home,
+                } => {
+                    let mut child_state = state.child(
+                        preserve_trusted_home,
+                        state.child_environment_may_be_unsafe,
+                        semantics,
+                    );
+                    if indeterminate_after_scan && semantics == ShellSemantics::Bash {
+                        child_state.posix_mode = PosixMode::Unknown;
+                        child_state.posix_child_mode = PosixMode::Unknown;
+                    }
+                    match budget.evaluate_nested(&program, &mut child_state, semantics) {
+                        SafetyEvaluation::NoDeterministicDecision if indeterminate_after_scan => {
+                            SafetyEvaluation::Indeterminate(ShellAnalysisError::UnsupportedSyntax)
+                        }
+                        result => result,
+                    }
+                }
+                NestedExecution::ChildUnresolved(error) => SafetyEvaluation::Indeterminate(error),
+            };
+            let nested_result = match nested_result {
+                SafetyEvaluation::NoDeterministicDecision if wrapper_indeterminate_after_scan => {
+                    SafetyEvaluation::Indeterminate(ShellAnalysisError::UnsupportedSyntax)
+                }
+                result => result,
+            };
+            if let Some(deny) = summary.observe(nested_result) {
+                return deny;
+            }
+            continue;
+        }
+        let command_name_literal =
+            command_name_literal.expect("ordinary execution has a literal command name");
+
+        update_lastpipe_state(
+            command_name_literal,
+            &words[1..],
+            command.context,
+            execution_context,
+            state,
+        );
+        let child_environment_was_unsafe = state.child_environment_may_be_unsafe;
+        let posix_only_set = update_posix_and_dispatch_state(
+            command_name_literal,
+            &words[1..],
+            command.context,
+            execution_context,
+            state,
+            &mut summary,
+        );
+
+        let command_assignments = state.assignments.clone();
+        let command_ifs_unknown = state.ifs_unknown;
         if matches!(
             command.context,
             shell::ExecutionContext::TopLevel
                 | shell::ExecutionContext::Conditional
                 | shell::ExecutionContext::Loop
-                | shell::ExecutionContext::Pipeline
-        ) {
-            assignments.clear();
-            ifs_unknown = true;
-        }
-
-        let mut words = Vec::with_capacity(command.arguments.len() + 1);
-        words.push(command_word);
-        words.extend(&command.arguments);
-        let words = match unwrap_command(&words) {
-            Ok(words) => words,
-            Err(()) => return dynamic_execution_deny(),
-        };
-        let Some(command_word) = words.first() else {
-            continue;
-        };
-        let Some(command_name_literal) = command_word.literal.as_deref() else {
-            if word_can_select_command(command_word) {
-                return dynamic_execution_deny();
+        ) || (command.context == shell::ExecutionContext::Pipeline
+            && state.lastpipe_may_be_enabled)
+        {
+            state.invalidate_mutable();
+            if posix_only_set && command.assignments.is_empty() {
+                state.child_environment_may_be_unsafe = child_environment_was_unsafe;
             }
-            continue;
-        };
+        }
         if command_name(command_name_literal) != "rm" {
+            if wrapper_indeterminate_after_scan {
+                summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+            }
             continue;
         }
         let args = &words[1..];
@@ -447,6 +1416,7 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
                         argument,
                         &command_assignments,
                         command_ifs_unknown,
+                        state.trusted_home.as_deref(),
                     ) =>
                 {
                     return dynamic_execution_deny();
@@ -455,6 +1425,9 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
             }
         }
         if !recursive {
+            if wrapper_indeterminate_after_scan {
+                summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+            }
             continue;
         }
 
@@ -471,24 +1444,25 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
                 if is_root_target(target) {
                     return canonical_deny("irreversible-root-delete");
                 }
-                if literal_home_or_ancestor_target(target) {
+                if literal_home_or_ancestor_target(target, state.trusted_home.as_deref()) {
                     return canonical_deny("irreversible-home-delete");
                 }
                 continue;
             }
-            if word_is_home_target(target, &command_assignments) {
+            if word_is_home_target(target, &command_assignments, state.trusted_home.as_deref()) {
                 return canonical_deny("irreversible-home-delete");
             }
-            if resolve_word(target, &command_assignments)
-                .is_some_and(|resolved| literal_home_or_ancestor_target(&resolved))
-            {
+            if resolve_word(target, &command_assignments).is_some_and(|resolved| {
+                literal_home_or_ancestor_target(&resolved, state.trusted_home.as_deref())
+            }) {
                 return canonical_deny("irreversible-home-delete");
             }
             match split_target_risk(
                 target,
                 &command_assignments,
                 command_ifs_unknown,
-                &mut pattern_match_budget,
+                state.trusted_home.as_deref(),
+                &mut budget.patterns,
             ) {
                 SplitTargetRisk::Root => {
                     return canonical_deny("irreversible-root-delete");
@@ -499,12 +1473,20 @@ pub(crate) fn evaluate_in_process(command: Option<&ShellCommandInput>) -> Safety
                 SplitTargetRisk::UnsafeExpansion => return expansion_target_deny(),
                 SplitTargetRisk::None => {}
             }
-            if dynamic_target_is_dangerous(target, &command_assignments, command_ifs_unknown) {
+            if dynamic_target_is_dangerous(
+                target,
+                &command_assignments,
+                command_ifs_unknown,
+                state.trusted_home.as_deref(),
+            ) {
                 return expansion_target_deny();
             }
         }
+        if wrapper_indeterminate_after_scan {
+            summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+        }
     }
-    SafetyEvaluation::NoDeterministicDecision
+    summary.finish()
 }
 
 fn canonical_deny(rule_id: &str) -> SafetyEvaluation {
@@ -550,17 +1532,16 @@ fn path_is_home_or_ancestor(target: &Path, home: &Path) -> bool {
         .is_some_and(|home| target.len() <= home.len() && home.starts_with(&target))
 }
 
-fn literal_home_or_ancestor_target(target: &str) -> bool {
-    std::env::var_os("HOME")
-        .is_some_and(|home| path_is_home_or_ancestor(Path::new(target), Path::new(&home)))
+fn literal_home_or_ancestor_target(target: &str, trusted_home: Option<&str>) -> bool {
+    trusted_home.is_some_and(|home| path_is_home_or_ancestor(Path::new(target), Path::new(home)))
 }
 
-fn literal_home_target(target: &str) -> bool {
+fn literal_home_target(target: &str, trusted_home: Option<&str>) -> bool {
     let Some(target) = lexical_absolute_parts(Path::new(target)) else {
         return false;
     };
-    std::env::var_os("HOME")
-        .and_then(|home| lexical_absolute_parts(Path::new(&home)))
+    trusted_home
+        .and_then(|home| lexical_absolute_parts(Path::new(home)))
         .is_some_and(|home| target == home)
 }
 
@@ -568,6 +1549,7 @@ fn split_target_risk(
     target: &shell::ShellWord,
     assignments: &HashMap<String, String>,
     ifs_unknown: bool,
+    trusted_home: Option<&str>,
     budget: &mut PatternMatchBudget,
 ) -> SplitTargetRisk {
     if !target.can_split_fields {
@@ -576,9 +1558,7 @@ fn split_target_risk(
     let Some(fields) = resolve_word_fields(target, assignments, ifs_unknown) else {
         return SplitTargetRisk::UnsafeExpansion;
     };
-    let Some(home) =
-        std::env::var_os("HOME").and_then(|home| lexical_absolute_parts(Path::new(&home)))
-    else {
+    let Some(home) = trusted_home.and_then(|home| lexical_absolute_parts(Path::new(home))) else {
         return SplitTargetRisk::UnsafeExpansion;
     };
 
@@ -890,12 +1870,13 @@ fn dynamic_target_is_dangerous(
     target: &shell::ShellWord,
     assignments: &HashMap<String, String>,
     ifs_unknown: bool,
+    trusted_home: Option<&str>,
 ) -> bool {
     if target.can_split_fields {
         return resolve_word_fields(target, assignments, ifs_unknown).is_none_or(|fields| {
             fields.iter().any(|field| {
                 is_root_target(&field.value)
-                    || literal_home_target(&field.value)
+                    || literal_home_target(&field.value, trusted_home)
                     || (!Path::new(&field.value).is_absolute()
                         && Path::new(&field.value)
                             .components()
@@ -1180,7 +2161,11 @@ fn leading_parameter(target: &shell::ShellWord) -> Option<LeadingParameter<'_>> 
     })
 }
 
-fn word_is_home_target(target: &shell::ShellWord, assignments: &HashMap<String, String>) -> bool {
+fn word_is_home_target(
+    target: &shell::ShellWord,
+    assignments: &HashMap<String, String>,
+    trusted_home: Option<&str>,
+) -> bool {
     let uses_current_home = (matches!(target.parts.first(), Some(shell::WordPart::TildeHome))
         && (target.raw == "~" || target.raw.starts_with("~/")))
         || matches!(
@@ -1192,8 +2177,8 @@ fn word_is_home_target(target: &shell::ShellWord, assignments: &HashMap<String, 
         return false;
     }
     match assignments.get("HOME") {
-        Some(home) => std::env::var_os("HOME")
-            .and_then(|trusted| lexical_absolute_parts(Path::new(&trusted)))
+        Some(home) => trusted_home
+            .and_then(|trusted| lexical_absolute_parts(Path::new(trusted)))
             .zip(lexical_absolute_parts(Path::new(home)))
             .is_some_and(|(trusted, assigned)| trusted == assigned),
         None => false,
@@ -1238,9 +2223,10 @@ fn word_is_definite_target(
     word: &shell::ShellWord,
     assignments: &HashMap<String, String>,
     ifs_unknown: bool,
+    trusted_home: Option<&str>,
 ) -> bool {
     resolve_word(word, assignments).map_or_else(
-        || word_is_home_target(word, assignments),
+        || word_is_home_target(word, assignments, trusted_home),
         |value| {
             if word.can_split_fields {
                 resolve_word_fields(word, assignments, ifs_unknown).is_some_and(|fields| {
@@ -1255,46 +2241,796 @@ fn word_is_definite_target(
     )
 }
 
-fn is_variable_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
-}
-
 fn command_name(command: &str) -> &str {
     command.rsplit('/').next().unwrap_or(command)
 }
 
-fn unwrap_command<'a>(
-    mut words: &'a [&'a shell::ShellWord],
-) -> Result<&'a [&'a shell::ShellWord], ()> {
-    loop {
-        while words
-            .first()
-            .is_some_and(|word| word.literal.as_deref().is_some_and(is_assignment))
-        {
-            words = &words[1..];
-        }
-        let Some(wrapper) = words.first() else {
-            return Ok(words);
+fn update_lastpipe_state(
+    command: &str,
+    arguments: &[&shell::ShellWord],
+    context: shell::ExecutionContext,
+    execution_context: EvalContext,
+    state: &mut EvaluationState,
+) {
+    if execution_context != EvalContext::Caller
+        || command != "shopt"
+        || !matches!(
+            context,
+            shell::ExecutionContext::TopLevel
+                | shell::ExecutionContext::Conditional
+                | shell::ExecutionContext::Loop
+        )
+    {
+        return;
+    }
+
+    let Some(arguments) = arguments
+        .iter()
+        .map(|argument| argument.literal.as_deref())
+        .collect::<Option<Vec<_>>>()
+    else {
+        state.lastpipe_may_be_enabled = true;
+        return;
+    };
+    if !arguments.contains(&"lastpipe") {
+        return;
+    }
+    let sets = arguments.iter().any(|argument| {
+        argument
+            .strip_prefix('-')
+            .is_some_and(|flags| flags.contains('s'))
+    });
+    let unsets = arguments.iter().any(|argument| {
+        argument
+            .strip_prefix('-')
+            .is_some_and(|flags| flags.contains('u'))
+    });
+    if sets {
+        state.lastpipe_may_be_enabled = true;
+    } else if unsets && context == shell::ExecutionContext::TopLevel {
+        state.lastpipe_may_be_enabled = false;
+    }
+}
+
+fn update_posix_and_dispatch_state(
+    command: &str,
+    arguments: &[&shell::ShellWord],
+    context: shell::ExecutionContext,
+    execution_context: EvalContext,
+    state: &mut EvaluationState,
+    summary: &mut EvaluationSummary,
+) -> bool {
+    if execution_context != EvalContext::Caller {
+        return false;
+    }
+
+    let literal_arguments = arguments
+        .iter()
+        .map(|argument| argument.literal.as_deref())
+        .collect::<Option<Vec<_>>>();
+    let mutation_affects_caller = matches!(
+        context,
+        shell::ExecutionContext::TopLevel
+            | shell::ExecutionContext::Conditional
+            | shell::ExecutionContext::Loop
+    ) || (context == shell::ExecutionContext::Pipeline
+        && state.lastpipe_may_be_enabled);
+
+    if command == "set" {
+        let Some(arguments) = literal_arguments.as_deref() else {
+            if mutation_affects_caller {
+                state.posix_mode = PosixMode::Unknown;
+            }
+            summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+            return false;
         };
-        let Some(wrapper) = wrapper.literal.as_deref() else {
-            return if word_can_select_command(wrapper) {
-                Err(())
+        let Ok((transition, posix_only)) = scan_set_posix_transition(arguments) else {
+            state.posix_mode = PosixMode::Unknown;
+            summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+            return false;
+        };
+        if transition.is_some() && !mutation_affects_caller {
+            summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+            return false;
+        }
+        if let Some(transition) = transition {
+            let prior_mode = state.posix_mode;
+            state.posix_mode = if context == shell::ExecutionContext::TopLevel {
+                transition
             } else {
-                Ok(words)
+                PosixMode::Unknown
+            };
+            if context == shell::ExecutionContext::TopLevel {
+                state.posix_child_mode = match transition {
+                    PosixMode::Disabled => PosixMode::Disabled,
+                    PosixMode::Enabled
+                        if state.posix_mode_propagates && prior_mode == PosixMode::Enabled =>
+                    {
+                        PosixMode::Enabled
+                    }
+                    PosixMode::Enabled if state.posix_mode_propagates => PosixMode::Unknown,
+                    PosixMode::Enabled | PosixMode::Unknown => PosixMode::Disabled,
+                };
+            } else {
+                state.posix_child_mode = PosixMode::Unknown;
+            }
+        }
+        return posix_only;
+    }
+
+    let dispatch_mutation = match command {
+        "alias" => literal_arguments
+            .as_ref()
+            .is_none_or(|arguments| arguments.iter().any(|argument| argument.contains('='))),
+        "unalias" => !arguments.is_empty(),
+        "hash" | "enable" => !arguments.is_empty(),
+        "shopt" => literal_arguments.as_ref().is_none_or(|arguments| {
+            arguments.contains(&"expand_aliases")
+                && arguments.iter().any(|argument| {
+                    argument
+                        .strip_prefix('-')
+                        .is_some_and(|flags| flags.contains('s') || flags.contains('u'))
+                })
+        }),
+        _ => false,
+    };
+    if dispatch_mutation {
+        summary.mark_indeterminate(ShellAnalysisError::UnsupportedSyntax);
+    }
+    false
+}
+
+fn scan_set_posix_transition(arguments: &[&str]) -> Result<(Option<PosixMode>, bool), ()> {
+    let mut transition = None;
+    let mut posix_only = !arguments.is_empty();
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
+        if *argument == "--" || *argument == "-" || !argument.starts_with(['-', '+']) {
+            break;
+        }
+        if *argument == "+" {
+            posix_only = false;
+            index += 1;
+            continue;
+        }
+        let mut flags = argument[1..].chars().peekable();
+        if flags.peek().is_none() {
+            break;
+        }
+        while let Some(flag) = flags.next() {
+            if flag != 'o' {
+                posix_only = false;
+                if !"abefhkmnptuvxBCEHPT".contains(flag) {
+                    return Err(());
+                }
+                continue;
+            }
+            if flags.peek().is_some() {
+                return Err(());
+            }
+            let Some(option) = arguments.get(index + 1) else {
+                return Ok((transition, false));
+            };
+            if *option != "posix" {
+                return Err(());
+            }
+            transition = Some(if argument.starts_with('-') {
+                PosixMode::Enabled
+            } else {
+                PosixMode::Disabled
+            });
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok((transition, posix_only && index == arguments.len()))
+}
+
+enum CurrentShellBuiltinClassification {
+    Nested(NestedExecution),
+    Ordinary,
+}
+
+enum MapfileCallback {
+    None,
+    Literal(String),
+    Unresolved,
+}
+
+fn classify_current_shell_builtin(
+    words: &[&shell::ShellWord],
+    context: EvalContext,
+    semantics: ShellSemantics,
+    prefix_assignments_persist: bool,
+) -> Option<CurrentShellBuiltinClassification> {
+    if context == EvalContext::External {
+        return None;
+    }
+
+    let command = words.first()?.literal.as_deref()?;
+    let arguments = &words[1..];
+    let nested = match command {
+        "source" | "." => {
+            if arguments.is_empty() {
+                NestedExecution::CurrentShellInert {
+                    prefix_assignments_persist,
+                }
+            } else {
+                NestedExecution::ExternalSource {
+                    context,
+                    prefix_assignments_persist,
+                }
+            }
+        }
+        "trap" => classify_trap(arguments, context, semantics, prefix_assignments_persist),
+        "mapfile" | "readarray" => {
+            return Some(match classify_mapfile_callback(arguments) {
+                MapfileCallback::None => CurrentShellBuiltinClassification::Ordinary,
+                MapfileCallback::Literal(program) if semantics != ShellSemantics::Portable => {
+                    CurrentShellBuiltinClassification::Nested(NestedExecution::DeferredLiteral {
+                        program,
+                        context,
+                        semantics,
+                        prefix_assignments_visible: true,
+                        prefix_assignments_persist: false,
+                    })
+                }
+                MapfileCallback::Literal(_) | MapfileCallback::Unresolved => {
+                    CurrentShellBuiltinClassification::Nested(NestedExecution::DeferredUnresolved {
+                        error: ShellAnalysisError::UnsupportedSyntax,
+                        prefix_assignments_persist: false,
+                    })
+                }
+            });
+        }
+        "set" | "alias" | "unalias" | "hash" | "enable" | "shopt" => {
+            return Some(CurrentShellBuiltinClassification::Ordinary);
+        }
+        _ => return None,
+    };
+    Some(CurrentShellBuiltinClassification::Nested(nested))
+}
+
+fn classify_trap(
+    mut arguments: &[&shell::ShellWord],
+    context: EvalContext,
+    semantics: ShellSemantics,
+    prefix_assignments_persist: bool,
+) -> NestedExecution {
+    let Some(first) = arguments.first() else {
+        return NestedExecution::CurrentShellInert {
+            prefix_assignments_persist,
+        };
+    };
+    let Some(first) = first.literal.as_deref() else {
+        return NestedExecution::DeferredUnresolved {
+            error: ShellAnalysisError::UnsupportedSyntax,
+            prefix_assignments_persist,
+        };
+    };
+
+    if first == "--" {
+        arguments = &arguments[1..];
+    } else if first != "-"
+        && let Some(flags) = first.strip_prefix('-')
+    {
+        if semantics == ShellSemantics::Portable
+            || flags.is_empty()
+            || !flags.chars().all(|flag| matches!(flag, 'l' | 'p'))
+        {
+            return NestedExecution::DeferredUnresolved {
+                error: ShellAnalysisError::UnsupportedSyntax,
+                prefix_assignments_persist,
+            };
+        }
+        return NestedExecution::CurrentShellInert {
+            prefix_assignments_persist,
+        };
+    }
+
+    if arguments.is_empty() {
+        return NestedExecution::CurrentShellInert {
+            prefix_assignments_persist,
+        };
+    }
+    if arguments.len() == 1 {
+        return if arguments[0].literal.is_some() {
+            NestedExecution::CurrentShellInert {
+                prefix_assignments_persist,
+            }
+        } else {
+            NestedExecution::DeferredUnresolved {
+                error: ShellAnalysisError::UnsupportedSyntax,
+                prefix_assignments_persist,
+            }
+        };
+    }
+
+    match arguments[0].literal.as_deref() {
+        Some("") | Some("-") => NestedExecution::CurrentShellInert {
+            prefix_assignments_persist,
+        },
+        Some(program) => NestedExecution::DeferredLiteral {
+            program: program.to_string(),
+            context,
+            semantics,
+            prefix_assignments_visible: prefix_assignments_persist,
+            prefix_assignments_persist,
+        },
+        None => NestedExecution::DeferredUnresolved {
+            error: ShellAnalysisError::UnsupportedSyntax,
+            prefix_assignments_persist,
+        },
+    }
+}
+
+fn classify_mapfile_callback(arguments: &[&shell::ShellWord]) -> MapfileCallback {
+    let mut callback = MapfileCallback::None;
+    let mut index = 0;
+
+    while let Some(argument) = arguments.get(index) {
+        let Some(option) = argument.literal.as_deref() else {
+            return MapfileCallback::Unresolved;
+        };
+        if option == "--" || option == "-" || !option.starts_with('-') {
+            return callback;
+        }
+
+        let flags = &option[1..];
+        if flags.is_empty() {
+            return callback;
+        }
+        for (offset, flag) in flags.char_indices() {
+            if flag == 't' {
+                continue;
+            }
+            if !matches!(flag, 'd' | 'n' | 'O' | 's' | 'u' | 'C' | 'c') {
+                return MapfileCallback::Unresolved;
+            }
+
+            let value_offset = offset + flag.len_utf8();
+            let attached = &option[1 + value_offset..];
+            let value = if attached.is_empty() {
+                index += 1;
+                let Some(value) = arguments.get(index) else {
+                    return MapfileCallback::Unresolved;
+                };
+                value.literal.as_deref()
+            } else {
+                Some(attached)
+            };
+            let Some(value) = value else {
+                callback = if flag == 'C' {
+                    MapfileCallback::Unresolved
+                } else {
+                    return MapfileCallback::Unresolved;
+                };
+                break;
+            };
+            if matches!(flag, 'n' | 'O' | 's' | 'u' | 'c') && !valid_mapfile_number(flag, value) {
+                return MapfileCallback::Unresolved;
+            }
+            if flag == 'C' {
+                callback = MapfileCallback::Literal(value.to_string());
+            }
+            break;
+        }
+        index += 1;
+    }
+
+    callback
+}
+
+fn valid_mapfile_number(option: char, value: &str) -> bool {
+    let value = value.trim_start_matches(|character: char| character.is_ascii_whitespace());
+    let value = value.trim_end_matches([' ', '\t']);
+    let (negative, digits) = match value.as_bytes().first() {
+        Some(b'+') => (false, &value[1..]),
+        Some(b'-') => (true, &value[1..]),
+        _ => (false, value),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(number) = digits.parse::<u64>() else {
+        return false;
+    };
+    if negative && number != 0 {
+        return false;
+    }
+
+    let maximum = if option == 'u' {
+        i32::MAX as u64
+    } else {
+        u32::MAX as u64
+    };
+    number <= maximum && (option != 'c' || number != 0)
+}
+
+fn classify_nested_execution<'a>(
+    mut words: &'a [&'a shell::ShellWord],
+    mut indeterminate_child_context: bool,
+    mut indeterminate_after_scan: bool,
+    mut eval_context: EvalContext,
+    mut time_keyword_allowed: bool,
+    mut eval_prefix_assignments_persist: bool,
+    semantics: ShellSemantics,
+) -> ClassifiedExecution<'a> {
+    loop {
+        let Some(command) = words.first().and_then(|word| word.literal.as_deref()) else {
+            return ClassifiedExecution {
+                words,
+                nested: None,
+                indeterminate_after_scan,
+                context: eval_context,
             };
         };
-        match command_name(wrapper) {
-            "time" => {
+        if command == "builtin" && !semantics.supports_builtin_dispatch() {
+            return ClassifiedExecution {
+                words,
+                nested: Some(NestedExecution::EvalUnresolved(
+                    ShellAnalysisError::UnsupportedSyntax,
+                )),
+                indeterminate_after_scan,
+                context: eval_context,
+            };
+        }
+        if command != "builtin" || eval_context == EvalContext::External {
+            break;
+        }
+
+        let mut dispatched = &words[1..];
+        if dispatched
+            .first()
+            .is_some_and(|word| word.literal.as_deref() == Some("--"))
+        {
+            dispatched = &dispatched[1..];
+        }
+        let Some(selector) = dispatched.first() else {
+            return ClassifiedExecution {
+                words: dispatched,
+                nested: Some(NestedExecution::EvalUnresolved(
+                    ShellAnalysisError::UnsupportedSyntax,
+                )),
+                indeterminate_after_scan,
+                context: eval_context,
+            };
+        };
+        let Some(selector) = selector.literal.as_deref() else {
+            return ClassifiedExecution {
+                words: dispatched,
+                nested: Some(NestedExecution::EvalUnresolved(
+                    ShellAnalysisError::UnsupportedSyntax,
+                )),
+                indeterminate_after_scan,
+                context: eval_context,
+            };
+        };
+        if let Some(classification) =
+            classify_current_shell_builtin(dispatched, eval_context, semantics, false)
+        {
+            match classification {
+                CurrentShellBuiltinClassification::Nested(nested) => {
+                    return ClassifiedExecution {
+                        words: dispatched,
+                        nested: Some(nested),
+                        indeterminate_after_scan,
+                        context: eval_context,
+                    };
+                }
+                CurrentShellBuiltinClassification::Ordinary => {
+                    words = dispatched;
+                    break;
+                }
+            }
+        }
+        match selector {
+            "eval" => {
+                return ClassifiedExecution {
+                    words: dispatched,
+                    nested: Some(classify_eval_arguments(
+                        &dispatched[1..],
+                        eval_context,
+                        eval_prefix_assignments_persist,
+                    )),
+                    indeterminate_after_scan,
+                    context: eval_context,
+                };
+            }
+            "builtin" => words = dispatched,
+            "exec" | "command" => {
+                let unwrapped = match unwrap_command_with_context(
+                    dispatched,
+                    eval_context,
+                    time_keyword_allowed,
+                    eval_prefix_assignments_persist,
+                ) {
+                    Ok(unwrapped) => unwrapped,
+                    Err(()) => {
+                        return ClassifiedExecution {
+                            words: dispatched,
+                            nested: Some(NestedExecution::EvalUnresolved(
+                                ShellAnalysisError::UnsupportedSyntax,
+                            )),
+                            indeterminate_after_scan,
+                            context: eval_context,
+                        };
+                    }
+                };
+                words = unwrapped.words;
+                indeterminate_child_context |= unwrapped.indeterminate_child_context;
+                indeterminate_after_scan |= unwrapped.indeterminate_after_scan;
+                eval_context = unwrapped.eval_context;
+                time_keyword_allowed = unwrapped.time_keyword_allowed;
+                eval_prefix_assignments_persist = unwrapped.eval_prefix_assignments_persist;
+            }
+            _ => {
+                return ClassifiedExecution {
+                    words: dispatched,
+                    nested: Some(NestedExecution::EvalUnresolved(
+                        ShellAnalysisError::UnsupportedSyntax,
+                    )),
+                    indeterminate_after_scan,
+                    context: eval_context,
+                };
+            }
+        }
+    }
+
+    let nested = match classify_current_shell_builtin(
+        words,
+        eval_context,
+        semantics,
+        eval_prefix_assignments_persist,
+    ) {
+        Some(CurrentShellBuiltinClassification::Nested(nested)) => Some(nested),
+        Some(CurrentShellBuiltinClassification::Ordinary) => None,
+        None => match words.first().and_then(|word| word.literal.as_deref()) {
+            Some("eval") if eval_context != EvalContext::External => Some(classify_eval_arguments(
+                &words[1..],
+                eval_context,
+                eval_prefix_assignments_persist,
+            )),
+            Some(_) => classify_shell_invocation(words),
+            None => None,
+        },
+    };
+    let nested = nested.map(|nested| match nested {
+        NestedExecution::ChildLiteral {
+            program,
+            semantics,
+            indeterminate_after_scan: child_indeterminate_after_scan,
+            ..
+        } => NestedExecution::ChildLiteral {
+            program,
+            semantics,
+            indeterminate_after_scan: child_indeterminate_after_scan || indeterminate_child_context,
+            preserve_trusted_home: !indeterminate_child_context,
+        },
+        nested => nested,
+    });
+    ClassifiedExecution {
+        words,
+        nested,
+        indeterminate_after_scan,
+        context: eval_context,
+    }
+}
+
+fn classify_eval_arguments(
+    mut arguments: &[&shell::ShellWord],
+    context: EvalContext,
+    prefix_assignments_persist: bool,
+) -> NestedExecution {
+    if arguments
+        .first()
+        .is_some_and(|word| word.literal.as_deref() == Some("--"))
+    {
+        arguments = &arguments[1..];
+    }
+    arguments
+        .iter()
+        .map(|word| word.literal.as_deref())
+        .collect::<Option<Vec<_>>>()
+        .map_or(
+            NestedExecution::EvalUnresolved(ShellAnalysisError::UnsupportedSyntax),
+            |arguments| NestedExecution::Eval {
+                program: arguments.join(" "),
+                context,
+                prefix_assignments_persist,
+            },
+        )
+}
+
+fn classify_shell_invocation(words: &[&shell::ShellWord]) -> Option<NestedExecution> {
+    let command = command_name(words.first()?.literal.as_deref()?);
+    if matches!(command, "zsh" | "ksh" | "mksh" | "fish") {
+        return Some(NestedExecution::ChildUnresolved(
+            ShellAnalysisError::UnsupportedDialect,
+        ));
+    }
+
+    let (interpreter, arguments) = match command {
+        "bash" | "sh" | "dash" | "ash" => (command, &words[1..]),
+        "busybox" | "toybox" => {
+            let Some(selector) = words.get(1) else {
+                return Some(NestedExecution::ChildUnresolved(
+                    ShellAnalysisError::UnsupportedSyntax,
+                ));
+            };
+            let Some(selector) = selector.literal.as_deref() else {
+                return Some(NestedExecution::ChildUnresolved(
+                    ShellAnalysisError::UnsupportedSyntax,
+                ));
+            };
+            if selector.starts_with('-') {
+                return Some(NestedExecution::ChildUnresolved(
+                    ShellAnalysisError::UnsupportedSyntax,
+                ));
+            }
+            let supported = match command {
+                "busybox" => matches!(selector, "sh" | "ash"),
+                "toybox" => selector == "sh",
+                _ => unreachable!("multicall registry"),
+            };
+            if !supported {
+                return None;
+            }
+            (selector, &words[2..])
+        }
+        _ => return None,
+    };
+
+    let mut semantics = if interpreter == "bash" {
+        ShellSemantics::Bash
+    } else {
+        ShellSemantics::Portable
+    };
+    let mut indeterminate_after_scan = false;
+    let mut index = 0;
+    while let Some(option) = arguments.get(index) {
+        let Some(option) = option.literal.as_deref() else {
+            return Some(NestedExecution::ChildUnresolved(
+                ShellAnalysisError::UnsupportedSyntax,
+            ));
+        };
+        if interpreter == "bash" && option == "--posix" {
+            semantics = ShellSemantics::BashPosix;
+            index += 1;
+            continue;
+        }
+        if option == "--" || option == "-" || !option.starts_with('-') || option.starts_with("--") {
+            return Some(NestedExecution::ChildUnresolved(
+                ShellAnalysisError::UnsupportedSyntax,
+            ));
+        }
+        let flags = &option[1..];
+        if flags.is_empty() || !supported_shell_flags(interpreter, flags) {
+            return Some(NestedExecution::ChildUnresolved(
+                ShellAnalysisError::UnsupportedSyntax,
+            ));
+        }
+        if flags.contains('c') {
+            let Some(program) = arguments.get(index + 1) else {
+                return Some(NestedExecution::ChildUnresolved(
+                    ShellAnalysisError::UnsupportedSyntax,
+                ));
+            };
+            let Some(program) = program.literal.as_deref() else {
+                return Some(NestedExecution::ChildUnresolved(
+                    ShellAnalysisError::UnsupportedSyntax,
+                ));
+            };
+            return Some(NestedExecution::ChildLiteral {
+                program: program.to_string(),
+                semantics,
+                indeterminate_after_scan: indeterminate_after_scan || flags != "c",
+                preserve_trusted_home: true,
+            });
+        }
+        indeterminate_after_scan = true;
+        index += 1;
+    }
+
+    Some(NestedExecution::ChildUnresolved(
+        ShellAnalysisError::UnsupportedSyntax,
+    ))
+}
+
+fn supported_shell_flags(interpreter: &str, flags: &str) -> bool {
+    let supported = match interpreter {
+        "bash" => "abcefhkmnptuvxBCDEHPTilrs",
+        "sh" => "abcCefimnuvxs",
+        "dash" => "acCefnuvxIimqVEbs",
+        "ash" => "abcefinuvxs",
+        _ => return false,
+    };
+    flags.chars().all(|flag| supported.contains(flag))
+}
+
+struct UnwrappedCommand<'a> {
+    words: &'a [&'a shell::ShellWord],
+    indeterminate_child_context: bool,
+    indeterminate_after_scan: bool,
+    eval_context: EvalContext,
+    time_keyword_allowed: bool,
+    eval_prefix_assignments_persist: bool,
+}
+
+fn unwrap_command<'a>(
+    words: &'a [&'a shell::ShellWord],
+    time_keyword_allowed: bool,
+    eval_prefix_assignments_persist: bool,
+) -> Result<UnwrappedCommand<'a>, ()> {
+    unwrap_command_with_context(
+        words,
+        EvalContext::Caller,
+        time_keyword_allowed,
+        eval_prefix_assignments_persist,
+    )
+}
+
+fn unwrap_command_with_context<'a>(
+    mut words: &'a [&'a shell::ShellWord],
+    mut eval_context: EvalContext,
+    mut time_keyword_allowed: bool,
+    mut eval_prefix_assignments_persist: bool,
+) -> Result<UnwrappedCommand<'a>, ()> {
+    let mut indeterminate_child_context = false;
+    let mut indeterminate_after_scan = false;
+    loop {
+        let Some(wrapper_word) = words.first() else {
+            return Ok(UnwrappedCommand {
+                words,
+                indeterminate_child_context,
+                indeterminate_after_scan,
+                eval_context,
+                time_keyword_allowed,
+                eval_prefix_assignments_persist,
+            });
+        };
+        let Some(wrapper) = wrapper_word.literal.as_deref() else {
+            return if word_can_select_command(wrapper_word) {
+                Err(())
+            } else {
+                Ok(UnwrappedCommand {
+                    words,
+                    indeterminate_child_context,
+                    indeterminate_after_scan,
+                    eval_context,
+                    time_keyword_allowed,
+                    eval_prefix_assignments_persist,
+                })
+            };
+        };
+        match (wrapper, command_name(wrapper)) {
+            (_, "time") => {
+                let original_words = words;
+                let shell_keyword = wrapper == "time"
+                    && (wrapper_word.raw == "time" || eval_context == EvalContext::Child)
+                    && eval_context != EvalContext::External
+                    && time_keyword_allowed;
+                if !shell_keyword {
+                    eval_context = EvalContext::External;
+                    eval_prefix_assignments_persist = false;
+                }
                 words = &words[1..];
                 while let Some(word) = words.first() {
                     match word.literal.as_deref() {
                         Some("--") => {
                             words = &words[1..];
                             break;
+                        }
+                        Some("-p") if shell_keyword => words = &words[1..],
+                        Some(option) if shell_keyword && option.starts_with('-') => {
+                            return Ok(UnwrappedCommand {
+                                words: original_words,
+                                indeterminate_child_context,
+                                indeterminate_after_scan,
+                                eval_context,
+                                time_keyword_allowed,
+                                eval_prefix_assignments_persist,
+                            });
                         }
                         Some(option) if option.starts_with('-') && option != "-" => {
                             let takes_value = time_option_takes_separate_value(option);
@@ -1308,108 +3044,250 @@ fn unwrap_command<'a>(
                     }
                 }
             }
-            "exec" => {
+            ("exec", _) if eval_context != EvalContext::External => {
+                let original_words = words;
+                eval_context = EvalContext::External;
+                eval_prefix_assignments_persist = false;
                 words = &words[1..];
                 while let Some(option) = words.first() {
                     let Some(option) = option.literal.as_deref() else {
                         return if word_can_select_command(option) {
                             Err(())
                         } else {
-                            Ok(words)
+                            Ok(UnwrappedCommand {
+                                words,
+                                indeterminate_child_context,
+                                indeterminate_after_scan,
+                                eval_context,
+                                time_keyword_allowed,
+                                eval_prefix_assignments_persist,
+                            })
                         };
                     };
                     if option == "--" {
                         words = &words[1..];
                         break;
                     }
-                    if is_assignment(option) {
-                        words = &words[1..];
-                        continue;
-                    }
                     if !option.starts_with('-') || option == "-" {
                         break;
                     }
-                    let takes_value = exec_option_takes_separate_value(option);
+                    let Some(takes_separate_value) = classify_exec_option(option) else {
+                        indeterminate_after_scan = true;
+                        return Ok(UnwrappedCommand {
+                            words: original_words,
+                            indeterminate_child_context,
+                            indeterminate_after_scan,
+                            eval_context,
+                            time_keyword_allowed,
+                            eval_prefix_assignments_persist,
+                        });
+                    };
+                    indeterminate_child_context = true;
+                    indeterminate_after_scan = true;
                     words = &words[1..];
-                    if takes_value && !words.is_empty() {
+                    if takes_separate_value && words.is_empty() {
+                        return Ok(UnwrappedCommand {
+                            words,
+                            indeterminate_child_context,
+                            indeterminate_after_scan,
+                            eval_context,
+                            time_keyword_allowed,
+                            eval_prefix_assignments_persist,
+                        });
+                    }
+                    if takes_separate_value {
                         words = &words[1..];
                     }
                 }
             }
-            "sudo" => {
+            (_, "sudo") => {
+                eval_context = EvalContext::External;
+                eval_prefix_assignments_persist = false;
+                indeterminate_child_context = true;
                 words = &words[1..];
                 while let Some(option) = words.first() {
                     let Some(option) = option.literal.as_deref() else {
                         return if word_can_select_command(option) {
                             Err(())
                         } else {
-                            Ok(words)
+                            Ok(UnwrappedCommand {
+                                words,
+                                indeterminate_child_context,
+                                indeterminate_after_scan,
+                                eval_context,
+                                time_keyword_allowed,
+                                eval_prefix_assignments_persist,
+                            })
                         };
                     };
                     if option == "--" {
                         words = &words[1..];
                         break;
                     }
-                    if is_assignment(option) {
+                    if option.starts_with('-') && option != "-" {
+                        let option = classify_sudo_option(option)?;
+                        indeterminate_child_context |= option.indeterminate_child_context;
+                        indeterminate_after_scan |= option.invokes_shell;
+                        if option.invokes_shell {
+                            eval_context = EvalContext::Child;
+                            time_keyword_allowed = true;
+                            eval_prefix_assignments_persist = false;
+                        }
+                        words = &words[1..];
+                        if option.takes_separate_value && !words.is_empty() {
+                            words = &words[1..];
+                        }
+                        continue;
+                    }
+                    if is_sudo_environment_argument(option) {
+                        indeterminate_child_context = true;
                         words = &words[1..];
                         continue;
                     }
-                    if !option.starts_with('-') || option == "-" {
-                        break;
-                    }
-                    let takes_value = sudo_option_takes_separate_value(option);
-                    words = &words[1..];
-                    if takes_value && !words.is_empty() {
-                        words = &words[1..];
-                    }
+                    break;
                 }
+                indeterminate_after_scan |= words.is_empty();
             }
-            "command" => {
+            ("command", _) if eval_context != EvalContext::External => {
+                let original_words = words;
+                let mut inspects_command = false;
                 words = &words[1..];
                 while let Some(word) = words.first() {
                     match word.literal.as_deref() {
+                        Some("--") => {
+                            words = &words[1..];
+                            break;
+                        }
                         Some(option) if option.starts_with('-') && option != "-" => {
+                            let flags = &option[1..];
+                            if !flags
+                                .chars()
+                                .all(|option| matches!(option, 'p' | 'v' | 'V'))
+                            {
+                                return Ok(UnwrappedCommand {
+                                    words: original_words,
+                                    indeterminate_child_context,
+                                    indeterminate_after_scan,
+                                    eval_context,
+                                    time_keyword_allowed,
+                                    eval_prefix_assignments_persist,
+                                });
+                            }
+                            inspects_command |=
+                                flags.chars().any(|option| matches!(option, 'v' | 'V'));
                             words = &words[1..];
                         }
                         None if word_can_select_command(word) => return Err(()),
                         _ => break,
                     }
                 }
+                if inspects_command {
+                    return Ok(UnwrappedCommand {
+                        words: original_words,
+                        indeterminate_child_context,
+                        indeterminate_after_scan,
+                        eval_context,
+                        time_keyword_allowed,
+                        eval_prefix_assignments_persist,
+                    });
+                }
+                time_keyword_allowed = false;
+                eval_prefix_assignments_persist = false;
             }
-            "env" => {
+            (_, "env") => {
+                let original_words = words;
+                eval_context = EvalContext::External;
+                eval_prefix_assignments_persist = false;
                 words = &words[1..];
+                let mut options_ended = false;
                 while let Some(word) = words.first() {
                     let Some(literal) = word.literal.as_deref() else {
                         return if word_can_select_command(word) {
                             Err(())
                         } else {
-                            Ok(words)
+                            Ok(UnwrappedCommand {
+                                words,
+                                indeterminate_child_context,
+                                indeterminate_after_scan,
+                                eval_context,
+                                time_keyword_allowed,
+                                eval_prefix_assignments_persist,
+                            })
                         };
                     };
-                    if literal == "--" {
+                    if !options_ended && literal == "--" {
+                        options_ended = true;
                         words = &words[1..];
-                        break;
-                    } else if literal == "-" || is_assignment(literal) {
+                    } else if !options_ended && literal == "-" {
+                        indeterminate_child_context = true;
                         words = &words[1..];
-                    } else if literal.starts_with('-') && literal != "-" {
+                    } else if !options_ended && literal.starts_with('-') && literal != "-" {
                         match classify_env_option(literal) {
-                            EnvOption::Flag => words = &words[1..],
-                            EnvOption::TakesSeparateValue => {
+                            EnvOption::Supported {
+                                takes_separate_value,
+                                child_context,
+                            } => {
+                                indeterminate_child_context |= child_context;
                                 words = &words[1..];
-                                if !words.is_empty() {
+                                if takes_separate_value && words.is_empty() {
+                                    indeterminate_after_scan = true;
+                                    return Ok(UnwrappedCommand {
+                                        words,
+                                        indeterminate_child_context,
+                                        indeterminate_after_scan,
+                                        eval_context,
+                                        time_keyword_allowed,
+                                        eval_prefix_assignments_persist,
+                                    });
+                                }
+                                if takes_separate_value {
                                     words = &words[1..];
                                 }
                             }
                             EnvOption::SplitString => return Err(()),
+                            EnvOption::Unsupported => {
+                                indeterminate_after_scan = true;
+                                return Ok(UnwrappedCommand {
+                                    words: original_words,
+                                    indeterminate_child_context,
+                                    indeterminate_after_scan,
+                                    eval_context,
+                                    time_keyword_allowed,
+                                    eval_prefix_assignments_persist,
+                                });
+                            }
                         }
+                    } else if is_env_environment_argument(literal) {
+                        indeterminate_child_context = true;
+                        words = &words[1..];
                     } else {
                         break;
                     }
                 }
             }
-            _ => return Ok(words),
+            _ => {
+                return Ok(UnwrappedCommand {
+                    words,
+                    indeterminate_child_context,
+                    indeterminate_after_scan,
+                    eval_context,
+                    time_keyword_allowed,
+                    eval_prefix_assignments_persist,
+                });
+            }
         }
     }
+}
+
+fn is_sudo_environment_argument(word: &str) -> bool {
+    word.as_bytes()
+        .first()
+        .is_some_and(|first| !matches!(*first, b'/' | b'='))
+        && word.contains('=')
+}
+
+fn is_env_environment_argument(word: &str) -> bool {
+    word.contains('=')
 }
 
 fn time_option_takes_separate_value(word: &str) -> bool {
@@ -1436,30 +3314,27 @@ fn time_option_takes_separate_value(word: &str) -> bool {
     false
 }
 
-fn exec_option_takes_separate_value(word: &str) -> bool {
-    let mut options = word
-        .strip_prefix('-')
-        .unwrap_or_default()
-        .chars()
-        .peekable();
+fn classify_exec_option(word: &str) -> Option<bool> {
+    let mut options = word.strip_prefix('-')?.chars().peekable();
+    options.peek()?;
     while let Some(option) = options.next() {
-        if option == 'a' {
-            return options.peek().is_none();
+        match option {
+            'c' | 'l' => {}
+            'a' => return Some(options.peek().is_none()),
+            _ => return None,
         }
     }
-    false
-}
-
-fn is_assignment(word: &str) -> bool {
-    word.split_once('=')
-        .is_some_and(|(name, _)| is_variable_name(name))
+    Some(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnvOption {
-    Flag,
-    TakesSeparateValue,
+    Supported {
+        takes_separate_value: bool,
+        child_context: bool,
+    },
     SplitString,
+    Unsupported,
 }
 
 fn classify_env_option(word: &str) -> EnvOption {
@@ -1467,14 +3342,24 @@ fn classify_env_option(word: &str) -> EnvOption {
         let (name, attached) = long
             .split_once('=')
             .map_or((long, false), |(name, _)| (name, true));
-        if !name.is_empty() && "split-string".starts_with(name) {
-            return EnvOption::SplitString;
-        }
-        if !attached && !name.is_empty() && ("unset".starts_with(name) || "chdir".starts_with(name))
-        {
-            return EnvOption::TakesSeparateValue;
-        }
-        return EnvOption::Flag;
+        let Some(option) = unique_env_long_option(name) else {
+            return EnvOption::Unsupported;
+        };
+        return match option {
+            "split-string" => EnvOption::SplitString,
+            "argv0" | "unset" | "chdir" => EnvOption::Supported {
+                takes_separate_value: !attached,
+                child_context: true,
+            },
+            "ignore-environment" => EnvOption::Supported {
+                takes_separate_value: false,
+                child_context: true,
+            },
+            _ => EnvOption::Supported {
+                takes_separate_value: false,
+                child_context: false,
+            },
+        };
     }
 
     let mut options = word
@@ -1482,52 +3367,177 @@ fn classify_env_option(word: &str) -> EnvOption {
         .unwrap_or_default()
         .chars()
         .peekable();
+    let mut child_context = false;
     while let Some(option) = options.next() {
         match option {
             'S' => return EnvOption::SplitString,
-            'u' | 'C' if options.peek().is_none() => return EnvOption::TakesSeparateValue,
-            'u' | 'C' => return EnvOption::Flag,
-            _ => {}
+            'a' | 'u' | 'C' => {
+                return EnvOption::Supported {
+                    takes_separate_value: options.peek().is_none(),
+                    child_context: true,
+                };
+            }
+            'i' => child_context = true,
+            '0' | 'v' => {}
+            _ => return EnvOption::Unsupported,
         }
     }
-    EnvOption::Flag
+    EnvOption::Supported {
+        takes_separate_value: false,
+        child_context,
+    }
 }
 
-fn sudo_option_takes_separate_value(word: &str) -> bool {
+fn unique_env_long_option(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return None;
+    }
+    const OPTIONS: &[&str] = &[
+        "argv0",
+        "block-signal",
+        "chdir",
+        "debug",
+        "default-signal",
+        "help",
+        "ignore-environment",
+        "ignore-signal",
+        "list-signal-handling",
+        "null",
+        "split-string",
+        "unset",
+        "version",
+    ];
+    let mut matches = OPTIONS
+        .iter()
+        .copied()
+        .filter(|option| option.starts_with(name));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SudoOptionArgument {
+    None,
+    Optional,
+    Required,
+}
+
+struct SudoOption {
+    takes_separate_value: bool,
+    indeterminate_child_context: bool,
+    invokes_shell: bool,
+}
+
+fn classify_sudo_option(word: &str) -> Result<SudoOption, ()> {
     if let Some(long) = word.strip_prefix("--") {
         let (name, attached) = long
             .split_once('=')
-            .map_or((long, false), |(name, _)| (name, true));
-        return !attached
-            && !name.is_empty()
-            && [
-                "user",
-                "group",
-                "host",
-                "prompt",
-                "close-from",
-                "command-timeout",
-                "chroot",
-                "chdir",
-                "role",
-                "type",
-                "other-user",
-            ]
-            .into_iter()
-            .any(|option| option.starts_with(name));
+            .map_or((long, None), |(name, value)| (name, Some(value)));
+        let options = [
+            ("background", SudoOptionArgument::None),
+            ("preserve-env", SudoOptionArgument::Optional),
+            ("edit", SudoOptionArgument::None),
+            ("set-home", SudoOptionArgument::None),
+            ("login", SudoOptionArgument::None),
+            ("remove-timestamp", SudoOptionArgument::None),
+            ("list", SudoOptionArgument::None),
+            ("preserve-groups", SudoOptionArgument::None),
+            ("shell", SudoOptionArgument::None),
+            ("other-user", SudoOptionArgument::Required),
+            ("validate", SudoOptionArgument::None),
+            ("askpass", SudoOptionArgument::None),
+            ("auth-type", SudoOptionArgument::Required),
+            ("bell", SudoOptionArgument::None),
+            ("close-from", SudoOptionArgument::Required),
+            ("login-class", SudoOptionArgument::Required),
+            ("chdir", SudoOptionArgument::Required),
+            ("group", SudoOptionArgument::Required),
+            ("help", SudoOptionArgument::None),
+            ("host", SudoOptionArgument::Required),
+            ("reset-timestamp", SudoOptionArgument::None),
+            ("no-update", SudoOptionArgument::None),
+            ("non-interactive", SudoOptionArgument::None),
+            ("prompt", SudoOptionArgument::Required),
+            ("chroot", SudoOptionArgument::Required),
+            ("role", SudoOptionArgument::Required),
+            ("stdin", SudoOptionArgument::None),
+            ("command-timeout", SudoOptionArgument::Required),
+            ("type", SudoOptionArgument::Required),
+            ("user", SudoOptionArgument::Required),
+            ("version", SudoOptionArgument::None),
+        ];
+        let (option, argument) =
+            if let Some(&(option, argument)) = options.iter().find(|(option, _)| *option == name) {
+                (option, argument)
+            } else {
+                let mut matches = options
+                    .iter()
+                    .filter(|(option, _)| !name.is_empty() && option.starts_with(name));
+                let Some(&(option, argument)) = matches.next() else {
+                    return Err(());
+                };
+                if matches.next().is_some() {
+                    return Err(());
+                }
+                (option, argument)
+            };
+        if (attached.is_some() && argument == SudoOptionArgument::None)
+            || (attached == Some("") && argument == SudoOptionArgument::Required)
+        {
+            return Err(());
+        }
+        return Ok(SudoOption {
+            takes_separate_value: attached.is_none() && argument == SudoOptionArgument::Required,
+            indeterminate_child_context: matches!(
+                option,
+                "preserve-env" | "set-home" | "login" | "user"
+            ),
+            invokes_shell: matches!(option, "login" | "shell"),
+        });
     }
 
-    let mut options = word
-        .strip_prefix('-')
-        .unwrap_or_default()
-        .chars()
-        .peekable();
+    let mut options = word.strip_prefix('-').ok_or(())?.chars().peekable();
+    let mut indeterminate_child_context = false;
+    let mut invokes_shell = false;
     while let Some(option) = options.next() {
-        if matches!(option, 'u' | 'g' | 'h' | 'p' | 'C' | 'T' | 'R' | 'D' | 't') {
-            return options.peek().is_none();
+        match option {
+            'E' => indeterminate_child_context = true,
+            'i' => {
+                indeterminate_child_context = true;
+                invokes_shell = true;
+            }
+            's' => invokes_shell = true,
+            'H' => indeterminate_child_context = true,
+            'A' | 'B' | 'b' | 'e' | 'K' | 'k' | 'l' | 'N' | 'n' | 'P' | 'S' | 'V' | 'v' => {}
+            'u' => {
+                return Ok(SudoOption {
+                    takes_separate_value: options.peek().is_none(),
+                    indeterminate_child_context: true,
+                    invokes_shell,
+                });
+            }
+            'a' | 'C' | 'c' | 'D' | 'g' | 'p' | 'R' | 'r' | 'T' | 't' | 'U' => {
+                return Ok(SudoOption {
+                    takes_separate_value: options.peek().is_none(),
+                    indeterminate_child_context,
+                    invokes_shell,
+                });
+            }
+            'h' => {
+                return Ok(SudoOption {
+                    takes_separate_value: options.peek().is_none(),
+                    indeterminate_child_context,
+                    invokes_shell,
+                });
+            }
+            _ => return Err(()),
         }
     }
-    false
+    Ok(SudoOption {
+        takes_separate_value: false,
+        indeterminate_child_context,
+        invokes_shell,
+    })
 }
 
 #[cfg(test)]
@@ -1664,6 +3674,67 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn isolated_helper_environment_overrides_forged_markers_with_boolean_state() {
+        let mut command = std::process::Command::new("/bin/true");
+        command
+            .env("BASH_ENV", "/tmp/attacker-startup")
+            .env("BASHOPTS", "lastpipe")
+            .env("SHELLOPTS", "posix")
+            .env("POSIXLY_CORRECT", "1")
+            .env(STARTUP_ENV_MARKER, "1")
+            .env(LASTPIPE_MARKER, "1")
+            .env(POSIX_MODE_ENABLED_MARKER, "1")
+            .env(POSIX_MODE_UNCERTAIN_MARKER, "1")
+            .env(POSIX_MODE_PROPAGATES_MARKER, "1");
+
+        configure_isolated_helper_environment(
+            &mut command,
+            OsString::from("/home/trusted"),
+            InheritedShellState {
+                startup_environment_uncertain: false,
+                lastpipe_enabled: false,
+                posix_mode: PosixMode::Disabled,
+                posix_mode_propagates: false,
+            },
+        );
+
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(environment.len(), 6);
+        assert_eq!(
+            environment.get(&OsString::from("HOME")),
+            Some(&Some(OsString::from("/home/trusted")))
+        );
+        assert_eq!(
+            environment.get(&OsString::from(STARTUP_ENV_MARKER)),
+            Some(&Some(OsString::from("0")))
+        );
+        assert_eq!(
+            environment.get(&OsString::from(LASTPIPE_MARKER)),
+            Some(&Some(OsString::from("0")))
+        );
+        assert_eq!(
+            environment.get(&OsString::from(POSIX_MODE_ENABLED_MARKER)),
+            Some(&Some(OsString::from("0")))
+        );
+        assert_eq!(
+            environment.get(&OsString::from(POSIX_MODE_UNCERTAIN_MARKER)),
+            Some(&Some(OsString::from("0")))
+        );
+        assert_eq!(
+            environment.get(&OsString::from(POSIX_MODE_PROPAGATES_MARKER)),
+            Some(&Some(OsString::from("0")))
+        );
+        assert!(!environment.contains_key(&OsString::from("BASH_ENV")));
+        assert!(!environment.contains_key(&OsString::from("BASHOPTS")));
+        assert!(!environment.contains_key(&OsString::from("SHELLOPTS")));
+        assert!(!environment.contains_key(&OsString::from("POSIXLY_CORRECT")));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn isolated_helper_process_accepts_valid_json() {
         let mut command = std::process::Command::new("/bin/sh");
         command.args([
@@ -1767,6 +3838,208 @@ mod tests {
         );
         assert!(output.len() <= MAX_HELPER_OUTPUT_BYTES);
         assert!(!String::from_utf8_lossy(&output).contains("reason"));
+    }
+
+    #[test]
+    fn helper_protocol_projects_nested_deny() {
+        for command in [
+            "sh -c 'rm --no-preserve-root -rf /'",
+            "eval -- 'rm --no-preserve-root -rf /'",
+            "builtin -- eval 'rm --no-preserve-root -rf /'",
+            "builtin exec sh -c 'rm --no-preserve-root -rf /'",
+            "builtin command sh -c 'rm --no-preserve-root -rf /'",
+            "builtin builtin eval 'rm --no-preserve-root -rf /'",
+        ] {
+            let mut output = Vec::new();
+            run_helper_with(std::io::Cursor::new(command), &mut output).unwrap();
+
+            assert!(
+                matches!(decode_helper_response(&output), SafetyEvaluation::Deny(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn helper_protocol_projects_unresolved_nested_execution_as_indeterminate() {
+        for command in [
+            "sh -c \"$PROGRAM\"",
+            "builtin -- eval \"$PROGRAM\"",
+            "builtin exec sh -c \"$PROGRAM\"",
+            "builtin command sh -c \"$PROGRAM\"",
+            "builtin builtin eval \"$PROGRAM\"",
+        ] {
+            let mut output = Vec::new();
+            run_helper_with(std::io::Cursor::new(command), &mut output).unwrap();
+
+            assert!(
+                matches!(
+                    decode_helper_response(&output),
+                    SafetyEvaluation::Indeterminate(ShellAnalysisError::HelperFailure)
+                ),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn helper_protocol_preserves_startup_environment_uncertainty() {
+        let mut output = Vec::new();
+        run_helper_with_inherited(
+            std::io::Cursor::new(b"printf ok"),
+            &mut output,
+            InheritedShellState {
+                startup_environment_uncertain: true,
+                lastpipe_enabled: false,
+                posix_mode: PosixMode::Disabled,
+                posix_mode_propagates: false,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            decode_helper_response(&output),
+            SafetyEvaluation::Indeterminate(ShellAnalysisError::HelperFailure)
+        ));
+    }
+
+    #[test]
+    fn helper_protocol_startup_uncertainty_keeps_proven_deny_precedence() {
+        let mut output = Vec::new();
+        run_helper_with_inherited(
+            std::io::Cursor::new(b"rm --no-preserve-root -rf /"),
+            &mut output,
+            InheritedShellState {
+                startup_environment_uncertain: true,
+                lastpipe_enabled: false,
+                posix_mode: PosixMode::Disabled,
+                posix_mode_propagates: false,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            decode_helper_response(&output),
+            SafetyEvaluation::Deny(SafetyDeny {
+                rule_id: "irreversible-root-delete",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn inherited_startup_uncertainty_applies_to_the_current_program() {
+        let inherited = InheritedShellState {
+            startup_environment_uncertain: true,
+            lastpipe_enabled: false,
+            posix_mode: PosixMode::Disabled,
+            posix_mode_propagates: false,
+        };
+        let benign = ShellCommandInput {
+            dialect: ShellDialect::Bash,
+            source: "printf ok".into(),
+        };
+        let destructive = ShellCommandInput {
+            dialect: ShellDialect::Bash,
+            source: "rm --no-preserve-root -rf /".into(),
+        };
+
+        assert!(matches!(
+            evaluate_in_process_with_inherited(Some(&benign), inherited),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+        let deny = evaluate_in_process_with_inherited(Some(&destructive), inherited);
+        assert!(matches!(
+            deny,
+            SafetyEvaluation::Deny(SafetyDeny {
+                rule_id: "irreversible-root-delete",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn later_startup_environment_mutation_is_not_retroactive() {
+        assert_eq!(
+            evaluate_result("BASH_ENV=/tmp/startup; export BASH_ENV; printf ok"),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+        assert!(matches!(
+            evaluate_result("BASH_ENV=/tmp/startup; export BASH_ENV; bash -c 'printf ok'"),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_bash_uses_bash_env_before_noninteractive_source() {
+        use std::io::Write as _;
+
+        let mut startup = tempfile::NamedTempFile::new().unwrap();
+        startup.write_all(b"printf STARTUP:").unwrap();
+        let output = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", "printf SOURCE"])
+            .env("BASH_ENV", startup.path())
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"STARTUP:SOURCE");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_bash_keeps_sudo_shell_escaped_assignment_inert() {
+        let escaped = std::process::Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                r#"FOO\=bar eval printf\ PAYLOAD"#,
+            ])
+            .output()
+            .unwrap();
+        let unescaped = std::process::Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                r#"FOO=bar eval printf\ CONTROL"#,
+            ])
+            .output()
+            .unwrap();
+
+        assert!(!escaped.status.success());
+        assert!(escaped.stdout.is_empty());
+        assert!(unescaped.status.success());
+        assert_eq!(unescaped.stdout, b"CONTROL");
+    }
+
+    #[test]
+    fn helper_protocol_preserves_inherited_lastpipe_state() {
+        let mut output = Vec::new();
+        run_helper_with_inherited(
+            std::io::Cursor::new(
+                b"TARGET=/tmp/safe; printf x | eval \"TARGET=/\"; rm --no-preserve-root -rf \"$TARGET\"",
+            ),
+            &mut output,
+            InheritedShellState {
+                startup_environment_uncertain: false,
+                lastpipe_enabled: true,
+                posix_mode: PosixMode::Disabled,
+                posix_mode_propagates: false,
+            },
+        )
+        .unwrap();
+
+        let deny = decode_helper_response(&output);
+        assert!(matches!(
+            deny,
+            SafetyEvaluation::Deny(SafetyDeny {
+                rule_id: "unsafe-recursive-delete-expansion",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1938,6 +4211,1715 @@ mod tests {
                 "{target}"
             );
         }
+    }
+
+    #[test]
+    fn literal_nested_shell_destruction_denies() {
+        for command in [
+            "sh -c 'rm --no-preserve-root -rf /'",
+            "/bin/bash -c 'rm --no-preserve-root -rf /'",
+            "dash -c 'rm --no-preserve-root -rf /'",
+            "ash -c 'rm --no-preserve-root -rf /'",
+            "busybox sh -c 'rm --no-preserve-root -rf /'",
+            "busybox ash -c 'rm --no-preserve-root -rf /'",
+            "toybox sh -c 'rm --no-preserve-root -rf /'",
+            "env bash -c 'rm --no-preserve-root -rf /'",
+            "env X-Y=z sh -c 'rm --no-preserve-root -rf /'",
+            "env 1X=z sh -c 'rm --no-preserve-root -rf /'",
+            "env .X=z sh -c 'rm --no-preserve-root -rf /'",
+            "env /X=z sh -c 'rm --no-preserve-root -rf /'",
+            "env =X=z sh -c 'rm --no-preserve-root -rf /'",
+            "env -- -X=z sh -c 'rm --no-preserve-root -rf /'",
+            "sudo sh -c 'rm --no-preserve-root -rf /'",
+            "sudo X-Y=z sh -c 'rm --no-preserve-root -rf /'",
+            "sudo 1X=z sh -c 'rm --no-preserve-root -rf /'",
+            "sudo .X=z sh -c 'rm --no-preserve-root -rf /'",
+            "command bash -c 'rm --no-preserve-root -rf /'",
+            "exec bash -c 'rm --no-preserve-root -rf /'",
+            "time bash -c 'rm --no-preserve-root -rf /'",
+            "time -- eval 'rm --no-preserve-root -rf /'",
+            "time -p -- sh -c 'rm --no-preserve-root -rf /'",
+            "time -- ! eval 'rm --no-preserve-root -rf /'",
+            "time -p -- ! sh -c 'rm --no-preserve-root -rf /'",
+            "eval 'rm --no-preserve-root -rf /'",
+            "eval rm --no-preserve-root -rf /",
+            "builtin eval 'rm --no-preserve-root -rf /'",
+            "sh -c \"eval 'rm --no-preserve-root -rf /'\"",
+            "sh -c \"bash -c 'rm --no-preserve-root -rf /'\"",
+            "/usr/bin/time bash -c 'rm --no-preserve-root -rf /'",
+            "command time bash -c 'rm --no-preserve-root -rf /'",
+            "builtin command time bash -c 'rm --no-preserve-root -rf /'",
+            "builtin exec sudo bash -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert!(
+                matches!(
+                    deny.rule_id,
+                    "irreversible-root-delete" | "unsafe-recursive-delete-expansion"
+                ),
+                "{command}: {}",
+                deny.rule_id
+            );
+        }
+    }
+
+    #[test]
+    fn eval_option_terminator_is_not_program_text() {
+        let deny = evaluate_command("eval -- 'rm --no-preserve-root -rf /'")
+            .expect("eval must consume its option terminator before executing the command");
+        assert_eq!(deny.rule_id, "irreversible-root-delete");
+    }
+
+    #[test]
+    fn external_process_wrappers_cannot_grant_caller_eval_state() {
+        for command in [
+            "TARGET=/; sudo eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+            "TARGET=/; builtin exec sudo eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+            "TARGET=/; env eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+            "TARGET=/; /usr/bin/time eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+            "TARGET=/; command time eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+            "TARGET=/; builtin command time eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+            "TARGET=/; command -v eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+            "TARGET=/; builtin command -V eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+            "TARGET=/; time -o log eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+            "TARGET=/; sudo -s eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+            "TARGET=/; builtin exec sudo -s eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"",
+        ] {
+            assert!(
+                evaluate_command(command).is_some(),
+                "external eval changed caller state: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_keyword_time_commands_cannot_grant_caller_eval_state() {
+        for dispatch in [
+            "FOO=bar time",
+            ">/dev/null time",
+            "'time'",
+            "\\time",
+            "ti'm'e",
+        ] {
+            let command =
+                format!("TARGET=/; {dispatch} eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"");
+            assert!(
+                evaluate_command(&command).is_some(),
+                "external time command exposed eval: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_command_options_cannot_grant_caller_eval_state() {
+        for dispatch in [
+            "command -x",
+            "builtin command -x",
+            "command -P",
+            "builtin command --help",
+            "command --verbose",
+        ] {
+            let command =
+                format!("TARGET=/; {dispatch} eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"");
+            assert!(
+                evaluate_command(&command).is_some(),
+                "unsupported command option exposed eval: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_operands_that_look_like_assignments_do_not_expose_eval() {
+        for dispatch in [
+            "command FOO=bar",
+            "builtin command FOO=bar",
+            "command -- FOO=bar",
+            "command -p FOO=bar",
+            "command command FOO=bar",
+            "command time FOO=bar",
+        ] {
+            let command =
+                format!("TARGET=/; {dispatch} eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"");
+            assert!(
+                evaluate_command(&command).is_some(),
+                "assignment-looking command operand exposed eval: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn syntactic_assignment_lookalike_commands_cannot_expose_caller_eval() {
+        for dispatch in [
+            "'FOO=bar'",
+            "FOO\\=bar",
+            "F'O'O=bar",
+            "./FOO=bar",
+            "time 'FOO=bar'",
+            "time time FOO\\=bar",
+        ] {
+            let command =
+                format!("TARGET=/; {dispatch} eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"");
+            let deny = evaluate_command(&command)
+                .unwrap_or_else(|| panic!("assignment lookalike exposed eval: {command}"));
+            assert_eq!(deny.rule_id, "unsafe-recursive-delete-expansion");
+        }
+    }
+
+    #[test]
+    fn syntactic_assignment_lookalike_commands_cannot_expose_caller_shopt() {
+        for dispatch in [
+            "'FOO=bar'",
+            "FOO\\=bar",
+            "F'O'O=bar",
+            "./FOO=bar",
+            "time 'FOO=bar'",
+            "time time FOO\\=bar",
+        ] {
+            let command = format!(
+                "{dispatch} shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${{X:+-rf}}\" /"
+            );
+            assert_eq!(
+                evaluate_result(&command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "assignment lookalike exposed shopt: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_assignment_lookalike_commands_keep_payloads_inert() {
+        for command in [
+            "exec 'FOO=bar' eval 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time FOO\\=bar eval 'rm --no-preserve-root -rf /'",
+            "env -- FOO=bar eval 'rm --no-preserve-root -rf /'",
+            "sudo -- 'FOO=bar' eval 'rm --no-preserve-root -rf /'",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+
+        for command in [
+            "sudo -s -- FOO=bar eval 'rm --no-preserve-root -rf /'",
+            "sudo -s -- 'FOO=bar' eval 'rm --no-preserve-root -rf /'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_prefix_and_wrapper_assignments_remain_structural() {
+        for command in [
+            "MODE=fast shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+            "time -- MODE=fast shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+            "env MODE=fast sh -c 'rm --no-preserve-root -rf /'",
+            "sudo MODE=fast sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert!(
+                matches!(
+                    deny.rule_id,
+                    "unsafe-recursive-delete-expansion" | "irreversible-root-delete"
+                ),
+                "{command}: {}",
+                deny.rule_id
+            );
+        }
+    }
+
+    #[test]
+    fn caller_shell_eval_dispatch_still_updates_caller_state() {
+        for dispatch in [
+            "eval",
+            "command eval",
+            "command -p eval",
+            "command -- eval",
+            "builtin command eval",
+            "builtin command -p eval",
+            "time eval",
+            "time command eval",
+            "! time eval",
+            "time -- time eval",
+        ] {
+            let command = format!("TARGET=/; {dispatch} 'TARGET=/tmp/safe'; rm -rf \"$TARGET\"");
+            assert_eq!(
+                evaluate_result(&command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_child_eval_prefix_assignments_persist() {
+        for interpreter in [
+            "sh",
+            "dash",
+            "ash",
+            "busybox sh",
+            "busybox ash",
+            "toybox sh",
+            "bash --posix",
+        ] {
+            let command = format!(
+                "{interpreter} -c 'TARGET=/tmp/safe; TARGET=/ eval \":\"; \
+                 rm --no-preserve-root -rf \"$TARGET\"'"
+            );
+            let deny = evaluate_command(&command)
+                .unwrap_or_else(|| panic!("POSIX eval prefix assignment escaped: {command}"));
+            assert!(
+                matches!(
+                    deny.rule_id,
+                    "irreversible-root-delete" | "unsafe-recursive-delete-expansion"
+                ),
+                "{command}: {}",
+                deny.rule_id
+            );
+        }
+
+        for command in [
+            "bash --posix -c 'TARGET=/tmp/safe; TARGET=/ builtin eval \":\"; \
+             rm --no-preserve-root -rf \"$TARGET\"'",
+            "bash --posix -c 'TARGET=/tmp/safe; time TARGET=/ eval \":\"; \
+             rm --no-preserve-root -rf \"$TARGET\"'",
+        ] {
+            assert!(
+                evaluate_command(command).is_some(),
+                "Bash POSIX special builtin assignment escaped: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_command_eval_prefix_assignments_are_temporary() {
+        for interpreter in ["sh", "dash", "ash", "bash --posix"] {
+            let command = format!(
+                "{interpreter} -c 'TARGET=/tmp/safe; TARGET=/ command eval \":\"; \
+                 rm --no-preserve-root -rf \"$TARGET\"'"
+            );
+            assert_eq!(
+                evaluate_result(&command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_children_do_not_trust_bash_only_time_or_builtin_dispatch() {
+        for interpreter in [
+            "sh",
+            "dash",
+            "ash",
+            "busybox sh",
+            "busybox ash",
+            "toybox sh",
+        ] {
+            for dispatch in ["time eval", "builtin eval"] {
+                let command = format!(
+                    "{interpreter} -c 'TARGET=/; {dispatch} \"TARGET=/tmp/safe\"; \
+                     rm --no-preserve-root -rf \"$TARGET\"'"
+                );
+                assert!(
+                    evaluate_command(&command).is_some(),
+                    "portable child trusted Bash-only dispatch: {command}"
+                );
+            }
+
+            let direct = format!("{interpreter} -c 'builtin eval \"rm --no-preserve-root -rf /\"'");
+            assert!(
+                matches!(
+                    evaluate_result(&direct),
+                    SafetyEvaluation::Indeterminate(ShellAnalysisError::UnsupportedSyntax)
+                ),
+                "portable builtin use was trusted: {direct}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_bash_child_eval_prefix_assignments_are_temporary() {
+        for command in [
+            "bash -c 'TARGET=/tmp/safe; TARGET=/ eval \":\"; \
+             rm --no-preserve-root -rf \"$TARGET\"'",
+            "bash -c 'TARGET=/tmp/safe; time TARGET=/ eval \":\"; \
+             rm --no-preserve-root -rf \"$TARGET\"'",
+            "bash -c 'TARGET=/tmp/safe; TARGET=/ builtin eval \":\"; \
+             rm --no-preserve-root -rf \"$TARGET\"'",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_eval_lookalikes_are_not_nested_programs() {
+        for command in [
+            "sudo eval 'rm --no-preserve-root -rf /'",
+            "env eval 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time eval 'rm --no-preserve-root -rf /'",
+            "command time eval 'rm --no-preserve-root -rf /'",
+            "command -v eval 'rm --no-preserve-root -rf /'",
+            "builtin command -V eval 'rm --no-preserve-root -rf /'",
+            "command -x eval 'rm --no-preserve-root -rf /'",
+            "builtin command -P eval 'rm --no-preserve-root -rf /'",
+            "command --help eval 'rm --no-preserve-root -rf /'",
+            "command --verbose eval 'rm --no-preserve-root -rf /'",
+            "command FOO=bar eval 'rm --no-preserve-root -rf /'",
+            "builtin command -- FOO=bar eval 'rm --no-preserve-root -rf /'",
+            "command time FOO=bar eval 'rm --no-preserve-root -rf /'",
+            "time -o log eval 'rm --no-preserve-root -rf /'",
+            "exec eval 'rm --no-preserve-root -rf /'",
+            "builtin exec eval 'rm --no-preserve-root -rf /'",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_prefix_assignments_flow_into_eval_without_escaping_caller_state() {
+        for dispatch in [
+            "eval",
+            "builtin eval",
+            "builtin -- eval",
+            "command eval",
+            "builtin command eval",
+            "builtin builtin eval",
+        ] {
+            let destructive = format!(
+                "TARGET=/tmp/safe; TARGET=/ {dispatch} \
+                 'rm --no-preserve-root -rf \"$TARGET\"'"
+            );
+            let deny = evaluate_command(&destructive)
+                .unwrap_or_else(|| panic!("eval prefix assignment escaped safety: {destructive}"));
+            assert!(
+                matches!(
+                    deny.rule_id,
+                    "irreversible-root-delete" | "unsafe-recursive-delete-expansion"
+                ),
+                "{destructive}: {}",
+                deny.rule_id
+            );
+
+            let safe =
+                format!("TARGET=/tmp/safe; TARGET=/ {dispatch} 'printf ok'; rm -rf \"$TARGET\"");
+            assert_eq!(
+                evaluate_result(&safe),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{safe}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_prefix_assignment_uncertainty_fails_closed_for_eval() {
+        assert!(matches!(
+            evaluate_result(
+                "TARGET=/tmp/safe; TARGET=\"$UNKNOWN\" eval 'printf ok'; \
+                 rm -rf \"$TARGET\""
+            ),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+    }
+
+    #[test]
+    fn prefixed_eval_still_propagates_other_caller_state_changes() {
+        let deny = evaluate_command(
+            "TARGET=/tmp/safe; TARGET=/ eval 'NEXT=/'; \
+             rm --no-preserve-root -rf \"$NEXT\"",
+        )
+        .expect("non-prefix eval assignments must still flow to the caller");
+        assert!(matches!(
+            deny.rule_id,
+            "irreversible-root-delete" | "unsafe-recursive-delete-expansion"
+        ));
+    }
+
+    #[test]
+    fn prefixed_eval_never_restores_a_stale_value_after_same_name_mutation() {
+        for dispatch in [
+            "eval",
+            "builtin eval",
+            "builtin -- eval",
+            "command eval",
+            "builtin command eval",
+            "builtin builtin eval",
+        ] {
+            let command = format!(
+                "TARGET=/tmp/safe; TARGET=/ {dispatch} 'TARGET=/'; \
+                 rm --no-preserve-root -rf \"$TARGET\""
+            );
+            assert!(
+                evaluate_command(&command).is_some(),
+                "same-name eval mutation restored stale safety state: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefixed_eval_restores_the_temporary_name_after_generic_invalidation() {
+        assert_eq!(
+            evaluate_result(
+                "TARGET=/tmp/safe; TARGET=/ eval 'arbitrary_mutator'; \
+                 rm -rf \"$TARGET\""
+            ),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+    }
+
+    #[test]
+    fn builtin_dispatch_preserves_supported_nested_execution() {
+        for command in [
+            "builtin -- eval 'rm --no-preserve-root -rf /'",
+            "builtin exec sh -c 'rm --no-preserve-root -rf /'",
+            "builtin command sh -c 'rm --no-preserve-root -rf /'",
+            "builtin builtin eval 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("supported builtin dispatch escaped safety: {command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn builtin_dispatch_uncertainty_fails_closed() {
+        for command in [
+            "builtin -- eval \"$UNKNOWN\"",
+            "builtin exec sh -c \"$UNKNOWN\"",
+            "builtin command sh -c \"$UNKNOWN\"",
+            "builtin builtin eval \"$UNKNOWN\"",
+            "builtin \"$SELECTOR\" 'printf ok'",
+            "builtin unknown-selector 'printf ok'",
+            "builtin /tmp/eval 'printf ok'",
+            "builtin ./exec sh -c 'printf ok'",
+            "builtin path/command sh -c 'printf ok'",
+            "builtin path/builtin eval 'printf ok'",
+            "builtin",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_dispatch_benign_and_inert_controls_stay_non_deterministic() {
+        for command in [
+            "builtin -- eval 'printf ok'",
+            "builtin exec sh -c 'printf ok'",
+            "builtin command sh -c 'printf ok'",
+            "builtin builtin eval 'printf ok'",
+            "printf '%s' \"builtin exec sh -c 'rm -rf /'\"",
+            "printf '%s' \"builtin -- eval 'rm -rf /'\"",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_bearing_source_and_dot_abstain_without_reading_external_content() {
+        for command in [
+            "source /definitely/not/read-by-safety",
+            ". /definitely/not/read-by-safety",
+            "'source' /definitely/not/read-by-safety",
+            "command source /definitely/not/read-by-safety",
+            "command -- . /definitely/not/read-by-safety",
+            "builtin source /definitely/not/read-by-safety",
+            "builtin -- . /definitely/not/read-by-safety",
+            "source /dev/stdin",
+            ". /dev/fd/0",
+            "source \"$FILE\"",
+            "bash -c 'source /definitely/not/read-by-safety'",
+            "bash --posix -c '. /definitely/not/read-by-safety'",
+            "sh -c '. /definitely/not/read-by-safety'",
+            "sh -c 'source /definitely/not/read-by-safety'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_and_dot_inert_controls_preserve_caller_state() {
+        for command in [
+            "TARGET=/tmp/safe; source; rm -rf \"$TARGET\"",
+            "TARGET=/tmp/safe; .; rm -rf \"$TARGET\"",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+
+        for command in [
+            "TARGET=/tmp/safe; /tmp/source file; rm -rf \"$TARGET\"",
+            "TARGET=/tmp/safe; ./source file; rm -rf \"$TARGET\"",
+            "TARGET=/tmp/safe; env source file; rm -rf \"$TARGET\"",
+            "TARGET=/tmp/safe; exec source file; rm -rf \"$TARGET\"",
+            "TARGET=/tmp/safe; printf '%s' 'source /tmp/file'; rm -rf \"$TARGET\"",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| {
+                panic!("ordinary external command skipped invalidation: {command}")
+            });
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn sourced_program_boundaries_cover_posix_prefix_state_without_reads() {
+        for command in [
+            "bash --posix -c 'TARGET=/tmp/safe; TARGET=/ . /dev/null; rm --no-preserve-root -rf \"$TARGET\"'",
+            "bash --posix -c 'TARGET=/tmp/safe; TARGET=/ source /dev/null; rm --no-preserve-root -rf \"$TARGET\"'",
+        ] {
+            assert!(evaluate_command(command).is_some(), "{command}");
+        }
+
+        for command in [
+            "bash --posix -c 'TARGET=/ command . /dev/null'",
+            "bash --posix -c 'TARGET=/ builtin . /dev/null'",
+            "bash --posix -c 'TARGET=/ command source /dev/null'",
+            "bash --posix -c 'TARGET=/ builtin source /dev/null'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn trap_literal_actions_are_recursively_scanned_before_abstention() {
+        for command in [
+            "trap 'rm --no-preserve-root -rf /' EXIT",
+            "trap -- 'rm --no-preserve-root -rf /' 0",
+            "builtin trap 'rm --no-preserve-root -rf /' EXIT",
+            "builtin -- trap 'rm --no-preserve-root -rf /' DEBUG",
+            "command trap 'rm --no-preserve-root -rf /' EXIT",
+            "trap 'rm --no-preserve-root -rf /' \"$SIGNAL\"",
+            "bash -c \"trap 'rm --no-preserve-root -rf /' EXIT\"",
+            "sh -c \"trap 'rm --no-preserve-root -rf /' EXIT\"",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("trap action escaped recursive scan: {command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+        let command = "TARGET=/; trap 'rm --no-preserve-root -rf \"$TARGET\"' EXIT";
+        assert!(evaluate_command(command).is_some(), "{command}");
+
+        for command in [
+            "trap ':' EXIT",
+            "trap \"$ACTION\" EXIT",
+            "trap 'printf ok' \"$SIGNAL\"",
+            "trap -x 'printf ok' EXIT",
+            "trap -P EXIT",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn trap_query_list_reset_and_ignore_forms_are_inert() {
+        for command in [
+            "trap",
+            "trap -p",
+            "trap -p EXIT",
+            "trap -p \"$SIGNAL\"",
+            "trap -l",
+            "trap -lp",
+            "trap EXIT",
+            "trap - EXIT",
+            "trap '' EXIT",
+            "trap --",
+            "trap -- - EXIT",
+            "trap -- '' EXIT",
+            "builtin trap -p EXIT",
+            "builtin -- trap -l",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+
+        for command in [
+            "TARGET=/tmp/safe; trap -p EXIT; rm -rf \"$TARGET\"",
+            "TARGET=/tmp/safe; trap - EXIT; rm -rf \"$TARGET\"",
+            "TARGET=/tmp/safe; trap '' EXIT; rm -rf \"$TARGET\"",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "trap inert form mutated caller state: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn trap_uncertainty_preserves_state_and_visible_deny_precedence() {
+        assert!(matches!(
+            evaluate_result("TARGET=/tmp/safe; trap ':' EXIT; rm -rf \"$TARGET\""),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+        for command in [
+            "trap ':' EXIT; rm --no-preserve-root -rf /",
+            "rm --no-preserve-root -rf /; trap \"$ACTION\" EXIT",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn trap_special_builtin_prefix_state_respects_shell_mode_and_wrappers() {
+        for command in [
+            "bash --posix -c 'TARGET=/tmp/safe; TARGET=/ trap -p EXIT; rm --no-preserve-root -rf \"$TARGET\"'",
+            "bash --posix -c 'TARGET=/tmp/safe; TARGET=/ trap - EXIT; rm --no-preserve-root -rf \"$TARGET\"'",
+            "sh -c 'TARGET=/tmp/safe; TARGET=/ trap \"\" EXIT; rm --no-preserve-root -rf \"$TARGET\"'",
+        ] {
+            assert!(evaluate_command(command).is_some(), "{command}");
+        }
+
+        for command in [
+            "TARGET=/tmp/safe; TARGET=/ trap -p EXIT; rm --no-preserve-root -rf \"$TARGET\"",
+            "bash --posix -c 'TARGET=/tmp/safe; TARGET=/ command trap -p EXIT; rm --no-preserve-root -rf \"$TARGET\"'",
+            "bash --posix -c 'TARGET=/tmp/safe; TARGET=/ builtin trap -p EXIT; rm --no-preserve-root -rf \"$TARGET\"'",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+
+        assert!(matches!(
+            evaluate_result("sh -c 'trap -p EXIT'"),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+    }
+
+    #[test]
+    fn trap_actions_observe_prefix_state_when_the_deferred_action_runs() {
+        for command in [
+            "TARGET=/; TARGET=/tmp/safe trap 'rm --no-preserve-root -rf \"$TARGET\"' EXIT",
+            "TARGET=/; TARGET=/tmp/safe command trap 'rm --no-preserve-root -rf \"$TARGET\"' EXIT",
+            "TARGET=/; TARGET=/tmp/safe builtin trap 'rm --no-preserve-root -rf \"$TARGET\"' EXIT",
+            "bash --posix -c \"TARGET=/; TARGET=/tmp/safe command trap 'rm --no-preserve-root -rf \\\"\\$TARGET\\\"' EXIT\"",
+            "bash --posix -c \"TARGET=/; TARGET=/tmp/safe builtin trap 'rm --no-preserve-root -rf \\\"\\$TARGET\\\"' EXIT\"",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("restored trap state escaped scan: {command}"));
+            assert!(
+                matches!(
+                    deny.rule_id,
+                    "irreversible-root-delete" | "unsafe-recursive-delete-expansion"
+                ),
+                "{command}: {}",
+                deny.rule_id
+            );
+        }
+
+        for command in [
+            "TARGET=/tmp/safe; TARGET=/ trap 'rm --no-preserve-root -rf \"$TARGET\"' EXIT",
+            "TARGET=/tmp/safe; TARGET=/ command trap 'rm --no-preserve-root -rf \"$TARGET\"' EXIT",
+            "TARGET=/tmp/safe; TARGET=/ builtin trap 'rm --no-preserve-root -rf \"$TARGET\"' EXIT",
+            "bash --posix -c \"TARGET=/tmp/safe; TARGET=/ command trap 'rm --no-preserve-root -rf \\\"\\$TARGET\\\"' EXIT\"",
+            "bash --posix -c \"TARGET=/tmp/safe; TARGET=/ builtin trap 'rm --no-preserve-root -rf \\\"\\$TARGET\\\"' EXIT\"",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "temporary trap prefix leaked into deferred action: {command}"
+            );
+        }
+
+        for command in [
+            "bash --posix -c \"TARGET=/tmp/safe; TARGET=/ trap 'rm --no-preserve-root -rf \\\"\\$TARGET\\\"' EXIT\"",
+            "sh -c \"TARGET=/tmp/safe; TARGET=/ trap 'rm --no-preserve-root -rf \\\"\\$TARGET\\\"' EXIT\"",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("persistent trap prefix escaped scan: {command}"));
+            assert!(
+                matches!(
+                    deny.rule_id,
+                    "irreversible-root-delete" | "unsafe-recursive-delete-expansion"
+                ),
+                "{command}: {}",
+                deny.rule_id
+            );
+        }
+    }
+
+    #[test]
+    fn mapfile_and_readarray_literal_callbacks_are_recursively_scanned() {
+        for command in [
+            "mapfile -c 1 -C 'rm --no-preserve-root -rf /'",
+            "mapfile -c1 -C'rm --no-preserve-root -rf /'",
+            "mapfile -tc1 -C 'rm --no-preserve-root -rf /'",
+            "mapfile -C 'rm --no-preserve-root -rf /' -c1",
+            "mapfile -d '' -n 1 -O 0 -s 0 -u 0 -tc1 -C 'rm --no-preserve-root -rf /'",
+            "mapfile -C 'rm --no-preserve-root -rf /' -- MAPFILE",
+            "readarray -c1 -C 'rm --no-preserve-root -rf /'",
+            "builtin mapfile -c1 -C 'rm --no-preserve-root -rf /'",
+            "builtin -- readarray -C'rm --no-preserve-root -rf /' -c1",
+            "command mapfile -c1 -C 'rm --no-preserve-root -rf /'",
+            "bash -c \"mapfile -c1 -C 'rm --no-preserve-root -rf /'\"",
+            "bash --posix -c \"mapfile -c1 -C 'rm --no-preserve-root -rf /'\"",
+            "mapfile -C ':' -C 'rm --no-preserve-root -rf /' -c1",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("mapfile callback escaped recursive scan: {command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+        for command in [
+            "TARGET=/ mapfile -c1 -C 'rm --no-preserve-root -rf \"$TARGET\"'",
+            "TARGET=/; mapfile -c1 -C 'rm --no-preserve-root -rf \"$TARGET\"'",
+        ] {
+            assert!(evaluate_command(command).is_some(), "{command}");
+        }
+
+        for command in [
+            "mapfile -c1 -C ':'",
+            "readarray -C \"$CALLBACK\" -c1",
+            "mapfile \"$OPTIONS\"",
+            "mapfile -C",
+            "mapfile -c",
+            "mapfile -c nope -C ':'",
+            "mapfile -n \"$COUNT\" -C ':'",
+            "mapfile -Z -C ':'",
+            "mapfile -C 'rm --no-preserve-root -rf /' -C ':' -c1",
+            "sh -c \"mapfile -c1 -C 'rm --no-preserve-root -rf /'\"",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn mapfile_numeric_operands_follow_bash_ranges_and_signs() {
+        for command in [
+            "mapfile -c +1 -C 'rm --no-preserve-root -rf /'",
+            "mapfile -c+1 -C 'rm --no-preserve-root -rf /'",
+            "mapfile -n +0 -O -0 -s +0 -u +0 -c +01 -C 'rm --no-preserve-root -rf /'",
+            "mapfile -n 4294967295 -c 1 -C 'rm --no-preserve-root -rf /'",
+            "mapfile -c '\n+1\t ' -C 'rm --no-preserve-root -rf /'",
+            "mapfile -c '\r+1\t ' -C 'rm --no-preserve-root -rf /'",
+            "mapfile -c '\u{000c}+1\t ' -C 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("valid Bash numeric operand escaped scan: {command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+
+        for command in [
+            "mapfile -C 'rm --no-preserve-root -rf /' -c 0",
+            "mapfile -C 'rm --no-preserve-root -rf /' -c -0",
+            "mapfile -C 'rm --no-preserve-root -rf /' -n 4294967296",
+            "mapfile -C 'rm --no-preserve-root -rf /' -O 4294967296",
+            "mapfile -C 'rm --no-preserve-root -rf /' -s 4294967296",
+            "mapfile -C 'rm --no-preserve-root -rf /' -u 2147483648",
+            "mapfile -C 'rm --no-preserve-root -rf /' -c 4294967296",
+            "mapfile -C 'rm --no-preserve-root -rf /' -c '1\n'",
+            "mapfile -C 'rm --no-preserve-root -rf /' -c '1\r'",
+            "mapfile -C 'rm --no-preserve-root -rf /' -c '1\u{000c}'",
+            "mapfile -C 'rm --no-preserve-root -rf /' -c '1\u{000b}'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "invalid Bash numeric operand reached callback scan: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_free_mapfile_controls_keep_existing_state_behavior() {
+        for command in [
+            "mapfile",
+            "readarray -c 1",
+            "mapfile -- MAPFILE",
+            "mapfile -- '-Cprintf DANGER'",
+            "readarray -c1 -- '-Cprintf DANGER'",
+            "mapfile -- \"$OPTIONS\"",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+
+        let deny = evaluate_command("TARGET=/tmp/safe; mapfile; rm -rf \"$TARGET\"")
+            .expect("plain mapfile must retain ordinary state invalidation");
+        assert_eq!(deny.rule_id, "unsafe-recursive-delete-expansion");
+
+        assert!(matches!(
+            evaluate_result("TARGET=/tmp/safe; mapfile -c1 -C ':'; rm -rf \"$TARGET\""),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+        assert!(matches!(
+            evaluate_result(
+                "TARGET=/tmp/safe; bash -c \"mapfile -c1 -C 'TARGET=/'\"; rm -rf \"$TARGET\""
+            ),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+    }
+
+    #[test]
+    fn mapfile_callbacks_keep_prefix_assignments_temporary_in_bash_modes() {
+        for command in [
+            "TARGET=/tmp/safe; TARGET=/ mapfile -c1 -C ':' </dev/null; rm --no-preserve-root -rf \"$TARGET\"",
+            "bash --posix -c 'TARGET=/tmp/safe; TARGET=/ mapfile -c1 -C \":\" </dev/null; rm --no-preserve-root -rf \"$TARGET\"'",
+            "bash --posix -c 'TARGET=/tmp/safe; TARGET=/ readarray -c1 -C \":\" </dev/null; rm --no-preserve-root -rf \"$TARGET\"'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_like_command_words_do_not_select_shell_builtins() {
+        for command in [
+            "/tmp/builtin eval 'rm --no-preserve-root -rf /'",
+            "./eval 'rm --no-preserve-root -rf /'",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_like_shell_builtin_wrappers_are_not_unwrapped() {
+        for command in [
+            "/tmp/command sh -c 'rm --no-preserve-root -rf /'",
+            "./exec sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_registered_child_shell_remains_supported() {
+        let deny = evaluate_command("/bin/sh -c 'rm --no-preserve-root -rf /'")
+            .expect("approved absolute child-shell basename must remain supported");
+        assert_eq!(deny.rule_id, "irreversible-root-delete");
+    }
+
+    #[test]
+    fn inert_nested_shell_text_stays_non_executable() {
+        for command in [
+            "printf '%s' \"sh -c 'rm -rf /'\"",
+            "printf '%s' \"eval 'rm -rf /'\"",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_nested_execution_is_indeterminate() {
+        for command in [
+            "sh -c \"$PROGRAM\"",
+            "bash script.sh",
+            "printf program | bash",
+            "bash <<< 'printf ok'",
+            "zsh -c 'printf ok'",
+            "bash -lc 'printf ok'",
+            "bash --rcfile profile -c 'printf ok'",
+            "busybox --help sh -c 'printf ok'",
+            "bash -c",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_child_shell_environment_is_indeterminate_after_benign_scan() {
+        for command in [
+            "BASH_ENV=/tmp/attacker-startup bash -c 'printf ok'",
+            "SAFE_VALUE=known sh -c 'printf ok'",
+            "env BASH_ENV=/tmp/attacker-startup bash -c 'printf ok'",
+            "env -- BASH_ENV=/tmp/attacker-startup bash -c 'printf ok'",
+            "env - BASH_ENV=/tmp/attacker-startup /bin/sh -c 'printf ok'",
+            "sudo BASH_ENV=/tmp/attacker-startup bash -c 'printf ok'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_child_shell_environment_still_scans_proven_destruction() {
+        for command in [
+            "BASH_ENV=/tmp/attacker-startup bash -c 'rm --no-preserve-root -rf /'",
+            "env BASH_ENV=/tmp/attacker-startup bash -c 'rm --no-preserve-root -rf /'",
+            "env -- BASH_ENV=/tmp/attacker-startup bash -c 'rm --no-preserve-root -rf /'",
+            "sudo BASH_ENV=/tmp/attacker-startup bash -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("environment metadata hid destruction: {command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn env_argv0_forms_preserve_child_execution_and_uncertainty() {
+        for command in [
+            "env -a displayed bash -c 'printf ok'",
+            "env -adisplayed bash -c 'printf ok'",
+            "env -ia displayed /bin/bash -c 'printf ok'",
+            "env --argv0=displayed bash -c 'printf ok'",
+            "env --argv0 displayed /bin/bash -c 'printf ok'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+
+        for command in [
+            "env -a displayed bash -c 'rm --no-preserve-root -rf /'",
+            "env -adisplayed /bin/bash -c 'rm --no-preserve-root -rf /'",
+            "env --argv0=displayed bash -c 'rm --no-preserve-root -rf /'",
+            "env --argv0 displayed /bin/bash -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command).expect("argv0 metadata must not hide destruction");
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+
+        for command in ["env -a", "env --argv0"] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_exact_options_preserve_child_execution_and_uncertainty() {
+        for command in [
+            "exec -a displayed bash -c 'printf ok'",
+            "exec -c bash -c 'printf ok'",
+            "exec -l bash -c 'printf ok'",
+            "exec -cla displayed /bin/bash -c 'printf ok'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+
+        for command in [
+            "exec -a displayed bash -c 'rm --no-preserve-root -rf /'",
+            "exec -c bash -c 'rm --no-preserve-root -rf /'",
+            "exec -l /bin/bash -c 'rm --no-preserve-root -rf /'",
+            "exec -cla displayed bash -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command).expect("exec metadata must not hide destruction");
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+
+        for command in [
+            "exec FOO=bar bash -c 'rm --no-preserve-root -rf /'",
+            "exec -- FOO=bar bash -c 'rm --no-preserve-root -rf /'",
+            "./exec -a displayed bash -c 'rm --no-preserve-root -rf /'",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn sudo_child_context_options_are_indeterminate_after_benign_scan() {
+        for command in [
+            "sudo -E bash -c 'printf ok'",
+            "sudo -nE bash -c 'printf ok'",
+            "sudo -En bash -c 'printf ok'",
+            "sudo --preserve-env bash -c 'printf ok'",
+            "sudo --preserve-env=BASH_ENV,SHELL bash -c 'printf ok'",
+            "sudo --preserve-e=BASH_ENV bash -c 'printf ok'",
+            "sudo -uE bash -c 'printf ok'",
+            "sudo -u E bash -c 'printf ok'",
+            "sudo --user=E bash -c 'printf ok'",
+            "sudo -i bash -c 'printf ok'",
+            "sudo -ni bash -c 'printf ok'",
+            "sudo --login bash -c 'printf ok'",
+            "sudo -i printf ok",
+            "sudo --login printf ok",
+            "sudo -s bash -c 'printf ok'",
+            "sudo -ns bash -c 'printf ok'",
+            "sudo --shell bash -c 'printf ok'",
+            "sudo --sh bash -c 'printf ok'",
+            "sudo -s printf ok",
+            "sudo -ns printf ok",
+            "sudo --shell printf ok",
+            "/usr/bin/sudo -E /bin/bash -c 'printf ok'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn sudo_environment_boundaries_do_not_seed_caller_home_into_child_shells() {
+        for command in [
+            "sudo bash -c 'rm --no-preserve-root -rf \"$HOME\"'",
+            "sudo -H bash -c 'rm --no-preserve-root -rf \"$HOME\"'",
+            "sudo --set-home bash -c 'rm --no-preserve-root -rf \"$HOME\"'",
+            "sudo -u root bash -c 'rm --no-preserve-root -rf \"$HOME\"'",
+            "sudo --user=root bash -c 'rm --no-preserve-root -rf \"$HOME\"'",
+            "sudo -i bash -c 'rm --no-preserve-root -rf \"$HOME\"'",
+        ] {
+            let deny = evaluate_command(command).expect("sudo child HOME must fail closed");
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+
+        assert!(matches!(
+            evaluate_result("sudo bash -c 'rm --no-preserve-root -rf /root'"),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+    }
+
+    #[test]
+    fn sudo_child_context_options_still_scan_proven_destruction() {
+        for command in [
+            "sudo -nE bash -c 'rm --no-preserve-root -rf /'",
+            "sudo --preserve-env=BASH_ENV bash -c 'rm --no-preserve-root -rf /'",
+            "sudo -ni bash -c 'rm --no-preserve-root -rf /'",
+            "sudo --login bash -c 'rm --no-preserve-root -rf /'",
+            "sudo -ns bash -c 'rm --no-preserve-root -rf /'",
+            "sudo --shell bash -c 'rm --no-preserve-root -rf /'",
+            "sudo -i rm --no-preserve-root -rf /",
+            "sudo --shell rm --no-preserve-root -rf /",
+            "builtin exec sudo --shell rm --no-preserve-root -rf /",
+            "command sudo -s time eval 'rm --no-preserve-root -rf /'",
+            "builtin command sudo -i time eval 'rm --no-preserve-root -rf /'",
+            "sudo -s 'time' eval 'rm --no-preserve-root -rf /'",
+            "sudo -i \\time eval 'rm --no-preserve-root -rf /'",
+            "sudo -s ti'm'e eval 'rm --no-preserve-root -rf /'",
+            "sudo X-Y=z -s eval 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("sudo context metadata hid destruction: {command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn sudo_option_terminator_keeps_assignment_looking_external_command() {
+        for command in [
+            "sudo -- FOO=bar sh -c 'rm --no-preserve-root -rf /'",
+            "sudo -- X-Y=z sh -c 'rm --no-preserve-root -rf /'",
+            "sudo /X=z sh -c 'rm --no-preserve-root -rf /'",
+            "sudo =X=z sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn sudo_implicit_shell_execution_is_indeterminate() {
+        for command in [
+            "sudo",
+            "sudo -E",
+            "sudo --preserve-env",
+            "sudo BASH_ENV=/tmp/attacker-startup",
+            "sudo -i",
+            "sudo -s",
+            "sudo -s '$DANGER'",
+            "sudo --shell '$DANGER'",
+            "sudo -i '$DANGER'",
+            "sudo --login '$DANGER'",
+            "sudo -ns '$DANGER'",
+            "sudo --shell 'rm${SEP}-rf' /",
+            "sudo DANGER='rm --no-preserve-root -rf /' -s '$DANGER'",
+            "sudo DANGER='rm --no-preserve-root -rf /' --login '$DANGER'",
+            "builtin command sudo -i printf ok",
+            "builtin exec sudo -s '$DANGER'",
+            "builtin exec sudo -E",
+            "builtin builtin exec sudo DANGER='rm --no-preserve-root -rf /' -s '$DANGER'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn sudo_context_option_lookalikes_do_not_create_metadata() {
+        for command in [
+            "sudo -pE printf ok",
+            "sudo -p -E printf ok",
+            "sudo -hE printf ok",
+            "sudo -h E printf ok",
+            "sudo --prompt=-E printf ok",
+            "printf '%s' \"sudo -E bash -c 'rm --no-preserve-root -rf /'\"",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_dynamic_and_ambiguous_sudo_options_fail_closed() {
+        for command in [
+            "sudo --unknown bash -c 'printf ok'",
+            "sudo --pre bash -c 'printf ok'",
+            "sudo --s bash -c 'printf ok'",
+            "sudo \"$OPTIONS\" bash -c 'printf ok'",
+        ] {
+            assert!(evaluate_command(command).is_some(), "{command}");
+        }
+    }
+
+    #[test]
+    fn child_shell_environment_text_is_inert_when_not_executed() {
+        for command in [
+            "printf '%s' \"BASH_ENV=/tmp/attacker-startup bash -c 'rm -rf /'\"",
+            "printf '%s' \"env BASH_ENV=/tmp/attacker-startup bash -c 'rm -rf /'\"",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_state_flows_back_to_outer_commands() {
+        assert_eq!(
+            evaluate_result("eval 'TARGET=/tmp/safe'; rm -rf \"$TARGET\""),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+    }
+
+    #[test]
+    fn child_shell_state_does_not_escape() {
+        assert_eq!(
+            evaluate_result("sh -c 'TARGET=/'; printf '%s' \"$TARGET\""),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+
+        let deny = evaluate_command("sh -c 'TARGET=/'; sh -c 'rm -rf \"$TARGET\"'")
+            .expect("unknown child state must fail closed");
+        assert_eq!(deny.rule_id, "unsafe-recursive-delete-expansion");
+    }
+
+    #[test]
+    fn child_shell_execution_preserves_outer_state() {
+        assert_eq!(
+            evaluate_result("TARGET=/tmp/safe; sh -c 'printf ok'; rm -rf \"$TARGET\""),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+        assert!(matches!(
+            evaluate_result("TARGET=/tmp/safe; sh -c \"$UNKNOWN\"; rm -rf \"$TARGET\""),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+    }
+
+    #[test]
+    fn child_shell_only_inherits_an_unchanged_trusted_home() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let control = evaluate_command("sh -c 'rm -rf \"$HOME\"'")
+            .expect("unchanged HOME must remain a trusted child target");
+        assert_eq!(control.rule_id, "irreversible-home-delete");
+
+        for command in [
+            "HOME=/tmp/safe; sh -c 'rm -rf \"$HOME\"'",
+            "unset HOME; sh -c 'rm -rf \"$HOME\"'",
+            "unknown_command; sh -c 'rm -rf \"$HOME\"'",
+            "HOME=/tmp/safe sh -c 'rm -rf \"$HOME\"'",
+            "env -i sh -c 'rm -rf \"$HOME\"'",
+            "env -u HOME sh -c 'rm -rf \"$HOME\"'",
+        ] {
+            let deny = evaluate_command(command).expect("untrusted child HOME must fail closed");
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+
+        let selector = evaluate_command("HOME=rm; sh -c '$HOME --no-preserve-root -rf /'")
+            .expect("untrusted child HOME command selector must fail closed");
+        assert_eq!(selector.rule_id, "unsafe-recursive-delete-expansion");
+    }
+
+    #[test]
+    fn proven_sibling_deny_dominates_nested_uncertainty() {
+        assert!(matches!(
+            evaluate_result("eval \"$UNKNOWN\"; rm --no-preserve-root -rf /"),
+            SafetyEvaluation::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn quote_fragmented_nested_execution_is_literal() {
+        assert_eq!(
+            evaluate_result("'sh' -'c' 'printf ok'"),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+    }
+
+    #[test]
+    fn undecoded_ansi_c_nested_execution_option_is_indeterminate() {
+        assert!(matches!(
+            evaluate_result("sh $'-\\x63' 'printf ok'"),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+    }
+
+    #[test]
+    fn nested_execution_positional_parameters_are_not_seeded() {
+        let deny = evaluate_command("sh -c '$0 --no-preserve-root -rf /' rm")
+            .expect("unresolved positional command selection must deny");
+        assert_eq!(deny.rule_id, "unsafe-recursive-delete-expansion");
+    }
+
+    #[test]
+    fn nested_execution_option_terminator_disables_command_string_mode() {
+        assert!(matches!(
+            evaluate_result("sh -- -c 'rm --no-preserve-root -rf /'"),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+    }
+
+    #[test]
+    fn uncertain_nested_execution_options_still_scan_a_located_destructive_payload() {
+        for command in [
+            "bash -lc 'rm --no-preserve-root -rf /'",
+            "bash -l -c 'rm --no-preserve-root -rf /'",
+            "bash -ic 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command).expect("located destructive payload must deny");
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn uncertain_nested_execution_options_abstain_after_a_benign_payload() {
+        for command in [
+            "bash -lc 'printf ok'",
+            "bash -l -c 'printf ok'",
+            "bash -ic 'printf ok'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_interpreter_clusters_do_not_mislocate_command_strings() {
+        for command in [
+            "bash -zc 'printf ok'",
+            "bash -cz 'rm --no-preserve-root -rf /'",
+            "bash -Oc 'rm --no-preserve-root -rf /'",
+            "bash -co 'rm --no-preserve-root -rf /'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+
+        for command in [
+            "bash -lc 'rm --no-preserve-root -rf /'",
+            "bash -cl 'rm --no-preserve-root -rf /'",
+            "sh -xc 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command).expect("supported -c cluster must be scanned");
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn pipeline_and_subshell_eval_use_discarded_state() {
+        for command in [
+            "TARGET=/tmp/safe; eval 'TARGET=/' | cat; rm -rf \"$TARGET\"",
+            "TARGET=/tmp/safe; (eval 'TARGET=/'); rm -rf \"$TARGET\"",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+
+        for command in [
+            "eval 'rm --no-preserve-root -rf /' | cat",
+            "(eval 'rm --no-preserve-root -rf /')",
+        ] {
+            let deny = evaluate_command(command).expect("isolated nested danger must be scanned");
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+
+        assert!(matches!(
+            evaluate_result("TARGET=/tmp/safe; eval \"$UNKNOWN\" | cat; rm -rf \"$TARGET\""),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+    }
+
+    #[test]
+    fn timed_prefix_assignments_reach_eval_and_child_shell_policy() {
+        assert_eq!(
+            evaluate_result("SAFE=/; time -- SAFE=/tmp eval 'rm -rf \"$SAFE\"'"),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+
+        let eval_deny = evaluate_command("time -- TARGET=/ eval 'rm -rf \"$TARGET\"'")
+            .expect("timed eval prefix assignment must be visible");
+        assert!(matches!(
+            eval_deny.rule_id,
+            "irreversible-root-delete" | "unsafe-recursive-delete-expansion"
+        ));
+
+        assert!(matches!(
+            evaluate_result("time -- BASH_ENV=/tmp/startup sh -c 'printf ok'"),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+        let child_deny =
+            evaluate_command("time -- BASH_ENV=/tmp/startup sh -c 'rm --no-preserve-root -rf /'")
+                .expect("timed child metadata must not hide destruction");
+        assert_eq!(child_deny.rule_id, "irreversible-root-delete");
+    }
+
+    #[test]
+    fn unknown_and_value_taking_nested_execution_options_are_indeterminate() {
+        for command in [
+            "bash -z -c 'printf ok'",
+            "bash -o posix -c 'printf ok'",
+            "bash -O extglob -c 'printf ok'",
+            "bash --rcfile profile -c 'printf ok'",
+            "bash --norc -c 'printf ok'",
+            "bash --rcf profile -c 'printf ok'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn multicall_nested_execution_requires_an_exact_applet_selector() {
+        for command in [
+            "busybox",
+            "APPLET=sh; busybox \"$APPLET\" -c 'printf ok'",
+            "toybox",
+            "APPLET=sh; toybox \"$APPLET\" -c 'printf ok'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_execution_result_precedence_is_order_independent() {
+        for command in [
+            "sh -c \"$PROGRAM\"; rm --no-preserve-root -rf /",
+            "rm --no-preserve-root -rf /; sh -c \"$PROGRAM\"",
+        ] {
+            assert!(matches!(
+                evaluate_result(command),
+                SafetyEvaluation::Deny(_)
+            ));
+        }
+        for command in [
+            "sh -c \"$PROGRAM\"; printf ok",
+            "sh -c 'bash script.sh; printf ok'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_state_flows_into_and_out_of_top_level_eval() {
+        for command in [
+            "TARGET=/; eval 'rm --no-preserve-root -rf \"$TARGET\"'",
+            "eval 'TARGET=/'; rm --no-preserve-root -rf \"$TARGET\"",
+        ] {
+            assert!(matches!(
+                evaluate_result(command),
+                SafetyEvaluation::Deny(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn indeterminate_eval_invalidates_caller_state_before_siblings() {
+        let deny = evaluate_command(
+            "TARGET=/tmp/safe; eval \"$UNKNOWN\"; rm --no-preserve-root -rf \"$TARGET\"",
+        )
+        .expect("unknown eval effects must invalidate the known-safe target");
+        assert_eq!(deny.rule_id, "unsafe-recursive-delete-expansion");
+    }
+
+    #[test]
+    fn eval_state_in_pipeline_and_subshell_does_not_escape() {
+        for command in [
+            "TARGET=/; eval 'TARGET=/tmp/safe' | cat; rm -rf \"$TARGET\"",
+            "TARGET=/; (eval 'TARGET=/tmp/safe'); rm -rf \"$TARGET\"",
+        ] {
+            assert!(matches!(
+                evaluate_result(command),
+                SafetyEvaluation::Deny(_)
+            ));
+        }
+
+        for command in [
+            "eval 'TARGET=/' | cat; eval 'rm -rf \"$TARGET\"'",
+            "eval 'TARGET=/' & eval 'rm -rf \"$TARGET\"'",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_eval_arguments_preserve_the_joined_program_positions() {
+        assert_eq!(
+            evaluate_result("eval '' 'printf ok' ''"),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+        assert_eq!(
+            evaluate_result("eval"),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+    }
+
+    #[test]
+    fn malformed_nested_program_is_indeterminate() {
+        assert!(matches!(
+            evaluate_result("sh -c 'if'"),
+            SafetyEvaluation::Indeterminate(_)
+        ));
+    }
+
+    fn shell_single_quote(source: &str) -> String {
+        format!("'{}'", source.replace('\'', "'\\''"))
+    }
+
+    fn nested_eval(depth: usize, leaf: &str) -> String {
+        (0..depth).fold(leaf.to_string(), |source, _| {
+            format!("eval {}", shell_single_quote(&source))
+        })
+    }
+
+    #[test]
+    fn recursive_parse_byte_budget_allows_exact_limit_and_rejects_plus_one() {
+        let payload = "x".repeat((MAX_SHELL_COMMAND_BYTES - 8) / 2);
+        let exact = format!("sh -c '{payload}'");
+        assert_eq!(exact.len() + payload.len(), MAX_SHELL_COMMAND_BYTES);
+        assert_eq!(
+            evaluate_result(&exact),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+
+        let plus_one = format!("{exact} ");
+        assert_eq!(plus_one.len() + payload.len(), MAX_SHELL_COMMAND_BYTES + 1);
+        assert_eq!(
+            evaluate_result(&plus_one),
+            SafetyEvaluation::Indeterminate(ShellAnalysisError::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn recursive_parse_byte_budget_accumulates_across_sibling_payloads() {
+        let source = std::iter::repeat_n(format!("sh -c '{}'", "x".repeat(100)), 313)
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(source.len() < MAX_SHELL_COMMAND_BYTES);
+        assert!(
+            source.len() + 313 * 100 > MAX_SHELL_COMMAND_BYTES,
+            "fixture must exhaust only the cumulative parse budget"
+        );
+        assert_eq!(
+            evaluate_result(&source),
+            SafetyEvaluation::Indeterminate(ShellAnalysisError::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn nested_execution_depth_budget_allows_exact_limit_and_rejects_plus_one() {
+        const NESTED_LIMIT: usize = 8;
+        assert_eq!(
+            evaluate_result(&nested_eval(NESTED_LIMIT, ":")),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+        assert_eq!(
+            evaluate_result(&nested_eval(NESTED_LIMIT + 1, ":")),
+            SafetyEvaluation::Indeterminate(ShellAnalysisError::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn nested_execution_depth_budget_is_restored_between_siblings() {
+        let nested = nested_eval(8, ":");
+        assert_eq!(
+            evaluate_result(&format!("{nested}; {nested}")),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+    }
+
+    #[test]
+    fn deferred_builtin_actions_share_recursive_depth_and_byte_budgets() {
+        for source in ["trap ':' EXIT", "mapfile -c1 -C ':'"] {
+            assert_eq!(
+                evaluate_with_limits(source, usize::MAX, 0, usize::MAX),
+                SafetyEvaluation::Indeterminate(ShellAnalysisError::ResourceLimit),
+                "{source}"
+            );
+            assert_eq!(
+                evaluate_with_limits(source, source.len(), 8, usize::MAX),
+                SafetyEvaluation::Indeterminate(ShellAnalysisError::ResourceLimit),
+                "{source}"
+            );
+        }
+    }
+
+    fn minimum_analysis_node_limit(source: &str) -> usize {
+        (0..1_024)
+            .find(|limit| {
+                shell::analyze_with_budget(source, &mut shell::AnalysisBudget::with_limit(*limit))
+                    .is_ok()
+            })
+            .expect("small fixture must fit within the probe range")
+    }
+
+    fn evaluate_with_limits(
+        source: &str,
+        remaining_bytes: usize,
+        remaining_nested: usize,
+        node_limit: usize,
+    ) -> SafetyEvaluation {
+        evaluate_program(
+            source,
+            &mut EvaluationState::trusted(),
+            &mut EvaluationBudget::with_limits(
+                remaining_bytes,
+                remaining_nested,
+                shell::AnalysisBudget::with_limit(node_limit),
+            ),
+            ShellSemantics::Bash,
+        )
+    }
+
+    #[test]
+    fn recursive_analysis_node_budget_is_cumulative_and_exact() {
+        let source = "sh -c ':'; sh -c ':'";
+        let exact_limit =
+            minimum_analysis_node_limit(source) + 2 * minimum_analysis_node_limit(":");
+
+        assert_eq!(
+            evaluate_with_limits(source, usize::MAX, 8, exact_limit),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+        assert_eq!(
+            evaluate_with_limits(source, usize::MAX, 8, exact_limit - 1),
+            SafetyEvaluation::Indeterminate(ShellAnalysisError::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn recursive_pattern_budget_is_shared_and_fails_closed() {
+        let nested = "sh -c 'IFS=:; X='\\''/xa99z*/**/**/**/zz'\\''; rm -rf $X'";
+        let mut state = EvaluationState::trusted();
+        let mut probe = EvaluationBudget::new();
+        assert_eq!(
+            evaluate_program(nested, &mut state, &mut probe, ShellSemantics::Bash),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+        let consumed = MAX_PATTERN_MATCH_STATES - probe.patterns.remaining_states;
+        assert!(consumed > 0);
+
+        let source = format!("{nested}; {nested}");
+        let mut budget = EvaluationBudget::new();
+        budget.patterns.remaining_states = consumed * 2 - 1;
+        let deny = evaluate_program(
+            &source,
+            &mut EvaluationState::trusted(),
+            &mut budget,
+            ShellSemantics::Bash,
+        );
+        assert!(matches!(
+            deny,
+            SafetyEvaluation::Deny(SafetyDeny {
+                rule_id: "unsafe-recursive-delete-expansion",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2521,6 +6503,20 @@ mod tests {
     }
 
     #[test]
+    fn unknown_commands_do_not_restore_trusted_home_state() {
+        for command in [
+            "arbitrary_mutator; rm -f \"$HOME\" /",
+            "HOME=/home/alexander; arbitrary_mutator; rm -f \"$HOME\" /",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn invalidated_home_never_falls_back_to_the_initial_policy_context() {
         for command in [
             "HOME=/tmp; export HOME=-rf; rm -f \"$HOME\" /",
@@ -2542,10 +6538,11 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_and_pipeline_parent_mutation_invalidate_tracked_assignments() {
+    fn arithmetic_and_lastpipe_parent_mutation_invalidate_tracked_assignments() {
         for command in [
             "X=; ((X=1)); rm -f \"${X:+-rf}\" /",
             "shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+            "shopt -s lastpipe; if false; then shopt -u lastpipe; fi; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
         ] {
             let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
             assert_eq!(
@@ -2553,6 +6550,79 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn external_shopt_cannot_enable_lastpipe_in_the_caller() {
+        for command in [
+            "env shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+            "sudo shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+            "/usr/bin/time shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+            "exec shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_shopt_cannot_disable_lastpipe_in_the_caller() {
+        for command in [
+            "shopt -s lastpipe; env shopt -u lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+            "shopt -s lastpipe; sudo shopt -u lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+            "shopt -s lastpipe; /usr/bin/time shopt -u lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+            "shopt -s lastpipe; exec shopt -u lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn child_shopt_updates_only_the_child_lastpipe_state() {
+        let command = "bash -c 'shopt -s lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /'; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /";
+        let deny = evaluate_command(command).expect("child lastpipe mutation must be analyzed");
+
+        assert_eq!(deny.rule_id, "unsafe-recursive-delete-expansion");
+        assert_eq!(
+            evaluate_result(
+                "bash -c 'shopt -s lastpipe'; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /"
+            ),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+    }
+
+    #[test]
+    fn direct_shopt_can_disable_lastpipe_in_the_caller() {
+        assert_eq!(
+            evaluate_result(
+                "shopt -s lastpipe; shopt -u lastpipe; X=; printf 1 | read X; rm -f \"${X:+-rf}\" /"
+            ),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+    }
+
+    #[test]
+    fn exported_bashopts_can_enable_lastpipe_in_a_child_bash() {
+        let command = "shopt -s lastpipe; export BASHOPTS; bash -c 'TARGET=/tmp/safe; printf x | eval \"TARGET=/\"; rm --no-preserve-root -rf \"$TARGET\"'";
+        let deny = evaluate_command(command)
+            .expect("exported BASHOPTS may enable child lastpipe mutation");
+        assert_eq!(deny.rule_id, "unsafe-recursive-delete-expansion");
+    }
+
+    #[test]
+    fn exported_bash_env_keeps_a_later_child_shell_indeterminate() {
+        let command = "BASH_ENV=/dev/fd/3; export BASH_ENV; bash -c 'rm -rf /tmp/safe' 3<<<'rm(){ printf OVERRIDDEN; }'";
+        assert!(matches!(
+            evaluate_result(command),
+            SafetyEvaluation::Indeterminate(_)
+        ));
     }
 
     #[test]
@@ -2902,9 +6972,13 @@ mod tests {
             "(rm --no-preserve-root -rf /)",
         ] {
             let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
-            assert_eq!(
-                deny.rule_id, "unsafe-recursive-delete-expansion",
-                "{command}"
+            assert!(
+                matches!(
+                    deny.rule_id,
+                    "unsafe-recursive-delete-expansion" | "irreversible-root-delete"
+                ),
+                "{command}: {}",
+                deny.rule_id
             );
         }
     }
