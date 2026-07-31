@@ -971,6 +971,11 @@ fn home_alias_field_splitting_is_denied_before_model_inference_for_every_provide
             "root cwd globstar HOME pattern",
             "root cwd globstar HOME-ancestor pattern",
             "root cwd nocase HOME pattern",
+            "globstar parent traversal",
+            "root globstar parent traversal",
+            "multiple globstar parent traversal",
+            "conservative direct root pattern",
+            "aggregate pathname budget exhaustion",
             "HOME-parent cwd normalized relative pattern",
             "HOME-parent cwd descendant",
             "shell changes to HOME parent",
@@ -1065,6 +1070,38 @@ fn home_alias_field_splitting_is_denied_before_model_inference_for_every_provide
                     Path::new("/"),
                     Path::new("/"),
                 ),
+                "globstar parent traversal" => (
+                    format!(
+                        "shopt -s globstar; IFS=:; X='{home_text}/**/../{home_name}'; rm -rf $X"
+                    ),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "root globstar parent traversal" => (
+                    "shopt -s globstar; IFS=:; X='/xa99-unrelated/**/..'; rm -rf $X".to_string(),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "multiple globstar parent traversal" => (
+                    "shopt -s globstar; IFS=:; X='/xa99-unrelated/**/**/..'; rm -rf $X".to_string(),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "conservative direct root pattern" => (
+                    "shopt -s globstar; IFS=:; X='/**/xa99-unrelated/**'; rm -rf $X".to_string(),
+                    Path::new("/"),
+                    Path::new("/"),
+                ),
+                "aggregate pathname budget exhaustion" => {
+                    let fields = std::iter::repeat_n("/xa99z*/**/**/**/zz", 500)
+                        .collect::<Vec<_>>()
+                        .join(":");
+                    (
+                        format!("IFS=:; X='{fields}'; rm -rf $X"),
+                        Path::new("/"),
+                        Path::new("/"),
+                    )
+                }
                 "HOME-parent cwd normalized relative pattern" => (
                     format!("IFS=,; X='./{home_name}*'; rm -rf $X"),
                     home_parent,
@@ -1114,6 +1151,16 @@ fn home_alias_field_splitting_is_denied_before_model_inference_for_every_provide
                 "root cwd globstar HOME pattern" | "root cwd nocase HOME pattern"
             ) {
                 "unsafe-recursive-delete-expansion"
+            } else if matches!(
+                case,
+                "root globstar parent traversal" | "multiple globstar parent traversal"
+            ) {
+                "irreversible-root-delete"
+            } else if matches!(
+                case,
+                "conservative direct root pattern" | "aggregate pathname budget exhaustion"
+            ) {
+                "unsafe-recursive-delete-expansion"
             } else {
                 "irreversible-home-delete"
             };
@@ -1126,6 +1173,8 @@ fn home_alias_field_splitting_is_denied_before_model_inference_for_every_provide
             "unrelated split pattern",
             "unrelated single-field split pattern",
             "shared-prefix split pattern suffix mismatch",
+            "quoted globstar parent traversal",
+            "unrelated globstar parent traversal",
         ] {
             let home = tempfile::tempdir().unwrap();
             let fake_model = install_model_fixture(home.path(), "approve");
@@ -1166,6 +1215,19 @@ fn home_alias_field_splitting_is_denied_before_model_inference_for_every_provide
                         })
                         .expect("temporary HOME must start with a UTF-8 component");
                     format!("IFS=:; X='{home_root_component}*/safe'; rm -rf $X")
+                }
+                "quoted globstar parent traversal" => {
+                    let home_text = home.path().to_str().unwrap();
+                    let home_name = home
+                        .path()
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .expect("temporary HOME must end with a UTF-8 component");
+                    format!("X='{home_text}/**/../{home_name}'; rm -rf \"$X\"")
+                }
+                "unrelated globstar parent traversal" => {
+                    "shopt -s globstar; IFS=:; X='/xa99-unrelated/**/../safe'; rm -rf $X"
+                        .to_string()
                 }
                 _ => unreachable!(),
             };
