@@ -2143,6 +2143,12 @@ mod tests {
                 "busybox time --unknown sh -c 'rm --no-preserve-root -rf /'",
                 false,
             ),
+            ("busybox time -h sh -c 'rm --no-preserve-root -rf /'", false),
+            (
+                "busybox env --help sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            ("busybox env -v sh -c 'rm --no-preserve-root -rf /'", false),
             ("time -- eval 'rm --no-preserve-root -rf /'", true),
             ("time -p -- ! sh -c 'rm --no-preserve-root -rf /'", true),
             ("eval -- 'rm --no-preserve-root -rf /'", true),
