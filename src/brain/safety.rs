@@ -2874,7 +2874,9 @@ fn classify_shell_invocation(words: &[&shell::ShellWord]) -> Option<NestedExecut
                 _ => unreachable!("multicall registry"),
             };
             if !supported {
-                return None;
+                return Some(NestedExecution::ChildUnresolved(
+                    ShellAnalysisError::UnsupportedSyntax,
+                ));
             }
             (selector, &words[2..])
         }
@@ -3003,6 +3005,19 @@ fn unwrap_command_with_context<'a>(
                 })
             };
         };
+        let wrapper_name = command_name(wrapper);
+        if matches!(wrapper_name, "busybox" | "toybox")
+            && words
+                .get(1)
+                .and_then(|selector| selector.literal.as_deref())
+                .is_some_and(|selector| matches!(selector, "env" | "time"))
+        {
+            words = &words[1..];
+            eval_context = EvalContext::External;
+            time_keyword_allowed = false;
+            eval_prefix_assignments_persist = false;
+            continue;
+        }
         match (wrapper, command_name(wrapper)) {
             (_, "time") => {
                 let original_words = words;
@@ -3033,9 +3048,30 @@ fn unwrap_command_with_context<'a>(
                             });
                         }
                         Some(option) if option.starts_with('-') && option != "-" => {
-                            let takes_value = time_option_takes_separate_value(option);
+                            let Some(takes_value) = classify_time_option(option) else {
+                                indeterminate_after_scan = true;
+                                return Ok(UnwrappedCommand {
+                                    words: original_words,
+                                    indeterminate_child_context,
+                                    indeterminate_after_scan,
+                                    eval_context,
+                                    time_keyword_allowed,
+                                    eval_prefix_assignments_persist,
+                                });
+                            };
                             words = &words[1..];
-                            if takes_value && !words.is_empty() {
+                            if takes_value && words.is_empty() {
+                                indeterminate_after_scan = true;
+                                return Ok(UnwrappedCommand {
+                                    words: original_words,
+                                    indeterminate_child_context,
+                                    indeterminate_after_scan,
+                                    eval_context,
+                                    time_keyword_allowed,
+                                    eval_prefix_assignments_persist,
+                                });
+                            }
+                            if takes_value {
                                 words = &words[1..];
                             }
                         }
@@ -3290,28 +3326,27 @@ fn is_env_environment_argument(word: &str) -> bool {
     word.contains('=')
 }
 
-fn time_option_takes_separate_value(word: &str) -> bool {
+fn classify_time_option(word: &str) -> Option<bool> {
     if let Some(long) = word.strip_prefix("--") {
         let (name, attached) = long
             .split_once('=')
             .map_or((long, false), |(name, _)| (name, true));
-        return !attached
-            && !name.is_empty()
-            && ["output", "format"]
-                .into_iter()
-                .any(|option| option.starts_with(name));
+        return match name {
+            "output" | "format" => Some(!attached),
+            "append" | "portability" | "quiet" | "verbose" if !attached => Some(false),
+            _ => None,
+        };
     }
-    let mut options = word
-        .strip_prefix('-')
-        .unwrap_or_default()
-        .chars()
-        .peekable();
+    let mut options = word.strip_prefix('-')?.chars().peekable();
+    options.peek()?;
     while let Some(option) = options.next() {
-        if matches!(option, 'o' | 'f') {
-            return options.peek().is_none();
+        match option {
+            'o' | 'f' => return Some(options.peek().is_none()),
+            'a' | 'h' | 'p' | 'q' | 'v' => {}
+            _ => return None,
         }
     }
-    false
+    Some(false)
 }
 
 fn classify_exec_option(word: &str) -> Option<bool> {
@@ -4223,6 +4258,15 @@ mod tests {
             "busybox sh -c 'rm --no-preserve-root -rf /'",
             "busybox ash -c 'rm --no-preserve-root -rf /'",
             "toybox sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -i sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -u HOME sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -p sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -o log sh -c 'rm --no-preserve-root -rf /'",
+            "toybox env sh -c 'rm --no-preserve-root -rf /'",
+            "toybox time sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env toybox time sh -c 'rm --no-preserve-root -rf /'",
             "env bash -c 'rm --no-preserve-root -rf /'",
             "env X-Y=z sh -c 'rm --no-preserve-root -rf /'",
             "env 1X=z sh -c 'rm --no-preserve-root -rf /'",
@@ -5669,8 +5713,47 @@ mod tests {
         for command in [
             "busybox",
             "APPLET=sh; busybox \"$APPLET\" -c 'printf ok'",
+            "busybox ls",
+            "busybox --list",
             "toybox",
             "APPLET=sh; toybox \"$APPLET\" -c 'printf ok'",
+            "toybox printf ok",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn multicall_command_carrying_applets_preserve_benign_literal_programs() {
+        for command in [
+            "busybox env sh -c 'printf ok'",
+            "busybox time sh -c 'printf ok'",
+            "toybox env sh -c 'printf ok'",
+            "toybox time sh -c 'printf ok'",
+            "busybox env toybox time sh -c 'printf ok'",
+            "printf '%s' \"busybox env sh -c 'rm -rf /'\"",
+        ] {
+            assert_eq!(
+                evaluate_result(command),
+                SafetyEvaluation::NoDeterministicDecision,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_time_options_are_indeterminate() {
+        for command in [
+            "/usr/bin/time --unknown sh -c 'printf ok'",
+            "/usr/bin/time --out log sh -c 'printf ok'",
+            "/usr/bin/time --help sh -c 'printf ok'",
+            "/usr/bin/time -o",
+            "busybox time --unknown sh -c 'printf ok'",
+            "busybox time -f",
+            "toybox time -Z sh -c 'printf ok'",
         ] {
             assert!(
                 matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
@@ -7131,10 +7214,11 @@ mod tests {
     }
 
     #[test]
-    fn abbreviated_gnu_time_value_option_reaches_the_wrapped_delete() {
-        let command = "/usr/bin/time --out log rm -rf /";
-        let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
-        assert_eq!(deny.rule_id, "irreversible-root-delete");
+    fn abbreviated_gnu_time_value_option_is_indeterminate() {
+        assert!(matches!(
+            evaluate_result("/usr/bin/time --out log rm -rf /"),
+            SafetyEvaluation::Indeterminate(_)
+        ));
     }
 
     #[test]

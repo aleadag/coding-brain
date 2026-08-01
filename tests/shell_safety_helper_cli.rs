@@ -53,6 +53,10 @@ fn shipped_helper_denies_literal_nested_root_deletion() {
         "builtin exec sh -c 'rm --no-preserve-root -rf /'",
         "builtin command sh -c 'rm --no-preserve-root -rf /'",
         "builtin builtin eval 'rm --no-preserve-root -rf /'",
+        "busybox env sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time sh -c 'rm --no-preserve-root -rf /'",
+        "toybox env sh -c 'rm --no-preserve-root -rf /'",
+        "toybox time sh -c 'rm --no-preserve-root -rf /'",
     ] {
         let response = run_shipped_helper(command, None);
         assert_eq!(response["result"], "deny", "{command}");

@@ -59,7 +59,10 @@ All notable changes to Coding Brain are documented here.
   `dash`, and `ash` interpreters (including absolute paths), BusyBox `sh`/`ash`
   and Toybox `sh` applets, and the `time`, `exec`, `sudo`, `command`, and `env`
   wrapper families are recursively scanned at supported `-c` and `eval`
-  boundaries under shared resource limits. Exact `eval [--]` and
+  boundaries under shared resource limits. BusyBox and Toybox `env`/`time`
+  applet composition reuses that boundary; unsupported multicall dispatch and
+  ambiguous `time` options preserve provider-native confirmation without model
+  inference. Exact `eval [--]` and
   `builtin [--]` dispatch through
   `eval`, `exec`, `command`, and repeated `builtin` are enforced: caller
   `eval` updates caller state, while child-shell state remains isolated.
