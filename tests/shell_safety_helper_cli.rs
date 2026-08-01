@@ -65,6 +65,18 @@ fn shipped_helper_denies_literal_nested_root_deletion() {
 }
 
 #[test]
+fn shipped_helper_preserves_multicall_terminating_option_uncertainty() {
+    for command in [
+        "busybox time -h sh -c 'rm --no-preserve-root -rf /'",
+        "busybox env --help sh -c 'rm --no-preserve-root -rf /'",
+        "busybox env -v sh -c 'rm --no-preserve-root -rf /'",
+    ] {
+        let response = run_shipped_helper(command, None);
+        assert_eq!(response["result"], "indeterminate", "{command}");
+    }
+}
+
+#[test]
 fn shipped_helper_projects_execution_bearing_builtins() {
     for command in [
         "trap 'rm --no-preserve-root -rf /' EXIT",

@@ -2980,6 +2980,7 @@ fn unwrap_command_with_context<'a>(
 ) -> Result<UnwrappedCommand<'a>, ()> {
     let mut indeterminate_child_context = false;
     let mut indeterminate_after_scan = false;
+    let mut multicall_launcher = None;
     loop {
         let Some(wrapper_word) = words.first() else {
             return Ok(UnwrappedCommand {
@@ -3012,6 +3013,7 @@ fn unwrap_command_with_context<'a>(
                 .and_then(|selector| selector.literal.as_deref())
                 .is_some_and(|selector| matches!(selector, "env" | "time"))
         {
+            multicall_launcher = Some(wrapper_name);
             words = &words[1..];
             eval_context = EvalContext::External;
             time_keyword_allowed = false;
@@ -3021,6 +3023,7 @@ fn unwrap_command_with_context<'a>(
         match (wrapper, command_name(wrapper)) {
             (_, "time") => {
                 let original_words = words;
+                let multicall_launcher = multicall_launcher.take();
                 let shell_keyword = wrapper == "time"
                     && (wrapper_word.raw == "time" || eval_context == EvalContext::Child)
                     && eval_context != EvalContext::External
@@ -3048,7 +3051,13 @@ fn unwrap_command_with_context<'a>(
                             });
                         }
                         Some(option) if option.starts_with('-') && option != "-" => {
-                            let Some(takes_value) = classify_time_option(option) else {
+                            let option = match multicall_launcher {
+                                Some("busybox") => classify_busybox_time_option(option),
+                                Some("toybox") => None,
+                                Some(_) => unreachable!("multicall launcher registry"),
+                                None => classify_time_option(option),
+                            };
+                            let Some(takes_value) = option else {
                                 indeterminate_after_scan = true;
                                 return Ok(UnwrappedCommand {
                                     words: original_words,
@@ -3232,6 +3241,7 @@ fn unwrap_command_with_context<'a>(
             }
             (_, "env") => {
                 let original_words = words;
+                let multicall_launcher = multicall_launcher.take();
                 eval_context = EvalContext::External;
                 eval_prefix_assignments_persist = false;
                 words = &words[1..];
@@ -3258,7 +3268,13 @@ fn unwrap_command_with_context<'a>(
                         indeterminate_child_context = true;
                         words = &words[1..];
                     } else if !options_ended && literal.starts_with('-') && literal != "-" {
-                        match classify_env_option(literal) {
+                        let option = match multicall_launcher {
+                            Some("busybox") => classify_busybox_env_option(literal),
+                            Some("toybox") => EnvOption::Unsupported,
+                            Some(_) => unreachable!("multicall launcher registry"),
+                            None => classify_env_option(literal),
+                        };
+                        match option {
                             EnvOption::Supported {
                                 takes_separate_value,
                                 child_context,
@@ -3349,6 +3365,19 @@ fn classify_time_option(word: &str) -> Option<bool> {
     Some(false)
 }
 
+fn classify_busybox_time_option(word: &str) -> Option<bool> {
+    let mut options = word.strip_prefix('-')?.chars().peekable();
+    options.peek()?;
+    while let Some(option) = options.next() {
+        match option {
+            'o' | 'f' => return Some(options.peek().is_none()),
+            'a' | 'p' | 'v' => {}
+            _ => return None,
+        }
+    }
+    Some(false)
+}
+
 fn classify_exec_option(word: &str) -> Option<bool> {
     let mut options = word.strip_prefix('-')?.chars().peekable();
     options.peek()?;
@@ -3414,6 +3443,34 @@ fn classify_env_option(word: &str) -> EnvOption {
             }
             'i' => child_context = true,
             '0' | 'v' => {}
+            _ => return EnvOption::Unsupported,
+        }
+    }
+    EnvOption::Supported {
+        takes_separate_value: false,
+        child_context,
+    }
+}
+
+fn classify_busybox_env_option(word: &str) -> EnvOption {
+    let Some(short) = word.strip_prefix('-') else {
+        return EnvOption::Unsupported;
+    };
+    let mut options = short.chars().peekable();
+    if options.peek().is_none() {
+        return EnvOption::Unsupported;
+    }
+    let mut child_context = false;
+    while let Some(option) = options.next() {
+        match option {
+            'u' => {
+                return EnvOption::Supported {
+                    takes_separate_value: options.peek().is_none(),
+                    child_context: true,
+                };
+            }
+            'i' => child_context = true,
+            '0' => {}
             _ => return EnvOption::Unsupported,
         }
     }
@@ -5754,6 +5811,20 @@ mod tests {
             "busybox time --unknown sh -c 'printf ok'",
             "busybox time -f",
             "toybox time -Z sh -c 'printf ok'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn multicall_terminating_or_unsupported_options_are_indeterminate() {
+        for command in [
+            "busybox time -h sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env --help sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -v sh -c 'rm --no-preserve-root -rf /'",
         ] {
             assert!(
                 matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
