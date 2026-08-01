@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -11,6 +11,9 @@ use coding_brain_core::brain_activity::ActivityEvent;
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::provider::AgentProvider;
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+
+use super::activity::LiveEvidenceBudget;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Re-exports from sub-modules so that existing `brain::decisions::*` paths
@@ -256,7 +259,7 @@ pub(super) fn decisions_dir() -> PathBuf {
     }
 }
 
-fn decisions_path() -> PathBuf {
+pub(crate) fn decisions_path() -> PathBuf {
     decisions_dir().join("decisions.jsonl")
 }
 
@@ -606,6 +609,90 @@ pub(crate) struct HookDecisionAudit<'a> {
     pub turn_id: &'a str,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct HookDecisionRecord {
+    pub provider: AgentProvider,
+    pub ts: String,
+    pub pid: u32,
+    pub project: String,
+    pub tool: String,
+    pub command: String,
+    pub brain_action: String,
+    pub brain_confidence: f64,
+    pub brain_reasoning: String,
+    pub brain_source: String,
+    pub brain_threshold: Option<f64>,
+    pub user_action: String,
+    pub decision_type: String,
+    pub suggested_at: u64,
+    pub resolved_at: u64,
+    pub decision_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+}
+
+impl HookDecisionRecord {
+    pub(crate) fn from_audit(
+        audit: &HookDecisionAudit<'_>,
+        decision_id: String,
+        user_action: &str,
+    ) -> Self {
+        let resolved_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            provider: audit.provider,
+            ts: timestamp_now(),
+            pid: 0,
+            project: audit.project.to_owned(),
+            tool: audit.tool.to_owned(),
+            command: audit.command.to_owned(),
+            brain_action: audit.brain_action.to_owned(),
+            brain_confidence: audit.brain_confidence,
+            brain_reasoning: audit.brain_reasoning.to_owned(),
+            brain_source: audit.brain_source.to_owned(),
+            brain_threshold: audit.brain_threshold,
+            user_action: user_action.to_owned(),
+            decision_type: DecisionType::Session.label().to_owned(),
+            suggested_at: resolved_at,
+            resolved_at,
+            decision_id,
+            session_id: audit.session_id.to_owned(),
+            turn_id: audit.turn_id.to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EnsureRecord {
+    Inserted,
+    Present,
+}
+
+#[derive(Debug)]
+pub(crate) enum DecisionStoreError {
+    Io(io::Error),
+    OverBudget,
+}
+
+impl std::fmt::Display for DecisionStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "decision store I/O failed: {error}"),
+            Self::OverBudget => formatter.write_str("decision evidence exceeds its byte budget"),
+        }
+    }
+}
+
+impl std::error::Error for DecisionStoreError {}
+
+impl From<io::Error> for DecisionStoreError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 /// Persist a permission-hook decision before it is returned to Codex.
 ///
 /// `hook_allow` and `hook_deny` mean that the decision was prepared; this
@@ -619,37 +706,179 @@ pub(crate) fn append_deterministic(audit: &HookDecisionAudit<'_>) -> io::Result<
 }
 
 fn append_hook_audit(audit: &HookDecisionAudit<'_>, user_action: &str) -> io::Result<String> {
-    let resolved_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     let decision_id = gen_decision_id();
-    let record = serde_json::json!({
-        "provider": audit.provider,
-        "ts": timestamp_now(),
-        "pid": 0,
-        "project": audit.project,
-        "tool": audit.tool,
-        "command": audit.command,
-        "brain_action": audit.brain_action,
-        "brain_confidence": audit.brain_confidence,
-        "brain_reasoning": audit.brain_reasoning,
-        "brain_source": audit.brain_source,
-        "brain_threshold": audit.brain_threshold,
-        "user_action": user_action,
-        "decision_type": DecisionType::Session.label(),
-        "suggested_at": resolved_at,
-        "resolved_at": resolved_at,
-        "decision_id": decision_id,
-        "session_id": audit.session_id,
-        "turn_id": audit.turn_id,
-    });
-    append_json_line(&decisions_path(), &record)?;
+    let record = HookDecisionRecord::from_audit(audit, decision_id.clone(), user_action);
+    ensure_hook_record_at(&decisions_path(), &record)?;
     trigger_distill();
     Ok(decision_id)
 }
 
-fn trigger_distill() {
+pub(crate) fn ensure_hook_record_at(
+    path: &std::path::Path,
+    record: &HookDecisionRecord,
+) -> io::Result<EnsureRecord> {
+    let mut serialized = serde_json::to_vec(record).map_err(io::Error::other)?;
+    let expected = serde_json::to_value(record).map_err(io::Error::other)?;
+    if serialized.len() as u64 > MAX_DECISION_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decision record exceeds its size limit",
+        ));
+    }
+    serialized.push(b'\n');
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        set_directory_mode(parent)?;
+    }
+    let _lock = acquire_decisions_lock(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    set_file_mode(&file)?;
+    repair_jsonl_tail(&mut file)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut found_exact = false;
+    {
+        let mut reader = BufReader::new(&mut file);
+        while let Some(line) = read_bounded_json_line(&mut reader)? {
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if value.get("decision_id").and_then(|value| value.as_str())
+                != Some(record.decision_id.as_str())
+            {
+                continue;
+            }
+            if value == expected {
+                found_exact = true;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "decision id conflicts with an existing record",
+                ));
+            }
+        }
+    }
+    if found_exact {
+        return Ok(EnsureRecord::Present);
+    }
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(&serialized)?;
+    file.flush()?;
+    file.sync_data()?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(EnsureRecord::Inserted)
+}
+
+pub(crate) fn ensure_hook_record_at_bounded(
+    path: &std::path::Path,
+    record: &HookDecisionRecord,
+    budget: &mut LiveEvidenceBudget,
+) -> Result<EnsureRecord, DecisionStoreError> {
+    let mut serialized = serde_json::to_vec(record).map_err(io::Error::other)?;
+    let expected = serde_json::to_value(record).map_err(io::Error::other)?;
+    if serialized.len() as u64 > MAX_DECISION_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decision record exceeds its size limit",
+        )
+        .into());
+    }
+    serialized.push(b'\n');
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        set_directory_mode(parent)?;
+    }
+    let _lock = acquire_decisions_lock(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    set_file_mode(&file)?;
+    let length =
+        usize::try_from(file.metadata()?.len()).map_err(|_| DecisionStoreError::OverBudget)?;
+    if length > budget.remaining() {
+        return Err(DecisionStoreError::OverBudget);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let limit = u64::try_from(budget.remaining()).unwrap_or(u64::MAX);
+    let mut contents = Vec::new();
+    Read::by_ref(&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if contents.len() > budget.remaining() {
+        return Err(DecisionStoreError::OverBudget);
+    }
+    budget
+        .charge(contents.len())
+        .map_err(|_| DecisionStoreError::OverBudget)?;
+    let mut found_exact = false;
+    let mut reader = BufReader::new(contents.as_slice());
+    while let Some(line) = read_bounded_json_line(&mut reader)? {
+        let value = serde_json::from_slice::<serde_json::Value>(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if value.get("decision_id").and_then(|value| value.as_str())
+            != Some(record.decision_id.as_str())
+        {
+            continue;
+        }
+        if value == expected {
+            found_exact = true;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "decision id conflicts with an existing record",
+            )
+            .into());
+        }
+    }
+    if found_exact {
+        return Ok(EnsureRecord::Present);
+    }
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(&serialized)?;
+    file.flush()?;
+    file.sync_data()?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(EnsureRecord::Inserted)
+}
+
+fn read_bounded_json_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(consumed) > MAX_DECISION_RECORD_BYTES as usize + 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decision record exceeds its size limit",
+            ));
+        }
+        line.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            return Ok(Some(line));
+        }
+    }
+}
+
+pub(crate) fn trigger_distill() {
     let environment = PathEnvironment::current();
     if let Ok(paths) = CodingBrainPaths::resolve(&environment) {
         let _ = super::distill::spawn_one_shot_if_due(&paths);
@@ -1014,6 +1243,62 @@ mod tests {
     use super::*;
     use crate::rules::RuleAction;
     use coding_brain_core::brain_activity::ActivityKind;
+
+    fn hook_record(decision_id: &str, brain_action: &str) -> HookDecisionRecord {
+        HookDecisionRecord {
+            provider: AgentProvider::Codex,
+            ts: "1".into(),
+            pid: 0,
+            project: "project".into(),
+            tool: "Bash".into(),
+            command: "cargo test".into(),
+            brain_action: brain_action.into(),
+            brain_confidence: 0.9,
+            brain_reasoning: "reason".into(),
+            brain_source: "model".into(),
+            brain_threshold: Some(0.8),
+            user_action: "hook_proposal".into(),
+            decision_type: "session".into(),
+            suggested_at: 1,
+            resolved_at: 1,
+            decision_id: decision_id.into(),
+            session_id: "session-1".into(),
+            turn_id: "turn-1".into(),
+        }
+    }
+
+    #[test]
+    fn ensure_hook_record_is_idempotent_and_rejects_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("decisions.jsonl");
+        let record = hook_record("decision-1", "approve");
+
+        assert_eq!(
+            ensure_hook_record_at(&path, &record).unwrap(),
+            EnsureRecord::Inserted
+        );
+        assert_eq!(
+            ensure_hook_record_at(&path, &record).unwrap(),
+            EnsureRecord::Present
+        );
+
+        let conflicting = hook_record("decision-1", "deny");
+        assert!(ensure_hook_record_at(&path, &conflicting).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+
+        let exact = serde_json::to_string(&record).unwrap();
+        let conflict = serde_json::to_string(&conflicting).unwrap();
+        std::fs::write(&path, format!("{exact}\n{conflict}\n")).unwrap();
+        assert!(ensure_hook_record_at(&path, &record).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 2);
+
+        let mut extended = serde_json::to_value(&record).unwrap();
+        extended["unexpected"] = serde_json::json!(true);
+        let path = temp.path().join("extended-decisions.jsonl");
+        std::fs::write(&path, format!("{extended}\n")).unwrap();
+        assert!(ensure_hook_record_at(&path, &record).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
+    }
 
     #[test]
     fn unit_test_decision_paths_are_thread_scoped() {
@@ -1631,5 +1916,26 @@ mod tests {
         // The make_context_with_hour helper sets the hour field
         let ctx = make_context_with_hour(50, false, 14);
         assert_eq!(ctx.hour, Some(14));
+    }
+
+    #[test]
+    fn bounded_hook_ensure_charges_shared_budget_and_rejects_growth() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("decisions.jsonl");
+        let record = hook_record("bounded-record", "approve");
+        ensure_hook_record_at(&path, &record).unwrap();
+        let length = std::fs::metadata(&path).unwrap().len() as usize;
+        let mut budget = LiveEvidenceBudget::new(length);
+        assert_eq!(
+            ensure_hook_record_at_bounded(&path, &record, &mut budget).unwrap(),
+            EnsureRecord::Present
+        );
+        assert_eq!(budget.remaining(), 0);
+        std::fs::write(&path, vec![b'x'; length + 1]).unwrap();
+        let mut budget = LiveEvidenceBudget::new(length);
+        assert!(matches!(
+            ensure_hook_record_at_bounded(&path, &record, &mut budget),
+            Err(DecisionStoreError::OverBudget)
+        ));
     }
 }

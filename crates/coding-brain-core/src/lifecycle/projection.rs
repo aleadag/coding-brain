@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 use crate::provider::{AgentProvider, AgentSessionKey};
 
 use super::input::{
-    LifecycleEvent, LifecycleEventKind, LifecycleEventName, PermissionDisposition, ProjectedStatus,
-    SessionStartSource,
+    LifecycleEvent, LifecycleEventKind, LifecycleEventName, PermissionAuthority,
+    PermissionDisposition, ProjectedStatus, SessionStartSource,
 };
 
-pub const LIFECYCLE_SCHEMA_VERSION: u32 = 3;
+pub const LIFECYCLE_SCHEMA_VERSION: u32 = 4;
 pub const MAX_RECENT_TURNS: usize = 32;
 pub const MAX_ACTIVE_SUBAGENTS: usize = 64;
 pub const MAX_ANTIGRAVITY_INVOCATION_STEPS: usize = 256;
@@ -93,7 +93,11 @@ pub struct SessionLifecycleState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub antigravity_child_events: BTreeMap<u64, u8>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub antigravity_permission_requests: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub permission_request_events: BTreeMap<String, u8>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub permission_authorities: BTreeMap<String, PermissionAuthority>,
     last_signature: Option<EventSignature>,
 }
 
@@ -119,7 +123,9 @@ impl SessionLifecycleState {
             ignored_reason: None,
             antigravity_initial_step: None,
             antigravity_child_events: BTreeMap::new(),
+            antigravity_permission_requests: BTreeMap::new(),
             permission_request_events: BTreeMap::new(),
+            permission_authorities: BTreeMap::new(),
             last_signature: None,
         }
     }
@@ -165,7 +171,40 @@ impl SessionLifecycleState {
         self.stopped_subagents.clear();
         self.antigravity_initial_step = None;
         self.antigravity_child_events.clear();
+        self.antigravity_permission_requests.clear();
         self.permission_request_events.clear();
+        self.permission_authorities.clear();
+    }
+
+    pub fn permission_disposition(&self, request_key: &str) -> Option<PermissionDisposition> {
+        let bits = self.permission_request_events.get(request_key).copied()?;
+        if bits & PERMISSION_NEEDS_INPUT_BIT != 0 {
+            Some(PermissionDisposition::NeedsInput)
+        } else if bits & PERMISSION_DECIDED_BIT != 0 {
+            Some(PermissionDisposition::Decided)
+        } else {
+            None
+        }
+    }
+
+    pub fn antigravity_permission_disposition(
+        &self,
+        request_key: &str,
+        step: u64,
+    ) -> Option<PermissionDisposition> {
+        if self.antigravity_permission_requests.get(request_key) != Some(&step) {
+            return None;
+        }
+        let keyed = self.permission_disposition(request_key)?;
+        let child_bits = self.antigravity_child_events.get(&step).copied()?;
+        let child = if child_bits & ANTIGRAVITY_PERMISSION_NEEDS_INPUT_BIT != 0 {
+            PermissionDisposition::NeedsInput
+        } else if child_bits & ANTIGRAVITY_PERMISSION_DECIDED_BIT != 0 {
+            PermissionDisposition::Decided
+        } else {
+            return None;
+        };
+        (child == keyed).then_some(keyed)
     }
 }
 
@@ -232,20 +271,19 @@ fn is_antigravity_execution_stop(
             .is_some()
 }
 
-fn permission_event(event: &LifecycleEvent) -> Option<(&str, u8)> {
-    if event.identity().provider() == AgentProvider::Antigravity {
-        return None;
-    }
+fn permission_event(event: &LifecycleEvent) -> Option<(&str, u8, Option<&PermissionAuthority>)> {
     match event.kind() {
         LifecycleEventKind::PermissionRequest {
             disposition,
             request_key: Some(request_key),
+            authority,
         } => Some((
             request_key,
             match disposition {
                 PermissionDisposition::Decided => PERMISSION_DECIDED_BIT,
                 PermissionDisposition::NeedsInput => PERMISSION_NEEDS_INPUT_BIT,
             },
+            authority.as_ref(),
         )),
         _ => None,
     }
@@ -584,6 +622,7 @@ impl LifecycleSnapshot {
                     LifecycleEventKind::PermissionRequest {
                         disposition,
                         request_key: Some(_),
+                        ..
                     },
                     Some(EventSignature {
                         turn_id: Some(last_turn_id),
@@ -591,6 +630,7 @@ impl LifecycleSnapshot {
                             LifecycleEventKind::PermissionRequest {
                                 disposition: previous_disposition,
                                 request_key: None,
+                                ..
                             },
                     }),
                 ) if state.turn_open
@@ -605,7 +645,13 @@ impl LifecycleSnapshot {
             return state.ignore(IgnoreReason::Duplicate);
         }
 
-        if let Some((step, bit)) = antigravity_child(state, &event, turn_id) {
+        let child_update = antigravity_child(state, &event, turn_id);
+        if child_update.is_none() && is_antigravity_child_candidate(&event, turn_id) {
+            return state.ignore(IgnoreReason::AmbiguousTurn);
+        }
+        let permission_update = permission_event(&event);
+
+        if let Some((step, bit)) = child_update {
             let previous = state
                 .antigravity_child_events
                 .get(&step)
@@ -621,9 +667,6 @@ impl LifecycleSnapshot {
             {
                 return state.ignore(IgnoreReason::AmbiguousTurn);
             }
-            state.antigravity_child_events.insert(step, previous | bit);
-        } else if is_antigravity_child_candidate(&event, turn_id) {
-            return state.ignore(IgnoreReason::AmbiguousTurn);
         } else {
             match state.current_turn.as_deref() {
                 Some(current) if state.turn_open && current != turn_id => {
@@ -636,7 +679,9 @@ impl LifecycleSnapshot {
                         }
                         let current = current.to_owned();
                         state.remember_turn(&current);
+                        state.antigravity_permission_requests.clear();
                         state.permission_request_events.clear();
+                        state.permission_authorities.clear();
                         state.current_turn = Some(turn_id.to_owned());
                     }
                 }
@@ -644,7 +689,9 @@ impl LifecycleSnapshot {
                     return state.ignore(IgnoreReason::RecentTurn);
                 }
                 Some(current) if current != turn_id => {
+                    state.antigravity_permission_requests.clear();
                     state.permission_request_events.clear();
+                    state.permission_authorities.clear();
                     state.current_turn = Some(turn_id.to_owned());
                 }
                 None => state.current_turn = Some(turn_id.to_owned()),
@@ -652,7 +699,7 @@ impl LifecycleSnapshot {
             }
         }
 
-        if let Some((request_key, bit)) = permission_event(&event) {
+        if let Some((request_key, bit, _)) = permission_update {
             let previous = state
                 .permission_request_events
                 .get(request_key)
@@ -668,9 +715,67 @@ impl LifecycleSnapshot {
             {
                 return state.ignore(IgnoreReason::AmbiguousTurn);
             }
+            if event.identity().provider() == AgentProvider::Antigravity {
+                let Some((step, _)) = child_update else {
+                    return state.ignore(IgnoreReason::AmbiguousTurn);
+                };
+                if state
+                    .antigravity_permission_requests
+                    .get(request_key)
+                    .is_some_and(|recorded| *recorded != step)
+                    || state.antigravity_permission_requests.iter().any(
+                        |(recorded_key, recorded_step)| {
+                            recorded_key != request_key && *recorded_step == step
+                        },
+                    )
+                {
+                    return state.ignore(IgnoreReason::AmbiguousTurn);
+                }
+                if !state
+                    .antigravity_permission_requests
+                    .contains_key(request_key)
+                    && state.antigravity_permission_requests.len()
+                        >= MAX_PERMISSION_REQUESTS_PER_TURN
+                {
+                    return state.ignore(IgnoreReason::AmbiguousTurn);
+                }
+            }
+        }
+
+        if let Some((step, bit)) = child_update {
+            let previous = state
+                .antigravity_child_events
+                .get(&step)
+                .copied()
+                .unwrap_or(0);
+            state.antigravity_child_events.insert(step, previous | bit);
+        }
+        if let Some((request_key, bit, authority)) = permission_update {
+            let previous = state
+                .permission_request_events
+                .get(request_key)
+                .copied()
+                .unwrap_or(0);
             state
                 .permission_request_events
                 .insert(request_key.to_owned(), previous | bit);
+            match authority {
+                Some(authority) => {
+                    state
+                        .permission_authorities
+                        .insert(request_key.to_owned(), authority.clone());
+                }
+                None if bit == PERMISSION_NEEDS_INPUT_BIT => {
+                    state.permission_authorities.remove(request_key);
+                }
+                None => {}
+            }
+            if event.identity().provider() == AgentProvider::Antigravity {
+                let (step, _) = child_update.expect("Antigravity permission preflight has a step");
+                state
+                    .antigravity_permission_requests
+                    .insert(request_key.to_owned(), step);
+            }
         }
 
         let sequence = self.next_sequence;
@@ -687,6 +792,7 @@ impl LifecycleSnapshot {
                     .then(|| event.turn_initial_step())
                     .flatten();
                 state.antigravity_child_events.clear();
+                state.antigravity_permission_requests.clear();
                 state.set_status(
                     event.name(),
                     ProjectedStatus::Processing,
@@ -735,7 +841,9 @@ impl LifecycleSnapshot {
                 state.stopped_subagents.clear();
                 state.antigravity_initial_step = None;
                 state.antigravity_child_events.clear();
+                state.antigravity_permission_requests.clear();
                 state.permission_request_events.clear();
+                state.permission_authorities.clear();
                 state.remember_turn(turn_id);
                 state.set_status(
                     event.name(),
@@ -994,8 +1102,15 @@ mod tests {
 
     use serde_json::{Map, Value, json};
 
+    use super::super::PermissionAction;
     use super::super::input::LifecycleIdentity;
     use super::*;
+
+    #[test]
+    fn lifecycle_schema_four_is_current() {
+        assert_eq!(LIFECYCLE_SCHEMA_VERSION, 4);
+        assert_eq!(LifecycleSnapshot::default().schema_version, 4);
+    }
     use crate::provider::{AgentProvider, AgentSessionKey};
 
     fn event(name: LifecycleEventName, turn: Option<&str>, agent: Option<&str>) -> LifecycleEvent {
@@ -1296,6 +1411,48 @@ mod tests {
         )
         .unwrap();
         LifecycleEvent::permission(identity, disposition).unwrap()
+    }
+
+    #[test]
+    fn lifecycle_schema_four_permission_authority_projects_exactly() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(prompt("turn-1"), 1_000),
+            ApplyOutcome::Applied
+        );
+        let authority = PermissionAuthority {
+            transaction_id: "transaction-a".into(),
+            action: PermissionAction::Allow,
+        };
+        assert_eq!(
+            snapshot.apply(
+                LifecycleEvent::permission_with_authority(
+                    LifecycleIdentity::try_new(
+                        AgentProvider::Codex,
+                        "session-1".into(),
+                        Some("turn-1".into()),
+                        None,
+                        "/work/codexctl".into(),
+                    )
+                    .unwrap(),
+                    "a".repeat(64),
+                    authority.clone(),
+                )
+                .unwrap(),
+                2_000,
+            ),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(snapshot.schema_version, 4);
+        let state = &snapshot.sessions[&native_key("session-1")];
+        assert_eq!(
+            state.permission_authorities.get(&"a".repeat(64)),
+            Some(&authority)
+        );
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let decoded: LifecycleSnapshot = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, snapshot);
     }
 
     fn keyed_permission(
@@ -2917,8 +3074,44 @@ mod tests {
         );
         let key =
             AgentSessionKey::native(AgentProvider::Antigravity, "agy-conversation-1").storage_key();
-        assert!(snapshot.sessions[&key].permission_request_events.is_empty());
+        assert_eq!(
+            snapshot.sessions[&key].antigravity_permission_disposition(KEY_A, 5),
+            Some(PermissionDisposition::Decided)
+        );
         assert_eq!(snapshot.next_sequence, before.next_sequence);
+    }
+
+    #[test]
+    fn antigravity_keyed_capacity_preflight_does_not_mutate_child_evidence() {
+        let mut snapshot = LifecycleSnapshot::default();
+        assert_eq!(
+            snapshot.apply(invocation("invocation-1", 0), 1),
+            ApplyOutcome::Applied
+        );
+        let storage_key =
+            AgentSessionKey::native(AgentProvider::Antigravity, "agy-conversation-1").storage_key();
+        let state = snapshot.sessions.get_mut(&storage_key).unwrap();
+        for index in 0..MAX_PERMISSION_REQUESTS_PER_TURN {
+            state
+                .permission_request_events
+                .insert(format!("{index:064x}"), PERMISSION_DECIDED_BIT);
+        }
+        let child_before = state.antigravity_child_events.clone();
+        let event = LifecycleEvent::permission_with_request_key(
+            antigravity_identity("step-300"),
+            PermissionDisposition::Decided,
+            KEY_A.into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.apply(event, 2),
+            ApplyOutcome::Ignored(IgnoreReason::AmbiguousTurn)
+        );
+        assert_eq!(
+            snapshot.sessions[&storage_key].antigravity_child_events,
+            child_before
+        );
     }
 
     #[test]

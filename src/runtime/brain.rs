@@ -128,9 +128,24 @@ impl LiveBrainSource {
     }
 
     fn refresh_from_store(
-        store: brain::activity::ActivityStore,
+        state_root: &Path,
         limits: SnapshotLimits,
     ) -> Result<BrainRefresh, BrainSourceError> {
+        let recovery = brain::permission_transaction::recover_pending(
+            state_root,
+            brain::permission_transaction::RecoveryLimits::startup(),
+        )
+        .map_err(|error| BrainSourceError::Other(error.to_string()))?;
+        if recovery.invalid != 0
+            || recovery.over_budget != 0
+            || recovery.removal_sync_uncertain != 0
+            || recovery.pending != 0
+        {
+            return Err(BrainSourceError::Other(
+                "permission transaction recovery remains unresolved".into(),
+            ));
+        }
+        let store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
         let activity = store.read().map_err(|error| match error {
             brain::activity::ActivityStoreError::LockTimeout => BrainSourceError::Busy,
             other => BrainSourceError::Other(other.to_string()),
@@ -153,10 +168,7 @@ impl BrainSource for LiveBrainSource {
     fn refresh(&self, limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
         let paths = brain::distill::current_paths()
             .map_err(|error| BrainSourceError::Other(error.to_string()))?;
-        Self::refresh_from_store(
-            brain::activity::ActivityStore::at(paths.state_root().join("activity.jsonl")),
-            limits,
-        )
+        Self::refresh_from_store(paths.state_root(), limits)
     }
 
     fn gate_mode(&self) -> BrainGateMode {
@@ -829,6 +841,69 @@ mod tests {
     }
 
     #[test]
+    fn live_brain_refresh_recovers_proposal_only_journal_before_projection() {
+        let _env_lock = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let state_home = temp.path().join("state");
+        let state_root = state_home.join("coding-brain");
+        let _env = RefreshEnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+        };
+        // SAFETY: this test holds HOME_ENV_LOCK and the guard restores all values.
+        unsafe {
+            std::env::set_var("HOME", temp.path().join("home"));
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join("config"));
+            std::env::set_var("XDG_STATE_HOME", &state_home);
+        }
+        let activity_id = brain::permission_transaction::test_support::proposal_only(
+            &state_root,
+            "runtime-proposal-only",
+        );
+
+        let refresh = LiveBrainSource::refresh_from_store(
+            &state_root,
+            SnapshotLimits {
+                interrupted_after_ms: 0,
+                ..SnapshotLimits::default()
+            },
+        )
+        .unwrap();
+
+        let projected = refresh
+            .snapshot
+            .attention
+            .iter()
+            .map(|item| &item.activity)
+            .find(|item| item.activity_id == activity_id)
+            .expect("recovered terminal activity must be projected");
+        assert_eq!(projected.state, ActivityState::Error);
+        assert_ne!(projected.state, ActivityState::Incomplete);
+    }
+
+    #[test]
+    fn live_brain_refresh_reports_but_does_not_steal_active_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let prepared =
+            brain::permission_transaction::test_support::active(temp.path(), "runtime-active");
+        let journal_path = prepared.path().to_owned();
+
+        LiveBrainSource::refresh_from_store(temp.path(), SnapshotLimits::default()).unwrap();
+
+        assert!(journal_path.exists());
+        let (_, report) =
+            brain::permission_transaction::PermissionTransactionStore::at(temp.path())
+                .discover(brain::permission_transaction::RecoveryLimits::startup())
+                .unwrap();
+        assert_eq!(report.active, 1);
+        drop(prepared);
+        assert!(journal_path.exists());
+    }
+
+    #[test]
     fn live_brain_refresh_reports_busy_during_activity_lock_contention() {
         let _env_lock = crate::config::HOME_ENV_LOCK
             .lock()
@@ -860,11 +935,6 @@ mod tests {
 
         let source = LiveBrainSource::default();
 
-        let success_store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"))
-            .with_limits(brain::activity::ActivityLimits {
-                lock_timeout_ms: 5_000,
-                ..brain::activity::ActivityLimits::default()
-            });
         let (unlocker_ready_tx, unlocker_ready_rx) = std::sync::mpsc::channel();
         let unlocker = std::thread::spawn(move || {
             unlocker_ready_tx.send(()).unwrap();
@@ -873,7 +943,7 @@ mod tests {
         });
         unlocker_ready_rx.recv().unwrap();
         assert!(
-            LiveBrainSource::refresh_from_store(success_store, SnapshotLimits::default()).is_ok()
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).is_ok()
         );
         unlocker.join().unwrap();
 

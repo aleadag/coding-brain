@@ -25,6 +25,26 @@ pub enum PermissionDisposition {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum PermissionAction {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionAuthority {
+    pub transaction_id: String,
+    pub action: PermissionAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PermissionDecision {
+    NeedsInput,
+    Decided(PermissionAuthority),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionStartSource {
     Startup,
     Resume,
@@ -85,6 +105,8 @@ pub enum LifecycleEventKind {
         disposition: PermissionDisposition,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authority: Option<PermissionAuthority>,
     },
     SubagentStart {
         agent_id: String,
@@ -228,6 +250,22 @@ impl LifecycleEvent {
         {
             validate_id("agent_id", agent_id)?;
         }
+        if let LifecycleEventKind::PermissionRequest {
+            disposition,
+            request_key,
+            authority,
+        } = &kind
+        {
+            if let Some(authority) = authority {
+                validate_id("transaction_id", &authority.transaction_id)?;
+                if *disposition != PermissionDisposition::Decided || request_key.is_none() {
+                    return Err(LifecycleInputError::Invalid("authority"));
+                }
+            }
+            if *disposition == PermissionDisposition::NeedsInput && authority.is_some() {
+                return Err(LifecycleInputError::Invalid("authority"));
+            }
+        }
         Ok(Self {
             identity,
             kind,
@@ -306,6 +344,25 @@ impl LifecycleEvent {
         Self::permission_from_parts(identity, disposition, Some(request_key))
     }
 
+    pub fn permission_with_authority(
+        identity: LifecycleIdentity,
+        request_key: String,
+        authority: PermissionAuthority,
+    ) -> Result<Self, LifecycleInputError> {
+        validate_id("request_key", &request_key)?;
+        validate_id("transaction_id", &authority.transaction_id)?;
+        require_turn(&identity)?;
+        Ok(Self {
+            identity,
+            kind: LifecycleEventKind::PermissionRequest {
+                disposition: PermissionDisposition::Decided,
+                request_key: Some(request_key),
+                authority: Some(authority),
+            },
+            turn_initial_step: None,
+        })
+    }
+
     fn permission_from_parts(
         identity: LifecycleIdentity,
         disposition: PermissionDisposition,
@@ -317,6 +374,7 @@ impl LifecycleEvent {
             kind: LifecycleEventKind::PermissionRequest {
                 disposition,
                 request_key,
+                authority: None,
             },
             turn_initial_step: None,
         })
@@ -717,6 +775,50 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<LifecycleEvent>(&legacy_encoded).unwrap(),
             legacy
+        );
+    }
+
+    #[test]
+    fn permission_authority_is_bounded_and_serde_stable() {
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "session-1".into(),
+            Some("turn-1".into()),
+            None,
+            PathBuf::from("/work/coding-brain"),
+        )
+        .unwrap();
+        let event = LifecycleEvent::permission_with_authority(
+            identity.clone(),
+            "a".repeat(64),
+            PermissionAuthority {
+                transaction_id: "transaction-a".into(),
+                action: PermissionAction::Allow,
+            },
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["kind"]["authority"]["action"], "allow");
+        assert_eq!(
+            encoded["kind"]["authority"]["transaction_id"],
+            "transaction-a"
+        );
+        assert_eq!(
+            serde_json::from_value::<LifecycleEvent>(encoded).unwrap(),
+            event
+        );
+
+        assert_eq!(
+            LifecycleEvent::permission_with_authority(
+                identity,
+                "a".repeat(64),
+                PermissionAuthority {
+                    transaction_id: "x".repeat(MAX_ID_BYTES + 1),
+                    action: PermissionAction::Deny,
+                },
+            )
+            .unwrap_err(),
+            LifecycleInputError::TooLong("transaction_id")
         );
     }
 }

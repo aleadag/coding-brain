@@ -409,6 +409,7 @@ fn decision_state(state: ActivityState) -> &'static str {
         ActivityState::Delivered => "delivered",
         ActivityState::DeliveryFailed => "delivery failed",
         ActivityState::Interrupted => "interrupted",
+        ActivityState::Incomplete => "permission evaluation timed out",
         ActivityState::Outcome => "outcome",
         ActivityState::Correction => "correction",
     }
@@ -490,6 +491,7 @@ fn activity_badge(item: &ActivityItem) -> ActivityBadge {
         ActivityState::Delivered => ActivityBadge::new("SENT", BadgeTone::Positive),
         ActivityState::DeliveryFailed => ActivityBadge::new("SEND FAIL", BadgeTone::Negative),
         ActivityState::Interrupted => ActivityBadge::new("STOPPED", BadgeTone::Warning),
+        ActivityState::Incomplete => ActivityBadge::new("INCOMPLETE", BadgeTone::Warning),
         ActivityState::Outcome => ActivityBadge::new("OUTCOME", BadgeTone::Active),
         ActivityState::Correction => ActivityBadge::new("RESOLVED", BadgeTone::Positive),
     }
@@ -763,11 +765,34 @@ mod tests {
             (ActivityState::Delivered, "SENT"),
             (ActivityState::DeliveryFailed, "SEND FAIL"),
             (ActivityState::Interrupted, "STOPPED"),
+            (ActivityState::Incomplete, "INCOMPLETE"),
             (ActivityState::Outcome, "OUTCOME"),
             (ActivityState::Correction, "RESOLVED"),
         ] {
             item.state = state;
             assert_eq!(activity_badge(&item).label, expected);
+        }
+    }
+
+    #[test]
+    fn incomplete_activity_renders_without_interrupted_tool_outcome() {
+        let mut item = activity();
+        item.state = ActivityState::Incomplete;
+        item.delivery = DeliveryState::NotApplicable;
+        assert_eq!(activity_badge(&item).label, "INCOMPLETE");
+        assert_eq!(activity_status(&item), "permission evaluation timed out");
+
+        let theme = Theme::from_mode(ThemeMode::Dark);
+        for density in [EvidenceDensity::Wide, EvidenceDensity::Compact] {
+            let text = evidence_lines(&item, density, &theme, true, 1_000)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("INCOMPLETE"), "{text}");
+            assert!(text.contains("permission evaluation timed out"), "{text}");
+            assert!(!text.contains("STOPPED"), "{text}");
+            assert!(!text.contains("interrupted"), "{text}");
         }
     }
 

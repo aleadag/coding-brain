@@ -13,9 +13,11 @@ use coding_brain_core::brain_activity::{
     SessionTarget, bounded_redacted_activity_text, lossless_redacted_activity_text,
 };
 use coding_brain_core::codex_transcript::{CodexResumeEvidenceError, read_codex_resume_evidence};
+#[cfg(test)]
+use coding_brain_core::lifecycle::LifecycleEvent;
 use coding_brain_core::lifecycle::{
-    ApplyOutcome, IgnoreReason, LifecycleEvent, LifecycleIdentity, LifecycleStore,
-    PermissionDisposition, coding_brain_state_root,
+    ApplyOutcome, IgnoreReason, LifecycleIdentity, LifecycleStore, PermissionDisposition,
+    coding_brain_state_root,
 };
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::project::ProjectIdentity;
@@ -23,9 +25,14 @@ use coding_brain_core::provider::AgentProvider;
 use coding_brain_core::runtime::BrainGateMode;
 
 use super::UNSUPPORTED_PERMISSION_TOOL_REASON;
-use super::activity::ActivityStore;
+use super::activity::{ActivityStore, LiveEvidenceBudget};
 use super::client::BrainSuggestion;
-use super::decisions::{HookDecisionAudit, append_deterministic, append_hook_proposal};
+use super::decisions::{self, HookDecisionAudit, HookDecisionRecord};
+use super::permission_request_lock::PermissionRequestLockStore;
+use super::permission_transaction::{
+    PermissionTransactionJournal, PermissionTransactionStore, RecoveryLimits, RecoveryReport,
+    TransactionError, commit_live, recover_pending_with_guard,
+};
 use super::query::{self, BrainDecision, BrainDecisionRequest};
 use super::safety::SafetyDeny;
 use crate::config::BrainConfig;
@@ -36,6 +43,7 @@ use crate::provider_hooks::{
 
 const HOOK_INFERENCE_TIMEOUT_MS: u64 = 25_000;
 const PERMISSION_ACTIVITY_LOCK_TIMEOUT_MS: u64 = 500;
+const PERMISSION_TRANSACTION_SCHEMA_VERSION: u32 = 2;
 static ACTIVITY_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug)]
@@ -50,21 +58,6 @@ impl HookDiagnostic {
 impl fmt::Display for HookDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
-    }
-}
-
-#[derive(Debug)]
-enum PermissionRecordError {
-    Ignored(IgnoreReason),
-    Failed(HookDiagnostic),
-}
-
-impl fmt::Display for PermissionRecordError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ignored(reason) => write!(formatter, "lifecycle event was ignored: {reason:?}"),
-            Self::Failed(diagnostic) => diagnostic.fmt(formatter),
-        }
     }
 }
 
@@ -400,31 +393,6 @@ fn write_diagnostic(stderr: &mut impl Write, diagnostic: impl fmt::Display) {
     let _ = writeln!(stderr, "cbrain permission hook: {diagnostic}");
 }
 
-fn record_permission(
-    store: &LifecycleStore,
-    identity: &LifecycleIdentity,
-    disposition: PermissionDisposition,
-    request_key: &str,
-) -> Result<(), PermissionRecordError> {
-    let event = LifecycleEvent::permission_with_request_key(
-        identity.clone(),
-        disposition,
-        request_key.to_owned(),
-    )
-    .map_err(|error| {
-        PermissionRecordError::Failed(HookDiagnostic::new(format!(
-            "invalid lifecycle event: {error}"
-        )))
-    })?;
-    match store.record(event) {
-        Ok(ApplyOutcome::Applied) => Ok(()),
-        Ok(ApplyOutcome::Ignored(reason)) => Err(PermissionRecordError::Ignored(reason)),
-        Err(error) => Err(PermissionRecordError::Failed(HookDiagnostic::new(format!(
-            "could not persist lifecycle state: {error}"
-        )))),
-    }
-}
-
 fn try_reprove_codex_subagent(
     store: &LifecycleStore,
     identity: &LifecycleIdentity,
@@ -448,6 +416,166 @@ fn try_reprove_codex_subagent(
         Ok(ApplyOutcome::Applied | ApplyOutcome::Ignored(IgnoreReason::Duplicate)) => None,
         Ok(ApplyOutcome::Ignored(_)) | Err(_) => Some(CodexResumeEvidenceError::InvalidRecord),
     }
+}
+
+fn permission_transaction_paths() -> Result<(PathBuf, PathBuf), HookDiagnostic> {
+    let decisions_path = decisions::decisions_path();
+    let Some(state_root) = decisions_path.parent().and_then(|brain| brain.parent()) else {
+        return Err(HookDiagnostic::new(
+            "could not resolve permission transaction state root",
+        ));
+    };
+    Ok((state_root.to_owned(), decisions_path))
+}
+
+fn recovery_blocks_inference(report: RecoveryReport) -> bool {
+    report.active != 0
+        || report.invalid != 0
+        || report.over_budget != 0
+        || report.removal_sync_uncertain != 0
+        || report.pending != 0
+}
+
+fn preflight_blocks_recovery(report: RecoveryReport) -> bool {
+    report.active != 0
+        || report.invalid != 0
+        || report.over_budget != 0
+        || report.removal_sync_uncertain != 0
+}
+
+fn recover_before_inference(
+    state_root: &std::path::Path,
+    guard: &super::permission_request_lock::PermissionRequestGuard,
+) -> Result<(), HookDiagnostic> {
+    let store = PermissionTransactionStore::at(state_root);
+    let preflight = store.preflight_live().map_err(|error| {
+        HookDiagnostic::new(format!("permission transaction preflight failed: {error}"))
+    })?;
+    if preflight_blocks_recovery(preflight) {
+        return Err(HookDiagnostic::new(format!(
+            "permission transaction preflight blocked: active={}, invalid={}, over_budget={}, \
+             pending={}, removal_sync_uncertain={}",
+            preflight.active,
+            preflight.invalid,
+            preflight.over_budget,
+            preflight.pending,
+            preflight.removal_sync_uncertain,
+        )));
+    }
+    let report =
+        recover_pending_with_guard(state_root, RecoveryLimits::live(), guard).map_err(|error| {
+            HookDiagnostic::new(format!("permission transaction recovery failed: {error}"))
+        })?;
+    if recovery_blocks_inference(report) {
+        return Err(HookDiagnostic::new(format!(
+            "permission transaction recovery blocked: active={}, invalid={}, over_budget={}, \
+             pending={}, removal_sync_uncertain={}",
+            report.active,
+            report.invalid,
+            report.over_budget,
+            report.pending,
+            report.removal_sync_uncertain,
+        )));
+    }
+    Ok(())
+}
+
+fn preflight_live_decision_evidence(
+    path: &std::path::Path,
+    budget: &mut LiveEvidenceBudget,
+) -> Result<(), HookDiagnostic> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(HookDiagnostic::new("decision evidence is unreadable")),
+    };
+    let length = usize::try_from(
+        file.metadata()
+            .map_err(|_| HookDiagnostic::new("decision evidence is unreadable"))?
+            .len(),
+    )
+    .map_err(|_| HookDiagnostic::new("decision evidence exceeds its byte budget"))?;
+    if length > budget.remaining() {
+        return Err(HookDiagnostic::new(
+            "decision evidence exceeds its byte budget",
+        ));
+    }
+    let limit = u64::try_from(budget.remaining()).unwrap_or(u64::MAX);
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| HookDiagnostic::new("decision evidence is unreadable"))?;
+    if bytes.len() > budget.remaining() {
+        return Err(HookDiagnostic::new(
+            "decision evidence exceeds its byte budget",
+        ));
+    }
+    budget
+        .charge(bytes.len())
+        .map_err(|_| HookDiagnostic::new("decision evidence exceeds its byte budget"))?;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if line.last() != Some(&b'\n')
+            || line.len() == 1
+            || serde_json::from_slice::<serde_json::Value>(&line[..line.len() - 1]).is_err()
+        {
+            return Err(HookDiagnostic::new("decision evidence is unreadable"));
+        }
+    }
+    Ok(())
+}
+
+fn preflight_live_destinations(
+    decisions_path: &std::path::Path,
+    activity_store: Option<&ActivityStore>,
+) -> Result<(), HookDiagnostic> {
+    let mut budget = LiveEvidenceBudget::new(RecoveryLimits::live().max_destination_bytes);
+    preflight_live_decision_evidence(decisions_path, &mut budget)?;
+    if let Some(activity_store) = activity_store {
+        activity_store.read_bounded(&mut budget).map_err(|error| {
+            HookDiagnostic::new(format!("activity evidence preflight failed: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_permission_transaction(
+    state_root: &std::path::Path,
+    decisions_path: &std::path::Path,
+    lifecycle_store: &LifecycleStore,
+    activity_store: &ActivityStore,
+    request: &PermissionHookRequest,
+    audit: &HookDecisionAudit<'_>,
+    mut terminal: ActivityEvent,
+    proposal_action: &str,
+    disposition: PermissionDisposition,
+) -> Result<String, TransactionError> {
+    let decision_id = decisions::gen_decision_id();
+    let proposal = HookDecisionRecord::from_audit(audit, decision_id.clone(), proposal_action);
+    terminal.decision_id = Some(decision_id.clone());
+    let journal = PermissionTransactionJournal {
+        schema_version: PERMISSION_TRANSACTION_SCHEMA_VERSION,
+        transaction_id: format!("transaction-{decision_id}"),
+        proposal,
+        allow_requires_lifecycle_authority: terminal.state == ActivityState::Allowed,
+        terminal,
+        lifecycle_identity: request.lifecycle.clone(),
+        request_key: request.request_key.clone(),
+        disposition,
+    };
+    let limits = RecoveryLimits::live();
+    let prepared = PermissionTransactionStore::at(state_root).prepare_live(journal)?;
+    let mut budget = LiveEvidenceBudget::new(limits.max_destination_bytes);
+    commit_live(
+        prepared,
+        lifecycle_store,
+        activity_store,
+        decisions_path,
+        &mut budget,
+    )?;
+    decisions::trigger_distill();
+    Ok(decision_id)
 }
 
 fn run_with_gate_and_store<R, W, E, F>(
@@ -591,20 +719,91 @@ fn run_provider_with_gate_and_stores_and_safety<R, W, E, S, F>(
             return;
         }
     };
+    let transaction_paths = match permission_transaction_paths() {
+        Ok(paths) => paths,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+    };
+    let request_guard = match PermissionRequestLockStore::at(&transaction_paths.0)
+        .try_acquire(&request.lifecycle, &request.request_key)
+    {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            write_diagnostic(&mut stderr, "permission request is already active");
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+    };
+    if let Err(error) = recover_before_inference(&transaction_paths.0, &request_guard) {
+        write_diagnostic(&mut stderr, error);
+        if provider == AgentProvider::Antigravity {
+            write_failsafe_ask(&mut stdout, &mut stderr);
+        }
+        return;
+    }
+    if let Err(error) = preflight_live_destinations(&transaction_paths.1, activity_store) {
+        write_diagnostic(&mut stderr, error);
+        if provider == AgentProvider::Antigravity {
+            write_failsafe_ask(&mut stdout, &mut stderr);
+        }
+        return;
+    }
+    let existing_decision =
+        match lifecycle_store.permission_decision(&request.lifecycle, &request.request_key) {
+            Ok(decision) => decision,
+            Err(error) => {
+                write_diagnostic(
+                    &mut stderr,
+                    format!("permission transaction admission failed: {error}"),
+                );
+                if provider == AgentProvider::Antigravity {
+                    write_failsafe_ask(&mut stdout, &mut stderr);
+                }
+                return;
+            }
+        };
+    let legacy_disposition = lifecycle_store
+        .permission_disposition(&request.lifecycle, &request.request_key)
+        .ok()
+        .flatten();
+    if existing_decision.is_some() || legacy_disposition.is_some() {
+        write_diagnostic(
+            &mut stderr,
+            "permission transaction admission blocked: duplicate permission request",
+        );
+        if provider == AgentProvider::Antigravity {
+            write_failsafe_ask(&mut stdout, &mut stderr);
+        }
+        return;
+    }
     let needs_input = |stderr: &mut E| {
-        if let Err(error) = record_permission(
-            lifecycle_store,
+        if let Err(error) = lifecycle_store.ensure_permission_decision(
             &request.lifecycle,
-            PermissionDisposition::NeedsInput,
             &request.request_key,
+            coding_brain_core::lifecycle::PermissionDecision::NeedsInput,
         ) {
             write_diagnostic(stderr, error);
         }
     };
+    let _request_guard = request_guard;
     let activity_context =
         current_paths().and_then(|paths| HookActivity::from_request(&request, &paths));
     let reproof_error = try_reprove_codex_subagent(lifecycle_store, &request.lifecycle);
-    let mut persistence_error = match (&activity_context, activity_store) {
+    let initial_activity_error = match (&activity_context, activity_store) {
         (Err(error), _) => Some(error.to_string()),
         (_, None) => Some("activity store unavailable".into()),
         (Ok(context), Some(activity_store)) => activity_store
@@ -615,6 +814,9 @@ fn run_provider_with_gate_and_stores_and_safety<R, W, E, S, F>(
             .err()
             .map(|error| error.to_string()),
     };
+    let persistence_error = initial_activity_error.or_else(|| {
+        reproof_error.map(|error| format!("UnprovenSubagent; Codex resume evidence: {error}"))
+    });
     let brain_request = BrainDecisionRequest {
         project: request.project.clone(),
         tool_name: request.tool_name.clone(),
@@ -714,32 +916,55 @@ fn run_provider_with_gate_and_stores_and_safety<R, W, E, S, F>(
             session_id: request.lifecycle.session_id(),
             turn_id: request.lifecycle.turn_id().unwrap_or_default(),
         };
-        let decision_id = match append_deterministic(&audit) {
-            Ok(decision_id) => Some(decision_id),
-            Err(error) => {
-                persistence_error.get_or_insert_with(|| error.to_string());
-                None
-            }
-        };
-        if let (Ok(context), Some(activity_store)) = (&activity_context, activity_store) {
+        let mut transaction_error = persistence_error
+            .as_ref()
+            .map(|error| format!("permission transaction unavailable: {error}"));
+        let decision_id = if transaction_error.is_none()
+            && let ((state_root, decisions_path), Ok(context), Some(activity_store)) =
+                (&transaction_paths, &activity_context, activity_store)
+        {
             let mut terminal = context.event(*terminal_state);
             terminal.rule_id = safety.as_ref().map(|deny| deny.rule_id.into());
             terminal.reasoning = Some(reason.into());
-            terminal.decision_id.clone_from(&decision_id);
-            if let Err(error) = activity_store.append(terminal) {
-                persistence_error.get_or_insert_with(|| error.to_string());
+            match commit_permission_transaction(
+                state_root,
+                decisions_path,
+                lifecycle_store,
+                activity_store,
+                &request,
+                &audit,
+                terminal,
+                "deterministic_deny",
+                PermissionDisposition::Decided,
+            ) {
+                Ok(decision_id) => Some(decision_id),
+                Err(error) => {
+                    transaction_error = Some(format!("permission transaction failed: {error}"));
+                    None
+                }
             }
-        }
-        if let Some(error) = &persistence_error {
-            write_diagnostic(&mut stderr, format!("deterministic deny audit: {error}"));
-        }
-        if let Err(error) = record_permission(
-            lifecycle_store,
-            &request.lifecycle,
-            PermissionDisposition::Decided,
-            &request.request_key,
-        ) {
-            write_diagnostic(&mut stderr, error);
+        } else {
+            transaction_error.get_or_insert_with(|| {
+                "permission transaction unavailable for deterministic deny".into()
+            });
+            None
+        };
+        if let Some(error) = &transaction_error {
+            let mut diagnostic = format!("deterministic deny audit: {error}");
+            if let Some(reproof_error) = reproof_error {
+                diagnostic.push_str(&format!("; Codex resume evidence: {reproof_error}"));
+            }
+            write_diagnostic(&mut stderr, diagnostic);
+            if let Err(error) = lifecycle_store.ensure_permission_decision(
+                &request.lifecycle,
+                &request.request_key,
+                coding_brain_core::lifecycle::PermissionDecision::NeedsInput,
+            ) {
+                write_diagnostic(
+                    &mut stderr,
+                    format!("could not persist deny state: {error}"),
+                );
+            }
         }
         let delivery = match write_response(&mut stdout, &serialized) {
             Ok(()) => ActivityState::Delivered,
@@ -821,6 +1046,18 @@ fn run_provider_with_gate_and_stores_and_safety<R, W, E, S, F>(
         None
     };
 
+    let bounded_reasoning = bounded_redacted_activity_text(&brain.reasoning);
+    let persisted_action = match terminal_state {
+        ActivityState::Allowed => "approve",
+        ActivityState::Denied => "deny",
+        ActivityState::Abstained => match brain.action.as_str() {
+            "approve" => "approve",
+            "deny" => "deny",
+            _ => "abstain",
+        },
+        ActivityState::Error => "abstain",
+        _ => unreachable!("permission transaction requires a terminal state"),
+    };
     let audit = HookDecisionAudit {
         provider: request.lifecycle.provider(),
         project: &request.project,
@@ -830,115 +1067,78 @@ fn run_provider_with_gate_and_stores_and_safety<R, W, E, S, F>(
             .ok()
             .and_then(|context| context.command.as_deref())
             .unwrap_or_default(),
-        brain_action: &brain.action,
+        brain_action: persisted_action,
         brain_confidence: brain.confidence,
-        brain_reasoning: &bounded_redacted_activity_text(&brain.reasoning),
+        brain_reasoning: &bounded_reasoning,
         brain_source: brain.source,
         brain_threshold: brain.threshold,
         session_id: request.lifecycle.session_id(),
         turn_id: request.lifecycle.turn_id().unwrap_or_default(),
     };
-    let decision_id = match append_hook_proposal(&audit) {
-        Ok(decision_id) => decision_id,
-        Err(error) => {
-            write_diagnostic(
-                &mut stderr,
-                format!("could not persist decision proposal: {error}"),
-            );
-            needs_input(&mut stderr);
-            if provider == AgentProvider::Antigravity {
-                write_failsafe_ask(&mut stdout, &mut stderr);
-            }
-            return;
-        }
-    };
     let mut terminal = activity_context.as_ref().unwrap().event(terminal_state);
     terminal.confidence = Some(brain.confidence);
     terminal.threshold = brain.threshold;
-    terminal.reasoning = Some(bounded_redacted_activity_text(&brain.reasoning));
-    terminal.decision_id = Some(decision_id.clone());
-    if behavior != Some(PermissionBehavior::Allow)
-        && let Err(error) = activity_store.unwrap().append(terminal.clone())
-    {
-        write_diagnostic(
-            &mut stderr,
-            format!("could not persist terminal activity: {error}"),
-        );
-        needs_input(&mut stderr);
-        if provider == AgentProvider::Antigravity {
-            write_failsafe_ask(&mut stdout, &mut stderr);
+    terminal.reasoning = Some(bounded_reasoning.clone());
+    let disposition = if behavior.is_some() {
+        PermissionDisposition::Decided
+    } else {
+        PermissionDisposition::NeedsInput
+    };
+    let transaction_result = match activity_store {
+        Some(activity_store) => commit_permission_transaction(
+            &transaction_paths.0,
+            &transaction_paths.1,
+            lifecycle_store,
+            activity_store,
+            &request,
+            &audit,
+            terminal,
+            "hook_proposal",
+            disposition,
+        )
+        .map_err(|error| format!("permission transaction failed: {error}")),
+        None => Err("permission transaction unavailable: activity store unavailable".into()),
+    };
+    let decision_id = match transaction_result {
+        Ok(decision_id) => Some(decision_id),
+        Err(mut error) => {
+            if behavior == Some(PermissionBehavior::Allow)
+                && let Some(reproof_error) = reproof_error
+            {
+                error.push_str(&format!("; Codex resume evidence: {reproof_error}"));
+            }
+            write_diagnostic(&mut stderr, &error);
+            if behavior == Some(PermissionBehavior::Deny) {
+                if let Err(lifecycle_error) = lifecycle_store.ensure_permission_decision(
+                    &request.lifecycle,
+                    &request.request_key,
+                    coding_brain_core::lifecycle::PermissionDecision::NeedsInput,
+                ) {
+                    write_diagnostic(
+                        &mut stderr,
+                        format!("could not persist deny state: {lifecycle_error}"),
+                    );
+                }
+                None
+            } else {
+                needs_input(&mut stderr);
+                if provider == AgentProvider::Antigravity {
+                    write_failsafe_ask(&mut stdout, &mut stderr);
+                }
+                return;
+            }
         }
-        return;
-    }
+    };
     let Some(serialized) = serialized else {
         let _ = activity_store.unwrap().compact_if_needed();
         if brain.source == "error" {
             write_diagnostic(&mut stderr, &brain.reasoning);
         }
-        needs_input(&mut stderr);
         if provider == AgentProvider::Antigravity {
             write_failsafe_ask(&mut stdout, &mut stderr);
         }
         return;
     };
-    if behavior == Some(PermissionBehavior::Allow) {
-        if let Err(error) = record_permission(
-            lifecycle_store,
-            &request.lifecycle,
-            PermissionDisposition::Decided,
-            &request.request_key,
-        ) {
-            let mut message = format!("could not persist executable permission state: {error}");
-            if let Some(error) = reproof_error {
-                message.push_str(&format!("; Codex resume evidence: {error}"));
-            }
-            write_diagnostic(&mut stderr, &message);
-            if let (Ok(context), Some(activity_store)) = (&activity_context, activity_store) {
-                let mut event = context.event(ActivityState::Error);
-                event.decision_id = Some(decision_id);
-                event.reasoning = Some(bounded_redacted_activity_text(&message));
-                if let Err(error) = activity_store.append(event) {
-                    write_diagnostic(
-                        &mut stderr,
-                        format!("could not persist permission failure activity: {error}"),
-                    );
-                }
-                let _ = activity_store.compact_if_needed();
-            }
-            if provider == AgentProvider::Antigravity {
-                write_failsafe_ask(&mut stdout, &mut stderr);
-            }
-            return;
-        }
-        if let Err(error) = activity_store.unwrap().append(terminal) {
-            write_diagnostic(
-                &mut stderr,
-                format!("could not persist terminal activity: {error}"),
-            );
-            if let Err(error) = record_permission(
-                lifecycle_store,
-                &request.lifecycle,
-                PermissionDisposition::NeedsInput,
-                &request.request_key,
-            ) {
-                write_diagnostic(
-                    &mut stderr,
-                    format!("could not compensate executable permission state: {error}"),
-                );
-            }
-            if provider == AgentProvider::Antigravity {
-                write_failsafe_ask(&mut stdout, &mut stderr);
-            }
-            return;
-        }
-    } else if let Err(error) = record_permission(
-        lifecycle_store,
-        &request.lifecycle,
-        PermissionDisposition::Decided,
-        &request.request_key,
-    ) {
-        write_diagnostic(&mut stderr, error);
-    }
     let (delivery, failure) = match write_response(&mut stdout, &serialized) {
         Ok(()) => (ActivityState::Delivered, None),
         Err(error) => {
@@ -948,7 +1148,7 @@ fn run_provider_with_gate_and_stores_and_safety<R, W, E, S, F>(
         }
     };
     let mut event = activity_context.as_ref().unwrap().event(delivery);
-    event.decision_id = Some(decision_id);
+    event.decision_id = decision_id;
     event.reasoning = failure;
     if let Err(error) = activity_store.unwrap().append(event) {
         write_diagnostic(
@@ -1088,7 +1288,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::brain::activity::{ActivityStore, LockContentionProbe, ReadParseGate};
+    use crate::brain::activity::{ActivityStore, ReadParseGate};
     use crate::brain::client::BrainSuggestion;
     use crate::brain::decisions::decisions_dir;
     use crate::config::BrainConfig;
@@ -1163,6 +1363,45 @@ mod tests {
         // SAFETY: every caller holds HOME_ENV_LOCK.
         unsafe { std::env::set_var("HOME", path) };
         RestoreHome(original)
+    }
+
+    struct RestorePathEnvironment {
+        home: Option<OsString>,
+        config: Option<OsString>,
+        state: Option<OsString>,
+    }
+
+    impl Drop for RestorePathEnvironment {
+        fn drop(&mut self) {
+            // SAFETY: every test that changes these variables holds HOME_ENV_LOCK.
+            unsafe {
+                for (name, value) in [
+                    ("HOME", self.home.take()),
+                    ("XDG_CONFIG_HOME", self.config.take()),
+                    ("XDG_STATE_HOME", self.state.take()),
+                ] {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_test_path_environment(path: &Path) -> RestorePathEnvironment {
+        let restore = RestorePathEnvironment {
+            home: std::env::var_os("HOME"),
+            config: std::env::var_os("XDG_CONFIG_HOME"),
+            state: std::env::var_os("XDG_STATE_HOME"),
+        };
+        // SAFETY: every caller holds HOME_ENV_LOCK.
+        unsafe {
+            std::env::set_var("HOME", path);
+            std::env::set_var("XDG_CONFIG_HOME", path.join(".config"));
+            std::env::set_var("XDG_STATE_HOME", path.join(".local/state"));
+        }
+        restore
     }
 
     fn payload() -> String {
@@ -1440,20 +1679,7 @@ mod tests {
                 .unwrap()
                 .contains("lifecycle")
         );
-        assert_eq!(
-            blocked_activity
-                .read()
-                .unwrap()
-                .events()
-                .iter()
-                .map(|event| event.state)
-                .collect::<Vec<_>>(),
-            [
-                ActivityState::Observed,
-                ActivityState::Evaluating,
-                ActivityState::Error,
-            ]
-        );
+        assert!(blocked_activity.read().unwrap().events().is_empty());
     }
 
     #[test]
@@ -2556,10 +2782,7 @@ mod tests {
                 .unwrap()
                 .contains("activity store lock timed out")
         );
-        assert_eq!(
-            projected_status(&lifecycle),
-            Some(ProjectedStatus::NeedsInput)
-        );
+        assert!(!lifecycle.snapshot_path().exists());
         assert!(!activity_path.exists());
         FileExt::unlock(&lock).unwrap();
     }
@@ -2575,9 +2798,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let lifecycle = LifecycleStore::at(temp.path().join("lifecycle"));
         let activity_path = temp.path().join("activity.jsonl");
-        let probe = Arc::new(LockContentionProbe::default());
-        let activity =
-            ActivityStore::at(&activity_path).with_lock_contention_probe(Arc::clone(&probe));
+        let activity = ActivityStore::at(&activity_path);
         let lock = OpenOptions::new()
             .create(true)
             .read(true)
@@ -2611,8 +2832,7 @@ mod tests {
             result_tx.send((stdout, stderr)).unwrap();
         });
 
-        assert!(probe.wait_until_contended(Duration::from_secs(1)));
-        assert!(result_rx.recv_timeout(Duration::from_millis(200)).is_err());
+        assert!(result_rx.recv_timeout(Duration::from_millis(150)).is_err());
         FileExt::unlock(&lock).unwrap();
         let (stdout, stderr) = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         worker.join().unwrap();
@@ -2690,33 +2910,15 @@ mod tests {
             .unwrap();
         reader_thread.join().unwrap();
 
-        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&stdout).unwrap()["hookSpecificOutput"]["decision"]
-                ["behavior"],
-            "allow"
-        );
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8_lossy(&stderr).contains("byte budget"));
         let events = activity.read().unwrap().events().to_vec();
         let permission_activity_ids = events
             .iter()
             .filter(|event| !event.activity_id.starts_with("scale-"))
             .map(|event| event.activity_id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(permission_activity_ids.len(), 1);
-        let activity_id = permission_activity_ids.into_iter().next().unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.activity_id == activity_id)
-                .map(|event| event.state)
-                .collect::<Vec<_>>(),
-            [
-                ActivityState::Observed,
-                ActivityState::Evaluating,
-                ActivityState::Allowed,
-                ActivityState::Delivered,
-            ]
-        );
+        assert!(permission_activity_ids.is_empty());
     }
 
     #[test]
@@ -2965,6 +3167,106 @@ mod tests {
     }
 
     #[test]
+    fn model_terminal_failure_retains_recoverable_transaction() {
+        let state_root = decisions_dir().parent().unwrap().to_path_buf();
+        let lifecycle = LifecycleStore::at(&state_root);
+        let activity_path = state_root.join("activity.jsonl");
+        let saved_activity_path = state_root.join("activity-before-failure.jsonl");
+        let activity = ActivityStore::at(&activity_path);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_with_gate_and_stores(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            |_, _| {
+                std::fs::rename(&activity_path, &saved_activity_path).unwrap();
+                std::fs::create_dir(&activity_path).unwrap();
+                Err("inference timed out".into())
+            },
+        );
+
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("permission transaction"),
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        let transaction_dir = state_root.join("brain/permission-transactions");
+        assert_eq!(std::fs::read_dir(&transaction_dir).unwrap().count(), 1);
+
+        std::fs::remove_dir(&activity_path).unwrap();
+        std::fs::rename(&saved_activity_path, &activity_path).unwrap();
+        super::super::permission_transaction::recover_pending(
+            &state_root,
+            super::super::permission_transaction::RecoveryLimits::default(),
+        )
+        .unwrap();
+
+        let events = activity.read().unwrap().events().to_vec();
+        assert_eq!(
+            events.iter().map(|event| event.state).collect::<Vec<_>>(),
+            [
+                ActivityState::Observed,
+                ActivityState::Evaluating,
+                ActivityState::Error,
+            ]
+        );
+    }
+
+    #[test]
+    fn recovered_inference_error_retains_bounded_query_diagnostic() {
+        let state_root = decisions_dir().parent().unwrap().to_path_buf();
+        let lifecycle = LifecycleStore::at(&state_root);
+        let activity_path = state_root.join("activity.jsonl");
+        let saved_activity_path = state_root.join("activity-before-failure.jsonl");
+        let activity = ActivityStore::at(&activity_path);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_with_gate_and_stores(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            |_, _| {
+                std::fs::rename(&activity_path, &saved_activity_path).unwrap();
+                std::fs::create_dir(&activity_path).unwrap();
+                Err("endpoint unavailable".into())
+            },
+        );
+
+        std::fs::remove_dir(&activity_path).unwrap();
+        std::fs::rename(&saved_activity_path, &activity_path).unwrap();
+        super::super::permission_transaction::recover_pending(
+            &state_root,
+            super::super::permission_transaction::RecoveryLimits::default(),
+        )
+        .unwrap();
+
+        let terminal = activity
+            .read()
+            .unwrap()
+            .events()
+            .iter()
+            .find(|event| event.state == ActivityState::Error)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            terminal.reasoning.as_deref(),
+            Some("Brain query failed: endpoint unavailable")
+        );
+    }
+
+    #[test]
     fn malformed_payload_leaves_stdout_empty() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -2980,7 +3282,12 @@ mod tests {
     }
 
     #[test]
-    fn persistence_failure_leaves_stdout_empty() {
+    fn invalid_request_lock_storage_leaves_stdout_empty_before_inference() {
+        let _environment_guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore = set_test_path_environment(home.path());
         let brain_dir = decisions_dir();
         std::fs::create_dir_all(brain_dir.parent().unwrap()).unwrap();
         std::fs::write(&brain_dir, "occupied").unwrap();
@@ -2992,26 +3299,331 @@ mod tests {
             &mut stdout,
             &mut stderr,
             Some(&enabled_config()),
+            |_, _| panic!("invalid request lock storage must block inference"),
+        );
+
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr).unwrap().contains("request lock"));
+    }
+
+    #[test]
+    fn model_allow_journal_creation_failure_leaves_stdout_empty() {
+        let _environment_guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore = set_test_path_environment(home.path());
+        let state_root = decisions_dir().parent().unwrap().to_path_buf();
+        let decisions_path = state_root.join("brain/decisions.jsonl");
+        let lifecycle = LifecycleStore::at(&state_root);
+        let activity_path = state_root.join("activity.jsonl");
+        let activity = ActivityStore::at(&activity_path);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_with_gate_and_stores(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            |_, _| {
+                std::fs::create_dir_all(&decisions_path).unwrap();
+                Ok(suggestion(RuleAction::Approve, 0.9))
+            },
+        );
+
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8_lossy(&stderr).contains("permission transaction"));
+    }
+
+    #[test]
+    fn antigravity_model_allow_journal_failure_returns_ask() {
+        let _environment_guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore = set_test_path_environment(home.path());
+        let state_root = decisions_dir().parent().unwrap().to_path_buf();
+        let decisions_path = state_root.join("brain/decisions.jsonl");
+        let lifecycle = LifecycleStore::at(&state_root);
+        let activity = ActivityStore::at(state_root.join("activity.jsonl"));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_provider_with_gate_and_stores(
+            Cursor::new(permission_payload_for_provider(
+                AgentProvider::Antigravity,
+                false,
+            )),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            AgentProvider::Antigravity,
+            Some("PreToolUse"),
+            |_, _| {
+                std::fs::create_dir_all(&decisions_path).unwrap();
+                Ok(suggestion(RuleAction::Approve, 0.9))
+            },
+        );
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stdout).unwrap()["decision"],
+            "ask"
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("permission transaction"));
+    }
+
+    #[test]
+    fn model_allow_destination_conflict_preserves_native_confirmation() {
+        let state_root = decisions_dir().parent().unwrap().to_path_buf();
+        let lifecycle = LifecycleStore::at(&state_root);
+        let activity = ActivityStore::at(state_root.join("activity.jsonl"));
+        let request = parse_request(&payload()).unwrap();
+        lifecycle
+            .ensure_permission_disposition(
+                &request.lifecycle,
+                &request.request_key,
+                PermissionDisposition::NeedsInput,
+            )
+            .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_with_gate_and_stores(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
             |_, _| Ok(suggestion(RuleAction::Approve, 0.9)),
         );
 
         assert!(stdout.is_empty());
-        assert!(String::from_utf8(stderr).unwrap().contains("persist"));
+        assert!(String::from_utf8_lossy(&stderr).contains("permission transaction"));
+        assert_eq!(
+            projected_status(&lifecycle),
+            Some(ProjectedStatus::NeedsInput)
+        );
+    }
+
+    #[test]
+    fn invalid_prior_transaction_blocks_inference_for_every_provider() {
+        let _environment_guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore = set_test_path_environment(home.path());
+        let state_root = decisions_dir().parent().unwrap().to_path_buf();
+        let transaction_dir = state_root.join("brain/permission-transactions");
+        std::fs::create_dir_all(&transaction_dir).unwrap();
+        let raw = "raw journal content must not leak";
+        std::fs::write(transaction_dir.join("unexpected.json"), raw).unwrap();
+        let lifecycle = LifecycleStore::at(&state_root);
+        let activity = ActivityStore::at(state_root.join("activity.jsonl"));
+        let calls = AtomicUsize::new(0);
+
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            run_provider_with_gate_and_stores(
+                Cursor::new(permission_payload_for_provider(provider, false)),
+                &mut stdout,
+                &mut stderr,
+                Some(&enabled_config()),
+                BrainGateMode::Auto,
+                &lifecycle,
+                Some(&activity),
+                provider,
+                (provider == AgentProvider::Antigravity).then_some("PreToolUse"),
+                |_, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("invalid prior transaction must block inference")
+                },
+            );
+
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&stdout).unwrap()["decision"],
+                    "ask"
+                );
+            } else {
+                assert!(stdout.is_empty());
+            }
+            let diagnostic = String::from_utf8(stderr).unwrap();
+            assert!(diagnostic.contains("permission transaction preflight"));
+            assert!(!diagnostic.contains(raw));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn busy_request_guard_blocks_every_provider_without_mutation_or_inference() {
+        let _environment_guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore = set_test_path_environment(home.path());
+        let (state_root, _) = permission_transaction_paths().unwrap();
+        let lifecycle = LifecycleStore::at(&state_root);
+        let activity_path = state_root.join("activity.jsonl");
+        let activity = ActivityStore::at(&activity_path);
+
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let event = (provider == AgentProvider::Antigravity).then_some("PreToolUse");
+            let payload = permission_payload_for_provider(provider, false);
+            let request = parse_permission(provider, event, &payload).unwrap();
+            let guard = PermissionRequestLockStore::at(&state_root)
+                .try_acquire(&request.lifecycle, &request.request_key)
+                .unwrap()
+                .unwrap();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            run_provider_with_gate_and_stores(
+                Cursor::new(payload),
+                &mut stdout,
+                &mut stderr,
+                Some(&enabled_config()),
+                BrainGateMode::Auto,
+                &lifecycle,
+                Some(&activity),
+                provider,
+                event,
+                |_, _| panic!("busy request guard must block inference"),
+            );
+
+            drop(guard);
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&stdout).unwrap()["decision"],
+                    "ask"
+                );
+            } else {
+                assert!(stdout.is_empty());
+            }
+            assert!(String::from_utf8_lossy(&stderr).contains("already active"));
+            assert!(!lifecycle.snapshot_path().exists());
+            assert!(!activity_path.exists());
+            assert!(!state_root.join("brain/permission-transactions").exists());
+        }
+    }
+
+    #[test]
+    fn provider_policy_deny_survives_journal_failure() {
+        let _environment_guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore = set_test_path_environment(home.path());
+        let state_root = decisions_dir().parent().unwrap().to_path_buf();
+        let decisions_path = state_root.join("brain/decisions.jsonl");
+        let lifecycle = LifecycleStore::at(&state_root);
+        let activity = ActivityStore::at(state_root.join("activity.jsonl"));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_provider_with_gate_and_stores_and_safety(
+            Cursor::new(permission_payload_for_provider(AgentProvider::Claude, true)),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            AgentProvider::Claude,
+            None,
+            |_| {
+                std::fs::create_dir_all(&decisions_path).unwrap();
+                super::super::safety::SafetyEvaluation::NoDeterministicDecision
+            },
+            |_, _| panic!("provider deny must not infer"),
+        );
+
+        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert!(String::from_utf8_lossy(&stderr).contains("permission transaction"));
+    }
+
+    #[test]
+    fn model_deny_survives_journal_failure_with_diagnostic() {
+        let _environment_guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore = set_test_path_environment(home.path());
+        let state_root = decisions_dir().parent().unwrap().to_path_buf();
+        let decisions_path = state_root.join("brain/decisions.jsonl");
+        let lifecycle = LifecycleStore::at(&state_root);
+        let activity = ActivityStore::at(state_root.join("activity.jsonl"));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_with_gate_and_stores(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            |_, _| {
+                std::fs::create_dir_all(&decisions_path).unwrap();
+                Ok(suggestion(RuleAction::Deny, 0.9))
+            },
+        );
+
+        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert!(String::from_utf8_lossy(&stderr).contains("permission transaction"));
     }
 
     #[test]
     fn deterministic_deny_survives_audit_failure() {
-        let brain_dir = decisions_dir();
-        std::fs::create_dir_all(brain_dir.parent().unwrap()).unwrap();
-        std::fs::write(&brain_dir, "occupied").unwrap();
+        let _environment_guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _restore = set_test_path_environment(home.path());
+        let state_root = decisions_dir().parent().unwrap().to_path_buf();
+        let decisions_path = state_root.join("brain/decisions.jsonl");
+        let lifecycle = LifecycleStore::at(&state_root);
+        let activity = ActivityStore::at(state_root.join("activity.jsonl"));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        run_test(
+        run_provider_with_gate_and_stores_and_safety(
             Cursor::new(payload_with_command("rm -rf /")),
             &mut stdout,
             &mut stderr,
             Some(&enabled_config()),
+            BrainGateMode::Auto,
+            &lifecycle,
+            Some(&activity),
+            AgentProvider::Codex,
+            None,
+            |_| {
+                std::fs::create_dir_all(&decisions_path).unwrap();
+                super::super::safety::SafetyEvaluation::Deny(SafetyDeny {
+                    rule_id: "test-deny",
+                    reason: "deterministic test deny".into(),
+                })
+            },
             |_, _| panic!("deterministic deny must not infer"),
         );
 
@@ -3305,6 +3917,7 @@ mod tests {
                 .iter()
                 .any(|event| event.state == ActivityState::Error)
         );
+        let replay_events_before = events.clone();
 
         let mut replay_stdout = Vec::new();
         let mut replay_stderr = Vec::new();
@@ -3322,29 +3935,13 @@ mod tests {
         assert!(
             String::from_utf8(replay_stderr)
                 .unwrap()
-                .contains("Duplicate")
+                .contains("duplicate")
         );
         let after_replay = lifecycle.read().unwrap().snapshot.unwrap();
         assert_eq!(after_replay.next_sequence, before_replay.next_sequence);
-        let replay_events = activity.read().unwrap().events().to_vec();
-        let replay_activity_ids = replay_events
-            .iter()
-            .filter(|event| event.state == ActivityState::Error)
-            .map(|event| event.activity_id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(replay_activity_ids.len(), 1);
-        let replay_activity_id = replay_activity_ids.into_iter().next().unwrap();
         assert_eq!(
-            replay_events
-                .iter()
-                .filter(|event| event.activity_id == replay_activity_id)
-                .map(|event| event.state)
-                .collect::<Vec<_>>(),
-            [
-                ActivityState::Observed,
-                ActivityState::Evaluating,
-                ActivityState::Error,
-            ]
+            activity.read().unwrap().events(),
+            replay_events_before.as_slice()
         );
     }
 
@@ -3361,9 +3958,21 @@ mod tests {
         let activity = ActivityStore::at(temp.path().join("activity.jsonl"))
             .with_lock_acquisition_counter(Arc::clone(&initial_lock_acquisitions));
         let config = enabled_config();
-        let payloads = (0..15)
-            .map(|index| payload_with_command(&format!("cargo info crate-{index}")))
-            .collect::<Vec<_>>();
+        let request_locks =
+            PermissionRequestLockStore::at(&permission_transaction_paths().unwrap().0);
+        let mut shards = std::collections::BTreeSet::new();
+        let mut payloads = Vec::new();
+        for index in 0..10_000 {
+            let payload = payload_with_command(&format!("cargo info crate-{index}"));
+            let request = parse_request(&payload).unwrap();
+            if shards.insert(request_locks.shard_for(&request.lifecycle, &request.request_key)) {
+                payloads.push(payload);
+                if payloads.len() == 15 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(payloads.len(), 15);
         let start = Arc::new(Barrier::new(payloads.len()));
         let (ready_tx, ready_rx) = mpsc::channel();
 

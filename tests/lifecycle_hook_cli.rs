@@ -1391,6 +1391,68 @@ fn permission_allow_is_suppressed_across_lifecycle_failure() {
 
 #[test]
 #[cfg(unix)]
+fn corrupt_and_future_lifecycle_block_permission_inference_without_rewrite() {
+    for original in [
+        b"not-json".as_slice(),
+        br#"{"schema_version":5}"#.as_slice(),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        write_brain_config(home.path());
+        let inference_marker = home.path().join("inference-called");
+        let curl = home.path().join("bin/curl");
+        fs::write(
+            &curl,
+            format!(
+                "#!/bin/sh\nprintf called > '{}'\nexit 99\n",
+                inference_marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+        let lifecycle = home
+            .path()
+            .join(".local/state/coding-brain/hooks/lifecycle.json");
+        fs::create_dir_all(lifecycle.parent().unwrap()).unwrap();
+        fs::write(&lifecycle, original).unwrap();
+        let request = serde_json::to_vec(&serde_json::json!({
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "cwd": home.path(),
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"}
+        }))
+        .unwrap();
+
+        let output = run_permission_hook(home.path(), &request);
+
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("admission failed"));
+        assert!(!inference_marker.exists());
+        assert_eq!(fs::read(&lifecycle).unwrap(), original);
+        assert!(
+            !home
+                .path()
+                .join(".local/state/coding-brain/activity.jsonl")
+                .exists()
+        );
+        assert!(
+            fs::read_dir(lifecycle.parent().unwrap())
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("corrupt-")
+                })
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
 fn child_permission_without_topology_suppresses_model_allow() {
     let home = tempfile::tempdir().unwrap();
     write_brain_config(home.path());
@@ -1435,17 +1497,30 @@ fn deterministic_child_deny_survives_missing_topology() {
         "deny"
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("allow"));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("UnprovenSubagent"));
-    let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
     assert!(
-        !lifecycle
-            .read()
-            .unwrap()
-            .snapshot
-            .unwrap()
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Codex resume evidence: resume transcript record is invalid")
+    );
+    let activity = coding_brain::brain::activity::ActivityStore::at(
+        home.path().join(".local/state/coding-brain/activity.jsonl"),
+    )
+    .read()
+    .unwrap();
+    assert!(activity.events().iter().any(|event| {
+        event.state == coding_brain_core::brain_activity::ActivityState::Delivered
+    }));
+    assert!(
+        !activity.events().iter().any(|event| {
+            event.state == coding_brain_core::brain_activity::ActivityState::Denied
+        })
+    );
+    let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
+    let snapshot = lifecycle.read().unwrap().snapshot;
+    assert!(snapshot.as_ref().is_none_or(|snapshot| {
+        !snapshot
             .sessions
             .contains_key(&AgentSessionKey::native(AgentProvider::Codex, "child-a").storage_key())
-    );
+    }));
 }
 
 #[test]

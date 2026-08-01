@@ -22,6 +22,8 @@ use coding_brain_core::durable_file::durable_replace;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+use super::decisions::EnsureRecord;
+
 const LOCK_RETRY: Duration = Duration::from_millis(5);
 const MAX_DIAGNOSTIC_OFFSETS: usize = 100;
 const MAX_RETAINED_INTERRUPTED_LIFECYCLES: usize = 256;
@@ -31,6 +33,29 @@ pub struct ActivityLimits {
     pub lock_timeout_ms: u64,
     pub compact_at_bytes: u64,
     pub retained_lifecycles: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct LiveEvidenceBudget {
+    remaining: usize,
+}
+
+impl LiveEvidenceBudget {
+    pub(crate) fn new(maximum: usize) -> Self {
+        Self { remaining: maximum }
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), ActivityStoreError> {
+        let Some(remaining) = self.remaining.checked_sub(bytes) else {
+            return Err(ActivityStoreError::OverBudget);
+        };
+        self.remaining = remaining;
+        Ok(())
+    }
 }
 
 impl Default for ActivityLimits {
@@ -119,6 +144,7 @@ pub enum ActivityStoreError {
     UnsupportedSchema(u32),
     InvalidEvent,
     EventTooLarge,
+    OverBudget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +167,7 @@ impl fmt::Display for ActivityStoreError {
             }
             Self::InvalidEvent => formatter.write_str("activity event payload is inconsistent"),
             Self::EventTooLarge => formatter.write_str("activity event exceeds its size limit"),
+            Self::OverBudget => formatter.write_str("live evidence exceeds its byte budget"),
         }
     }
 }
@@ -309,6 +336,112 @@ impl ActivityStore {
             return Err(ActivityStoreError::UnsupportedSchema(event.schema_version));
         }
         self.append_batch(&[event])
+    }
+
+    pub(crate) fn ensure_terminal(
+        &self,
+        event: ActivityEvent,
+    ) -> Result<EnsureRecord, ActivityStoreError> {
+        if event.schema_version != ACTIVITY_SCHEMA_VERSION {
+            return Err(ActivityStoreError::UnsupportedSchema(event.schema_version));
+        }
+        let event = event.normalized();
+        if !event.state.is_terminal() || !event.has_consistent_payload() {
+            return Err(ActivityStoreError::InvalidEvent);
+        }
+        let expected = serde_json::to_value(&event)?;
+        let mut serialized = serde_json::to_vec(&event)?;
+        if serialized.len() > MAX_ACTIVITY_EVENT_BYTES {
+            return Err(ActivityStoreError::EventTooLarge);
+        }
+        serialized.push(b'\n');
+
+        let lock = self.open_lock()?;
+        let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Exclusive)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)?;
+        set_file_mode(&file)?;
+        if let Some(discarded_bytes) = repair_tail(&mut file)? {
+            let row = DiagnosticRow {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                diagnostic: StoreDiagnostic::TruncatedTail { discarded_bytes },
+            };
+            let mut diagnostic = serde_json::to_vec(&row)?;
+            diagnostic.push(b'\n');
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(&diagnostic)?;
+        }
+        if let Some(existing) = self.read_unlocked()?.events().iter().find(|candidate| {
+            candidate.activity_id == event.activity_id && candidate.state.is_terminal()
+        }) {
+            return if serde_json::to_value(existing)? == expected {
+                Ok(EnsureRecord::Present)
+            } else {
+                Err(ActivityStoreError::InvalidEvent)
+            };
+        }
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&serialized)?;
+        file.flush()?;
+        file.sync_data()?;
+        Ok(EnsureRecord::Inserted)
+    }
+
+    pub(crate) fn ensure_terminal_bounded(
+        &self,
+        event: ActivityEvent,
+        budget: &mut LiveEvidenceBudget,
+    ) -> Result<EnsureRecord, ActivityStoreError> {
+        if event.schema_version != ACTIVITY_SCHEMA_VERSION {
+            return Err(ActivityStoreError::UnsupportedSchema(event.schema_version));
+        }
+        let event = event.normalized();
+        if !event.state.is_terminal() || !event.has_consistent_payload() {
+            return Err(ActivityStoreError::InvalidEvent);
+        }
+        let expected = serde_json::to_value(&event)?;
+        let mut serialized = serde_json::to_vec(&event)?;
+        if serialized.len() > MAX_ACTIVITY_EVENT_BYTES {
+            return Err(ActivityStoreError::EventTooLarge);
+        }
+        serialized.push(b'\n');
+
+        let lock = self.open_lock()?;
+        let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Exclusive)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)?;
+        set_file_mode(&file)?;
+        let log = parse_activity_log(&self.read_bytes_bounded_unlocked(budget)?)?;
+        let diagnostics = log.diagnostics();
+        if diagnostics.malformed_rows > 0
+            || diagnostics.duplicate_terminal_states > 0
+            || diagnostics.truncated_tails > 0
+            || diagnostics.discarded_tail_bytes > 0
+        {
+            return Err(ActivityStoreError::InvalidEvent);
+        }
+        if let Some(existing) = log.events().iter().find(|candidate| {
+            candidate.activity_id == event.activity_id && candidate.state.is_terminal()
+        }) {
+            return if serde_json::to_value(existing)? == expected {
+                Ok(EnsureRecord::Present)
+            } else {
+                Err(ActivityStoreError::InvalidEvent)
+            };
+        }
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&serialized)?;
+        file.flush()?;
+        file.sync_data()?;
+        Ok(EnsureRecord::Inserted)
     }
 
     pub(crate) fn append_batch(&self, events: &[ActivityEvent]) -> Result<(), ActivityStoreError> {
@@ -531,6 +664,18 @@ impl ActivityStore {
         parse_activity_log(&contents)
     }
 
+    pub(crate) fn read_bounded(
+        &self,
+        budget: &mut LiveEvidenceBudget,
+    ) -> Result<ActivityLog, ActivityStoreError> {
+        let contents = {
+            let lock = self.open_lock()?;
+            let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Shared)?;
+            self.read_bytes_bounded_unlocked(budget)?
+        };
+        parse_activity_log(&contents)
+    }
+
     pub fn snapshot(&self, limits: SnapshotLimits) -> Result<ActivitySnapshot, ActivityStoreError> {
         let log = self.read()?;
         Ok(self.project_snapshot(&log, limits))
@@ -696,6 +841,41 @@ impl ActivityStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        Ok(contents)
+    }
+
+    fn read_bytes_bounded_unlocked(
+        &self,
+        budget: &mut LiveEvidenceBudget,
+    ) -> Result<Vec<u8>, ActivityStoreError> {
+        self.read_bytes_bounded_unlocked_with_hook(budget, || {})
+    }
+
+    fn read_bytes_bounded_unlocked_with_hook(
+        &self,
+        budget: &mut LiveEvidenceBudget,
+        after_metadata: impl FnOnce(),
+    ) -> Result<Vec<u8>, ActivityStoreError> {
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        if usize::try_from(file.metadata()?.len())
+            .map_or(true, |length| length > budget.remaining())
+        {
+            return Err(ActivityStoreError::OverBudget);
+        }
+        after_metadata();
+        let limit = u64::try_from(budget.remaining()).unwrap_or(u64::MAX);
+        let mut contents = Vec::new();
+        Read::by_ref(&mut file)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut contents)?;
+        if contents.len() > budget.remaining() {
+            return Err(ActivityStoreError::OverBudget);
+        }
+        budget.charge(contents.len())?;
         Ok(contents)
     }
 }
@@ -879,6 +1059,7 @@ fn project_snapshot(log: &ActivityLog, limits: SnapshotLimits, now_ms: u64) -> A
                     | ActivityState::Abstained
                     | ActivityState::Error
                     | ActivityState::Interrupted
+                    | ActivityState::Incomplete
             ) || matches!(
                 item.delivery,
                 DeliveryState::Unknown | DeliveryState::Failed
@@ -1000,7 +1181,7 @@ fn project_activity(events: &[&ActivityEvent], stale_after_ms: u64, now_ms: u64)
         && matches!(state, ActivityState::Observed | ActivityState::Evaluating)
         && now_ms.saturating_sub(latest_at) > stale_after_ms
     {
-        state = ActivityState::Interrupted;
+        state = ActivityState::Incomplete;
     }
     if matches!(state, ActivityState::Allowed | ActivityState::Denied)
         && delivery == DeliveryState::NotApplicable
@@ -1064,7 +1245,7 @@ fn activity_rank(item: &ActivityItem) -> u8 {
         match item.state {
             ActivityState::Denied => 4,
             ActivityState::Error => 3,
-            ActivityState::Interrupted => 2,
+            ActivityState::Interrupted | ActivityState::Incomplete => 2,
             ActivityState::Abstained => 1,
             _ => 0,
         }
@@ -1215,6 +1396,69 @@ mod tests {
 
     fn event(activity_id: &str, state: ActivityState) -> ActivityEvent {
         event_at(activity_id, state, 100)
+    }
+
+    #[test]
+    fn ensure_terminal_ignores_initial_rows_but_rejects_terminal_conflict() {
+        let (_root, store) = fixture_store();
+        store.append(event("a1", ActivityState::Observed)).unwrap();
+        store
+            .append(event("a1", ActivityState::Evaluating))
+            .unwrap();
+        let mut allowed = event("a1", ActivityState::Allowed);
+        allowed.decision_id = Some("decision-1".into());
+
+        assert_eq!(
+            store.ensure_terminal(allowed.clone()).unwrap(),
+            EnsureRecord::Inserted
+        );
+        assert_eq!(
+            store.ensure_terminal(allowed).unwrap(),
+            EnsureRecord::Present
+        );
+
+        let mut denied = event("a1", ActivityState::Denied);
+        denied.decision_id = Some("decision-1".into());
+        assert!(store.ensure_terminal(denied).is_err());
+
+        let mut hinted = event("a2", ActivityState::Allowed);
+        hinted.session = Some(coding_brain_core::brain_activity::SessionTarget {
+            provider: coding_brain_core::provider::AgentProvider::Codex,
+            session_id: "session-1".into(),
+            provider_session_id: None,
+            turn_id: Some("turn-1".into()),
+            tool_use_id: None,
+            project_id: ProjectId::Temporary("project".into()),
+            cwd: PathBuf::from("/work/project"),
+            provider_hints: vec!["provider hint".into()],
+            provenance: coding_brain_core::brain_activity::SessionTargetProvenance::Structured,
+        });
+        assert_eq!(
+            store.ensure_terminal(hinted.clone()).unwrap(),
+            EnsureRecord::Inserted
+        );
+        assert_eq!(
+            store.ensure_terminal(hinted).unwrap(),
+            EnsureRecord::Present
+        );
+    }
+
+    #[test]
+    fn bounded_terminal_ensure_charges_shared_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ActivityStore::at(temp.path().join("activity.jsonl"));
+        let event = event_at("bounded", ActivityState::Allowed, 1_000);
+        store.ensure_terminal(event.clone()).unwrap();
+        let length = std::fs::metadata(temp.path().join("activity.jsonl"))
+            .unwrap()
+            .len() as usize;
+        let mut budget = LiveEvidenceBudget::new(length);
+
+        assert_eq!(
+            store.ensure_terminal_bounded(event, &mut budget).unwrap(),
+            EnsureRecord::Present
+        );
+        assert_eq!(budget.remaining(), 0);
     }
 
     fn realistically_sized_events() -> Vec<ActivityEvent> {
@@ -1904,7 +2148,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_evaluating_projects_as_interrupted_without_rewriting_source() {
+    fn stale_evaluating_projects_as_incomplete_without_rewriting_source() {
         let (root, store) = fixture_store();
         let store = store.with_clock(1_000);
         store
@@ -1919,7 +2163,7 @@ mod tests {
                 ..SnapshotLimits::default()
             })
             .unwrap();
-        assert_eq!(snapshot.attention[0].state, ActivityState::Interrupted);
+        assert_eq!(snapshot.attention[0].state, ActivityState::Incomplete);
         assert_eq!(store.read().unwrap().events().len(), 2);
         drop(root);
     }
@@ -2394,5 +2638,38 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn live_evidence_budget_is_shared_and_reader_enforced() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("activity.jsonl");
+        std::fs::write(&path, b"1234").unwrap();
+        let store = ActivityStore::at(&path);
+        let mut budget = LiveEvidenceBudget::new(4);
+        assert!(store.read_bounded(&mut budget).is_ok());
+        assert_eq!(budget.remaining(), 0);
+        std::fs::write(&path, b"12345").unwrap();
+        let mut budget = LiveEvidenceBudget::new(4);
+        assert!(matches!(
+            store.read_bounded(&mut budget),
+            Err(ActivityStoreError::OverBudget)
+        ));
+    }
+
+    #[test]
+    fn bounded_reader_rejects_growth_after_metadata_preflight() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("activity.jsonl");
+        std::fs::write(&path, b"1234").unwrap();
+        let store = ActivityStore::at(&path);
+        let mut budget = LiveEvidenceBudget::new(4);
+
+        assert!(matches!(
+            store.read_bytes_bounded_unlocked_with_hook(&mut budget, || {
+                std::fs::write(&path, b"12345").unwrap();
+            }),
+            Err(ActivityStoreError::OverBudget)
+        ));
     }
 }
