@@ -78,6 +78,15 @@ All notable changes to Coding Brain are documented here.
 - Lifecycle snapshots and activity-log compaction now use private,
   same-directory atomic replacements with durable file syncs and
   parent-directory sync on Unix, preventing partial JSON after a crash.
+- Permission decisions now use private recovery journals so a killed or
+  concurrent hook cannot publish a partial model decision as an approval.
+  Brain startup and `cbrain doctor` recover valid pending work; unresolved
+  evidence remains fail-closed, and Doctor names the fixed evidence source and
+  numeric limit when recovery exceeds a budget.
+- Live now shows stale permission evaluations as `INCOMPLETE` with
+  `permission evaluation timed out`. This is unresolved source evidence, not a
+  tool interruption, delivered response, or execution claim. Run
+  `cbrain doctor` to inspect recovery state.
 - New Recent activity no longer moves the selected Live row or its Evidence
   pane while the selected activity is still present.
 - Live corrections now target the selected Decision in either Needs Attention
@@ -145,11 +154,11 @@ All notable changes to Coding Brain are documented here.
   current Codex Bash executions when PermissionRequest omits `tool_use_id`.
   Opaque unified-exec responses produce a neutral Completed outcome, not a
   success result, and `cbrain doctor` advises when runtime or attribution
-  coverage remains zero. New activity rows and lifecycle snapshots use schema
-  v3 while older supported schemas remain readable; the upgrade performs no
-  backfill or destructive migration. Downgrading after v3 state is written is
-  unsupported, so back up
-  `~/.local/state/coding-brain/activity.jsonl` before upgrading if rollback
+  coverage remains zero. New activity rows use schema v3 and lifecycle
+  snapshots use schema v4 while older supported schemas remain readable; the
+  upgrade performs no backfill or destructive migration. Downgrading after
+  either schema is written is unsupported, so back up the complete
+  `$XDG_STATE_HOME/coding-brain/` state directory before upgrading if rollback
   matters.
 - **Breaking:** the crates.io package and internal Rust crates now use the
   `coding-brain` namespace. No `codexctl` compatibility package or executable

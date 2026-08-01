@@ -112,10 +112,13 @@ For a normal Git clone with a usable network origin, `cbrain init` is optional f
 | User state | `$XDG_STATE_HOME/coding-brain/` |
 | Lifecycle snapshot | `$XDG_STATE_HOME/coding-brain/hooks/lifecycle.json` |
 | Brain prompts | `$XDG_STATE_HOME/coding-brain/brain/prompts/` |
+| Permission transaction journals | `$XDG_STATE_HOME/coding-brain/brain/permission-transactions/` |
 | Project config | `.coding-brain.toml` |
 | Project identity | `.coding-brain/project.toml` |
 | Codex managed hooks | project `.codex/hooks.json` or user `~/.codex/hooks.json` |
 | Claude managed hooks | `~/.claude/settings.json` |
 | Antigravity managed hooks | `~/.gemini/config/hooks.json` |
+
+Permission transaction journals are private internal recovery state, not configuration or a supported hand-editing surface. On Unix, Coding Brain requires the directory to be mode `0700` and journal files to be mode `0600`, with ownership bound to the current effective user.
 
 If `XDG_STATE_HOME` is unset, Coding Brain uses `~/.local/state`. Removing `.coding-brain/project.toml` and rerunning init deliberately creates a new project identity; use that only when a fork should learn independently.
