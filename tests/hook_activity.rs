@@ -1824,7 +1824,19 @@ fn reopened_shell_safety_corpus_denies_before_model_inference_for_every_provider
         ("rm --rec --no-preserve-root /", "irreversible-root-delete"),
         ("exec -ca display rm -rf /", "irreversible-root-delete"),
         (
-            "/usr/bin/time --out log rm -rf /",
+            "busybox env sh -c 'rm --no-preserve-root -rf /'",
+            "irreversible-root-delete",
+        ),
+        (
+            "busybox time sh -c 'rm --no-preserve-root -rf /'",
+            "irreversible-root-delete",
+        ),
+        (
+            "toybox env sh -c 'rm --no-preserve-root -rf /'",
+            "irreversible-root-delete",
+        ),
+        (
+            "toybox time sh -c 'rm --no-preserve-root -rf /'",
             "irreversible-root-delete",
         ),
     ] {
@@ -2454,6 +2466,10 @@ fn real_shell_safety_indeterminate_corpus_preserves_native_confirmation_without_
         (
             "quoted parameter depth limit",
             format!("printf '%s' \"{nested}\""),
+        ),
+        (
+            "abbreviated GNU time option",
+            "/usr/bin/time --out log rm -rf /".to_string(),
         ),
     ];
 

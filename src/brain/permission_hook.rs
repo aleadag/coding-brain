@@ -2134,6 +2134,15 @@ mod tests {
     fn nested_shell_safety_precedes_inference_for_every_provider() {
         for (command, proven_deny) in [
             ("sh -c 'rm --no-preserve-root -rf /'", true),
+            ("busybox env sh -c 'rm --no-preserve-root -rf /'", true),
+            ("busybox time sh -c 'rm --no-preserve-root -rf /'", true),
+            ("toybox env sh -c 'rm --no-preserve-root -rf /'", true),
+            ("toybox time sh -c 'rm --no-preserve-root -rf /'", true),
+            ("busybox ls", false),
+            (
+                "busybox time --unknown sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
             ("time -- eval 'rm --no-preserve-root -rf /'", true),
             ("time -p -- ! sh -c 'rm --no-preserve-root -rf /'", true),
             ("eval -- 'rm --no-preserve-root -rf /'", true),
