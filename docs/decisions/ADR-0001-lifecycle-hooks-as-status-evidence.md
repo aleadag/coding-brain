@@ -43,6 +43,22 @@ Codexctl will consume lifecycle hooks as a bounded, status-only overlay:
   root under `~/.codexctl`; the Coding Brain cutover now writes lifecycle state
   below `XDG_STATE_HOME/coding-brain` without automatic migration.
 
+### 2026-08-01 clarification: transaction-bound permission authority
+
+General lifecycle events remain the bounded, status-only evidence described
+above. Lifecycle schema v4 also contains a separate permission-decision map
+whose executable authority is bound to the exact request, transaction ID, and
+`Allow` or `Deny` action. A bare legacy `Decided` value from schema v3 remains
+useful for diagnostics and duplicate suppression but cannot authorize a
+permission response.
+
+This separate authority record does not make arbitrary lifecycle payloads
+actionable. Permission hooks still derive policy inputs independently and emit
+a model decision only after the exact authority, proposal, and terminal
+activity agree. Corrupt or newer lifecycle authority evidence is preserved for
+startup and Doctor handling; a permission hook does not quarantine, replace,
+initialize, or write fallback state against it.
+
 The detailed event model, leases, storage bounds, rollout behavior, and test
 matrix live in the [approved design](https://github.com/aleadag/codexctl/blob/main/.internal/specs/2026-07-17-codex-lifecycle-hook-status-design.md)
 and [implementation plan](https://github.com/aleadag/codexctl/blob/main/.internal/plans/2026-07-17-codex-lifecycle-hook-status.md).
@@ -60,6 +76,11 @@ A bounded snapshot is simpler than a new daemon or event database. It supports
 short-lived hook processes, cross-process updates, and one dashboard read per
 refresh while remaining disposable after corruption or data loss.
 
+The disposable-status rationale applies to the general lifecycle overlay. The
+schema-v4 permission authority map has a stronger fail-closed persistence
+contract because it participates in deciding whether a response may leave the
+hook process.
+
 ## Consequences
 
 - Session status can update before the corresponding transcript line is
@@ -67,10 +88,13 @@ refresh while remaining disposable after corruption or data loss.
 - The implementation must maintain a validated state machine, cross-process
   locking, leases, transcript reconciliation, and exact hook installation and
   removal tests.
-- Hook input or persistence failures fail open for Codex operation and never
-  create an authorization response. Status may temporarily fall back to the
-  existing transcript, CPU, and process heuristics.
-- Lifecycle writes deliberately omit `fsync`; a crash may lose recent status
-  evidence without losing authoritative session data.
+- General lifecycle-hook input or status-persistence failures fail open for
+  Codex operation and never create an authorization response. Status may
+  temporarily fall back to the existing transcript, CPU, and process
+  heuristics. Permission-authority failures instead fail closed as described
+  above.
+- Lifecycle snapshots use private same-directory atomic replacement with durable
+  file and parent-directory sync on Unix. General status remains reconstructable,
+  while unreadable permission authority fails closed.
 - Broader non-Bash authorization is deferred to `codexctl-85x`. XDG state
   migration is deferred to `codexctl-2yk`.

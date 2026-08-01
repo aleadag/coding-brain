@@ -51,6 +51,20 @@ Before treating a future `agy` release as fixed, repeat the isolated real-binary
 
 Codex and Claude continuation, process-only sessions, and prompts outside a structured response contract require guarded tmux input. Coding Brain acts only when current process identity maps to one pane and immediate prompt recapture reproduces the expected provider-specific evidence. If tmux is missing, a pane is ambiguous, or the prompt changed, the semantic action remains unresolved instead of sending input. Press `x` on the exact Live activity to preflight current availability; only the recognized semantic actions appear, while `t` accepts bounded hidden manual text after you confirm with Enter. Semantic dispatch independently revalidates the exact target and prompt. Manual-text dispatch revalidates the exact target, backend, and bounded capture but does not require prompt equality.
 
+## Live shows INCOMPLETE or Doctor reports permission transaction recovery
+
+Run `cbrain doctor` before changing any state. `INCOMPLETE` with `permission evaluation timed out` means a permission evaluation became stale without terminal evidence. It does not prove that the hook died, that Coding Brain delivered a response, or that the provider executed the command.
+
+Interpret the `Permission transaction recovery` row as follows:
+
+- Pass means Doctor recovered the reported number of valid transactions.
+- Advisory means a permission hook still owns an active transaction. Let the hook finish, then rerun `cbrain doctor`.
+- Fail means recovery found invalid, over-budget, unresolved, removal-sync-uncertain, or unreadable evidence. The evidence remains retained and permission handling stays fail-closed.
+
+For an over-budget failure, `over_budget_store` identifies `journal_count`, `journal_bytes`, `decisions.jsonl`, or `activity.jsonl`, and `over_budget_limit` gives the enforced count or byte limit. The private journal directory is `$XDG_STATE_HOME/coding-brain/brain/permission-transactions/`; the destination stores are under the same Coding Brain state root.
+
+Do not delete, rename, truncate, or edit a retained journal to clear the row. Stop the affected agent processes, back up the complete `$XDG_STATE_HOME/coding-brain/` directory, and inspect the named store and its permissions before planning maintenance. Preserve invalid or uncertain evidence for diagnosis. After correcting the underlying ownership, capacity, or store-integrity problem, rerun `cbrain doctor` and let its bounded recovery confirm the result.
+
 ## Brain endpoint warnings
 
 The default endpoint is loopback. A remote HTTPS endpoint produces an advisory that transcript context may leave the machine. Remote plaintext HTTP adds a stronger warning because context and credentials may be exposed in transit.
@@ -61,7 +75,9 @@ Project `.coding-brain.toml` cannot change the endpoint. Set it in `$XDG_CONFIG_
 
 Coding Brain state is under `$XDG_STATE_HOME/coding-brain/`, normally `~/.local/state/coding-brain/`. Check ownership and permissions for that directory. A newer-schema advisory means the state was written by a newer build; upgrade before writing it again.
 
-Activity and preference files use bounded, repair-aware writes. If doctor reports corrupt lifecycle state, let the next hook event quarantine and rebuild the snapshot, or remove only that snapshot after inspecting it.
+Activity and preference files use bounded, repair-aware writes. Do not assume the next hook event repairs every lifecycle failure: permission hooks preserve corrupt or newer lifecycle authority evidence and fail closed without quarantining, replacing, initializing, or writing a fallback snapshot. Back up and inspect the state reported by Doctor before changing it.
+
+Current activity rows use schema v3 and lifecycle snapshots use schema v4. A rollback binary that supports only lifecycle schema v3 rejects a v4 snapshot. If rollback matters, back up the complete `$XDG_STATE_HOME/coding-brain/` directory before upgrading rather than copying only `activity.jsonl`.
 
 ## Agent Deck attach fails
 
