@@ -1,11 +1,14 @@
 #![cfg(unix)]
 
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use coding_brain::brain::activity::ActivityStore;
 use coding_brain_core::brain_activity::{
@@ -17,6 +20,7 @@ use coding_brain_core::lifecycle::{
     LifecycleStore, PermissionDisposition, ProjectedStatus,
 };
 use coding_brain_core::provider::AgentProvider;
+use fs2::FileExt;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[test]
@@ -39,6 +43,23 @@ fn permission_payload(cwd: &Path, command: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "session_id": "session-1",
         "turn_id": "turn-1",
+        "cwd": cwd,
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "Bash",
+        "tool_input": {"command": command}
+    }))
+    .unwrap()
+}
+
+fn permission_payload_for_request(
+    cwd: &Path,
+    session_id: &str,
+    turn_id: &str,
+    command: &str,
+) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "session_id": session_id,
+        "turn_id": turn_id,
         "cwd": cwd,
         "hook_event_name": "PermissionRequest",
         "tool_name": "Bash",
@@ -376,12 +397,971 @@ fn spawn_permission_hook(home: &Path) -> Child {
         .unwrap()
 }
 
+fn spawn_faulted_permission_hook(
+    home: &Path,
+    payload: &[u8],
+    point: &str,
+    marker: &Path,
+    release: &Path,
+) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cbrain"))
+        .arg("--permission-hook")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", isolated_path(home))
+        .env("CBRAIN_TEST_PERMISSION_TX_FAULT", point)
+        .env("CBRAIN_TEST_PERMISSION_TX_MARKER", marker)
+        .env("CBRAIN_TEST_PERMISSION_TX_RELEASE", release)
+        .current_dir(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    child
+}
+
+fn permission_transaction_fault_dir(home: &Path) -> PathBuf {
+    let path = home.join(".cbrain-test-permission-tx");
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+fn run_permission_hook_with_fault_tuple(
+    home: &Path,
+    point: Option<&str>,
+    marker: Option<&Path>,
+    release: Option<&Path>,
+) -> Output {
+    static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+    install_model_fixture(home, "approve");
+    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let payload = permission_payload_for_request(
+        home,
+        &format!("fault-tuple-session-{request_id}"),
+        &format!("fault-tuple-turn-{request_id}"),
+        "cargo test",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
+    command
+        .arg("--permission-hook")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", isolated_path(home))
+        .current_dir(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(point) = point {
+        command.env("CBRAIN_TEST_PERMISSION_TX_FAULT", point);
+    }
+    if let Some(marker) = marker {
+        command.env("CBRAIN_TEST_PERMISSION_TX_MARKER", marker);
+    }
+    if let Some(release) = release {
+        command.env("CBRAIN_TEST_PERMISSION_TX_RELEASE", release);
+    }
+    let mut child = command.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(&payload).unwrap();
+    wait_child_output(child)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_synchronized_faulted_permission_hook(
+    home: &Path,
+    payload: &[u8],
+    inference_marker: &Path,
+    inference_release: &Path,
+    transaction_marker: &Path,
+    transaction_release: &Path,
+) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cbrain"))
+        .arg("--permission-hook")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", isolated_path(home))
+        .env("CBRAIN_TEST_MODEL_ACTION", "approve")
+        .env("CBRAIN_TEST_INFERENCE_MARKER", inference_marker)
+        .env("CBRAIN_TEST_INFERENCE_RELEASE", inference_release)
+        .env("CBRAIN_TEST_PERMISSION_TX_FAULT", "after_prepare")
+        .env("CBRAIN_TEST_PERMISSION_TX_MARKER", transaction_marker)
+        .env("CBRAIN_TEST_PERMISSION_TX_RELEASE", transaction_release)
+        .current_dir(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    child
+}
+
+fn install_synchronized_model_fixture(home: &Path) {
+    install_model_fixture(home, "approve");
+    overwrite_curl(
+        home,
+        r#"dd of=/dev/null 2>/dev/null
+printf '%s' "$CBRAIN_TEST_MODEL_ACTION" > "$CBRAIN_TEST_INFERENCE_MARKER"
+while [ ! -e "$CBRAIN_TEST_INFERENCE_RELEASE" ]; do sleep 0.01; done
+printf '{"response":"{\\"action\\":\\"%s\\",\\"reasoning\\":\\"fixture\\",\\"confidence\\":0.9}"}' "$CBRAIN_TEST_MODEL_ACTION""#,
+    );
+}
+
+fn spawn_synchronized_permission_hook(
+    home: &Path,
+    payload: &[u8],
+    action: &str,
+    marker: &Path,
+    release: &Path,
+) -> Child {
+    spawn_synchronized_provider_permission_hook(home, "codex", payload, action, marker, release)
+}
+
+fn spawn_synchronized_provider_permission_hook(
+    home: &Path,
+    provider: &str,
+    payload: &[u8],
+    action: &str,
+    marker: &Path,
+    release: &Path,
+) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cbrain"))
+        .args(["--permission-hook", "--provider", provider])
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", isolated_path(home))
+        .env("CBRAIN_TEST_MODEL_ACTION", action)
+        .env("CBRAIN_TEST_INFERENCE_MARKER", marker)
+        .env("CBRAIN_TEST_INFERENCE_RELEASE", release)
+        .current_dir(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    child
+}
+
+fn wait_for_activity_state(home: &Path, expected: ActivityState) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if activity(home)
+            .read()
+            .map(|log| log.events().iter().any(|event| event.state == expected))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected:?} activity"
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn optional_bytes(path: &Path) -> Option<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("failed to read {}: {error}", path.display()),
+    }
+}
+
+fn transaction_entries(home: &Path) -> Vec<OsString> {
+    let path = home.join(".local/state/coding-brain/brain/permission-transactions");
+    let mut entries = match fs::read_dir(path) {
+        Ok(entries) => entries
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("failed to inspect transaction entries: {error}"),
+    };
+    entries.sort();
+    entries
+}
+
+fn wait_child_output(mut child: Child) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => return child.wait_with_output().unwrap(),
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            None => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "timed out waiting for hook: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+fn wait_children_output(mut children: Vec<Child>) -> Vec<Output> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if children
+            .iter_mut()
+            .all(|child| child.try_wait().unwrap().is_some())
+        {
+            return children
+                .into_iter()
+                .map(|child| child.wait_with_output().unwrap())
+                .collect();
+        }
+        if Instant::now() >= deadline {
+            for child in &mut children {
+                let _ = child.kill();
+            }
+            let stderr = children
+                .into_iter()
+                .map(|child| child.wait_with_output().unwrap().stderr)
+                .map(|stderr| String::from_utf8_lossy(&stderr).into_owned())
+                .collect::<Vec<_>>();
+            panic!("timed out waiting for permission hooks: {stderr:?}");
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn decision_records(home: &Path) -> Vec<serde_json::Value> {
+    let path = home.join(".local/state/coding-brain/brain/decisions.jsonl");
+    match fs::read_to_string(path) {
+        Ok(contents) => contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("failed to read permission proposals: {error}"),
+    }
+}
+
+fn assert_owner_only(path: &Path, expected_mode: u32) {
+    let metadata = fs::metadata(path).unwrap();
+    assert_eq!(metadata.mode() & 0o777, expected_mode, "{}", path.display());
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+}
+
 fn isolated_path(home: &Path) -> OsString {
     let mut paths = vec![home.join("bin")];
     if let Some(existing) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&existing));
     }
     std::env::join_paths(paths).unwrap()
+}
+
+#[test]
+fn permission_transaction_process_kill_recovers_once_after_proposal_persistence() {
+    let home = tempfile::tempdir().unwrap();
+    install_model_fixture(home.path(), "approve");
+    overwrite_curl(home.path(), "dd of=/dev/null 2>/dev/null\nexit 28");
+    let payload = permission_payload(home.path(), "cargo test");
+    let fault_dir = permission_transaction_fault_dir(home.path());
+    let marker = fault_dir.join("after-proposal.ready");
+    let release = fault_dir.join("never.release");
+    let mut child =
+        spawn_faulted_permission_hook(home.path(), &payload, "after_proposal", &marker, &release);
+
+    wait_for_path(&marker);
+    let transaction_dir = home
+        .path()
+        .join(".local/state/coding-brain/brain/permission-transactions");
+    let journals = transaction_entries(home.path());
+    assert_eq!(journals.len(), 1);
+    assert_eq!(decision_records(home.path()).len(), 1);
+    assert_owner_only(&transaction_dir, 0o700);
+    assert_owner_only(&transaction_dir.join(&journals[0]), 0o600);
+
+    child.kill().unwrap();
+    let killed = child.wait_with_output().unwrap();
+    assert!(!killed.status.success());
+
+    for recovery_number in 1..=2 {
+        let recovery = run_permission_hook(home.path(), &payload);
+        assert!(recovery.status.success());
+        assert!(recovery.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&recovery.stderr).contains("duplicate"),
+            "recovery {recovery_number}: {}",
+            String::from_utf8_lossy(&recovery.stderr)
+        );
+        assert_eq!(decision_records(home.path()).len(), 1);
+        let events = activity(home.path()).read().unwrap().events().to_vec();
+        assert_eq!(
+            events.iter().map(|event| event.state).collect::<Vec<_>>(),
+            [
+                ActivityState::Observed,
+                ActivityState::Evaluating,
+                ActivityState::Error,
+            ]
+        );
+        let reason = events[2].reasoning.as_deref().unwrap();
+        assert!(reason.starts_with("Brain query failed:"), "{reason}");
+        assert!(reason.len() <= MAX_ACTIVITY_FIELD_BYTES);
+        assert!(transaction_entries(home.path()).is_empty());
+    }
+}
+
+#[test]
+fn permission_transaction_fault_variables_require_an_exact_complete_tuple() {
+    let home = tempfile::tempdir().unwrap();
+    let fault_dir = permission_transaction_fault_dir(home.path());
+    let marker = fault_dir.join("valid.ready");
+    let release = fault_dir.join("valid.release");
+    fs::write(&release, b"release").unwrap();
+
+    for (point, marker_path, release_path) in [
+        (None, None, None),
+        (Some("after_prepare"), None, None),
+        (None, Some(marker.as_path()), None),
+        (None, None, Some(release.as_path())),
+        (Some("after_prepare"), Some(marker.as_path()), None),
+        (Some("after_prepare"), None, Some(release.as_path())),
+        (None, Some(marker.as_path()), Some(release.as_path())),
+    ] {
+        let output =
+            run_permission_hook_with_fault_tuple(home.path(), point, marker_path, release_path);
+        assert!(output.status.success());
+        assert!(!marker.exists());
+    }
+
+    let relative_marker = Path::new("relative.ready");
+    let relative_release = Path::new("relative.release");
+    fs::write(home.path().join(relative_release), b"release").unwrap();
+    let output = run_permission_hook_with_fault_tuple(
+        home.path(),
+        Some("after_prepare"),
+        Some(relative_marker),
+        Some(relative_release),
+    );
+    assert!(output.status.success());
+    assert!(!home.path().join(relative_marker).exists());
+
+    let equal = fault_dir.join("equal.sentinel");
+    fs::write(&equal, b"unchanged").unwrap();
+    let output = run_permission_hook_with_fault_tuple(
+        home.path(),
+        Some("after_prepare"),
+        Some(&equal),
+        Some(&equal),
+    );
+    assert!(output.status.success());
+    assert_eq!(fs::read(&equal).unwrap(), b"unchanged");
+
+    let other_dir = home.path().join("other");
+    fs::create_dir(&other_dir).unwrap();
+    let different_parent_marker = fault_dir.join("different-parent.ready");
+    let different_parent_release = other_dir.join("different-parent.release");
+    fs::write(&different_parent_release, b"release").unwrap();
+    let output = run_permission_hook_with_fault_tuple(
+        home.path(),
+        Some("after_prepare"),
+        Some(&different_parent_marker),
+        Some(&different_parent_release),
+    );
+    assert!(output.status.success());
+    assert!(!different_parent_marker.exists());
+
+    let outside_home = tempfile::tempdir().unwrap();
+    let outside_dir = permission_transaction_fault_dir(outside_home.path());
+    let outside_marker = outside_dir.join("outside.ready");
+    let outside_release = outside_dir.join("outside.release");
+    fs::write(&outside_release, b"release").unwrap();
+    let output = run_permission_hook_with_fault_tuple(
+        home.path(),
+        Some("after_prepare"),
+        Some(&outside_marker),
+        Some(&outside_release),
+    );
+    assert!(output.status.success());
+    assert!(!outside_marker.exists());
+
+    let existing_marker = fault_dir.join("existing.sentinel");
+    fs::write(&existing_marker, b"unchanged").unwrap();
+    let output = run_permission_hook_with_fault_tuple(
+        home.path(),
+        Some("after_prepare"),
+        Some(&existing_marker),
+        Some(&release),
+    );
+    assert!(output.status.success());
+    assert_eq!(fs::read(&existing_marker).unwrap(), b"unchanged");
+
+    let symlink_target = home.path().join("symlink-target.sentinel");
+    let symlink_marker = fault_dir.join("symlink.ready");
+    fs::write(&symlink_target, b"unchanged").unwrap();
+    std::os::unix::fs::symlink(&symlink_target, &symlink_marker).unwrap();
+    let output = run_permission_hook_with_fault_tuple(
+        home.path(),
+        Some("after_prepare"),
+        Some(&symlink_marker),
+        Some(&release),
+    );
+    assert!(output.status.success());
+    assert_eq!(fs::read(&symlink_target).unwrap(), b"unchanged");
+
+    let wrong_marker = fault_dir.join("wrong.ready");
+    let output = run_permission_hook_with_fault_tuple(
+        home.path(),
+        Some("after_terminal"),
+        Some(&wrong_marker),
+        Some(&release),
+    );
+    assert!(output.status.success());
+    assert!(!wrong_marker.exists());
+
+    let complete_marker = fault_dir.join("complete.ready");
+    let output = run_permission_hook_with_fault_tuple(
+        home.path(),
+        Some("after_prepare"),
+        Some(&complete_marker),
+        Some(&release),
+    );
+    assert!(output.status.success());
+    #[cfg(debug_assertions)]
+    {
+        assert_eq!(fs::read(&complete_marker).unwrap(), b"after_prepare");
+        assert_owner_only(&complete_marker, 0o600);
+    }
+    #[cfg(not(debug_assertions))]
+    assert!(!complete_marker.exists());
+}
+
+#[test]
+fn permission_transaction_fault_rejects_unsafe_fault_directory_metadata() {
+    let home = tempfile::tempdir().unwrap();
+    let fault_dir = permission_transaction_fault_dir(home.path());
+    fs::set_permissions(&fault_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = fault_dir.join("unsafe.ready");
+    let release = fault_dir.join("unsafe.release");
+    fs::write(&release, b"release").unwrap();
+
+    let output = run_permission_hook_with_fault_tuple(
+        home.path(),
+        Some("after_prepare"),
+        Some(&marker),
+        Some(&release),
+    );
+
+    assert!(output.status.success());
+    assert!(!marker.exists());
+}
+
+#[test]
+fn parallel_permission_transactions_use_distinct_owner_only_journals() {
+    let home = tempfile::tempdir().unwrap();
+    install_synchronized_model_fixture(home.path());
+    let fault_dir = permission_transaction_fault_dir(home.path());
+    let transaction_release = fault_dir.join("parallel.release");
+    let mut requests = Vec::new();
+    for index in 1..=3 {
+        let session_id = format!("parallel-session-{index}");
+        let turn_id = format!("parallel-turn-{index}");
+        let command = format!("printf parallel-{index}");
+        let payload = permission_payload_for_request(home.path(), &session_id, &turn_id, &command);
+        let inference_marker = home
+            .path()
+            .join(format!("parallel-inference-{index}.ready"));
+        let inference_release = home
+            .path()
+            .join(format!("parallel-inference-{index}.release"));
+        let transaction_marker = fault_dir.join(format!("parallel-transaction-{index}.ready"));
+        let child = spawn_synchronized_faulted_permission_hook(
+            home.path(),
+            &payload,
+            &inference_marker,
+            &inference_release,
+            &transaction_marker,
+            &transaction_release,
+        );
+        requests.push((
+            session_id,
+            command,
+            inference_marker,
+            inference_release,
+            transaction_marker,
+            child,
+        ));
+    }
+    for (_, _, inference_marker, _, _, _) in &requests {
+        wait_for_path(inference_marker);
+    }
+    for (_, _, _, inference_release, transaction_marker, _) in &requests {
+        fs::write(inference_release, b"release").unwrap();
+        wait_for_path(transaction_marker);
+    }
+    let transaction_dir = home
+        .path()
+        .join(".local/state/coding-brain/brain/permission-transactions");
+    let journals = transaction_entries(home.path());
+    assert_eq!(journals.len(), requests.len());
+    assert_owner_only(&transaction_dir, 0o700);
+    for journal in &journals {
+        assert_owner_only(&transaction_dir.join(journal), 0o600);
+    }
+
+    fs::write(&transaction_release, b"release").unwrap();
+    let outputs = wait_children_output(
+        requests
+            .into_iter()
+            .map(|(_, _, _, _, _, child)| child)
+            .collect(),
+    );
+    for output in outputs {
+        assert!(output.status.success());
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["hookSpecificOutput"]
+                ["decision"]["behavior"],
+            "allow"
+        );
+    }
+
+    let proposals = decision_records(home.path());
+    let events = activity(home.path()).read().unwrap().events().to_vec();
+    for index in 1..=3 {
+        let session_id = format!("parallel-session-{index}");
+        let command = format!("printf parallel-{index}");
+        assert_eq!(
+            proposals
+                .iter()
+                .filter(|proposal| proposal["session_id"] == session_id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.session_id == session_id)
+                        && event.normalized_command.as_deref() == Some(command.as_str())
+                        && event.state == ActivityState::Allowed
+                })
+                .count(),
+            1
+        );
+    }
+    assert_eq!(proposals.len(), 3);
+    assert!(transaction_entries(home.path()).is_empty());
+}
+
+#[test]
+fn same_request_model_winner_is_exclusive_in_both_action_orders() {
+    for (winner_action, loser_action) in [("approve", "deny"), ("deny", "approve")] {
+        let home = tempfile::tempdir().unwrap();
+        install_synchronized_model_fixture(home.path());
+        let payload = permission_payload(home.path(), "cargo test");
+        let winner_marker = home.path().join(format!("winner-{winner_action}.ready"));
+        let winner_release = home.path().join(format!("winner-{winner_action}.release"));
+        let loser_marker = home.path().join(format!("loser-{loser_action}.ready"));
+        let loser_release = home.path().join(format!("loser-{loser_action}.release"));
+        let winner = spawn_synchronized_permission_hook(
+            home.path(),
+            &payload,
+            winner_action,
+            &winner_marker,
+            &winner_release,
+        );
+        wait_for_path(&winner_marker);
+
+        let state_root = home.path().join(".local/state/coding-brain");
+        let lifecycle_path = state_root.join("hooks/lifecycle.json");
+        let activity_path = state_root.join("activity.jsonl");
+        let decisions_path = state_root.join("brain/decisions.jsonl");
+        let before = (
+            optional_bytes(&lifecycle_path),
+            optional_bytes(&activity_path),
+            optional_bytes(&decisions_path),
+            transaction_entries(home.path()),
+        );
+
+        let loser = spawn_synchronized_permission_hook(
+            home.path(),
+            &payload,
+            loser_action,
+            &loser_marker,
+            &loser_release,
+        );
+        let loser_output = wait_child_output(loser);
+
+        assert!(loser_output.status.success());
+        assert!(loser_output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&loser_output.stderr).contains("already active"));
+        assert!(!loser_marker.exists(), "loser reached model inference");
+        assert_eq!(optional_bytes(&lifecycle_path), before.0);
+        assert_eq!(optional_bytes(&activity_path), before.1);
+        assert_eq!(optional_bytes(&decisions_path), before.2);
+        assert_eq!(transaction_entries(home.path()), before.3);
+
+        fs::write(&winner_release, b"release").unwrap();
+        let winner_output = wait_child_output(winner);
+        assert!(winner_output.status.success());
+        assert!(
+            winner_output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&winner_output.stderr)
+        );
+        let expected = if winner_action == "approve" {
+            "allow"
+        } else {
+            "deny"
+        };
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&winner_output.stdout).unwrap()["hookSpecificOutput"]
+                ["decision"]["behavior"],
+            expected
+        );
+    }
+}
+
+#[test]
+fn same_request_model_allow_holder_excludes_provider_policy_deny_process() {
+    let home = tempfile::tempdir().unwrap();
+    install_synchronized_model_fixture(home.path());
+    let allow_payload = claude_permission_payload(home.path(), None);
+    let deny_payload = claude_permission_payload(home.path(), Some("deny"));
+    let allow_marker = home.path().join("allow.ready");
+    let allow_release = home.path().join("allow.release");
+    let deny_marker = home.path().join("deny.ready");
+    let deny_release = home.path().join("deny.release");
+    fs::write(&deny_release, b"release").unwrap();
+    let allow = spawn_synchronized_provider_permission_hook(
+        home.path(),
+        "claude",
+        &allow_payload,
+        "approve",
+        &allow_marker,
+        &allow_release,
+    );
+    wait_for_path(&allow_marker);
+
+    let state_root = home.path().join(".local/state/coding-brain");
+    let lifecycle_path = state_root.join("hooks/lifecycle.json");
+    let activity_path = state_root.join("activity.jsonl");
+    let decisions_path = state_root.join("brain/decisions.jsonl");
+    let before = (
+        optional_bytes(&lifecycle_path),
+        optional_bytes(&activity_path),
+        optional_bytes(&decisions_path),
+        transaction_entries(home.path()),
+    );
+
+    let deny = spawn_synchronized_provider_permission_hook(
+        home.path(),
+        "claude",
+        &deny_payload,
+        "deny",
+        &deny_marker,
+        &deny_release,
+    );
+    let deny_output = wait_child_output(deny);
+
+    assert!(deny_output.status.success());
+    assert!(deny_output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&deny_output.stderr).contains("already active"));
+    assert!(!deny_marker.exists(), "deny loser reached model inference");
+    assert_eq!(optional_bytes(&lifecycle_path), before.0);
+    assert_eq!(optional_bytes(&activity_path), before.1);
+    assert_eq!(optional_bytes(&decisions_path), before.2);
+    assert_eq!(transaction_entries(home.path()), before.3);
+
+    fs::write(&allow_release, b"release").unwrap();
+    let allow_output = wait_child_output(allow);
+    assert!(allow_output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&allow_output.stdout).unwrap()["hookSpecificOutput"]
+            ["decision"]["behavior"],
+        "allow"
+    );
+}
+
+#[test]
+fn same_request_provider_policy_deny_holder_excludes_model_allow_process() {
+    let home = tempfile::tempdir().unwrap();
+    install_synchronized_model_fixture(home.path());
+    let allow_payload = claude_permission_payload(home.path(), None);
+    let deny_payload = claude_permission_payload(home.path(), Some("deny"));
+    let state_root = home.path().join(".local/state/coding-brain");
+    let lifecycle = LifecycleStore::at(&state_root);
+    fs::create_dir_all(lifecycle.hooks_dir()).unwrap();
+    let lifecycle_lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lifecycle.lock_path())
+        .unwrap();
+    FileExt::lock_shared(&lifecycle_lock).unwrap();
+    let deny_marker = home.path().join("deny.ready");
+    let deny_release = home.path().join("deny.release");
+    fs::write(&deny_release, b"release").unwrap();
+    let deny = spawn_synchronized_provider_permission_hook(
+        home.path(),
+        "claude",
+        &deny_payload,
+        "deny",
+        &deny_marker,
+        &deny_release,
+    );
+    wait_for_activity_state(home.path(), ActivityState::Evaluating);
+    let decisions_path = state_root.join("brain/decisions.jsonl");
+    wait_for_path(&decisions_path);
+
+    let lifecycle_path = lifecycle.snapshot_path();
+    let activity_path = state_root.join("activity.jsonl");
+    let before = (
+        optional_bytes(&lifecycle_path),
+        optional_bytes(&activity_path),
+        optional_bytes(&decisions_path),
+        transaction_entries(home.path()),
+    );
+    let allow_marker = home.path().join("allow.ready");
+    let allow_release = home.path().join("allow.release");
+    fs::write(&allow_release, b"release").unwrap();
+    let allow = spawn_synchronized_provider_permission_hook(
+        home.path(),
+        "claude",
+        &allow_payload,
+        "approve",
+        &allow_marker,
+        &allow_release,
+    );
+    let allow_output = wait_child_output(allow);
+
+    assert!(allow_output.status.success());
+    assert!(allow_output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&allow_output.stderr).contains("already active"));
+    assert!(
+        !allow_marker.exists(),
+        "allow loser reached model inference"
+    );
+    assert_eq!(optional_bytes(&lifecycle_path), before.0);
+    assert_eq!(optional_bytes(&activity_path), before.1);
+    assert_eq!(optional_bytes(&decisions_path), before.2);
+    assert_eq!(transaction_entries(home.path()), before.3);
+
+    FileExt::unlock(&lifecycle_lock).unwrap();
+    let deny_output = wait_child_output(deny);
+    assert!(deny_output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&deny_output.stdout).unwrap()["hookSpecificOutput"]
+            ["decision"]["behavior"],
+        "deny"
+    );
+    assert!(
+        !deny_marker.exists(),
+        "provider-policy deny invoked the model"
+    );
+}
+
+#[test]
+fn retained_allow_journal_cannot_be_completed_by_same_request_provider_policy_deny() {
+    let home = tempfile::tempdir().unwrap();
+    let fake_model = install_model_fixture(home.path(), "approve");
+    let activity_path = home.path().join(".local/state/coding-brain/activity.jsonl");
+    let saved_activity_path = home.path().join("activity-before-allow-failure.jsonl");
+    overwrite_curl(
+        home.path(),
+        &format!(
+            "dd of=/dev/null 2>/dev/null\nprintf 1 > '{}'\nmv '{}' '{}'\nmkdir '{}'\nprintf '%s' '{{\"response\":\"{{\\\"action\\\":\\\"approve\\\",\\\"reasoning\\\":\\\"fixture\\\",\\\"confidence\\\":0.9}}\"}}'",
+            fake_model.script.with_extension("count").display(),
+            activity_path.display(),
+            saved_activity_path.display(),
+            activity_path.display(),
+        ),
+    );
+    let allow_payload = claude_permission_payload(home.path(), None);
+
+    let allow = run_provider_permission_hook(home.path(), "claude", None, &allow_payload);
+
+    assert!(allow.status.success());
+    assert!(allow.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&allow.stderr).contains("permission transaction"));
+    assert_eq!(transaction_entries(home.path()).len(), 1);
+    fs::remove_dir(&activity_path).unwrap();
+    fs::rename(&saved_activity_path, &activity_path).unwrap();
+
+    let deny_payload = claude_permission_payload(home.path(), Some("deny"));
+    let recovery = run_provider_permission_hook(home.path(), "claude", None, &deny_payload);
+
+    assert!(recovery.status.success());
+    assert!(recovery.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&recovery.stderr).contains("duplicate"));
+    assert_eq!(fake_model.request_count(), 1);
+    assert!(transaction_entries(home.path()).is_empty());
+    let events = activity(home.path()).read().unwrap().events().to_vec();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state == ActivityState::Error)
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.state != ActivityState::Allowed)
+    );
+    let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
+    let key = coding_brain_core::provider::AgentSessionKey::native(
+        AgentProvider::Claude,
+        "claude-session-1",
+    )
+    .storage_key();
+    assert_eq!(
+        lifecycle.read().unwrap().snapshot.unwrap().sessions[&key].projected_status,
+        Some(ProjectedStatus::NeedsInput)
+    );
+}
+
+#[test]
+fn unreadable_activity_recovery_preserves_unreadable_lifecycle_without_response() {
+    for (case, authority) in [
+        ("corrupt", b"{not-json".to_vec()),
+        (
+            "future",
+            serde_json::to_vec(&serde_json::json!({"schema_version": u32::MAX})).unwrap(),
+        ),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let fake_model = install_model_fixture(home.path(), "approve");
+        let state_root = home.path().join(".local/state/coding-brain");
+        let activity_path = state_root.join("activity.jsonl");
+        let saved_activity_path = home.path().join("activity-before-failure.jsonl");
+        overwrite_curl(
+            home.path(),
+            &format!(
+                "dd of=/dev/null 2>/dev/null\nprintf 1 > '{}'\nmv '{}' '{}'\nmkdir '{}'\nprintf '%s' '{{\"response\":\"{{\\\"action\\\":\\\"approve\\\",\\\"reasoning\\\":\\\"fixture\\\",\\\"confidence\\\":0.9}}\"}}'",
+                fake_model.script.with_extension("count").display(),
+                activity_path.display(),
+                saved_activity_path.display(),
+                activity_path.display(),
+            ),
+        );
+        let payload = claude_permission_payload(home.path(), None);
+        let failed = run_provider_permission_hook(home.path(), "claude", None, &payload);
+        assert!(failed.status.success(), "{case}");
+        assert!(failed.stdout.is_empty(), "{case}");
+        assert_eq!(transaction_entries(home.path()).len(), 1, "{case}");
+        let lifecycle = LifecycleStore::at(&state_root);
+        fs::write(lifecycle.snapshot_path(), &authority).unwrap();
+        let activity_before = fs::read(&saved_activity_path).unwrap();
+        let decisions_path = state_root.join("brain/decisions.jsonl");
+        let decisions_before = fs::read(&decisions_path).unwrap();
+
+        let recovery = run_provider_permission_hook(home.path(), "claude", None, &payload);
+
+        assert!(recovery.status.success(), "{case}");
+        assert!(recovery.stdout.is_empty(), "{case}");
+        assert!(
+            String::from_utf8_lossy(&recovery.stderr).contains("permission transaction"),
+            "{case}: {}",
+            String::from_utf8_lossy(&recovery.stderr)
+        );
+        assert_eq!(fake_model.request_count(), 1, "{case}");
+        assert_eq!(
+            fs::read(lifecycle.snapshot_path()).unwrap(),
+            authority,
+            "{case}"
+        );
+        assert_eq!(
+            fs::read(&saved_activity_path).unwrap(),
+            activity_before,
+            "{case}"
+        );
+        assert_eq!(
+            fs::read(&decisions_path).unwrap(),
+            decisions_before,
+            "{case}"
+        );
+        assert_eq!(transaction_entries(home.path()).len(), 1, "{case}");
+        let hooks = fs::read_dir(lifecycle.hooks_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            hooks
+                .iter()
+                .all(|name| !name.to_string_lossy().contains(".corrupt-")),
+            "{case}: {hooks:?}"
+        );
+        assert!(
+            ActivityStore::at(&saved_activity_path)
+                .read()
+                .unwrap()
+                .events()
+                .iter()
+                .all(|event| event.state != ActivityState::Allowed),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn killed_same_request_holder_releases_guard_for_next_process() {
+    let home = tempfile::tempdir().unwrap();
+    install_synchronized_model_fixture(home.path());
+    let payload = permission_payload(home.path(), "cargo test");
+    let holder_marker = home.path().join("holder.ready");
+    let holder_release = home.path().join("holder.release");
+    let mut holder = spawn_synchronized_permission_hook(
+        home.path(),
+        &payload,
+        "approve",
+        &holder_marker,
+        &holder_release,
+    );
+    wait_for_path(&holder_marker);
+    holder.kill().unwrap();
+    let killed = holder.wait_with_output().unwrap();
+    assert!(!killed.status.success());
+
+    let next_marker = home.path().join("next.ready");
+    let next_release = home.path().join("next.release");
+    fs::write(&next_release, b"release").unwrap();
+    let next = spawn_synchronized_permission_hook(
+        home.path(),
+        &payload,
+        "deny",
+        &next_marker,
+        &next_release,
+    );
+    let output = wait_child_output(next);
+
+    assert!(output.status.success());
+    assert!(next_marker.exists());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["hookSpecificOutput"]
+            ["decision"]["behavior"],
+        "deny"
+    );
 }
 
 fn run_lifecycle_hook(home: &Path, payload: &[u8]) -> Output {
@@ -667,7 +1647,7 @@ fn overwrite_curl(home: &Path, script: &str) {
 }
 
 #[test]
-fn deterministic_deny_is_delivered_when_decision_audit_is_down() {
+fn invalid_request_lock_storage_blocks_deterministic_deny_before_mutation() {
     let home = tempfile::tempdir().unwrap();
     fs::create_dir_all(home.path().join(".local/state/coding-brain")).unwrap();
     fs::write(
@@ -679,34 +1659,20 @@ fn deterministic_deny_is_delivered_when_decision_audit_is_down() {
     let output = run_permission_hook(home.path(), &permission_payload(home.path(), "rm -rf /"));
 
     assert!(output.status.success());
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        response["hookSpecificOutput"]["decision"]["behavior"],
-        "deny"
-    );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("audit"));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("request lock"));
     let events = activity(home.path()).read().unwrap().events().to_vec();
-    assert_eq!(
-        events.iter().map(|event| event.state).collect::<Vec<_>>(),
-        [
-            ActivityState::Observed,
-            ActivityState::Evaluating,
-            ActivityState::Denied,
-            ActivityState::Delivered,
-        ]
-    );
+    assert!(events.is_empty());
     let snapshot = activity(home.path())
         .snapshot(SnapshotLimits::default())
         .unwrap();
     assert!(snapshot.attention.is_empty());
     assert_eq!(snapshot.unresolved_count, 0);
-    assert_eq!(snapshot.recent.len(), 1);
-    assert_eq!(snapshot.recent[0].state, ActivityState::Denied);
-    assert_eq!(snapshot.recent[0].delivery, DeliveryState::Delivered);
+    assert!(snapshot.recent.is_empty());
 }
 
 #[test]
-fn deterministic_deny_survives_both_audits_being_down() {
+fn invalid_request_lock_and_activity_storage_emit_no_deterministic_deny() {
     let home = tempfile::tempdir().unwrap();
     fs::create_dir_all(home.path().join(".local/state/coding-brain")).unwrap();
     fs::write(
@@ -718,12 +1684,8 @@ fn deterministic_deny_survives_both_audits_being_down() {
 
     let output = run_permission_hook(home.path(), &permission_payload(home.path(), "rm -rf /"));
 
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        response["hookSpecificOutput"]["decision"]["behavior"],
-        "deny"
-    );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("audit"));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("request lock"));
 }
 
 fn assert_safety_deny(home: &Path, expected_rule_id: &str) {
@@ -873,6 +1835,9 @@ fn reopened_shell_safety_corpus_denies_before_model_inference_for_every_provider
         ] {
             let home = tempfile::tempdir().unwrap();
             let fake_model = install_model_fixture(home.path(), "approve");
+            if provider == AgentProvider::Antigravity {
+                seed_antigravity_invocation(home.path(), 5);
+            }
             let (provider_name, event, payload) =
                 shell_permission_payload(home.path(), provider, command, None);
 
@@ -904,6 +1869,9 @@ fn append_assignment_bypasses_are_denied_before_model_inference_for_every_provid
         for case in ["recursive flag", "trusted home"] {
             let home = tempfile::tempdir().unwrap();
             let fake_model = install_model_fixture(home.path(), "approve");
+            if provider == AgentProvider::Antigravity {
+                seed_antigravity_invocation(home.path(), 5);
+            }
             let command = match case {
                 "recursive flag" => "X=-; X+=rf; rm --no-preserve-root -f $X /".to_string(),
                 "trusted home" => {
@@ -1261,6 +2229,9 @@ fn literal_home_delete_denies_before_model_inference_for_every_provider() {
         for case in ["exact HOME", "literal ancestor", "resolved ancestor"] {
             let home = tempfile::tempdir().unwrap();
             let fake_model = install_model_fixture(home.path(), "approve");
+            if provider == AgentProvider::Antigravity {
+                seed_antigravity_invocation(home.path(), 5);
+            }
             let home_parent = home
                 .path()
                 .parent()
@@ -1627,6 +2598,7 @@ fn destructive_commands_are_denied_across_permission_providers() {
 
     let antigravity_home = tempfile::tempdir().unwrap();
     install_model_fixture(antigravity_home.path(), "approve");
+    seed_antigravity_invocation(antigravity_home.path(), 5);
     let mut antigravity_payload: serde_json::Value = serde_json::from_slice(
         &antigravity_permission_payload(antigravity_home.path(), None),
     )
@@ -1648,6 +2620,7 @@ fn destructive_commands_are_denied_across_permission_providers() {
 fn antigravity_dynamic_rm_arguments_deny_before_inference() {
     let home = tempfile::tempdir().unwrap();
     install_model_fixture(home.path(), "approve");
+    seed_antigravity_invocation(home.path(), 5);
     let mut payload: serde_json::Value =
         serde_json::from_slice(&antigravity_permission_payload(home.path(), None)).unwrap();
     payload["toolCall"]["args"]["CommandLine"] = serde_json::json!("rm $(printf '%s\\n' -rf /)");
@@ -2034,7 +3007,7 @@ fn invalid_active_codex_followup_evidence_emits_no_allow() {
     let stderr = String::from_utf8_lossy(&permission.stderr);
     assert!(permission.status.success());
     assert!(permission.stdout.is_empty());
-    assert!(stderr.contains("SubagentTurnMismatch"), "{stderr}");
+    assert!(stderr.contains("UnprovenSubagent"), "{stderr}");
     assert!(stderr.contains("Codex resume evidence:"), "{stderr}");
 }
 
@@ -2593,9 +3566,9 @@ fn provider_ask_and_model_deny_survive_ignored_lifecycle_decision() {
                     "{provider_name} {ignored_reason}: invalid response ({error})"
                 )),
             }
-            if !String::from_utf8_lossy(&output.stderr).contains(&ignored_reason) {
+            if !String::from_utf8_lossy(&output.stderr).contains("persist lifecycle disposition") {
                 failures.push(format!(
-                    "{provider_name} {ignored_reason}: missing diagnostic: {}",
+                    "{provider_name} {ignored_reason}: missing transaction conflict diagnostic: {}",
                     String::from_utf8_lossy(&output.stderr)
                 ));
             }
@@ -2779,7 +3752,7 @@ fn antigravity_post_invocation_preserves_bounded_permission_authority_until_stop
         &antigravity_permission_payload_for_step(home.path(), 74),
     );
     assert!(after_stop.status.success());
-    assert!(String::from_utf8_lossy(&after_stop.stderr).contains("AmbiguousTurn"));
+    assert!(String::from_utf8_lossy(&after_stop.stderr).contains("permission transaction"));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&after_stop.stdout).unwrap(),
         serde_json::json!({
@@ -2873,7 +3846,7 @@ fn claude_allow_is_suppressed_for_open_turn_mismatch() {
 
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("ignored"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("permission transaction"));
     assert_eq!(
         activity(home.path())
             .read()
@@ -2893,6 +3866,7 @@ fn repeated_claude_synthesized_turn_id_suppresses_second_allow() {
     let payload = claude_permission_payload(home.path(), None);
 
     let first = run_provider_permission_hook(home.path(), "claude", None, &payload);
+    let before_second = activity(home.path()).read().unwrap().events().to_vec();
     let second = run_provider_permission_hook(home.path(), "claude", None, &payload);
 
     assert!(first.status.success());
@@ -2903,7 +3877,11 @@ fn repeated_claude_synthesized_turn_id_suppresses_second_allow() {
     );
     assert!(second.status.success());
     assert!(second.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&second.stderr).contains("ignored"));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("duplicate"));
+    assert_eq!(
+        activity(home.path()).read().unwrap().events(),
+        before_second
+    );
 }
 
 #[test]
@@ -2915,6 +3893,7 @@ fn repeated_antigravity_synthesized_turn_id_asks_after_model_allow() {
 
     let first =
         run_provider_permission_hook(home.path(), "antigravity", Some("PreToolUse"), &payload);
+    let before_second = activity(home.path()).read().unwrap().events().to_vec();
     let second =
         run_provider_permission_hook(home.path(), "antigravity", Some("PreToolUse"), &payload);
 
@@ -2931,16 +3910,10 @@ fn repeated_antigravity_synthesized_turn_id_asks_after_model_allow() {
             "reason": "Coding Brain abstained"
         })
     );
-    assert!(String::from_utf8_lossy(&second.stderr).contains("ignored"));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("duplicate"));
     assert_eq!(
-        activity(home.path())
-            .read()
-            .unwrap()
-            .events()
-            .last()
-            .unwrap()
-            .state,
-        ActivityState::Error
+        activity(home.path()).read().unwrap().events(),
+        before_second
     );
 }
 
@@ -3432,7 +4405,7 @@ fn explicit_auto_without_toml_uses_defaults_and_emits_allow() {
 #[test]
 fn model_proposal_failure_abstains_before_terminal_commit() {
     let home = tempfile::tempdir().unwrap();
-    install_model_fixture(home.path(), "approve");
+    let fake_model = install_model_fixture(home.path(), "approve");
     fs::create_dir_all(
         home.path()
             .join(".local/state/coding-brain/brain/decisions.jsonl"),
@@ -3443,18 +4416,16 @@ fn model_proposal_failure_abstains_before_terminal_commit() {
 
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("proposal"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("decision evidence"));
+    assert_eq!(fake_model.request_count(), 0);
     let events = activity(home.path()).read().unwrap().events().to_vec();
-    assert_eq!(
-        events.iter().map(|event| event.state).collect::<Vec<_>>(),
-        [ActivityState::Observed, ActivityState::Evaluating]
-    );
+    assert!(events.is_empty());
 }
 
 #[test]
-fn model_terminal_failure_abstains_with_proposal_only() {
+fn model_terminal_failure_retains_a_recoverable_transaction() {
     let home = tempfile::tempdir().unwrap();
-    install_model_fixture(home.path(), "approve");
+    let fake_model = install_model_fixture(home.path(), "approve");
     let activity_path = home.path().join(".local/state/coding-brain/activity.jsonl");
     let saved_activity_path = home
         .path()
@@ -3462,7 +4433,8 @@ fn model_terminal_failure_abstains_with_proposal_only() {
     overwrite_curl(
         home.path(),
         &format!(
-            "dd of=/dev/null 2>/dev/null\nmv '{}' '{}'\nmkdir '{}'\nprintf '%s' '{{\"response\":\"{{\\\"action\\\":\\\"approve\\\",\\\"reasoning\\\":\\\"fixture\\\",\\\"confidence\\\":0.9}}\"}}'",
+            "dd of=/dev/null 2>/dev/null\nprintf 1 > '{}'\nmv '{}' '{}'\nmkdir '{}'\nprintf '%s' '{{\"response\":\"{{\\\"action\\\":\\\"approve\\\",\\\"reasoning\\\":\\\"fixture\\\",\\\"confidence\\\":0.9}}\"}}'",
+            fake_model.script.with_extension("count").display(),
             activity_path.display(),
             saved_activity_path.display(),
             activity_path.display(),
@@ -3473,19 +4445,39 @@ fn model_terminal_failure_abstains_with_proposal_only() {
 
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("terminal activity"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("permission transaction"));
     let proposal = fs::read_to_string(
         home.path()
             .join(".local/state/coding-brain/brain/decisions.jsonl"),
     )
     .unwrap();
     assert_eq!(proposal.lines().count(), 1);
-    let events = ActivityStore::at(saved_activity_path)
+    let events = ActivityStore::at(&saved_activity_path)
         .read()
         .unwrap()
         .events()
         .to_vec();
     assert_eq!(events.len(), 2);
+    let transaction_dir = home
+        .path()
+        .join(".local/state/coding-brain/brain/permission-transactions");
+    assert_eq!(fs::read_dir(&transaction_dir).unwrap().count(), 1);
+
+    fs::remove_dir(&activity_path).unwrap();
+    fs::rename(&saved_activity_path, &activity_path).unwrap();
+    let recovery = run_permission_hook(home.path(), &permission_payload(home.path(), "cargo test"));
+
+    assert!(recovery.status.success());
+    assert!(recovery.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&recovery.stderr).contains("duplicate"));
+    assert_eq!(fake_model.request_count(), 1);
+    let events = activity(home.path()).read().unwrap().events().to_vec();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state == ActivityState::Error)
+    );
+    assert_eq!(fs::read_dir(transaction_dir).unwrap().count(), 0);
 }
 
 #[test]

@@ -1546,7 +1546,7 @@ mod tests {
                 "io" => fs::write(&lifecycle_path, b"occupied").unwrap(),
                 "newer-schema" => {
                     fs::create_dir_all(lifecycle.hooks_dir()).unwrap();
-                    fs::write(lifecycle.snapshot_path(), br#"{"schema_version":4}"#).unwrap();
+                    fs::write(lifecycle.snapshot_path(), br#"{"schema_version":5}"#).unwrap();
                 }
                 "capacity" => {
                     for index in 0..MAX_SESSIONS {
@@ -1949,7 +1949,7 @@ mod tests {
 
         let store = LifecycleStore::at(temp.path().join("newer"));
         fs::create_dir_all(store.hooks_dir()).unwrap();
-        let newer = br#"{"schema_version":4}"#;
+        let newer = br#"{"schema_version":5}"#;
         fs::write(store.snapshot_path(), newer).unwrap();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -3249,7 +3249,7 @@ mod tests {
             if newer_schema {
                 let store = LifecycleStore::at(&lifecycle_path);
                 fs::create_dir_all(store.hooks_dir()).unwrap();
-                fs::write(store.snapshot_path(), br#"{"schema_version":4}"#).unwrap();
+                fs::write(store.snapshot_path(), br#"{"schema_version":5}"#).unwrap();
             } else {
                 fs::write(&lifecycle_path, b"occupied").unwrap();
             }

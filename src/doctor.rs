@@ -21,6 +21,10 @@ use coding_brain_core::brain_activity::{ActivityKind, ActivityState};
 use coding_brain_core::lifecycle::{LifecycleStore, StoreCondition, coding_brain_state_root};
 
 use crate::brain::activity::ActivityStore;
+use crate::brain::permission_transaction::{
+    RecoveryLimits as PermissionRecoveryLimits, RecoveryReport as PermissionRecoveryReport,
+    TransactionError as PermissionTransactionError, recover_pending,
+};
 
 use coding_brain_core::provider::AgentProvider;
 
@@ -70,6 +74,12 @@ pub struct Check {
 /// together.
 pub fn run_all_checks() -> Vec<Check> {
     let mut checks = Vec::new();
+    if let Some(check) = permission_transaction_recovery_check(recover_pending(
+        &coding_brain_state_root(),
+        PermissionRecoveryLimits::startup(),
+    )) {
+        checks.push(check);
+    }
     if let Some(check) =
         provider_hook_recovery_check(crate::init::provider_hooks::recover_hook_transaction())
     {
@@ -114,6 +124,86 @@ fn provider_hook_recovery_check(
             ),
         }),
     }
+}
+
+fn permission_transaction_recovery_check(
+    result: Result<PermissionRecoveryReport, PermissionTransactionError>,
+) -> Option<Check> {
+    let report = match result {
+        Ok(report) => report,
+        Err(_) => {
+            return Some(Check {
+                name: "Permission transaction recovery".into(),
+                status: CheckStatus::Fail,
+                message: "permission transaction recovery could not complete safely".into(),
+                fix_hint: Some(
+                    "Inspect the permission transaction journal directory and destination stores, then rerun `cbrain doctor`."
+                        .into(),
+                ),
+            });
+        }
+    };
+    if report == PermissionRecoveryReport::default() {
+        return None;
+    }
+    if report.invalid != 0
+        || report.over_budget != 0
+        || report.pending != 0
+        || report.removal_sync_uncertain != 0
+    {
+        let mut blockers = Vec::new();
+        if report.active != 0 {
+            blockers.push(format!("active={}", report.active));
+        }
+        if report.invalid != 0 {
+            blockers.push(format!("invalid={}", report.invalid));
+        }
+        if report.over_budget != 0 {
+            blockers.push(format!("over_budget={}", report.over_budget));
+            if let Some(detail) = report.over_budget_detail {
+                blockers.push(format!("over_budget_store={}", detail.source.store_label()));
+                blockers.push(format!("over_budget_limit={}", detail.limit));
+            }
+        }
+        if report.pending != 0 {
+            blockers.push(format!("unresolved={}", report.pending));
+        }
+        if report.removal_sync_uncertain != 0 {
+            blockers.push(format!(
+                "removal_sync_uncertain={}",
+                report.removal_sync_uncertain
+            ));
+        }
+        return Some(Check {
+            name: "Permission transaction recovery".into(),
+            status: CheckStatus::Fail,
+            message: format!("recovery blocked: {}", blockers.join(", ")),
+            fix_hint: Some(
+                "Inspect the permission transaction journal directory and destination stores, then rerun `cbrain doctor`."
+                    .into(),
+            ),
+        });
+    }
+    if report.active != 0 {
+        return Some(Check {
+            name: "Permission transaction recovery".into(),
+            status: CheckStatus::Advisory,
+            message: format!(
+                "recovered {} transaction(s); {} active transaction(s) remain locked",
+                report.completed, report.active
+            ),
+            fix_hint: Some(
+                "Allow active permission hooks to finish, then rerun `cbrain doctor`.".into(),
+            ),
+        });
+    }
+    debug_assert!(report.rollback_ready());
+    Some(Check {
+        name: "Permission transaction recovery".into(),
+        status: CheckStatus::Pass,
+        message: format!("recovered {} permission transaction(s)", report.completed),
+        fix_hint: None,
+    })
 }
 
 /// Human-readable renderer. Lays out one row per check, two-space
@@ -1022,6 +1112,9 @@ mod tests {
     use coding_brain_core::provider::AgentProvider;
 
     use crate::brain::activity::ActivityStore;
+    use crate::brain::permission_transaction::{
+        OverBudgetDetail, OverBudgetSource, RecoveryReport, TransactionError,
+    };
     use crate::init::provider_hooks::{
         ProviderHookInspection, ProviderHookOwnership, ProviderHookState,
     };
@@ -1486,6 +1579,137 @@ mod tests {
             .expect("recovery failure must be visible");
 
         assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(exit_code(&[check]), 1);
+    }
+
+    #[test]
+    fn permission_transaction_recovery_clean_store_adds_no_check() {
+        assert!(permission_transaction_recovery_check(Ok(RecoveryReport::default())).is_none());
+    }
+
+    #[test]
+    fn permission_transaction_recovery_reports_bounded_completed_count() {
+        let check = permission_transaction_recovery_check(Ok(RecoveryReport {
+            completed: 7,
+            ..RecoveryReport::default()
+        }))
+        .expect("completed recovery must be visible");
+
+        assert_eq!(check.name, "Permission transaction recovery");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.message.contains('7'));
+        assert!(check.message.len() <= 256);
+        assert_eq!(check.fix_hint, None);
+    }
+
+    #[test]
+    fn permission_transaction_recovery_reports_active_without_failure() {
+        let check = permission_transaction_recovery_check(Ok(RecoveryReport {
+            completed: 2,
+            active: 1,
+            ..RecoveryReport::default()
+        }))
+        .expect("active recovery must be visible");
+
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert!(check.message.contains("2"));
+        assert!(check.message.contains("active"));
+        assert_eq!(exit_code(&[check]), 0);
+    }
+
+    #[test]
+    fn permission_transaction_recovery_invalid_and_pending_are_failing() {
+        let check = permission_transaction_recovery_check(Ok(RecoveryReport {
+            invalid: 1,
+            pending: 1,
+            ..RecoveryReport::default()
+        }))
+        .expect("invalid recovery evidence must be visible");
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("invalid=1"));
+        assert!(check.message.contains("unresolved=1"));
+        assert!(!check.message.contains("secret"));
+        assert!(check.message.len() <= 256);
+        assert!(check.fix_hint.as_deref().unwrap().len() <= 256);
+    }
+
+    #[test]
+    fn permission_transaction_recovery_over_budget_names_fixed_store_and_limit() {
+        for (source, store, limit) in [
+            (OverBudgetSource::JournalCount, "journal_count", 1),
+            (OverBudgetSource::JournalBytes, "journal_bytes", 1_048_576),
+            (
+                OverBudgetSource::DecisionEvidence,
+                "decisions.jsonl",
+                16_777_216,
+            ),
+            (
+                OverBudgetSource::ActivityEvidence,
+                "activity.jsonl",
+                16_777_216,
+            ),
+        ] {
+            let check = permission_transaction_recovery_check(Ok(RecoveryReport {
+                over_budget: 1,
+                over_budget_detail: Some(OverBudgetDetail { source, limit }),
+                ..RecoveryReport::default()
+            }))
+            .expect("over-budget recovery evidence must be visible");
+
+            assert_eq!(check.status, CheckStatus::Fail);
+            assert!(check.message.contains("over_budget=1"));
+            assert!(
+                check
+                    .message
+                    .contains(&format!("over_budget_store={store}"))
+            );
+            assert!(
+                check
+                    .message
+                    .contains(&format!("over_budget_limit={limit}"))
+            );
+            assert!(!check.message.contains('/'));
+            assert!(check.message.len() <= 256);
+        }
+    }
+
+    #[test]
+    fn permission_transaction_recovery_pending_is_failing() {
+        let check = permission_transaction_recovery_check(Ok(RecoveryReport {
+            pending: 1,
+            ..RecoveryReport::default()
+        }))
+        .expect("unresolved recovery evidence must be visible");
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("unresolved=1"));
+    }
+
+    #[test]
+    fn permission_transaction_removal_sync_uncertainty_is_not_called_pending() {
+        let check = permission_transaction_recovery_check(Ok(RecoveryReport {
+            removal_sync_uncertain: 1,
+            ..RecoveryReport::default()
+        }))
+        .expect("removal sync uncertainty must be visible");
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("removal_sync_uncertain=1"));
+        assert!(!check.message.contains("pending"));
+        assert!(!check.message.contains("unresolved"));
+    }
+
+    #[test]
+    fn permission_transaction_recovery_error_is_failing_and_redacted() {
+        let check = permission_transaction_recovery_check(Err(TransactionError::Filesystem(
+            "secret path and content",
+        )))
+        .expect("recovery error must be visible");
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(!check.message.contains("secret"));
+        assert!(!check.fix_hint.as_deref().unwrap().contains("secret"));
         assert_eq!(exit_code(&[check]), 1);
     }
 

@@ -13,6 +13,8 @@ pub mod garden;
 pub mod insights;
 pub mod metrics;
 pub mod permission_hook;
+pub mod permission_request_lock;
+pub mod permission_transaction;
 pub mod pref_store;
 pub mod preferences;
 pub mod prompts;

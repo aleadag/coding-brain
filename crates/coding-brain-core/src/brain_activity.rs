@@ -70,6 +70,7 @@ pub enum ActivityState {
     Outcome,
     Correction,
     Interrupted,
+    Incomplete,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +190,9 @@ impl ActivityEvent {
     }
 
     pub fn has_consistent_payload(&self) -> bool {
+        if self.state == ActivityState::Incomplete {
+            return false;
+        }
         let state_payload_is_valid = match self.state {
             ActivityState::Outcome => {
                 self.outcome.is_some() && self.correction.is_none() && self.note.is_none()
@@ -610,6 +614,13 @@ mod tests {
         let mut activity = event("cargo test", "safe", "note");
         activity.kind = ActivityKind::Lifecycle;
         assert!(!activity.has_consistent_payload());
+    }
+
+    #[test]
+    fn incomplete_is_projection_only() {
+        let mut event = event("cargo test", "reason", "note");
+        event.state = ActivityState::Incomplete;
+        assert!(!event.has_consistent_payload());
     }
 
     #[test]

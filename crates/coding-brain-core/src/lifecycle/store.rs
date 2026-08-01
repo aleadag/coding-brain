@@ -17,7 +17,7 @@ use super::{
     ANTIGRAVITY_CHILD_BITS, ActiveSubagentState, ApplyOutcome, IgnoreReason,
     LIFECYCLE_SCHEMA_VERSION, LifecycleEvent, LifecycleIdentity, LifecycleSnapshot,
     MAX_ACTIVE_SUBAGENTS, MAX_ANTIGRAVITY_INVOCATION_STEPS, MAX_PERMISSION_REQUESTS_PER_TURN,
-    MAX_RECENT_TURNS, PERMISSION_BITS,
+    MAX_RECENT_TURNS, PERMISSION_BITS, PermissionDecision, PermissionDisposition,
 };
 
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
@@ -36,6 +36,18 @@ pub struct LifecycleStore {
 pub struct RecordedLifecycleEvent {
     pub outcome: ApplyOutcome,
     pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnsurePermissionDisposition {
+    Inserted,
+    Present,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnsurePermissionDecision {
+    Inserted,
+    Present,
 }
 
 impl LifecycleStore {
@@ -76,6 +88,114 @@ impl LifecycleStore {
                 condition: StoreCondition::NewerSchema(version),
             }),
         }
+    }
+
+    pub fn permission_disposition(
+        &self,
+        identity: &LifecycleIdentity,
+        request_key: &str,
+    ) -> Result<Option<PermissionDisposition>, StoreError> {
+        let lock = self.open_lock()?;
+        let _guard = lock_with_timeout(&lock, LockKind::Shared)?;
+        let LoadedSnapshot::Healthy(snapshot) = self.load()? else {
+            return Ok(None);
+        };
+        Ok(snapshot_permission_disposition(
+            &snapshot,
+            identity,
+            request_key,
+        ))
+    }
+
+    pub fn permission_decision(
+        &self,
+        identity: &LifecycleIdentity,
+        request_key: &str,
+    ) -> Result<Option<PermissionDecision>, StoreError> {
+        let lock = self.open_lock()?;
+        let _guard = lock_with_timeout(&lock, LockKind::Shared)?;
+        let snapshot = match self.load()? {
+            LoadedSnapshot::Missing => return Ok(None),
+            LoadedSnapshot::Healthy(snapshot) => snapshot,
+            LoadedSnapshot::Corrupt => return Err(StoreError::InvalidSnapshot),
+            LoadedSnapshot::NewerSchema(version) => return Err(StoreError::NewerSchema(version)),
+        };
+        Ok(snapshot_permission_decision(
+            &snapshot,
+            identity,
+            request_key,
+        ))
+    }
+
+    pub fn ensure_permission_disposition(
+        &self,
+        identity: &LifecycleIdentity,
+        request_key: &str,
+        disposition: PermissionDisposition,
+    ) -> Result<EnsurePermissionDisposition, StoreError> {
+        if disposition == PermissionDisposition::Decided {
+            return Err(StoreError::PermissionConflict);
+        }
+        let lock = self.open_lock()?;
+        let _guard = lock_with_timeout(&lock, LockKind::Exclusive)?;
+        let mut snapshot = self.load_for_locked_permission_update(epoch_ms(), disposition)?;
+        if snapshot_permission_disposition(&snapshot, identity, request_key) == Some(disposition) {
+            return Ok(EnsurePermissionDisposition::Present);
+        }
+        let event = LifecycleEvent::permission_with_request_key(
+            identity.clone(),
+            disposition,
+            request_key.to_owned(),
+        )
+        .map_err(|_| StoreError::InvalidSnapshot)?;
+        snapshot.apply(event, epoch_ms());
+        if snapshot_permission_disposition(&snapshot, identity, request_key) != Some(disposition) {
+            return Err(StoreError::PermissionConflict);
+        }
+        self.persist_locked_snapshot(&snapshot)?;
+        Ok(EnsurePermissionDisposition::Inserted)
+    }
+
+    pub fn ensure_permission_decision(
+        &self,
+        identity: &LifecycleIdentity,
+        request_key: &str,
+        decision: PermissionDecision,
+    ) -> Result<EnsurePermissionDecision, StoreError> {
+        let lock = self.open_lock()?;
+        let _guard = lock_with_timeout(&lock, LockKind::Exclusive)?;
+        let mut snapshot = self.load_for_locked_exact_permission_update(epoch_ms())?;
+        match snapshot_permission_decision(&snapshot, identity, request_key) {
+            Some(current) if current == decision => return Ok(EnsurePermissionDecision::Present),
+            Some(PermissionDecision::NeedsInput) => {
+                return Err(StoreError::PermissionConflict);
+            }
+            Some(PermissionDecision::Decided(_))
+                if matches!(decision, PermissionDecision::Decided(_)) =>
+            {
+                return Err(StoreError::PermissionConflict);
+            }
+            _ => {}
+        }
+        let event = match &decision {
+            PermissionDecision::NeedsInput => LifecycleEvent::permission_with_request_key(
+                identity.clone(),
+                PermissionDisposition::NeedsInput,
+                request_key.to_owned(),
+            ),
+            PermissionDecision::Decided(authority) => LifecycleEvent::permission_with_authority(
+                identity.clone(),
+                request_key.to_owned(),
+                authority.clone(),
+            ),
+        }
+        .map_err(|_| StoreError::InvalidSnapshot)?;
+        snapshot.apply(event, epoch_ms());
+        if snapshot_permission_decision(&snapshot, identity, request_key) != Some(decision) {
+            return Err(StoreError::PermissionConflict);
+        }
+        self.persist_locked_snapshot(&snapshot)?;
+        Ok(EnsurePermissionDecision::Inserted)
     }
 
     pub fn codex_subagent_is_proven(
@@ -316,6 +436,34 @@ impl LifecycleStore {
         Ok(snapshot)
     }
 
+    fn load_for_locked_permission_update(
+        &self,
+        received_at_ms: u64,
+        disposition: PermissionDisposition,
+    ) -> Result<LifecycleSnapshot, StoreError> {
+        if disposition == PermissionDisposition::NeedsInput {
+            return self.load_for_locked_update(received_at_ms);
+        }
+        self.load_for_locked_exact_permission_update(received_at_ms)
+    }
+
+    fn load_for_locked_exact_permission_update(
+        &self,
+        received_at_ms: u64,
+    ) -> Result<LifecycleSnapshot, StoreError> {
+        self.cleanup_abandoned_temps()?;
+        let mut snapshot = match self.load()? {
+            LoadedSnapshot::Missing => LifecycleSnapshot::default(),
+            LoadedSnapshot::Healthy(snapshot) => snapshot,
+            LoadedSnapshot::Corrupt => return Err(StoreError::InvalidSnapshot),
+            LoadedSnapshot::NewerSchema(version) => {
+                return Err(StoreError::NewerSchema(version));
+            }
+        };
+        retain_sessions(&mut snapshot, received_at_ms);
+        Ok(snapshot)
+    }
+
     fn persist_locked_snapshot(&self, snapshot: &LifecycleSnapshot) -> Result<(), StoreError> {
         if snapshot.sessions.len() > MAX_SESSIONS {
             return Err(StoreError::SessionCapacity);
@@ -363,7 +511,7 @@ impl LifecycleStore {
         if header.schema_version > LIFECYCLE_SCHEMA_VERSION {
             return Ok(LoadedSnapshot::NewerSchema(header.schema_version));
         }
-        if !matches!(header.schema_version, 1 | 2 | LIFECYCLE_SCHEMA_VERSION) {
+        if !matches!(header.schema_version, 1 | 2 | 3 | LIFECYCLE_SCHEMA_VERSION) {
             return Ok(LoadedSnapshot::Corrupt);
         }
         let Ok(mut snapshot) = serde_json::from_slice::<LifecycleSnapshot>(&bytes) else {
@@ -374,6 +522,9 @@ impl LifecycleStore {
         }
         if header.schema_version <= 2 {
             snapshot = project_schema_two(snapshot);
+        }
+        if header.schema_version <= 3 {
+            snapshot = project_schema_three(snapshot);
         }
         if !valid_snapshot_shape(&snapshot) {
             return Ok(LoadedSnapshot::Corrupt);
@@ -435,6 +586,61 @@ impl LifecycleStore {
     }
 }
 
+fn snapshot_permission_disposition(
+    snapshot: &LifecycleSnapshot,
+    identity: &LifecycleIdentity,
+    request_key: &str,
+) -> Option<PermissionDisposition> {
+    let key = AgentSessionKey::native(identity.provider(), identity.session_id()).storage_key();
+    let state = snapshot.sessions.get(&key)?;
+    if !state.turn_open
+        || state.provider_session_id.as_deref() != identity.provider_session_id()
+        || state.cwd != identity.cwd()
+    {
+        return None;
+    }
+    if identity.provider() == AgentProvider::Antigravity {
+        state
+            .current_turn
+            .as_deref()?
+            .strip_prefix("invocation-")?
+            .parse::<u64>()
+            .ok()?;
+        let step = identity
+            .turn_id()?
+            .strip_prefix("step-")?
+            .parse::<u64>()
+            .ok()?;
+        if step < state.antigravity_initial_step? {
+            return None;
+        }
+        return state.antigravity_permission_disposition(request_key, step);
+    }
+    if state.current_turn.as_deref() != identity.turn_id() {
+        return None;
+    }
+    state.permission_disposition(request_key)
+}
+
+fn snapshot_permission_decision(
+    snapshot: &LifecycleSnapshot,
+    identity: &LifecycleIdentity,
+    request_key: &str,
+) -> Option<PermissionDecision> {
+    match snapshot_permission_disposition(snapshot, identity, request_key)? {
+        PermissionDisposition::NeedsInput => Some(PermissionDecision::NeedsInput),
+        PermissionDisposition::Decided => snapshot
+            .sessions
+            .get(
+                &AgentSessionKey::native(identity.provider(), identity.session_id()).storage_key(),
+            )?
+            .permission_authorities
+            .get(request_key)
+            .cloned()
+            .map(PermissionDecision::Decided),
+    }
+}
+
 pub fn coding_brain_state_root() -> PathBuf {
     crate::paths::CodingBrainPaths::resolve(&crate::paths::PathEnvironment::current())
         .map(|paths| paths.state_root().to_path_buf())
@@ -474,6 +680,7 @@ pub enum StoreError {
     Io,
     LockTimeout,
     NewerSchema(u32),
+    PermissionConflict,
     Quarantine,
     Serialization,
     SnapshotTooLarge,
@@ -488,6 +695,9 @@ impl fmt::Display for StoreError {
             Self::LockTimeout => f.write_str("lifecycle store lock timed out"),
             Self::NewerSchema(version) => {
                 write!(f, "lifecycle schema {version} is newer than supported")
+            }
+            Self::PermissionConflict => {
+                f.write_str("lifecycle permission disposition conflicts with durable state")
             }
             Self::Quarantine => f.write_str("corrupt lifecycle state could not be quarantined"),
             Self::Serialization => f.write_str("lifecycle state serialization failed"),
@@ -598,6 +808,43 @@ fn valid_snapshot_shape(snapshot: &LifecycleSnapshot) -> bool {
                 })
             && (state.permission_request_events.is_empty()
                 || state.turn_open && state.current_turn.is_some());
+        let permission_authorities_valid = state.permission_authorities.len()
+            <= state.permission_request_events.len()
+            && state
+                .permission_authorities
+                .iter()
+                .all(|(request_key, authority)| {
+                    valid_id(&authority.transaction_id)
+                        && state.permission_disposition(request_key)
+                            == Some(PermissionDisposition::Decided)
+                });
+        let antigravity_permissions_valid = match key.provider {
+            AgentProvider::Antigravity => {
+                state.antigravity_permission_requests.len() == state.permission_request_events.len()
+                    && state.antigravity_permission_requests.len()
+                        <= MAX_PERMISSION_REQUESTS_PER_TURN
+                    && state
+                        .antigravity_permission_requests
+                        .values()
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        == state.antigravity_permission_requests.len()
+                    && state
+                        .antigravity_permission_requests
+                        .iter()
+                        .all(|(request_key, step)| {
+                            state
+                                .antigravity_initial_step
+                                .is_some_and(|floor| *step >= floor)
+                                && state
+                                    .antigravity_permission_disposition(request_key, *step)
+                                    .is_some()
+                        })
+            }
+            AgentProvider::Codex | AgentProvider::Claude => {
+                state.antigravity_permission_requests.is_empty()
+            }
+        };
         if !valid_id(&key.session_id)
             || !valid_path(&state.cwd)
             || !state.transcript_path.as_deref().is_none_or(valid_path)
@@ -614,6 +861,8 @@ fn valid_snapshot_shape(snapshot: &LifecycleSnapshot) -> bool {
             || (!state.stopped_subagents.is_empty() && key.provider != AgentProvider::Codex)
             || !antigravity_state_valid
             || !permission_events_valid
+            || !permission_authorities_valid
+            || !antigravity_permissions_valid
         {
             return false;
         }
@@ -768,11 +1017,18 @@ fn project_schema_one(mut snapshot: LifecycleSnapshot) -> LifecycleSnapshot {
 }
 
 fn project_schema_two(mut snapshot: LifecycleSnapshot) -> LifecycleSnapshot {
-    snapshot.schema_version = LIFECYCLE_SCHEMA_VERSION;
     for state in snapshot.sessions.values_mut() {
         state.provider_session_id = None;
         state.active_subagents.clear();
         state.stopped_subagents.clear();
+    }
+    snapshot
+}
+
+fn project_schema_three(mut snapshot: LifecycleSnapshot) -> LifecycleSnapshot {
+    snapshot.schema_version = LIFECYCLE_SCHEMA_VERSION;
+    for state in snapshot.sessions.values_mut() {
+        state.permission_authorities.clear();
     }
     snapshot
 }
@@ -975,6 +1231,7 @@ mod tests {
 
     use super::super::IgnoreReason;
     use super::super::ProjectedStatus;
+    use super::super::{PermissionAction, PermissionAuthority};
     use super::*;
     use crate::codex_transcript::CodexResumeEvidence;
     use crate::provider::{AgentProvider, AgentSessionKey};
@@ -1058,6 +1315,554 @@ mod tests {
 
     fn store() -> LifecycleStore {
         LifecycleStore::at(tempfile::tempdir().unwrap().keep())
+    }
+
+    fn open_turn(
+        store: &LifecycleStore,
+        provider: AgentProvider,
+        session: &str,
+        turn: &str,
+    ) -> super::super::LifecycleIdentity {
+        let event = provider_prompt(provider, session, turn);
+        let identity = event.identity().clone();
+        assert_eq!(store.record_at(event, 1_000), Ok(ApplyOutcome::Applied));
+        identity
+    }
+
+    fn record_permission(
+        store: &LifecycleStore,
+        identity: super::super::LifecycleIdentity,
+        disposition: super::super::PermissionDisposition,
+        request_key: &str,
+        received_at_ms: u64,
+    ) {
+        let event =
+            LifecycleEvent::permission_with_request_key(identity, disposition, request_key.into())
+                .unwrap();
+        assert_eq!(
+            store.record_at(event, received_at_ms),
+            Ok(ApplyOutcome::Applied)
+        );
+    }
+
+    #[test]
+    fn permission_disposition_is_exact_and_compensation_wins() {
+        let store = store();
+        let identity = open_turn(&store, AgentProvider::Codex, "session-1", "turn-1");
+        let request_key = "a".repeat(64);
+        assert_eq!(
+            store
+                .permission_disposition(&identity, &request_key)
+                .unwrap(),
+            None
+        );
+
+        record_permission(
+            &store,
+            identity.clone(),
+            super::super::PermissionDisposition::Decided,
+            &request_key,
+            2_000,
+        );
+        assert_eq!(
+            store
+                .permission_disposition(&identity, &request_key)
+                .unwrap(),
+            Some(super::super::PermissionDisposition::Decided)
+        );
+
+        let wrong_provider = super::super::LifecycleIdentity::try_new(
+            AgentProvider::Claude,
+            "session-1".into(),
+            Some("turn-1".into()),
+            None,
+            "/work/project".into(),
+        )
+        .unwrap();
+        let wrong_provider_session =
+            super::super::LifecycleIdentity::try_new_with_provider_session(
+                AgentProvider::Codex,
+                "session-1".into(),
+                Some("parent-1".into()),
+                Some("turn-1".into()),
+                None,
+                "/work/project".into(),
+            )
+            .unwrap();
+        let wrong_turn = super::super::LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "session-1".into(),
+            Some("turn-2".into()),
+            None,
+            "/work/project".into(),
+        )
+        .unwrap();
+        let wrong_cwd = super::super::LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "session-1".into(),
+            Some("turn-1".into()),
+            None,
+            "/work/other".into(),
+        )
+        .unwrap();
+        for inexact in [
+            wrong_provider,
+            wrong_provider_session,
+            wrong_turn,
+            wrong_cwd,
+        ] {
+            assert_eq!(
+                store
+                    .permission_disposition(&inexact, &request_key)
+                    .unwrap(),
+                None
+            );
+        }
+
+        record_permission(
+            &store,
+            identity.clone(),
+            super::super::PermissionDisposition::NeedsInput,
+            &request_key,
+            3_000,
+        );
+        assert_eq!(
+            store
+                .permission_disposition(&identity, &request_key)
+                .unwrap(),
+            Some(super::super::PermissionDisposition::NeedsInput)
+        );
+        assert_eq!(
+            store
+                .permission_disposition(&identity, &"b".repeat(64))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn compatibility_disposition_writer_rejects_bare_decided() {
+        let store = store();
+        let identity = open_turn(&store, AgentProvider::Codex, "session-1", "turn-1");
+        let request_key = "a".repeat(64);
+
+        assert_eq!(
+            store.ensure_permission_disposition(
+                &identity,
+                &request_key,
+                super::super::PermissionDisposition::Decided,
+            ),
+            Err(StoreError::PermissionConflict)
+        );
+        assert_eq!(
+            store
+                .ensure_permission_disposition(
+                    &identity,
+                    &request_key,
+                    super::super::PermissionDisposition::NeedsInput,
+                )
+                .unwrap(),
+            EnsurePermissionDisposition::Inserted
+        );
+        assert_eq!(
+            store
+                .ensure_permission_disposition(
+                    &identity,
+                    &request_key,
+                    super::super::PermissionDisposition::NeedsInput,
+                )
+                .unwrap(),
+            EnsurePermissionDisposition::Present
+        );
+        assert_eq!(
+            store.ensure_permission_disposition(
+                &identity,
+                &request_key,
+                super::super::PermissionDisposition::Decided,
+            ),
+            Err(StoreError::PermissionConflict)
+        );
+        assert_eq!(
+            store
+                .permission_disposition(&identity, &request_key)
+                .unwrap(),
+            Some(super::super::PermissionDisposition::NeedsInput)
+        );
+    }
+
+    #[test]
+    fn permission_authority_is_transaction_action_exact_and_monotonic() {
+        let store = store();
+        let identity = open_turn(&store, AgentProvider::Codex, "session-1", "turn-1");
+        let request_key = "a".repeat(64);
+        let allow_a = PermissionDecision::Decided(PermissionAuthority {
+            transaction_id: "transaction-a".into(),
+            action: PermissionAction::Allow,
+        });
+        let allow_b = PermissionDecision::Decided(PermissionAuthority {
+            transaction_id: "transaction-b".into(),
+            action: PermissionAction::Allow,
+        });
+        let deny_a = PermissionDecision::Decided(PermissionAuthority {
+            transaction_id: "transaction-a".into(),
+            action: PermissionAction::Deny,
+        });
+
+        assert_eq!(
+            store
+                .ensure_permission_decision(&identity, &request_key, allow_a.clone())
+                .unwrap(),
+            EnsurePermissionDecision::Inserted
+        );
+        assert_eq!(
+            store
+                .ensure_permission_decision(&identity, &request_key, allow_a.clone())
+                .unwrap(),
+            EnsurePermissionDecision::Present
+        );
+        assert_eq!(
+            store.ensure_permission_decision(&identity, &request_key, allow_b),
+            Err(StoreError::PermissionConflict)
+        );
+        assert_eq!(
+            store.ensure_permission_decision(&identity, &request_key, deny_a),
+            Err(StoreError::PermissionConflict)
+        );
+        assert_eq!(
+            store.ensure_permission_decision(
+                &identity,
+                &request_key,
+                PermissionDecision::NeedsInput,
+            ),
+            Ok(EnsurePermissionDecision::Inserted)
+        );
+        assert_eq!(
+            store.permission_decision(&identity, &request_key),
+            Ok(Some(PermissionDecision::NeedsInput))
+        );
+        assert_eq!(
+            store.ensure_permission_decision(&identity, &request_key, allow_a),
+            Err(StoreError::PermissionConflict)
+        );
+    }
+
+    #[test]
+    fn permission_authority_legacy_bare_decision_is_not_executable() {
+        let store = store();
+        let identity = open_turn(&store, AgentProvider::Codex, "session-1", "turn-1");
+        let request_key = "a".repeat(64);
+        record_permission(
+            &store,
+            identity.clone(),
+            PermissionDisposition::Decided,
+            &request_key,
+            2_000,
+        );
+
+        assert_eq!(
+            store.permission_disposition(&identity, &request_key),
+            Ok(Some(PermissionDisposition::Decided))
+        );
+        assert_eq!(store.permission_decision(&identity, &request_key), Ok(None));
+    }
+
+    #[test]
+    fn permission_authority_is_cleared_with_its_turn() {
+        let store = store();
+        let identity = open_turn(&store, AgentProvider::Codex, "session-1", "turn-1");
+        let request_key = "a".repeat(64);
+        store
+            .ensure_permission_decision(
+                &identity,
+                &request_key,
+                PermissionDecision::Decided(PermissionAuthority {
+                    transaction_id: "transaction-a".into(),
+                    action: PermissionAction::Allow,
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.record_at(prompt("session-1", "turn-2"), 2_000),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert!(
+            store.read().unwrap().snapshot.unwrap().sessions[&key("session-1")]
+                .permission_authorities
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn permission_authority_query_distinguishes_missing_corrupt_and_newer_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LifecycleStore::at(temp.path());
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "session-1".into(),
+            Some("turn-1".into()),
+            None,
+            "/work/project".into(),
+        )
+        .unwrap();
+        let request_key = "a".repeat(64);
+
+        assert_eq!(store.permission_decision(&identity, &request_key), Ok(None));
+        fs::create_dir_all(store.hooks_dir()).unwrap();
+        fs::write(store.snapshot_path(), b"not-json").unwrap();
+        assert_eq!(
+            store.permission_decision(&identity, &request_key),
+            Err(StoreError::InvalidSnapshot)
+        );
+        fs::write(store.snapshot_path(), br#"{"schema_version":5}"#).unwrap();
+        assert_eq!(
+            store.permission_decision(&identity, &request_key),
+            Err(StoreError::NewerSchema(5))
+        );
+    }
+
+    #[test]
+    fn exact_permission_updates_preserve_corrupt_and_newer_snapshots() {
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "session-1".into(),
+            Some("turn-1".into()),
+            None,
+            "/work/project".into(),
+        )
+        .unwrap();
+        let request_key = "a".repeat(64);
+        let decisions = [
+            PermissionDecision::NeedsInput,
+            PermissionDecision::Decided(PermissionAuthority {
+                transaction_id: "transaction-a".into(),
+                action: PermissionAction::Allow,
+            }),
+        ];
+
+        for (bytes, expected) in [
+            (b"not-json".as_slice(), StoreError::InvalidSnapshot),
+            (
+                br#"{"schema_version":5}"#.as_slice(),
+                StoreError::NewerSchema(5),
+            ),
+        ] {
+            for decision in &decisions {
+                let temp = tempfile::tempdir().unwrap();
+                let store = LifecycleStore::at(temp.path());
+                fs::create_dir_all(store.hooks_dir()).unwrap();
+                fs::write(store.snapshot_path(), bytes).unwrap();
+
+                assert_eq!(
+                    store.ensure_permission_decision(&identity, &request_key, decision.clone()),
+                    Err(expected)
+                );
+                assert_eq!(fs::read(store.snapshot_path()).unwrap(), bytes);
+                assert!(store.corrupt_paths().unwrap().is_empty());
+                let file_names = fs::read_dir(store.hooks_dir())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(
+                    file_names,
+                    ["lifecycle.json", "lifecycle.lock"]
+                        .into_iter()
+                        .map(Into::into)
+                        .collect()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_permission_disposition_is_dual_exact_and_monotonic() {
+        let store = store();
+        assert_eq!(
+            store.record(antigravity_invocation()),
+            Ok(ApplyOutcome::Applied)
+        );
+        let identity = super::super::LifecycleIdentity::try_new(
+            AgentProvider::Antigravity,
+            "agy-conversation-1".into(),
+            Some("step-5".into()),
+            None,
+            "/work/antigravity".into(),
+        )
+        .unwrap();
+        let request_key = "a".repeat(64);
+
+        assert_eq!(
+            store.ensure_permission_decision(
+                &identity,
+                &request_key,
+                PermissionDecision::Decided(PermissionAuthority {
+                    transaction_id: "transaction-antigravity".into(),
+                    action: PermissionAction::Allow,
+                }),
+            ),
+            Ok(EnsurePermissionDecision::Inserted)
+        );
+        assert_eq!(
+            store.permission_disposition(&identity, &request_key),
+            Ok(Some(super::super::PermissionDisposition::Decided))
+        );
+        let changed_request_key = "b".repeat(64);
+        assert_eq!(
+            store.ensure_permission_disposition(
+                &identity,
+                &changed_request_key,
+                super::super::PermissionDisposition::Decided,
+            ),
+            Err(StoreError::PermissionConflict)
+        );
+        let changed_step = super::super::LifecycleIdentity::try_new(
+            AgentProvider::Antigravity,
+            "agy-conversation-1".into(),
+            Some("step-6".into()),
+            None,
+            "/work/antigravity".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.ensure_permission_disposition(
+                &changed_step,
+                &request_key,
+                super::super::PermissionDisposition::Decided,
+            ),
+            Err(StoreError::PermissionConflict)
+        );
+        let below_floor = super::super::LifecycleIdentity::try_new(
+            AgentProvider::Antigravity,
+            "agy-conversation-1".into(),
+            Some("step-4".into()),
+            None,
+            "/work/antigravity".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.ensure_permission_disposition(
+                &below_floor,
+                &"c".repeat(64),
+                super::super::PermissionDisposition::Decided,
+            ),
+            Err(StoreError::PermissionConflict)
+        );
+
+        let dual = store.read().unwrap().snapshot.unwrap();
+        let mut child_only = dual.clone();
+        let child_only_state = child_only.sessions.get_mut(&antigravity_key()).unwrap();
+        child_only_state.permission_request_events.clear();
+        child_only_state.antigravity_permission_requests.clear();
+        assert_eq!(
+            snapshot_permission_disposition(&child_only, &identity, &request_key),
+            None
+        );
+        let mut key_only = dual.clone();
+        key_only
+            .sessions
+            .get_mut(&antigravity_key())
+            .unwrap()
+            .antigravity_child_events
+            .clear();
+        assert_eq!(
+            snapshot_permission_disposition(&key_only, &identity, &request_key),
+            None
+        );
+        let mut wrong_invocation = dual.clone();
+        wrong_invocation
+            .sessions
+            .get_mut(&antigravity_key())
+            .unwrap()
+            .current_turn = Some("turn-1".into());
+        assert_eq!(
+            snapshot_permission_disposition(&wrong_invocation, &identity, &request_key),
+            None
+        );
+        let mut closed = dual;
+        closed
+            .sessions
+            .get_mut(&antigravity_key())
+            .unwrap()
+            .turn_open = false;
+        assert_eq!(
+            snapshot_permission_disposition(&closed, &identity, &request_key),
+            None
+        );
+
+        assert_eq!(
+            store.ensure_permission_disposition(
+                &identity,
+                &request_key,
+                super::super::PermissionDisposition::NeedsInput,
+            ),
+            Ok(EnsurePermissionDisposition::Inserted)
+        );
+        assert_eq!(
+            store.permission_disposition(&identity, &request_key),
+            Ok(Some(super::super::PermissionDisposition::NeedsInput))
+        );
+        assert_eq!(
+            store.ensure_permission_disposition(
+                &identity,
+                &request_key,
+                super::super::PermissionDisposition::Decided,
+            ),
+            Err(StoreError::PermissionConflict)
+        );
+    }
+
+    #[test]
+    fn antigravity_permission_authority_requires_exact_dual_projection() {
+        let store = store();
+        assert_eq!(
+            store.record(antigravity_invocation()),
+            Ok(ApplyOutcome::Applied)
+        );
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Antigravity,
+            "agy-conversation-1".into(),
+            Some("step-5".into()),
+            None,
+            "/work/antigravity".into(),
+        )
+        .unwrap();
+        let request_key = "a".repeat(64);
+        let decision = PermissionDecision::Decided(PermissionAuthority {
+            transaction_id: "transaction-a".into(),
+            action: PermissionAction::Allow,
+        });
+        assert_eq!(
+            store.ensure_permission_decision(&identity, &request_key, decision.clone()),
+            Ok(EnsurePermissionDecision::Inserted)
+        );
+        assert_eq!(
+            store.permission_decision(&identity, &request_key),
+            Ok(Some(decision))
+        );
+
+        let snapshot = store.read().unwrap().snapshot.unwrap();
+        let mut missing_step_binding = snapshot.clone();
+        missing_step_binding
+            .sessions
+            .get_mut(&antigravity_key())
+            .unwrap()
+            .antigravity_permission_requests
+            .clear();
+        assert_eq!(
+            snapshot_permission_decision(&missing_step_binding, &identity, &request_key),
+            None
+        );
+        let mut missing_child_bits = snapshot;
+        missing_child_bits
+            .sessions
+            .get_mut(&antigravity_key())
+            .unwrap()
+            .antigravity_child_events
+            .clear();
+        assert_eq!(
+            snapshot_permission_decision(&missing_child_bits, &identity, &request_key),
+            None
+        );
     }
 
     fn subagent_start(root: &str, child: &str, turn: &str) -> LifecycleEvent {
@@ -1441,15 +2246,43 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = LifecycleStore::at(temp.path());
         fs::create_dir_all(store.hooks_dir()).unwrap();
-        let original = br#"{"schema_version":4}"#;
+        let original = br#"{"schema_version":5}"#;
         fs::write(store.snapshot_path(), original).unwrap();
 
         let view = store.read().unwrap();
-        assert_eq!(view.condition, StoreCondition::NewerSchema(4));
+        assert_eq!(view.condition, StoreCondition::NewerSchema(5));
         assert!(view.snapshot.is_none());
         assert_eq!(
             store.record_at(prompt("session-1", "turn-1"), 1_000),
-            Err(StoreError::NewerSchema(4))
+            Err(StoreError::NewerSchema(5))
+        );
+        assert_eq!(fs::read(store.snapshot_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn schema_three_bare_permission_decision_migrates_without_authority() {
+        let mut value = snapshot_with_permission_events(json!({
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": 2
+        }));
+        value["schema_version"] = json!(3);
+        value["sessions"][key("session-1")]
+            .as_object_mut()
+            .unwrap()
+            .remove("permission_authorities");
+        let original = serde_json::to_vec(&value).unwrap();
+        let store = store();
+        fs::create_dir_all(store.hooks_dir()).unwrap();
+        fs::write(store.snapshot_path(), &original).unwrap();
+
+        let view = store.read().unwrap();
+
+        assert_eq!(view.condition, StoreCondition::Healthy);
+        let projected = view.snapshot.unwrap();
+        assert_eq!(projected.schema_version, 4);
+        assert!(
+            projected.sessions[&key("session-1")]
+                .permission_authorities
+                .is_empty()
         );
         assert_eq!(fs::read(store.snapshot_path()).unwrap(), original);
     }
@@ -2289,7 +3122,7 @@ mod tests {
         let view = store.read().unwrap();
         let snapshot = view.snapshot.unwrap();
         assert_eq!(view.condition, StoreCondition::Healthy);
-        assert_eq!(snapshot.schema_version, 3);
+        assert_eq!(snapshot.schema_version, 4);
         assert!(
             snapshot
                 .sessions
