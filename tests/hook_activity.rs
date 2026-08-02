@@ -1780,10 +1780,6 @@ fn reopened_shell_safety_corpus_denies_before_model_inference_for_every_provider
         ),
         ("rm -rf $'\\x2f'", "unsafe-recursive-delete-expansion"),
         (
-            "env $'-\\x53' 'rm -rf /'",
-            "unsafe-recursive-delete-expansion",
-        ),
-        (
             "cat <(rm --no-preserve-root -rf /)",
             "unsafe-recursive-delete-expansion",
         ),
@@ -1830,6 +1826,22 @@ fn reopened_shell_safety_corpus_denies_before_model_inference_for_every_provider
         (
             "busybox time sh -c 'rm --no-preserve-root -rf /'",
             "irreversible-root-delete",
+        ),
+        (
+            "/usr/bin/time -o \"$@\" 'rm --no-preserve-root -rf /'",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "builtin exec /usr/bin/env -u \"${VALUES[@]}\" 'rm --no-preserve-root -rf /'",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "builtin command busybox time -f \"$@\" 'rm --no-preserve-root -rf /'",
+            "unsafe-recursive-delete-expansion",
+        ),
+        (
+            "env -S 'rm --no-preserve-root -rf /'",
+            "unsafe-recursive-delete-expansion",
         ),
         (
             "toybox env sh -c 'rm --no-preserve-root -rf /'",
@@ -2470,6 +2482,10 @@ fn real_shell_safety_indeterminate_corpus_preserves_native_confirmation_without_
         (
             "abbreviated GNU time option",
             "/usr/bin/time --out log rm -rf /".to_string(),
+        ),
+        (
+            "ANSI-C env split-string option",
+            "env $'-\\x53' 'rm -rf /'".to_string(),
         ),
     ];
 

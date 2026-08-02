@@ -2136,6 +2136,20 @@ mod tests {
             ("sh -c 'rm --no-preserve-root -rf /'", true),
             ("busybox env sh -c 'rm --no-preserve-root -rf /'", true),
             ("busybox time sh -c 'rm --no-preserve-root -rf /'", true),
+            (
+                "VALUE='log sh'; /usr/bin/time -o $VALUE 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "/usr/bin/env -u {HOME,sh} 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            ("busybox time -o * 'rm --no-preserve-root -rf /'", true),
+            (
+                "VALUE='HOME sh'; busybox env -u $VALUE 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            ("env -S 'rm --no-preserve-root -rf /'", true),
             ("toybox env sh -c 'rm --no-preserve-root -rf /'", true),
             ("toybox time sh -c 'rm --no-preserve-root -rf /'", true),
             ("busybox ls", false),
@@ -2149,6 +2163,38 @@ mod tests {
                 false,
             ),
             ("busybox env -v sh -c 'rm --no-preserve-root -rf /'", false),
+            (
+                "/usr/bin/time -h sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/time -q sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/env --help sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/env --version sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            ("/usr/bin/env -0 sh -c 'rm --no-preserve-root -rf /'", false),
+            ("env FOO=bar -i sh -c 'rm --no-preserve-root -rf /'", false),
+            (
+                "/usr/bin/time \"$OPTION\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            ("env \"$OPTION\" sh -c 'rm --no-preserve-root -rf /'", false),
+            (
+                "env FOO=bar \"$COMMAND\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            ("env --split-string 'rm -rf /'", false),
+            ("env --split='rm -rf /'", false),
+            ("env $'-\\x53' 'rm -rf /'", false),
+            ("/usr/bin/time -p sh -c 'rm --no-preserve-root -rf /'", true),
+            ("/usr/bin/env -i sh -c 'rm --no-preserve-root -rf /'", true),
             ("time -- eval 'rm --no-preserve-root -rf /'", true),
             ("time -p -- ! sh -c 'rm --no-preserve-root -rf /'", true),
             ("eval -- 'rm --no-preserve-root -rf /'", true),
@@ -2248,7 +2294,7 @@ mod tests {
             ("env -a displayed bash -c 'printf ok'", false),
             (
                 "env --argv0=displayed /bin/bash -c 'rm --no-preserve-root -rf /'",
-                true,
+                false,
             ),
             ("env --argv0", false),
             ("exec -cla displayed bash -c 'printf ok'", false),
