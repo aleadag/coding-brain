@@ -2149,6 +2149,110 @@ mod tests {
                 "VALUE='HOME sh'; busybox env -u $VALUE 'rm --no-preserve-root -rf /'",
                 true,
             ),
+            (
+                "/usr/bin/time -o '' sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "busybox time -o '' sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/env -u '' sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/env -u '=HOME' sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/env -u=HOME sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/env -uA=B sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/time -o \"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/env -u \"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "busybox env -u '=HOME' sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox env -u \"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox time -o\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "busybox time -f\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "busybox time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "busybox time -vfX\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "busybox env -u\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "busybox env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox env -u\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox env -iu\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox env -u\"$@\" sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox env -uX\"$@\" sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox env -u\"$@\"X sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox env -uX\"${VALUES[@]}\" sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox env -u\"${VALUES[@]}\"X sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox env -iu\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
             ("env -S 'rm --no-preserve-root -rf /'", true),
             ("toybox env sh -c 'rm --no-preserve-root -rf /'", true),
             ("toybox time sh -c 'rm --no-preserve-root -rf /'", true),

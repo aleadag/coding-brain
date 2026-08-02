@@ -3079,7 +3079,7 @@ fn unwrap_command_with_context<'a>(
                                 Some(_) => unreachable!("multicall launcher registry"),
                                 None => classify_time_option(option),
                             };
-                            let Some(takes_value) = option else {
+                            let Some(option) = option else {
                                 indeterminate_after_scan = true;
                                 return Ok(UnwrappedCommand {
                                     words: original_words,
@@ -3091,7 +3091,59 @@ fn unwrap_command_with_context<'a>(
                                 });
                             };
                             words = &words[1..];
-                            if takes_value && words.is_empty() {
+                            match consume_wrapper_option_value(words, option) {
+                                WrapperValueConsumption::Consumed(remaining) => words = remaining,
+                                WrapperValueConsumption::Indeterminate => {
+                                    indeterminate_after_scan = true;
+                                    return Ok(UnwrappedCommand {
+                                        words: original_words,
+                                        indeterminate_child_context,
+                                        indeterminate_after_scan,
+                                        eval_context,
+                                        time_keyword_allowed,
+                                        eval_prefix_assignments_persist,
+                                    });
+                                }
+                                WrapperValueConsumption::UnsafeExpansion => {
+                                    return Err(UnwrapError::UnsafeExpansion);
+                                }
+                            }
+                        }
+                        None => {
+                            let option = match multicall_launcher {
+                                Some("busybox") => classify_dynamic_busybox_time_option(word),
+                                Some("toybox") => None,
+                                Some(_) => unreachable!("multicall launcher registry"),
+                                None => classify_dynamic_time_option(word),
+                            };
+                            if let Some(option) = option {
+                                words = &words[1..];
+                                match consume_wrapper_option_value(words, option) {
+                                    WrapperValueConsumption::Consumed(remaining) => {
+                                        words = remaining
+                                    }
+                                    WrapperValueConsumption::Indeterminate => {
+                                        indeterminate_after_scan = true;
+                                        return Ok(UnwrappedCommand {
+                                            words: original_words,
+                                            indeterminate_child_context,
+                                            indeterminate_after_scan,
+                                            eval_context,
+                                            time_keyword_allowed,
+                                            eval_prefix_assignments_persist,
+                                        });
+                                    }
+                                    WrapperValueConsumption::UnsafeExpansion => {
+                                        return Err(UnwrapError::UnsafeExpansion);
+                                    }
+                                }
+                                continue;
+                            }
+                            if word_can_select_command(word)
+                                && !word.can_split_fields
+                                && multicall_launcher.is_none()
+                                && eval_context == EvalContext::External
+                            {
                                 indeterminate_after_scan = true;
                                 return Ok(UnwrappedCommand {
                                     words: original_words,
@@ -3102,30 +3154,10 @@ fn unwrap_command_with_context<'a>(
                                     eval_prefix_assignments_persist,
                                 });
                             }
-                            if takes_value {
-                                if word_may_not_expand_to_exactly_one_argv(words[0]) {
-                                    return Err(UnwrapError::UnsafeExpansion);
-                                }
-                                words = &words[1..];
+                            if word_can_select_command(word) {
+                                return Err(UnwrapError::DynamicOrUnsupported);
                             }
-                        }
-                        None if word_can_select_command(word)
-                            && !word.can_split_fields
-                            && multicall_launcher.is_none()
-                            && eval_context == EvalContext::External =>
-                        {
-                            indeterminate_after_scan = true;
-                            return Ok(UnwrappedCommand {
-                                words: original_words,
-                                indeterminate_child_context,
-                                indeterminate_after_scan,
-                                eval_context,
-                                time_keyword_allowed,
-                                eval_prefix_assignments_persist,
-                            });
-                        }
-                        None if word_can_select_command(word) => {
-                            return Err(UnwrapError::DynamicOrUnsupported);
+                            break;
                         }
                         _ => break,
                     }
@@ -3292,6 +3324,77 @@ fn unwrap_command_with_context<'a>(
                 words = &words[1..];
                 let mut options_ended = false;
                 while let Some(word) = words.first() {
+                    if !options_ended {
+                        let option = match word.literal.as_deref() {
+                            Some(literal)
+                                if literal.starts_with('-') && !matches!(literal, "-" | "--") =>
+                            {
+                                match multicall_launcher {
+                                    Some("busybox") => classify_busybox_env_option(literal),
+                                    Some("toybox") => EnvOption::Unsupported,
+                                    Some(_) => unreachable!("multicall launcher registry"),
+                                    None => classify_env_option(literal),
+                                }
+                            }
+                            None => match multicall_launcher {
+                                Some("busybox") => classify_dynamic_busybox_env_option(word),
+                                Some("toybox") => None,
+                                Some(_) => unreachable!("multicall launcher registry"),
+                                None => classify_dynamic_env_option(word),
+                            }
+                            .unwrap_or(EnvOption::Unsupported),
+                            _ => EnvOption::Unsupported,
+                        };
+                        if !matches!(option, EnvOption::Unsupported)
+                            || word.literal.as_deref().is_some_and(|literal| {
+                                literal.starts_with('-') && !matches!(literal, "-" | "--")
+                            })
+                        {
+                            match option {
+                                EnvOption::Supported {
+                                    value,
+                                    child_context,
+                                } => {
+                                    indeterminate_child_context |= child_context;
+                                    words = &words[1..];
+                                    match consume_wrapper_option_value(words, value) {
+                                        WrapperValueConsumption::Consumed(remaining) => {
+                                            words = remaining
+                                        }
+                                        WrapperValueConsumption::Indeterminate => {
+                                            indeterminate_after_scan = true;
+                                            return Ok(UnwrappedCommand {
+                                                words: original_words,
+                                                indeterminate_child_context,
+                                                indeterminate_after_scan,
+                                                eval_context,
+                                                time_keyword_allowed,
+                                                eval_prefix_assignments_persist,
+                                            });
+                                        }
+                                        WrapperValueConsumption::UnsafeExpansion => {
+                                            return Err(UnwrapError::UnsafeExpansion);
+                                        }
+                                    }
+                                    continue;
+                                }
+                                EnvOption::SplitString => {
+                                    return Err(UnwrapError::UnsafeExpansion);
+                                }
+                                EnvOption::Unsupported => {
+                                    indeterminate_after_scan = true;
+                                    return Ok(UnwrappedCommand {
+                                        words: original_words,
+                                        indeterminate_child_context,
+                                        indeterminate_after_scan,
+                                        eval_context,
+                                        time_keyword_allowed,
+                                        eval_prefix_assignments_persist,
+                                    });
+                                }
+                            }
+                        }
+                    }
                     let Some(literal) = word.literal.as_deref() else {
                         return if word_can_select_command(word) {
                             if multicall_launcher.is_none() && !word.can_split_fields {
@@ -3324,51 +3427,6 @@ fn unwrap_command_with_context<'a>(
                     } else if !options_ended && literal == "-" {
                         indeterminate_child_context = true;
                         words = &words[1..];
-                    } else if !options_ended && literal.starts_with('-') && literal != "-" {
-                        let option = match multicall_launcher {
-                            Some("busybox") => classify_busybox_env_option(literal),
-                            Some("toybox") => EnvOption::Unsupported,
-                            Some(_) => unreachable!("multicall launcher registry"),
-                            None => classify_env_option(literal),
-                        };
-                        match option {
-                            EnvOption::Supported {
-                                takes_separate_value,
-                                child_context,
-                            } => {
-                                indeterminate_child_context |= child_context;
-                                words = &words[1..];
-                                if takes_separate_value && words.is_empty() {
-                                    indeterminate_after_scan = true;
-                                    return Ok(UnwrappedCommand {
-                                        words,
-                                        indeterminate_child_context,
-                                        indeterminate_after_scan,
-                                        eval_context,
-                                        time_keyword_allowed,
-                                        eval_prefix_assignments_persist,
-                                    });
-                                }
-                                if takes_separate_value {
-                                    if word_may_not_expand_to_exactly_one_argv(words[0]) {
-                                        return Err(UnwrapError::UnsafeExpansion);
-                                    }
-                                    words = &words[1..];
-                                }
-                            }
-                            EnvOption::SplitString => return Err(UnwrapError::UnsafeExpansion),
-                            EnvOption::Unsupported => {
-                                indeterminate_after_scan = true;
-                                return Ok(UnwrappedCommand {
-                                    words: original_words,
-                                    indeterminate_child_context,
-                                    indeterminate_after_scan,
-                                    eval_context,
-                                    time_keyword_allowed,
-                                    eval_prefix_assignments_persist,
-                                });
-                            }
-                        }
                     } else if is_env_environment_argument(literal) {
                         options_ended = true;
                         indeterminate_child_context = true;
@@ -3413,34 +3471,217 @@ fn is_env_environment_argument(word: &str) -> bool {
     word.contains('=')
 }
 
-fn classify_time_option(word: &str) -> Option<bool> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WrapperOptionValue {
+    None,
+    Required {
+        attached: WrapperOptionAttachment,
+        rule: WrapperValueRule,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WrapperOptionAttachment {
+    Separate,
+    Literal(String),
+    Dynamic {
+        literal_prefix: String,
+        literal_after_dynamic_proves_nonempty: bool,
+        may_not_expand_to_exactly_one_argv: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperValueRule {
+    Any,
+    NonEmpty,
+    EnvUnsetName,
+}
+
+impl WrapperValueRule {
+    fn accepts_literal(self, value: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::NonEmpty => !value.is_empty(),
+            Self::EnvUnsetName => !value.is_empty() && !value.contains('='),
+        }
+    }
+}
+
+enum WrapperValueConsumption<'a> {
+    Consumed(&'a [&'a shell::ShellWord]),
+    Indeterminate,
+    UnsafeExpansion,
+}
+
+fn consume_wrapper_option_value<'a>(
+    words: &'a [&'a shell::ShellWord],
+    value: WrapperOptionValue,
+) -> WrapperValueConsumption<'a> {
+    let WrapperOptionValue::Required { attached, rule } = value else {
+        return WrapperValueConsumption::Consumed(words);
+    };
+
+    match attached {
+        WrapperOptionAttachment::Literal(attached) => {
+            return if rule.accepts_literal(&attached) {
+                WrapperValueConsumption::Consumed(words)
+            } else {
+                WrapperValueConsumption::Indeterminate
+            };
+        }
+        WrapperOptionAttachment::Dynamic {
+            literal_prefix,
+            literal_after_dynamic_proves_nonempty,
+            may_not_expand_to_exactly_one_argv,
+        } => {
+            if may_not_expand_to_exactly_one_argv {
+                return WrapperValueConsumption::UnsafeExpansion;
+            }
+            return match rule {
+                WrapperValueRule::Any
+                    if !literal_prefix.is_empty() || literal_after_dynamic_proves_nonempty =>
+                {
+                    WrapperValueConsumption::Consumed(words)
+                }
+                WrapperValueRule::Any
+                | WrapperValueRule::NonEmpty
+                | WrapperValueRule::EnvUnsetName => WrapperValueConsumption::Indeterminate,
+            };
+        }
+        WrapperOptionAttachment::Separate => {}
+    }
+
+    let Some((word, remaining)) = words.split_first() else {
+        return WrapperValueConsumption::Indeterminate;
+    };
+    if word_may_not_expand_to_exactly_one_argv(word) {
+        return WrapperValueConsumption::UnsafeExpansion;
+    }
+    match word.literal.as_deref() {
+        Some(literal) if rule.accepts_literal(literal) => {
+            WrapperValueConsumption::Consumed(remaining)
+        }
+        None if rule == WrapperValueRule::Any => WrapperValueConsumption::Consumed(remaining),
+        _ => WrapperValueConsumption::Indeterminate,
+    }
+}
+
+fn leading_literal_option_prefix(word: &shell::ShellWord) -> Option<String> {
+    if word.literal.is_some() {
+        return None;
+    }
+    let mut prefix = String::new();
+    for part in &word.parts {
+        match part {
+            shell::WordPart::Literal(value) | shell::WordPart::UnquotedLiteral(value) => {
+                prefix.push_str(value);
+            }
+            _ => break,
+        }
+    }
+    (!prefix.is_empty()).then_some(prefix)
+}
+
+fn dynamic_word_has_literal_after_dynamic(word: &shell::ShellWord) -> bool {
+    let mut saw_dynamic = false;
+    word.parts.iter().any(|part| match part {
+        shell::WordPart::Literal(value) | shell::WordPart::UnquotedLiteral(value) => {
+            saw_dynamic && !value.is_empty()
+        }
+        _ => {
+            saw_dynamic = true;
+            false
+        }
+    })
+}
+
+fn classify_time_option(word: &str) -> Option<WrapperOptionValue> {
+    classify_time_option_prefix(word, false, false)
+}
+
+fn classify_dynamic_time_option(word: &shell::ShellWord) -> Option<WrapperOptionValue> {
+    let option = classify_time_option_prefix(
+        &leading_literal_option_prefix(word)?,
+        true,
+        word_may_not_expand_to_exactly_one_argv(word),
+    );
+    matches!(&option, Some(WrapperOptionValue::Required { .. })).then_some(option)?
+}
+
+fn classify_time_option_prefix(
+    word: &str,
+    dynamic_suffix: bool,
+    may_not_expand_to_exactly_one_argv: bool,
+) -> Option<WrapperOptionValue> {
     if word.starts_with("--") {
         return None;
     }
 
-    let mut options = word.strip_prefix('-')?.chars().peekable();
-    options.peek()?;
-    while let Some(option) = options.next() {
+    let mut options = word.strip_prefix('-')?;
+    if options.is_empty() {
+        return None;
+    }
+    while let Some(option) = options.chars().next() {
+        options = &options[option.len_utf8()..];
         match option {
-            'o' => return Some(options.peek().is_none()),
+            'o' => {
+                return Some(WrapperOptionValue::Required {
+                    attached: wrapper_option_attachment(
+                        options,
+                        dynamic_suffix,
+                        may_not_expand_to_exactly_one_argv,
+                    ),
+                    rule: WrapperValueRule::NonEmpty,
+                });
+            }
             'a' | 'p' => {}
             _ => return None,
         }
     }
-    Some(false)
+    Some(WrapperOptionValue::None)
 }
 
-fn classify_busybox_time_option(word: &str) -> Option<bool> {
-    let mut options = word.strip_prefix('-')?.chars().peekable();
-    options.peek()?;
-    while let Some(option) = options.next() {
+fn classify_busybox_time_option(word: &str) -> Option<WrapperOptionValue> {
+    classify_busybox_time_option_prefix(word, false, false)
+}
+
+fn classify_dynamic_busybox_time_option(word: &shell::ShellWord) -> Option<WrapperOptionValue> {
+    let option = classify_busybox_time_option_prefix(
+        &leading_literal_option_prefix(word)?,
+        true,
+        word_may_not_expand_to_exactly_one_argv(word),
+    );
+    matches!(&option, Some(WrapperOptionValue::Required { .. })).then_some(option)?
+}
+
+fn classify_busybox_time_option_prefix(
+    word: &str,
+    dynamic_suffix: bool,
+    may_not_expand_to_exactly_one_argv: bool,
+) -> Option<WrapperOptionValue> {
+    let mut options = word.strip_prefix('-')?;
+    if options.is_empty() {
+        return None;
+    }
+    while let Some(option) = options.chars().next() {
+        options = &options[option.len_utf8()..];
         match option {
-            'o' | 'f' => return Some(options.peek().is_none()),
+            'o' | 'f' => {
+                return Some(WrapperOptionValue::Required {
+                    attached: wrapper_option_attachment(
+                        options,
+                        dynamic_suffix,
+                        may_not_expand_to_exactly_one_argv,
+                    ),
+                    rule: WrapperValueRule::NonEmpty,
+                });
+            }
             'a' | 'p' | 'v' => {}
             _ => return None,
         }
     }
-    Some(false)
+    Some(WrapperOptionValue::None)
 }
 
 fn classify_exec_option(word: &str) -> Option<bool> {
@@ -3456,33 +3697,79 @@ fn classify_exec_option(word: &str) -> Option<bool> {
     Some(false)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum EnvOption {
     Supported {
-        takes_separate_value: bool,
+        value: WrapperOptionValue,
         child_context: bool,
     },
     SplitString,
     Unsupported,
 }
 
+fn wrapper_option_attachment(
+    attached: &str,
+    dynamic_suffix: bool,
+    may_not_expand_to_exactly_one_argv: bool,
+) -> WrapperOptionAttachment {
+    if dynamic_suffix {
+        WrapperOptionAttachment::Dynamic {
+            literal_prefix: attached.into(),
+            literal_after_dynamic_proves_nonempty: false,
+            may_not_expand_to_exactly_one_argv,
+        }
+    } else if attached.is_empty() {
+        WrapperOptionAttachment::Separate
+    } else {
+        WrapperOptionAttachment::Literal(attached.into())
+    }
+}
+
 fn classify_env_option(word: &str) -> EnvOption {
+    classify_env_option_prefix(word, false, false)
+}
+
+fn classify_dynamic_env_option(word: &shell::ShellWord) -> Option<EnvOption> {
+    let option = classify_env_option_prefix(
+        &leading_literal_option_prefix(word)?,
+        true,
+        word_may_not_expand_to_exactly_one_argv(word),
+    );
+    matches!(
+        &option,
+        EnvOption::Supported {
+            value: WrapperOptionValue::Required { .. },
+            ..
+        }
+    )
+    .then_some(option)
+}
+
+fn classify_env_option_prefix(
+    word: &str,
+    dynamic_suffix: bool,
+    may_not_expand_to_exactly_one_argv: bool,
+) -> EnvOption {
     if word.starts_with("--") {
         return EnvOption::Unsupported;
     }
 
-    let mut options = word
-        .strip_prefix('-')
-        .unwrap_or_default()
-        .chars()
-        .peekable();
+    let mut options = word.strip_prefix('-').unwrap_or_default();
     let mut child_context = false;
-    while let Some(option) = options.next() {
+    while let Some(option) = options.chars().next() {
+        options = &options[option.len_utf8()..];
         match option {
             'S' => return EnvOption::SplitString,
             'u' => {
                 return EnvOption::Supported {
-                    takes_separate_value: options.peek().is_none(),
+                    value: WrapperOptionValue::Required {
+                        attached: wrapper_option_attachment(
+                            options,
+                            dynamic_suffix,
+                            may_not_expand_to_exactly_one_argv,
+                        ),
+                        rule: WrapperValueRule::EnvUnsetName,
+                    },
                     child_context: true,
                 };
             }
@@ -3492,25 +3779,71 @@ fn classify_env_option(word: &str) -> EnvOption {
         }
     }
     EnvOption::Supported {
-        takes_separate_value: false,
+        value: WrapperOptionValue::None,
         child_context,
     }
 }
 
 fn classify_busybox_env_option(word: &str) -> EnvOption {
-    let Some(short) = word.strip_prefix('-') else {
+    classify_busybox_env_option_prefix(word, false, false)
+}
+
+fn classify_dynamic_busybox_env_option(word: &shell::ShellWord) -> Option<EnvOption> {
+    let mut option = classify_busybox_env_option_prefix(
+        &leading_literal_option_prefix(word)?,
+        true,
+        word_may_not_expand_to_exactly_one_argv(word),
+    );
+    if let EnvOption::Supported {
+        value:
+            WrapperOptionValue::Required {
+                attached:
+                    WrapperOptionAttachment::Dynamic {
+                        literal_after_dynamic_proves_nonempty,
+                        ..
+                    },
+                rule: WrapperValueRule::Any,
+            },
+        ..
+    } = &mut option
+    {
+        *literal_after_dynamic_proves_nonempty = dynamic_word_has_literal_after_dynamic(word);
+    }
+    matches!(
+        &option,
+        EnvOption::Supported {
+            value: WrapperOptionValue::Required { .. },
+            ..
+        }
+    )
+    .then_some(option)
+}
+
+fn classify_busybox_env_option_prefix(
+    word: &str,
+    dynamic_suffix: bool,
+    may_not_expand_to_exactly_one_argv: bool,
+) -> EnvOption {
+    let Some(mut options) = word.strip_prefix('-') else {
         return EnvOption::Unsupported;
     };
-    let mut options = short.chars().peekable();
-    if options.peek().is_none() {
+    if options.is_empty() {
         return EnvOption::Unsupported;
     }
     let mut child_context = false;
-    while let Some(option) = options.next() {
+    while let Some(option) = options.chars().next() {
+        options = &options[option.len_utf8()..];
         match option {
             'u' => {
                 return EnvOption::Supported {
-                    takes_separate_value: options.peek().is_none(),
+                    value: WrapperOptionValue::Required {
+                        attached: wrapper_option_attachment(
+                            options,
+                            dynamic_suffix,
+                            may_not_expand_to_exactly_one_argv,
+                        ),
+                        rule: WrapperValueRule::Any,
+                    },
                     child_context: true,
                 };
             }
@@ -3520,7 +3853,7 @@ fn classify_busybox_env_option(word: &str) -> EnvOption {
         }
     }
     EnvOption::Supported {
-        takes_separate_value: false,
+        value: WrapperOptionValue::None,
         child_context,
     }
 }
@@ -5916,6 +6249,132 @@ mod tests {
     }
 
     #[test]
+    fn invalid_or_unknown_wrapper_option_values_are_indeterminate() {
+        for command in [
+            "/usr/bin/time -o '' sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -o '' sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -u '' sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -u '=HOME' sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -u=HOME sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -uA=B sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -o \"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -u \"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -f \"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
+            "builtin command /usr/bin/time -o \"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+            "builtin exec /usr/bin/env -u \"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}: {:?}",
+                evaluate_result(command)
+            );
+        }
+    }
+
+    #[test]
+    fn valid_wrapper_option_values_reach_destructive_children() {
+        for command in [
+            "/usr/bin/time -o log sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -aolog sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -olog sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -vfFORMAT sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -u HOME sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -ivuHOME sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -u '' sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -u '=HOME' sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -u=HOME sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -uA=B sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -u \"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("{command}: {:?}", evaluate_result(command)));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn invalid_wrapper_value_keeps_deny_precedence_in_both_orders() {
+        for command in [
+            "/usr/bin/time -o '' sh -c 'rm -rf /'; rm --no-preserve-root -rf /",
+            "rm --no-preserve-root -rf /; /usr/bin/env -u '=HOME' sh -c 'rm -rf /'",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn attached_dynamic_wrapper_values_preserve_value_semantics() {
+        for command in [
+            "busybox time -o\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -f\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -vfX\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -u\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -iu\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}: {:?}",
+                evaluate_result(command)
+            );
+        }
+
+        for command in [
+            "busybox env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -u\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -iu\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("{command}: {:?}", evaluate_result(command)));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+
+        for command in [
+            "busybox env -u\"$@\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -uX\"$@\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -u\"$@\"X sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -uX\"${VALUES[@]}\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -u\"${VALUES[@]}\"X sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("{command}: {:?}", evaluate_result(command)));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_attached_non_value_options_do_not_project_children() {
+        for command in [
+            "/usr/bin/time -a\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -i\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}: {:?}",
+                evaluate_result(command)
+            );
+        }
+
+        for command in [
+            "busybox time -a\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox env -i\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("{command}: {:?}", evaluate_result(command)));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn expanding_separate_wrapper_option_values_fail_closed() {
         for command in [
             "VALUE='log sh'; /usr/bin/time -o $VALUE 'rm --no-preserve-root -rf /'",
@@ -5993,27 +6452,37 @@ mod tests {
     }
 
     #[test]
-    fn single_field_separate_wrapper_option_values_do_not_deny() {
+    fn dynamic_separate_wrapper_option_values_are_indeterminate() {
         for command in [
             "VALUE='log sh'; /usr/bin/time -o \"$VALUE\" printf ok",
-            "/usr/bin/time -o log printf ok",
-            "/usr/bin/time -o ~ printf ok",
             "VALUE='HOME sh'; /usr/bin/env -u \"$VALUE\" printf ok",
-            "/usr/bin/env -u HOME printf ok",
-            "/usr/bin/env -u $'H\\x4fME' printf ok",
             "VALUE='log sh'; busybox time -o \"$VALUE\" printf ok",
-            "busybox time -o log printf ok",
-            "busybox time -o $'log' printf ok",
             "busybox time -f \"$VALUE\" printf ok",
-            "VALUE='HOME sh'; busybox env -u \"$VALUE\" printf ok",
-            "busybox env -u HOME printf ok",
-            "busybox env -u ~ printf ok",
             "/usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
             "/usr/bin/env -u \"${VALUE:+$*}\" printf ok",
             "busybox time -f \"${VALUE:-${FORMAT[*]}}\" printf ok",
-            "busybox env -u \"${VALUE:-${NAME:-HOME}}\" printf ok",
             "builtin command /usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
             "builtin exec busybox time -f \"${VALUE:+$*}\" printf ok",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}: {:?}",
+                evaluate_result(command)
+            );
+        }
+    }
+
+    #[test]
+    fn literal_or_busybox_env_separate_wrapper_option_values_do_not_deny() {
+        for command in [
+            "/usr/bin/time -o log printf ok",
+            "/usr/bin/env -u HOME printf ok",
+            "busybox time -o log printf ok",
+            "busybox time -o $'log' printf ok",
+            "VALUE='HOME sh'; busybox env -u \"$VALUE\" printf ok",
+            "busybox env -u HOME printf ok",
+            "busybox env -u ~ printf ok",
+            "busybox env -u \"${VALUE:-${NAME:-HOME}}\" printf ok",
         ] {
             assert!(evaluate_command(command).is_none(), "{command}");
         }
@@ -6374,6 +6843,7 @@ mod tests {
             "sudo rm -rf -- /",
             "sudo -n /usr/bin/rm -rf /",
             "sudo --user root /usr/bin/rm -rf /",
+            "busybox env -- /bin/rm -rf /",
             "env -- /bin/rm -rf /",
             "env -u PATH /bin/rm -rf /",
             "$'rm' --no-preserve-root -rf /",

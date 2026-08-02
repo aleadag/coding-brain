@@ -91,18 +91,24 @@ fn shipped_helper_denies_expanding_wrapper_option_values() {
 }
 
 #[test]
-fn shipped_helper_accepts_quoted_exact_one_fallback_option_values() {
+fn shipped_helper_preserves_quoted_exact_one_fallback_option_value_uncertainty() {
     for command in [
         "/usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
         "/usr/bin/env -u \"${VALUE:+$*}\" printf ok",
         "busybox time -f \"${VALUE:-${FORMAT[*]}}\" printf ok",
-        "busybox env -u \"${VALUE:-${NAME:-HOME}}\" printf ok",
         "builtin command /usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
         "builtin exec busybox time -f \"${VALUE:+$*}\" printf ok",
     ] {
         let response = run_shipped_helper(command, None);
-        assert_eq!(response["result"], "no_deterministic_decision", "{command}");
+        assert_eq!(response["result"], "indeterminate", "{command}");
     }
+}
+
+#[test]
+fn shipped_helper_accepts_busybox_env_quoted_exact_one_fallback_option_value() {
+    let command = "busybox env -u \"${VALUE:-${NAME:-HOME}}\" printf ok";
+    let response = run_shipped_helper(command, None);
+    assert_eq!(response["result"], "no_deterministic_decision", "{command}");
 }
 
 #[test]
@@ -138,6 +144,65 @@ fn shipped_helper_preserves_direct_wrapper_command_position_uncertainty() {
     ] {
         let response = run_shipped_helper(command, None);
         assert_eq!(response["result"], "indeterminate", "{command}");
+    }
+}
+
+#[test]
+fn shipped_helper_preserves_wrapper_value_uncertainty() {
+    for command in [
+        "/usr/bin/time -o '' sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -o '' sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env -u '' sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env -u '=HOME' sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env -u=HOME sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env -uA=B sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/time -o \"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env -u \"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+    ] {
+        let response = run_shipped_helper(command, None);
+        assert_eq!(response["result"], "indeterminate", "{command}");
+    }
+}
+
+#[test]
+fn shipped_helper_preserves_attached_dynamic_wrapper_value_semantics() {
+    for command in [
+        "busybox time -o\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -f\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -vfX\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
+        "busybox env -u\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+        "busybox env -iu\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+    ] {
+        let response = run_shipped_helper(command, None);
+        assert_eq!(response["result"], "indeterminate", "{command}");
+    }
+
+    for command in [
+        "busybox env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
+        "busybox env -u\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
+        "busybox env -iu\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
+    ] {
+        let response = run_shipped_helper(command, None);
+        assert_eq!(response["result"], "deny", "{command}");
+        assert_eq!(response["rule_id"], "irreversible-root-delete", "{command}");
+    }
+
+    for command in [
+        "busybox env -u\"$@\" sh -c 'rm --no-preserve-root -rf /'",
+        "busybox env -uX\"$@\" sh -c 'rm --no-preserve-root -rf /'",
+        "busybox env -u\"$@\"X sh -c 'rm --no-preserve-root -rf /'",
+        "busybox env -uX\"${VALUES[@]}\" sh -c 'rm --no-preserve-root -rf /'",
+        "busybox env -u\"${VALUES[@]}\"X sh -c 'rm --no-preserve-root -rf /'",
+    ] {
+        let response = run_shipped_helper(command, None);
+        assert_eq!(response["result"], "deny", "{command}");
+        assert_eq!(
+            response["rule_id"], "unsafe-recursive-delete-expansion",
+            "{command}"
+        );
     }
 }
 
