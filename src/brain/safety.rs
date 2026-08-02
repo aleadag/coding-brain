@@ -482,6 +482,7 @@ enum NestedExecution {
         prefix_assignments_persist: bool,
     },
     EvalUnresolved(ShellAnalysisError),
+    UnsafeExpansion,
     ChildLiteral {
         program: String,
         semantics: ShellSemantics,
@@ -1096,7 +1097,9 @@ fn evaluate_program(
             eval_prefix_assignments_persist.unwrap_or(false),
         ) {
             Ok(unwrapped) => unwrapped,
-            Err(()) => return dynamic_execution_deny(),
+            Err(UnwrapError::DynamicOrUnsupported | UnwrapError::UnsafeExpansion) => {
+                return dynamic_execution_deny();
+            }
         };
         let classified = classify_nested_execution(
             unwrapped.words,
@@ -1324,6 +1327,7 @@ fn evaluate_program(
                     }
                     SafetyEvaluation::Indeterminate(error)
                 }
+                NestedExecution::UnsafeExpansion => dynamic_execution_deny(),
                 NestedExecution::ChildLiteral {
                     program,
                     semantics,
@@ -2203,6 +2207,10 @@ fn word_can_select_command(word: &shell::ShellWord) -> bool {
     word.parts.iter().any(word_part_is_target_dynamic)
 }
 
+fn word_may_not_expand_to_exactly_one_argv(word: &shell::ShellWord) -> bool {
+    word.may_not_expand_to_exactly_one_argv
+}
+
 fn word_can_supply_flag(word: &shell::ShellWord) -> bool {
     word.parts.iter().any(|part| {
         matches!(
@@ -2746,12 +2754,20 @@ fn classify_nested_execution<'a>(
                     eval_prefix_assignments_persist,
                 ) {
                     Ok(unwrapped) => unwrapped,
-                    Err(()) => {
+                    Err(UnwrapError::DynamicOrUnsupported) => {
                         return ClassifiedExecution {
                             words: dispatched,
                             nested: Some(NestedExecution::EvalUnresolved(
                                 ShellAnalysisError::UnsupportedSyntax,
                             )),
+                            indeterminate_after_scan,
+                            context: eval_context,
+                        };
+                    }
+                    Err(UnwrapError::UnsafeExpansion) => {
+                        return ClassifiedExecution {
+                            words: dispatched,
+                            nested: Some(NestedExecution::UnsafeExpansion),
                             indeterminate_after_scan,
                             context: eval_context,
                         };
@@ -2959,11 +2975,17 @@ struct UnwrappedCommand<'a> {
     eval_prefix_assignments_persist: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnwrapError {
+    DynamicOrUnsupported,
+    UnsafeExpansion,
+}
+
 fn unwrap_command<'a>(
     words: &'a [&'a shell::ShellWord],
     time_keyword_allowed: bool,
     eval_prefix_assignments_persist: bool,
-) -> Result<UnwrappedCommand<'a>, ()> {
+) -> Result<UnwrappedCommand<'a>, UnwrapError> {
     unwrap_command_with_context(
         words,
         EvalContext::Caller,
@@ -2977,7 +2999,7 @@ fn unwrap_command_with_context<'a>(
     mut eval_context: EvalContext,
     mut time_keyword_allowed: bool,
     mut eval_prefix_assignments_persist: bool,
-) -> Result<UnwrappedCommand<'a>, ()> {
+) -> Result<UnwrappedCommand<'a>, UnwrapError> {
     let mut indeterminate_child_context = false;
     let mut indeterminate_after_scan = false;
     let mut multicall_launcher = None;
@@ -2994,7 +3016,7 @@ fn unwrap_command_with_context<'a>(
         };
         let Some(wrapper) = wrapper_word.literal.as_deref() else {
             return if word_can_select_command(wrapper_word) {
-                Err(())
+                Err(UnwrapError::DynamicOrUnsupported)
             } else {
                 Ok(UnwrappedCommand {
                     words,
@@ -3081,10 +3103,30 @@ fn unwrap_command_with_context<'a>(
                                 });
                             }
                             if takes_value {
+                                if word_may_not_expand_to_exactly_one_argv(words[0]) {
+                                    return Err(UnwrapError::UnsafeExpansion);
+                                }
                                 words = &words[1..];
                             }
                         }
-                        None if word_can_select_command(word) => return Err(()),
+                        None if word_can_select_command(word)
+                            && !word.can_split_fields
+                            && multicall_launcher.is_none()
+                            && eval_context == EvalContext::External =>
+                        {
+                            indeterminate_after_scan = true;
+                            return Ok(UnwrappedCommand {
+                                words: original_words,
+                                indeterminate_child_context,
+                                indeterminate_after_scan,
+                                eval_context,
+                                time_keyword_allowed,
+                                eval_prefix_assignments_persist,
+                            });
+                        }
+                        None if word_can_select_command(word) => {
+                            return Err(UnwrapError::DynamicOrUnsupported);
+                        }
                         _ => break,
                     }
                 }
@@ -3097,7 +3139,7 @@ fn unwrap_command_with_context<'a>(
                 while let Some(option) = words.first() {
                     let Some(option) = option.literal.as_deref() else {
                         return if word_can_select_command(option) {
-                            Err(())
+                            Err(UnwrapError::DynamicOrUnsupported)
                         } else {
                             Ok(UnwrappedCommand {
                                 words,
@@ -3153,7 +3195,7 @@ fn unwrap_command_with_context<'a>(
                 while let Some(option) = words.first() {
                     let Some(option) = option.literal.as_deref() else {
                         return if word_can_select_command(option) {
-                            Err(())
+                            Err(UnwrapError::DynamicOrUnsupported)
                         } else {
                             Ok(UnwrappedCommand {
                                 words,
@@ -3170,7 +3212,8 @@ fn unwrap_command_with_context<'a>(
                         break;
                     }
                     if option.starts_with('-') && option != "-" {
-                        let option = classify_sudo_option(option)?;
+                        let option = classify_sudo_option(option)
+                            .map_err(|()| UnwrapError::DynamicOrUnsupported)?;
                         indeterminate_child_context |= option.indeterminate_child_context;
                         indeterminate_after_scan |= option.invokes_shell;
                         if option.invokes_shell {
@@ -3222,7 +3265,9 @@ fn unwrap_command_with_context<'a>(
                                 flags.chars().any(|option| matches!(option, 'v' | 'V'));
                             words = &words[1..];
                         }
-                        None if word_can_select_command(word) => return Err(()),
+                        None if word_can_select_command(word) => {
+                            return Err(UnwrapError::DynamicOrUnsupported);
+                        }
                         _ => break,
                     }
                 }
@@ -3249,7 +3294,19 @@ fn unwrap_command_with_context<'a>(
                 while let Some(word) = words.first() {
                     let Some(literal) = word.literal.as_deref() else {
                         return if word_can_select_command(word) {
-                            Err(())
+                            if multicall_launcher.is_none() && !word.can_split_fields {
+                                indeterminate_after_scan = true;
+                                Ok(UnwrappedCommand {
+                                    words: original_words,
+                                    indeterminate_child_context,
+                                    indeterminate_after_scan,
+                                    eval_context,
+                                    time_keyword_allowed,
+                                    eval_prefix_assignments_persist,
+                                })
+                            } else {
+                                Err(UnwrapError::DynamicOrUnsupported)
+                            }
                         } else {
                             Ok(UnwrappedCommand {
                                 words,
@@ -3293,10 +3350,13 @@ fn unwrap_command_with_context<'a>(
                                     });
                                 }
                                 if takes_separate_value {
+                                    if word_may_not_expand_to_exactly_one_argv(words[0]) {
+                                        return Err(UnwrapError::UnsafeExpansion);
+                                    }
                                     words = &words[1..];
                                 }
                             }
-                            EnvOption::SplitString => return Err(()),
+                            EnvOption::SplitString => return Err(UnwrapError::UnsafeExpansion),
                             EnvOption::Unsupported => {
                                 indeterminate_after_scan = true;
                                 return Ok(UnwrappedCommand {
@@ -3310,8 +3370,19 @@ fn unwrap_command_with_context<'a>(
                             }
                         }
                     } else if is_env_environment_argument(literal) {
+                        options_ended = true;
                         indeterminate_child_context = true;
                         words = &words[1..];
+                    } else if options_ended && literal.starts_with('-') {
+                        indeterminate_after_scan = true;
+                        return Ok(UnwrappedCommand {
+                            words: original_words,
+                            indeterminate_child_context,
+                            indeterminate_after_scan,
+                            eval_context,
+                            time_keyword_allowed,
+                            eval_prefix_assignments_persist,
+                        });
                     } else {
                         break;
                     }
@@ -3343,22 +3414,16 @@ fn is_env_environment_argument(word: &str) -> bool {
 }
 
 fn classify_time_option(word: &str) -> Option<bool> {
-    if let Some(long) = word.strip_prefix("--") {
-        let (name, attached) = long
-            .split_once('=')
-            .map_or((long, false), |(name, _)| (name, true));
-        return match name {
-            "output" | "format" => Some(!attached),
-            "append" | "portability" | "quiet" | "verbose" if !attached => Some(false),
-            _ => None,
-        };
+    if word.starts_with("--") {
+        return None;
     }
+
     let mut options = word.strip_prefix('-')?.chars().peekable();
     options.peek()?;
     while let Some(option) = options.next() {
         match option {
-            'o' | 'f' => return Some(options.peek().is_none()),
-            'a' | 'h' | 'p' | 'q' | 'v' => {}
+            'o' => return Some(options.peek().is_none()),
+            'a' | 'p' => {}
             _ => return None,
         }
     }
@@ -3402,28 +3467,8 @@ enum EnvOption {
 }
 
 fn classify_env_option(word: &str) -> EnvOption {
-    if let Some(long) = word.strip_prefix("--") {
-        let (name, attached) = long
-            .split_once('=')
-            .map_or((long, false), |(name, _)| (name, true));
-        let Some(option) = unique_env_long_option(name) else {
-            return EnvOption::Unsupported;
-        };
-        return match option {
-            "split-string" => EnvOption::SplitString,
-            "argv0" | "unset" | "chdir" => EnvOption::Supported {
-                takes_separate_value: !attached,
-                child_context: true,
-            },
-            "ignore-environment" => EnvOption::Supported {
-                takes_separate_value: false,
-                child_context: true,
-            },
-            _ => EnvOption::Supported {
-                takes_separate_value: false,
-                child_context: false,
-            },
-        };
+    if word.starts_with("--") {
+        return EnvOption::Unsupported;
     }
 
     let mut options = word
@@ -3435,14 +3480,14 @@ fn classify_env_option(word: &str) -> EnvOption {
     while let Some(option) = options.next() {
         match option {
             'S' => return EnvOption::SplitString,
-            'a' | 'u' | 'C' => {
+            'u' => {
                 return EnvOption::Supported {
                     takes_separate_value: options.peek().is_none(),
                     child_context: true,
                 };
             }
             'i' => child_context = true,
-            '0' | 'v' => {}
+            'v' => {}
             _ => return EnvOption::Unsupported,
         }
     }
@@ -3478,33 +3523,6 @@ fn classify_busybox_env_option(word: &str) -> EnvOption {
         takes_separate_value: false,
         child_context,
     }
-}
-
-fn unique_env_long_option(name: &str) -> Option<&'static str> {
-    if name.is_empty() {
-        return None;
-    }
-    const OPTIONS: &[&str] = &[
-        "argv0",
-        "block-signal",
-        "chdir",
-        "debug",
-        "default-signal",
-        "help",
-        "ignore-environment",
-        "ignore-signal",
-        "list-signal-handling",
-        "null",
-        "split-string",
-        "unset",
-        "version",
-    ];
-    let mut matches = OPTIONS
-        .iter()
-        .copied()
-        .filter(|option| option.starts_with(name));
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5314,21 +5332,15 @@ mod tests {
             "env -ia displayed /bin/bash -c 'printf ok'",
             "env --argv0=displayed bash -c 'printf ok'",
             "env --argv0 displayed /bin/bash -c 'printf ok'",
-        ] {
-            assert!(
-                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
-                "{command}"
-            );
-        }
-
-        for command in [
             "env -a displayed bash -c 'rm --no-preserve-root -rf /'",
             "env -adisplayed /bin/bash -c 'rm --no-preserve-root -rf /'",
             "env --argv0=displayed bash -c 'rm --no-preserve-root -rf /'",
             "env --argv0 displayed /bin/bash -c 'rm --no-preserve-root -rf /'",
         ] {
-            let deny = evaluate_command(command).expect("argv0 metadata must not hide destruction");
-            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
         }
 
         for command in ["env -a", "env --argv0"] {
@@ -5817,6 +5829,205 @@ mod tests {
                 "{command}"
             );
         }
+
+        assert_eq!(
+            evaluate_result("time -h sh -c 'rm --no-preserve-root -rf /'"),
+            SafetyEvaluation::NoDeterministicDecision
+        );
+    }
+
+    #[test]
+    fn direct_external_wrapper_nonexecuting_forms_are_indeterminate() {
+        for command in [
+            "/usr/bin/time -h sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -q sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time --verbose sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -vf FORMAT sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -vo log sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -volog sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -vfFORMAT sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env --help sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env --version sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env --ver sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -0 sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -i0 sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -0i sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -a displayed sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env --argv0=displayed sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -iC/tmp sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env --chdir=/tmp sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_assignments_end_option_parsing() {
+        for command in [
+            "env FOO=bar -i sh -c 'rm --no-preserve-root -rf /'",
+            "env FOO=bar -- sh -c 'rm --no-preserve-root -rf /'",
+            "env FOO=bar BAR=baz -v sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+
+        for command in [
+            "env -i FOO=bar sh -c 'rm --no-preserve-root -rf /'",
+            "env -v FOO=bar BAR=baz sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn dynamic_direct_wrapper_transitions_remain_indeterminate() {
+        for command in [
+            "/usr/bin/time \"$OPTION\" sh -c 'rm --no-preserve-root -rf /'",
+            "env \"$OPTION\" sh -c 'rm --no-preserve-root -rf /'",
+            "env FOO=bar \"$COMMAND\" sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_wrapper_common_option_arity_reaches_the_child() {
+        for command in [
+            "/usr/bin/time -o log sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -olog sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -aolog sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -u HOME sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -uHOME sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -ivuHOME sh -c 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+    }
+
+    #[test]
+    fn expanding_separate_wrapper_option_values_fail_closed() {
+        for command in [
+            "VALUE='log sh'; /usr/bin/time -o $VALUE 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -o {log,sh} 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -o * 'rm --no-preserve-root -rf /'",
+            "VALUE='HOME sh'; /usr/bin/env -u $VALUE 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -u {HOME,sh} 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -u * 'rm --no-preserve-root -rf /'",
+            "VALUE='log sh'; busybox time -o $VALUE 'rm --no-preserve-root -rf /'",
+            "busybox time -o {log,sh} 'rm --no-preserve-root -rf /'",
+            "busybox time -o * 'rm --no-preserve-root -rf /'",
+            "VALUE='HOME sh'; busybox env -u $VALUE 'rm --no-preserve-root -rf /'",
+            "busybox env -u {HOME,sh} 'rm --no-preserve-root -rf /'",
+            "busybox env -u * 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("{command}: {:?}", evaluate_result(command)));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_multi_argv_separate_wrapper_values_fail_closed() {
+        for command in [
+            "/usr/bin/time -o \"$@\" 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -u \"${VALUES[@]}\" 'rm --no-preserve-root -rf /'",
+            "busybox time -o \"$@\" 'rm --no-preserve-root -rf /'",
+            "busybox time -f \"${VALUES[@]}\" 'rm --no-preserve-root -rf /'",
+            "busybox env -u \"${VALUES[@]}\" 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("{command}: {:?}", evaluate_result(command)));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_builtin_quoted_multi_argv_values_remain_deterministic_denies() {
+        for command in [
+            "builtin command /usr/bin/time -o \"$@\" 'rm --no-preserve-root -rf /'",
+            "builtin exec /usr/bin/env -u \"${VALUES[@]}\" 'rm --no-preserve-root -rf /'",
+            "builtin command busybox time -f \"$@\" 'rm --no-preserve-root -rf /'",
+            "builtin exec busybox env -u \"${VALUES[@]}\" 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("{command}: {:?}", evaluate_result(command)));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_multi_argv_fallback_option_values_remain_deterministic_denies() {
+        for command in [
+            "/usr/bin/time -o \"${VALUE:-$@}\" 'rm --no-preserve-root -rf /'",
+            "busybox env -u \"${VALUE:-${VALUES[@]}}\" 'rm --no-preserve-root -rf /'",
+            "builtin command busybox time -f \"${VALUE:+$@}\" 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -o ${VALUE:-$LOG} 'rm --no-preserve-root -rf /'",
+        ] {
+            let deny = evaluate_command(command)
+                .unwrap_or_else(|| panic!("{command}: {:?}", evaluate_result(command)));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_field_separate_wrapper_option_values_do_not_deny() {
+        for command in [
+            "VALUE='log sh'; /usr/bin/time -o \"$VALUE\" printf ok",
+            "/usr/bin/time -o log printf ok",
+            "/usr/bin/time -o ~ printf ok",
+            "VALUE='HOME sh'; /usr/bin/env -u \"$VALUE\" printf ok",
+            "/usr/bin/env -u HOME printf ok",
+            "/usr/bin/env -u $'H\\x4fME' printf ok",
+            "VALUE='log sh'; busybox time -o \"$VALUE\" printf ok",
+            "busybox time -o log printf ok",
+            "busybox time -o $'log' printf ok",
+            "busybox time -f \"$VALUE\" printf ok",
+            "VALUE='HOME sh'; busybox env -u \"$VALUE\" printf ok",
+            "busybox env -u HOME printf ok",
+            "busybox env -u ~ printf ok",
+            "/usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
+            "/usr/bin/env -u \"${VALUE:+$*}\" printf ok",
+            "busybox time -f \"${VALUE:-${FORMAT[*]}}\" printf ok",
+            "busybox env -u \"${VALUE:-${NAME:-HOME}}\" printf ok",
+            "builtin command /usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
+            "builtin exec busybox time -f \"${VALUE:+$*}\" printf ok",
+        ] {
+            assert!(evaluate_command(command).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn uncertain_direct_wrapper_keeps_deny_precedence_in_both_orders() {
+        for command in [
+            "/usr/bin/env --help sh -c 'rm -rf /'; rm --no-preserve-root -rf /",
+            "rm --no-preserve-root -rf /; /usr/bin/env --help sh -c 'rm -rf /'",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
     }
 
     #[test]
@@ -6110,10 +6321,6 @@ mod tests {
             ),
             ("rm -rf $'\\x2f'", "unsafe-recursive-delete-expansion"),
             (
-                "env $'-\\x53' 'rm -rf /'",
-                "unsafe-recursive-delete-expansion",
-            ),
-            (
                 "cat <(rm --no-preserve-root -rf /)",
                 "unsafe-recursive-delete-expansion",
             ),
@@ -6148,6 +6355,10 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        assert_eq!(
+            evaluate_result("env $'-\\x53' 'rm -rf /'"),
+            SafetyEvaluation::Indeterminate(ShellAnalysisError::UnsupportedSyntax)
+        );
     }
 
     #[test]
@@ -6181,9 +6392,6 @@ mod tests {
             "sudo -nu root rm -rf /",
             "sudo FOO=bar -- rm -rf /",
             "sudo 'FOO=bar' rm -rf /",
-            "env -iC/tmp rm -rf /",
-            "env --chdir=/tmp rm -rf /",
-            "env FOO=bar -- rm -rf /",
             "env 'FOO=bar' rm -rf /",
             "env - rm -rf /",
             "exec -a displayed rm -rf /",
@@ -6191,13 +6399,24 @@ mod tests {
             "command -- rm -rf /",
             "time -p rm -rf /",
             "/usr/bin/time -o log rm -rf /",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+        }
+
+        for command in [
+            "env FOO=bar -- rm -rf /",
+            "env -iC/tmp rm -rf /",
+            "env --chdir=/tmp rm -rf /",
             "/usr/bin/time -vo log rm -rf /",
             "/usr/bin/time -vf FORMAT rm -rf /",
             "/usr/bin/time -volog rm -rf /",
             "/usr/bin/time -vfFORMAT rm -rf /",
         ] {
-            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
-            assert_eq!(deny.rule_id, "irreversible-root-delete", "{command}");
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
+                "{command}"
+            );
         }
 
         for command in [
@@ -7253,18 +7472,26 @@ mod tests {
     fn variable_expanded_command_after_supported_wrappers_denies() {
         for command in [
             "CMD=rm; sudo FOO=bar $CMD --no-preserve-root -rf /",
-            "CMD=rm; env -iC /tmp $CMD --no-preserve-root -rf /",
             "CMD=rm; sudo >/dev/null -u root $CMD --no-preserve-root -rf /",
             "CMD=rm; sudo -u >/dev/null root $CMD --no-preserve-root -rf /",
             "CMD=rm; sudo -nu root $CMD --no-preserve-root -rf /",
-            "CMD=rm; env >/dev/null -iC /tmp $CMD --no-preserve-root -rf /",
-            "CMD=rm; env -iC >/dev/null /tmp $CMD --no-preserve-root -rf /",
             "CMD=rm; exec >/dev/null -a fake $CMD --no-preserve-root -rf /",
             "CMD=rm; command >/dev/null -- $CMD --no-preserve-root -rf /",
         ] {
             let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
             assert_eq!(
                 deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+
+        for command in [
+            "CMD=rm; env -iC /tmp $CMD --no-preserve-root -rf /",
+            "CMD=rm; env >/dev/null -iC /tmp $CMD --no-preserve-root -rf /",
+            "CMD=rm; env -iC >/dev/null /tmp $CMD --no-preserve-root -rf /",
+        ] {
+            assert!(
+                matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
                 "{command}"
             );
         }
@@ -7317,14 +7544,23 @@ mod tests {
             "env -S'rm -rf /'",
             "env -iS 'rm -rf /'",
             "env -iS'rm -rf /'",
+        ] {
+            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(
+                deny.rule_id, "unsafe-recursive-delete-expansion",
+                "{command}"
+            );
+        }
+
+        for command in [
             "env --split-string 'rm -rf /'",
             "env --split-string='rm -rf /'",
             "env --split 'rm -rf /'",
             "env --split='rm -rf /'",
         ] {
-            let deny = evaluate_command(command).unwrap_or_else(|| panic!("{command}"));
             assert_eq!(
-                deny.rule_id, "unsafe-recursive-delete-expansion",
+                evaluate_result(command),
+                SafetyEvaluation::Indeterminate(ShellAnalysisError::UnsupportedSyntax),
                 "{command}"
             );
         }

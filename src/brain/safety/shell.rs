@@ -126,10 +126,11 @@ pub(super) struct ShellWord {
     pub parts: Vec<WordPart>,
     pub assign_default_invalidations: Vec<String>,
     pub can_split_fields: bool,
+    pub may_not_expand_to_exactly_one_argv: bool,
     pub may_mutate_shell_state: bool,
 }
 
-type ProjectedPieces = (Vec<WordPart>, Option<String>, Vec<String>);
+type ProjectedPieces = (Vec<WordPart>, Option<String>, Vec<String>, bool);
 
 #[derive(Debug)]
 pub(super) enum WordPart {
@@ -787,6 +788,7 @@ impl Analyzer<'_> {
                     parts: vec![WordPart::Literal(raw)],
                     assign_default_invalidations: Vec::new(),
                     can_split_fields: false,
+                    may_not_expand_to_exactly_one_argv: false,
                     may_mutate_shell_state: false,
                 }))
             }
@@ -818,6 +820,7 @@ impl Analyzer<'_> {
             parts: vec![WordPart::ProcessSubstitution],
             assign_default_invalidations: Vec::new(),
             can_split_fields: false,
+            may_not_expand_to_exactly_one_argv: false,
             may_mutate_shell_state: false,
         })
     }
@@ -839,6 +842,7 @@ impl Analyzer<'_> {
             parts: vec![WordPart::Literal(raw.into())],
             assign_default_invalidations: Vec::new(),
             can_split_fields: false,
+            may_not_expand_to_exactly_one_argv: false,
             may_mutate_shell_state: false,
         })
     }
@@ -848,6 +852,15 @@ impl Analyzer<'_> {
         raw: &str,
         heredoc: bool,
     ) -> Result<ShellWord, ShellAnalysisError> {
+        self.project_raw_word_with_context(raw, heredoc, heredoc)
+    }
+
+    fn project_raw_word_with_context(
+        &mut self,
+        raw: &str,
+        heredoc: bool,
+        quoted: bool,
+    ) -> Result<ShellWord, ShellAnalysisError> {
         self.budget.visit()?;
         let pieces = if heredoc {
             word::parse_heredoc(raw, &self.options)
@@ -855,10 +868,10 @@ impl Analyzer<'_> {
             word::parse(raw, &self.options)
         }
         .map_err(|_| ShellAnalysisError::UnsupportedSyntax)?;
-        let (parts, mut literal, assign_default_invalidations) =
-            self.project_pieces(&pieces, heredoc)?;
+        let (parts, mut literal, assign_default_invalidations, parameter_may_expand_to_many) =
+            self.project_pieces(&pieces, quoted)?;
         let mut parts = parts;
-        if !heredoc {
+        if !quoted {
             if let Some(classification) = quote_aware_word_syntax(&pieces) {
                 let has_brace_expansion =
                     word::parse_brace_expansions(&classification, &self.options)
@@ -898,13 +911,21 @@ impl Analyzer<'_> {
         {
             literal = Some(raw.into());
         }
+        let can_split_fields = !quoted && pieces_have_unquoted_parameter_expansion(&pieces, false);
+        let may_expand_through_word_syntax = parts
+            .iter()
+            .any(|part| matches!(part, WordPart::BraceExpansion | WordPart::PathnamePattern));
         Ok(ShellWord {
             raw: raw.into(),
             literal,
             may_mutate_shell_state: word_parts_may_mutate_shell_state(&parts),
             parts,
             assign_default_invalidations,
-            can_split_fields: !heredoc && pieces_have_unquoted_parameter_expansion(&pieces, false),
+            can_split_fields,
+            may_not_expand_to_exactly_one_argv: !heredoc
+                && (can_split_fields
+                    || parameter_may_expand_to_many
+                    || may_expand_through_word_syntax),
         })
     }
 
@@ -916,6 +937,7 @@ impl Analyzer<'_> {
         let mut parts = Vec::new();
         let mut literal = Some(String::new());
         let mut assign_default_invalidations = Vec::new();
+        let mut may_not_expand_to_exactly_one_argv = false;
         for piece in pieces {
             self.budget.visit()?;
             self.project_piece(
@@ -924,9 +946,15 @@ impl Analyzer<'_> {
                 &mut parts,
                 &mut literal,
                 &mut assign_default_invalidations,
+                &mut may_not_expand_to_exactly_one_argv,
             )?;
         }
-        Ok((parts, literal, assign_default_invalidations))
+        Ok((
+            parts,
+            literal,
+            assign_default_invalidations,
+            may_not_expand_to_exactly_one_argv,
+        ))
     }
 
     fn project_piece(
@@ -936,6 +964,7 @@ impl Analyzer<'_> {
         parts: &mut Vec<WordPart>,
         literal: &mut Option<String>,
         assign_default_invalidations: &mut Vec<String>,
+        may_not_expand_to_exactly_one_argv: &mut bool,
     ) -> Result<(), ShellAnalysisError> {
         match piece {
             word::WordPiece::Text(text) => {
@@ -991,8 +1020,9 @@ impl Analyzer<'_> {
                 }
             }
             word::WordPiece::DoubleQuotedSequence(pieces) => {
-                let (nested_parts, nested_literal, nested_invalidations) =
+                let (nested_parts, nested_literal, nested_invalidations, nested_may_expand_to_many) =
                     self.nested(|analyzer| analyzer.project_pieces(pieces, true))?;
+                *may_not_expand_to_exactly_one_argv |= nested_may_expand_to_many;
                 parts.extend(nested_parts);
                 extend_unique(
                     assign_default_invalidations,
@@ -1006,8 +1036,9 @@ impl Analyzer<'_> {
             word::WordPiece::GettextDoubleQuotedSequence(pieces) => {
                 *literal = None;
                 parts.push(WordPart::LocalizedText);
-                let (nested_parts, _, nested_invalidations) =
+                let (nested_parts, _, nested_invalidations, nested_may_expand_to_many) =
                     self.nested(|analyzer| analyzer.project_pieces(pieces, true))?;
+                *may_not_expand_to_exactly_one_argv |= nested_may_expand_to_many;
                 extend_unique(
                     assign_default_invalidations,
                     nested_invalidations.iter().map(String::as_str),
@@ -1028,8 +1059,14 @@ impl Analyzer<'_> {
             }
             word::WordPiece::ParameterExpansion(parameter) => {
                 *literal = None;
-                let (parameter, has_command_substitution, invalidations, may_mutate_shell_state) =
-                    self.project_parameter(parameter)?;
+                let (
+                    parameter,
+                    has_command_substitution,
+                    invalidations,
+                    may_mutate_shell_state,
+                    parameter_may_expand_to_many,
+                ) = self.project_parameter(parameter, quoted)?;
+                *may_not_expand_to_exactly_one_argv |= parameter_may_expand_to_many;
                 extend_unique(
                     assign_default_invalidations,
                     invalidations.iter().map(String::as_str),
@@ -1081,7 +1118,8 @@ impl Analyzer<'_> {
     fn project_parameter(
         &mut self,
         expression: &word::ParameterExpr,
-    ) -> Result<(ParameterUse, bool, Vec<String>, bool), ShellAnalysisError> {
+        quoted: bool,
+    ) -> Result<(ParameterUse, bool, Vec<String>, bool, bool), ShellAnalysisError> {
         self.budget.visit()?;
         match expression {
             word::ParameterExpr::Parameter {
@@ -1100,6 +1138,7 @@ impl Analyzer<'_> {
                     has_command,
                     invalidations,
                     may_mutate_shell_state,
+                    parameter_may_not_expand_to_exactly_one_argv(parameter),
                 ))
             }
             word::ParameterExpr::UseDefaultValues {
@@ -1113,6 +1152,7 @@ impl Analyzer<'_> {
                 FallbackOperator::Default,
                 test_type,
                 default_value.as_deref(),
+                quoted,
             ),
             word::ParameterExpr::AssignDefaultValues {
                 parameter,
@@ -1125,6 +1165,7 @@ impl Analyzer<'_> {
                 FallbackOperator::AssignDefault,
                 test_type,
                 default_value.as_deref(),
+                quoted,
             ),
             word::ParameterExpr::UseAlternativeValue {
                 parameter,
@@ -1137,6 +1178,7 @@ impl Analyzer<'_> {
                 FallbackOperator::Alternative,
                 test_type,
                 alternative_value.as_deref(),
+                quoted,
             ),
             word::ParameterExpr::IndicateErrorIfNullOrUnset {
                 parameter,
@@ -1156,10 +1198,10 @@ impl Analyzer<'_> {
                     has_command,
                     invalidations,
                     may_mutate_shell_state,
+                    parameter_may_not_expand_to_exactly_one_argv(parameter),
                 ))
             }
-            word::ParameterExpr::ParameterLength { parameter, .. }
-            | word::ParameterExpr::Transform { parameter, .. } => {
+            word::ParameterExpr::ParameterLength { parameter, .. } => {
                 let (has_command, invalidations, may_mutate_shell_state) =
                     self.project_parameter_operand(parameter)?;
                 Ok((
@@ -1167,6 +1209,24 @@ impl Analyzer<'_> {
                     has_command,
                     invalidations,
                     may_mutate_shell_state,
+                    false,
+                ))
+            }
+            word::ParameterExpr::Transform { parameter, op, .. } => {
+                let (has_command, invalidations, may_mutate_shell_state) =
+                    self.project_parameter_operand(parameter)?;
+                let separates_words = matches!(
+                    op,
+                    word::ParameterTransformOp::PossiblyQuoteWithArraysExpanded {
+                        separate_words: true
+                    }
+                );
+                Ok((
+                    ParameterUse::Other,
+                    has_command,
+                    invalidations,
+                    may_mutate_shell_state,
+                    separates_words || parameter_may_not_expand_to_exactly_one_argv(parameter),
                 ))
             }
             word::ParameterExpr::RemoveSmallestSuffixPattern {
@@ -1206,6 +1266,7 @@ impl Analyzer<'_> {
                     has_command,
                     invalidations,
                     may_mutate_shell_state,
+                    parameter_may_not_expand_to_exactly_one_argv(parameter),
                 ))
             }
             word::ParameterExpr::Substring {
@@ -1235,6 +1296,7 @@ impl Analyzer<'_> {
                     has_command,
                     invalidations,
                     may_mutate_shell_state,
+                    parameter_may_not_expand_to_exactly_one_argv(parameter),
                 ))
             }
             word::ParameterExpr::ReplaceSubstring {
@@ -1267,10 +1329,12 @@ impl Analyzer<'_> {
                     has_command,
                     invalidations,
                     may_mutate_shell_state,
+                    parameter_may_not_expand_to_exactly_one_argv(parameter),
                 ))
             }
-            word::ParameterExpr::VariableNames { .. } | word::ParameterExpr::MemberKeys { .. } => {
-                Ok((ParameterUse::Other, false, Vec::new(), false))
+            word::ParameterExpr::VariableNames { concatenate, .. }
+            | word::ParameterExpr::MemberKeys { concatenate, .. } => {
+                Ok((ParameterUse::Other, false, Vec::new(), false, !concatenate))
             }
         }
     }
@@ -1282,14 +1346,18 @@ impl Analyzer<'_> {
         operator: FallbackOperator,
         test_type: &word::ParameterTestType,
         value: Option<&str>,
-    ) -> Result<(ParameterUse, bool, Vec<String>, bool), ShellAnalysisError> {
+        quoted: bool,
+    ) -> Result<(ParameterUse, bool, Vec<String>, bool, bool), ShellAnalysisError> {
         let (has_parameter_command, mut invalidations, parameter_may_mutate_shell_state) =
             self.project_parameter_operand(parameter)?;
-        let value = self.project_word_operand(value.unwrap_or(""))?;
+        let value = self.project_word_operand_with_context(value.unwrap_or(""), quoted)?;
         let has_command =
             has_parameter_command || word_parts_have_command_substitution(&value.parts);
         let may_mutate_shell_state =
             parameter_may_mutate_shell_state || value.may_mutate_shell_state;
+        let may_not_expand_to_exactly_one_argv =
+            parameter_may_not_expand_to_exactly_one_argv(parameter)
+                || value.may_not_expand_to_exactly_one_argv;
         extend_unique(
             &mut invalidations,
             value
@@ -1321,6 +1389,7 @@ impl Analyzer<'_> {
             has_command,
             invalidations,
             may_mutate_shell_state,
+            may_not_expand_to_exactly_one_argv,
         ))
     }
 
@@ -1355,7 +1424,15 @@ impl Analyzer<'_> {
     }
 
     fn project_word_operand(&mut self, operand: &str) -> Result<ShellWord, ShellAnalysisError> {
-        self.nested(|analyzer| analyzer.project_raw_word(operand, false))
+        self.project_word_operand_with_context(operand, false)
+    }
+
+    fn project_word_operand_with_context(
+        &mut self,
+        operand: &str,
+        quoted: bool,
+    ) -> Result<ShellWord, ShellAnalysisError> {
+        self.nested(|analyzer| analyzer.project_raw_word_with_context(operand, false, quoted))
     }
 
     fn project_arithmetic_operand(
@@ -1369,7 +1446,7 @@ impl Analyzer<'_> {
         &mut self,
         expression: &str,
     ) -> Result<(bool, Vec<String>, bool), ShellAnalysisError> {
-        let (nested_parts, _, invalidations) = self.nested(|analyzer| {
+        let (nested_parts, _, invalidations, _) = self.nested(|analyzer| {
             let nested_pieces = word::parse(expression, &analyzer.options)
                 .map_err(|_| ShellAnalysisError::UnsupportedSyntax)?;
             analyzer.project_pieces(&nested_pieces, true)
@@ -1379,6 +1456,19 @@ impl Analyzer<'_> {
             invalidations,
             true,
         ))
+    }
+}
+
+fn parameter_may_not_expand_to_exactly_one_argv(parameter: &word::Parameter) -> bool {
+    match parameter {
+        word::Parameter::Special(word::SpecialParameter::AllPositionalParameters {
+            concatenate,
+        })
+        | word::Parameter::NamedWithAllIndices { concatenate, .. } => !concatenate,
+        word::Parameter::Positional(_)
+        | word::Parameter::Special(_)
+        | word::Parameter::Named(_)
+        | word::Parameter::NamedWithIndex { .. } => false,
     }
 }
 
@@ -1956,6 +2046,56 @@ mod tests {
     }
 
     #[test]
+    fn words_track_may_not_expand_to_exactly_one_argv() {
+        for input in [
+            "\"$@\"",
+            "\"${ARRAY[@]}\"",
+            "\"${!PREFIX@}\"",
+            "\"${!ARRAY[@]}\"",
+            "\"${VALUE@k}\"",
+            "\"${ARRAY[@]@k}\"",
+            "\"${VALUE:-$@}\"",
+            "\"${ARRAY[@]#prefix}\"",
+            "$VALUE",
+            "${VALUE:-$OTHER}",
+            "{one,two}",
+            "*",
+        ] {
+            let (word, _) = project_test_word(input).expect(input);
+            assert!(
+                word.may_not_expand_to_exactly_one_argv,
+                "{input}: {:?}",
+                word.parts
+            );
+        }
+
+        for input in [
+            "\"$VALUE\"",
+            "\"$1\"",
+            "\"$*\"",
+            "\"${ARRAY[*]}\"",
+            "\"${!PREFIX*}\"",
+            "\"${!ARRAY[*]}\"",
+            "\"${#ARRAY[@]}\"",
+            "\"${VALUE:-literal}\"",
+            "literal",
+            "~",
+            "$'H\\x4fME'",
+            "\"${VALUE:-$OTHER}\"",
+            "\"${VALUE:+$*}\"",
+            "\"${VALUE:=${ARRAY[*]}}\"",
+            "\"${VALUE:-${OTHER:-$THIRD}}\"",
+        ] {
+            let (word, _) = project_test_word(input).expect(input);
+            assert!(
+                !word.may_not_expand_to_exactly_one_argv,
+                "{input}: {:?}",
+                word.parts
+            );
+        }
+    }
+
+    #[test]
     fn words_preserve_nested_assign_default_invalidations() {
         for input in [
             "\"${Y%${X:=-rf}}\"",
@@ -1977,7 +2117,7 @@ mod tests {
             );
         }
 
-        let (ansi, _) = project_test_word("$'${X:=-rf}'").expect("ANSI-C word");
+        let (ansi, _) = project_test_word("$'${X:=\\x2drf}'").expect("ANSI-C word");
         assert!(
             ansi.assign_default_invalidations.is_empty(),
             "{:?}",

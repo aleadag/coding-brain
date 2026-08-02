@@ -57,10 +57,51 @@ fn shipped_helper_denies_literal_nested_root_deletion() {
         "busybox time sh -c 'rm --no-preserve-root -rf /'",
         "toybox env sh -c 'rm --no-preserve-root -rf /'",
         "toybox time sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/time -p sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env -i sh -c 'rm --no-preserve-root -rf /'",
     ] {
         let response = run_shipped_helper(command, None);
         assert_eq!(response["result"], "deny", "{command}");
         assert_eq!(response["rule_id"], "irreversible-root-delete", "{command}");
+    }
+}
+
+#[test]
+fn shipped_helper_denies_expanding_wrapper_option_values() {
+    for command in [
+        "VALUE='log sh'; /usr/bin/time -o $VALUE 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env -u {HOME,sh} 'rm --no-preserve-root -rf /'",
+        "busybox time -o * 'rm --no-preserve-root -rf /'",
+        "VALUE='HOME sh'; busybox env -u $VALUE 'rm --no-preserve-root -rf /'",
+        "env -S 'rm --no-preserve-root -rf /'",
+        "/usr/bin/time -o \"$@\" 'rm --no-preserve-root -rf /'",
+        "builtin exec /usr/bin/env -u \"${VALUES[@]}\" 'rm --no-preserve-root -rf /'",
+        "builtin command busybox time -f \"$@\" 'rm --no-preserve-root -rf /'",
+        "/usr/bin/time -o \"${VALUE:-$@}\" 'rm --no-preserve-root -rf /'",
+        "builtin exec busybox env -u \"${VALUE:-${VALUES[@]}}\" 'rm --no-preserve-root -rf /'",
+        "/usr/bin/time -o ${VALUE:-$LOG} 'rm --no-preserve-root -rf /'",
+    ] {
+        let response = run_shipped_helper(command, None);
+        assert_eq!(response["result"], "deny", "{command}");
+        assert_eq!(
+            response["rule_id"], "unsafe-recursive-delete-expansion",
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn shipped_helper_accepts_quoted_exact_one_fallback_option_values() {
+    for command in [
+        "/usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
+        "/usr/bin/env -u \"${VALUE:+$*}\" printf ok",
+        "busybox time -f \"${VALUE:-${FORMAT[*]}}\" printf ok",
+        "busybox env -u \"${VALUE:-${NAME:-HOME}}\" printf ok",
+        "builtin command /usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
+        "builtin exec busybox time -f \"${VALUE:+$*}\" printf ok",
+    ] {
+        let response = run_shipped_helper(command, None);
+        assert_eq!(response["result"], "no_deterministic_decision", "{command}");
     }
 }
 
@@ -70,6 +111,30 @@ fn shipped_helper_preserves_multicall_terminating_option_uncertainty() {
         "busybox time -h sh -c 'rm --no-preserve-root -rf /'",
         "busybox env --help sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -v sh -c 'rm --no-preserve-root -rf /'",
+    ] {
+        let response = run_shipped_helper(command, None);
+        assert_eq!(response["result"], "indeterminate", "{command}");
+    }
+}
+
+#[test]
+fn shipped_helper_preserves_direct_wrapper_command_position_uncertainty() {
+    for command in [
+        "/usr/bin/time -h sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/time -q sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/time -vf FORMAT sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env --help sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env --version sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env -0 sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env --argv0=displayed sh -c 'rm --no-preserve-root -rf /'",
+        "env FOO=bar -i sh -c 'rm --no-preserve-root -rf /'",
+        "env FOO=bar -- sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/time \"$OPTION\" sh -c 'rm --no-preserve-root -rf /'",
+        "env \"$OPTION\" sh -c 'rm --no-preserve-root -rf /'",
+        "env FOO=bar \"$COMMAND\" sh -c 'rm --no-preserve-root -rf /'",
+        "env --split-string 'rm -rf /'",
+        "env --split='rm -rf /'",
+        "env $'-\\x53' 'rm -rf /'",
     ] {
         let response = run_shipped_helper(command, None);
         assert_eq!(response["result"], "indeterminate", "{command}");
