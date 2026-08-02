@@ -55,6 +55,8 @@ fn shipped_helper_denies_literal_nested_root_deletion() {
         "builtin builtin eval 'rm --no-preserve-root -rf /'",
         "busybox env sh -c 'rm --no-preserve-root -rf /'",
         "busybox time sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -f '' sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -f \"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
         "toybox env sh -c 'rm --no-preserve-root -rf /'",
         "toybox time sh -c 'rm --no-preserve-root -rf /'",
         "/usr/bin/time -p sh -c 'rm --no-preserve-root -rf /'",

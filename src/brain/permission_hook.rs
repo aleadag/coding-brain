@@ -2137,6 +2137,14 @@ mod tests {
             ("busybox env sh -c 'rm --no-preserve-root -rf /'", true),
             ("busybox time sh -c 'rm --no-preserve-root -rf /'", true),
             (
+                "busybox time -f '' sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox time -f \"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
                 "VALUE='log sh'; /usr/bin/time -o $VALUE 'rm --no-preserve-root -rf /'",
                 true,
             ),
@@ -2211,7 +2219,7 @@ mod tests {
             ),
             (
                 "busybox time -vfX\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
-                false,
+                true,
             ),
             (
                 "busybox env -u\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
