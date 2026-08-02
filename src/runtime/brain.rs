@@ -131,6 +131,18 @@ impl LiveBrainSource {
         state_root: &Path,
         limits: SnapshotLimits,
     ) -> Result<BrainRefresh, BrainSourceError> {
+        Self::refresh_from_store_with_activity_store(
+            state_root,
+            brain::activity::ActivityStore::at(state_root.join("activity.jsonl")),
+            limits,
+        )
+    }
+
+    fn refresh_from_store_with_activity_store(
+        state_root: &Path,
+        store: brain::activity::ActivityStore,
+        limits: SnapshotLimits,
+    ) -> Result<BrainRefresh, BrainSourceError> {
         let recovery = brain::permission_transaction::recover_pending(
             state_root,
             brain::permission_transaction::RecoveryLimits::startup(),
@@ -145,7 +157,6 @@ impl LiveBrainSource {
                 "permission transaction recovery remains unresolved".into(),
             ));
         }
-        let store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
         let activity = store.read().map_err(|error| match error {
             brain::activity::ActivityStoreError::LockTimeout => BrainSourceError::Busy,
             other => BrainSourceError::Other(other.to_string()),
@@ -934,6 +945,11 @@ mod tests {
         lock.lock_exclusive().unwrap();
 
         let source = LiveBrainSource::default();
+        let success_store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"))
+            .with_limits(brain::activity::ActivityLimits {
+                lock_timeout_ms: 5_000,
+                ..brain::activity::ActivityLimits::default()
+            });
 
         let (unlocker_ready_tx, unlocker_ready_rx) = std::sync::mpsc::channel();
         let unlocker = std::thread::spawn(move || {
@@ -943,7 +959,12 @@ mod tests {
         });
         unlocker_ready_rx.recv().unwrap();
         assert!(
-            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).is_ok()
+            LiveBrainSource::refresh_from_store_with_activity_store(
+                &state_root,
+                success_store,
+                SnapshotLimits::default(),
+            )
+            .is_ok()
         );
         unlocker.join().unwrap();
 
