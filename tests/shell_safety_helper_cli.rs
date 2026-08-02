@@ -180,6 +180,9 @@ fn shipped_helper_preserves_attached_dynamic_wrapper_value_semantics() {
     for command in [
         "busybox time -o\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox time -f\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -o\"$LOG\"X sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/time -o\"$LOG\"X sh -c 'rm --no-preserve-root -rf /'",
+        "/usr/bin/env -u\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
         "/usr/bin/time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
         "/usr/bin/env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
@@ -191,6 +194,9 @@ fn shipped_helper_preserves_attached_dynamic_wrapper_value_semantics() {
     }
 
     for command in [
+        "busybox time -f\"$FORMAT\"X sh -c 'rm --no-preserve-root -rf /'",
+        "builtin command busybox time -vf\"$FORMAT\"X sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -f\"$OUTER\"X busybox time -vf\"$INNER\"Y sh -c 'rm --no-preserve-root -rf /'",
         "busybox time -vfX\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -u\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
@@ -202,6 +208,9 @@ fn shipped_helper_preserves_attached_dynamic_wrapper_value_semantics() {
     }
 
     for command in [
+        "busybox time -f\"$@\"X sh -c 'rm --no-preserve-root -rf /'",
+        "builtin command busybox time -vf\"${VALUES[@]}\"X sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -\"$OPTION\"X sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -u\"$@\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -uX\"$@\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -u\"$@\"X sh -c 'rm --no-preserve-root -rf /'",
