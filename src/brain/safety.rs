@@ -3667,7 +3667,7 @@ fn classify_busybox_time_option_prefix(
     while let Some(option) = options.chars().next() {
         options = &options[option.len_utf8()..];
         match option {
-            'o' | 'f' => {
+            'o' => {
                 return Some(WrapperOptionValue::Required {
                     attached: wrapper_option_attachment(
                         options,
@@ -3675,6 +3675,16 @@ fn classify_busybox_time_option_prefix(
                         may_not_expand_to_exactly_one_argv,
                     ),
                     rule: WrapperValueRule::NonEmpty,
+                });
+            }
+            'f' => {
+                return Some(WrapperOptionValue::Required {
+                    attached: wrapper_option_attachment(
+                        options,
+                        dynamic_suffix,
+                        may_not_expand_to_exactly_one_argv,
+                    ),
+                    rule: WrapperValueRule::Any,
                 });
             }
             'a' | 'p' | 'v' => {}
@@ -6259,7 +6269,6 @@ mod tests {
             "/usr/bin/env -uA=B sh -c 'rm --no-preserve-root -rf /'",
             "/usr/bin/time -o \"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
             "/usr/bin/env -u \"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
-            "busybox time -f \"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
             "builtin command /usr/bin/time -o \"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
             "builtin exec /usr/bin/env -u \"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
         ] {
@@ -6278,6 +6287,8 @@ mod tests {
             "/usr/bin/time -aolog sh -c 'rm --no-preserve-root -rf /'",
             "busybox time -olog sh -c 'rm --no-preserve-root -rf /'",
             "busybox time -vfFORMAT sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -f '' sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -f \"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
             "/usr/bin/env -u HOME sh -c 'rm --no-preserve-root -rf /'",
             "/usr/bin/env -ivuHOME sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -u '' sh -c 'rm --no-preserve-root -rf /'",
@@ -6311,7 +6322,6 @@ mod tests {
             "/usr/bin/time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
             "/usr/bin/env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
-            "busybox time -vfX\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -u\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -iu\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
         ] {
@@ -6323,6 +6333,7 @@ mod tests {
         }
 
         for command in [
+            "busybox time -vfX\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -u\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -iu\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
@@ -6457,12 +6468,9 @@ mod tests {
             "VALUE='log sh'; /usr/bin/time -o \"$VALUE\" printf ok",
             "VALUE='HOME sh'; /usr/bin/env -u \"$VALUE\" printf ok",
             "VALUE='log sh'; busybox time -o \"$VALUE\" printf ok",
-            "busybox time -f \"$VALUE\" printf ok",
             "/usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
             "/usr/bin/env -u \"${VALUE:+$*}\" printf ok",
-            "busybox time -f \"${VALUE:-${FORMAT[*]}}\" printf ok",
             "builtin command /usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
-            "builtin exec busybox time -f \"${VALUE:+$*}\" printf ok",
         ] {
             assert!(
                 matches!(evaluate_result(command), SafetyEvaluation::Indeterminate(_)),
@@ -6479,6 +6487,9 @@ mod tests {
             "/usr/bin/env -u HOME printf ok",
             "busybox time -o log printf ok",
             "busybox time -o $'log' printf ok",
+            "busybox time -f \"$VALUE\" printf ok",
+            "busybox time -f \"${VALUE:-${FORMAT[*]}}\" printf ok",
+            "builtin exec busybox time -f \"${VALUE:+$*}\" printf ok",
             "VALUE='HOME sh'; busybox env -u \"$VALUE\" printf ok",
             "busybox env -u HOME printf ok",
             "busybox env -u ~ printf ok",

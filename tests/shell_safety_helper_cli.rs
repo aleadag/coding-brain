@@ -55,6 +55,8 @@ fn shipped_helper_denies_literal_nested_root_deletion() {
         "builtin builtin eval 'rm --no-preserve-root -rf /'",
         "busybox env sh -c 'rm --no-preserve-root -rf /'",
         "busybox time sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -f '' sh -c 'rm --no-preserve-root -rf /'",
+        "busybox time -f \"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
         "toybox env sh -c 'rm --no-preserve-root -rf /'",
         "toybox time sh -c 'rm --no-preserve-root -rf /'",
         "/usr/bin/time -p sh -c 'rm --no-preserve-root -rf /'",
@@ -95,12 +97,21 @@ fn shipped_helper_preserves_quoted_exact_one_fallback_option_value_uncertainty()
     for command in [
         "/usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
         "/usr/bin/env -u \"${VALUE:+$*}\" printf ok",
-        "busybox time -f \"${VALUE:-${FORMAT[*]}}\" printf ok",
         "builtin command /usr/bin/time -o \"${VALUE:-$LOG}\" printf ok",
-        "builtin exec busybox time -f \"${VALUE:+$*}\" printf ok",
     ] {
         let response = run_shipped_helper(command, None);
         assert_eq!(response["result"], "indeterminate", "{command}");
+    }
+}
+
+#[test]
+fn shipped_helper_accepts_busybox_time_quoted_exact_one_format_values() {
+    for command in [
+        "busybox time -f \"${VALUE:-${FORMAT[*]}}\" printf ok",
+        "builtin exec busybox time -f \"${VALUE:+$*}\" printf ok",
+    ] {
+        let response = run_shipped_helper(command, None);
+        assert_eq!(response["result"], "no_deterministic_decision", "{command}");
     }
 }
 
@@ -172,7 +183,6 @@ fn shipped_helper_preserves_attached_dynamic_wrapper_value_semantics() {
         "/usr/bin/time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
         "/usr/bin/env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
-        "busybox time -vfX\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -u\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -iu\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
     ] {
@@ -181,6 +191,7 @@ fn shipped_helper_preserves_attached_dynamic_wrapper_value_semantics() {
     }
 
     for command in [
+        "busybox time -vfX\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -u\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
         "busybox env -iu\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
