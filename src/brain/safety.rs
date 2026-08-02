@@ -3480,13 +3480,24 @@ enum WrapperOptionValue {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WrapperOptionSource<'a> {
+    Literal,
+    Dynamic(&'a shell::ShellWord),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicAttachmentPresence {
+    Proven,
+    MayDisappear,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WrapperOptionAttachment {
     Separate,
     Literal(String),
     Dynamic {
-        literal_prefix: String,
-        literal_after_dynamic_proves_nonempty: bool,
+        presence: DynamicAttachmentPresence,
         may_not_expand_to_exactly_one_argv: bool,
     },
 }
@@ -3531,17 +3542,14 @@ fn consume_wrapper_option_value<'a>(
             };
         }
         WrapperOptionAttachment::Dynamic {
-            literal_prefix,
-            literal_after_dynamic_proves_nonempty,
+            presence,
             may_not_expand_to_exactly_one_argv,
         } => {
             if may_not_expand_to_exactly_one_argv {
                 return WrapperValueConsumption::UnsafeExpansion;
             }
             return match rule {
-                WrapperValueRule::Any
-                    if !literal_prefix.is_empty() || literal_after_dynamic_proves_nonempty =>
-                {
+                WrapperValueRule::Any if presence == DynamicAttachmentPresence::Proven => {
                     WrapperValueConsumption::Consumed(words)
                 }
                 WrapperValueRule::Any
@@ -3583,7 +3591,7 @@ fn leading_literal_option_prefix(word: &shell::ShellWord) -> Option<String> {
     (!prefix.is_empty()).then_some(prefix)
 }
 
-fn dynamic_word_has_literal_after_dynamic(word: &shell::ShellWord) -> bool {
+fn dynamic_word_has_nonempty_literal_after_dynamic(word: &shell::ShellWord) -> bool {
     let mut saw_dynamic = false;
     word.parts.iter().any(|part| match part {
         shell::WordPart::Literal(value) | shell::WordPart::UnquotedLiteral(value) => {
@@ -3597,22 +3605,20 @@ fn dynamic_word_has_literal_after_dynamic(word: &shell::ShellWord) -> bool {
 }
 
 fn classify_time_option(word: &str) -> Option<WrapperOptionValue> {
-    classify_time_option_prefix(word, false, false)
+    classify_time_option_prefix(word, WrapperOptionSource::Literal)
 }
 
 fn classify_dynamic_time_option(word: &shell::ShellWord) -> Option<WrapperOptionValue> {
     let option = classify_time_option_prefix(
         &leading_literal_option_prefix(word)?,
-        true,
-        word_may_not_expand_to_exactly_one_argv(word),
+        WrapperOptionSource::Dynamic(word),
     );
     matches!(&option, Some(WrapperOptionValue::Required { .. })).then_some(option)?
 }
 
 fn classify_time_option_prefix(
     word: &str,
-    dynamic_suffix: bool,
-    may_not_expand_to_exactly_one_argv: bool,
+    source: WrapperOptionSource<'_>,
 ) -> Option<WrapperOptionValue> {
     if word.starts_with("--") {
         return None;
@@ -3627,11 +3633,7 @@ fn classify_time_option_prefix(
         match option {
             'o' => {
                 return Some(WrapperOptionValue::Required {
-                    attached: wrapper_option_attachment(
-                        options,
-                        dynamic_suffix,
-                        may_not_expand_to_exactly_one_argv,
-                    ),
+                    attached: wrapper_option_attachment(options, source),
                     rule: WrapperValueRule::NonEmpty,
                 });
             }
@@ -3643,22 +3645,20 @@ fn classify_time_option_prefix(
 }
 
 fn classify_busybox_time_option(word: &str) -> Option<WrapperOptionValue> {
-    classify_busybox_time_option_prefix(word, false, false)
+    classify_busybox_time_option_prefix(word, WrapperOptionSource::Literal)
 }
 
 fn classify_dynamic_busybox_time_option(word: &shell::ShellWord) -> Option<WrapperOptionValue> {
     let option = classify_busybox_time_option_prefix(
         &leading_literal_option_prefix(word)?,
-        true,
-        word_may_not_expand_to_exactly_one_argv(word),
+        WrapperOptionSource::Dynamic(word),
     );
     matches!(&option, Some(WrapperOptionValue::Required { .. })).then_some(option)?
 }
 
 fn classify_busybox_time_option_prefix(
     word: &str,
-    dynamic_suffix: bool,
-    may_not_expand_to_exactly_one_argv: bool,
+    source: WrapperOptionSource<'_>,
 ) -> Option<WrapperOptionValue> {
     let mut options = word.strip_prefix('-')?;
     if options.is_empty() {
@@ -3669,21 +3669,13 @@ fn classify_busybox_time_option_prefix(
         match option {
             'o' => {
                 return Some(WrapperOptionValue::Required {
-                    attached: wrapper_option_attachment(
-                        options,
-                        dynamic_suffix,
-                        may_not_expand_to_exactly_one_argv,
-                    ),
+                    attached: wrapper_option_attachment(options, source),
                     rule: WrapperValueRule::NonEmpty,
                 });
             }
             'f' => {
                 return Some(WrapperOptionValue::Required {
-                    attached: wrapper_option_attachment(
-                        options,
-                        dynamic_suffix,
-                        may_not_expand_to_exactly_one_argv,
-                    ),
+                    attached: wrapper_option_attachment(options, source),
                     rule: WrapperValueRule::Any,
                 });
             }
@@ -3719,31 +3711,32 @@ enum EnvOption {
 
 fn wrapper_option_attachment(
     attached: &str,
-    dynamic_suffix: bool,
-    may_not_expand_to_exactly_one_argv: bool,
+    source: WrapperOptionSource<'_>,
 ) -> WrapperOptionAttachment {
-    if dynamic_suffix {
-        WrapperOptionAttachment::Dynamic {
-            literal_prefix: attached.into(),
-            literal_after_dynamic_proves_nonempty: false,
-            may_not_expand_to_exactly_one_argv,
-        }
-    } else if attached.is_empty() {
-        WrapperOptionAttachment::Separate
-    } else {
-        WrapperOptionAttachment::Literal(attached.into())
+    match source {
+        WrapperOptionSource::Dynamic(word) => WrapperOptionAttachment::Dynamic {
+            presence: if !attached.is_empty()
+                || dynamic_word_has_nonempty_literal_after_dynamic(word)
+            {
+                DynamicAttachmentPresence::Proven
+            } else {
+                DynamicAttachmentPresence::MayDisappear
+            },
+            may_not_expand_to_exactly_one_argv: word_may_not_expand_to_exactly_one_argv(word),
+        },
+        WrapperOptionSource::Literal if attached.is_empty() => WrapperOptionAttachment::Separate,
+        WrapperOptionSource::Literal => WrapperOptionAttachment::Literal(attached.into()),
     }
 }
 
 fn classify_env_option(word: &str) -> EnvOption {
-    classify_env_option_prefix(word, false, false)
+    classify_env_option_prefix(word, WrapperOptionSource::Literal)
 }
 
 fn classify_dynamic_env_option(word: &shell::ShellWord) -> Option<EnvOption> {
     let option = classify_env_option_prefix(
         &leading_literal_option_prefix(word)?,
-        true,
-        word_may_not_expand_to_exactly_one_argv(word),
+        WrapperOptionSource::Dynamic(word),
     );
     matches!(
         &option,
@@ -3755,11 +3748,7 @@ fn classify_dynamic_env_option(word: &shell::ShellWord) -> Option<EnvOption> {
     .then_some(option)
 }
 
-fn classify_env_option_prefix(
-    word: &str,
-    dynamic_suffix: bool,
-    may_not_expand_to_exactly_one_argv: bool,
-) -> EnvOption {
+fn classify_env_option_prefix(word: &str, source: WrapperOptionSource<'_>) -> EnvOption {
     if word.starts_with("--") {
         return EnvOption::Unsupported;
     }
@@ -3773,11 +3762,7 @@ fn classify_env_option_prefix(
             'u' => {
                 return EnvOption::Supported {
                     value: WrapperOptionValue::Required {
-                        attached: wrapper_option_attachment(
-                            options,
-                            dynamic_suffix,
-                            may_not_expand_to_exactly_one_argv,
-                        ),
+                        attached: wrapper_option_attachment(options, source),
                         rule: WrapperValueRule::EnvUnsetName,
                     },
                     child_context: true,
@@ -3795,30 +3780,14 @@ fn classify_env_option_prefix(
 }
 
 fn classify_busybox_env_option(word: &str) -> EnvOption {
-    classify_busybox_env_option_prefix(word, false, false)
+    classify_busybox_env_option_prefix(word, WrapperOptionSource::Literal)
 }
 
 fn classify_dynamic_busybox_env_option(word: &shell::ShellWord) -> Option<EnvOption> {
-    let mut option = classify_busybox_env_option_prefix(
+    let option = classify_busybox_env_option_prefix(
         &leading_literal_option_prefix(word)?,
-        true,
-        word_may_not_expand_to_exactly_one_argv(word),
+        WrapperOptionSource::Dynamic(word),
     );
-    if let EnvOption::Supported {
-        value:
-            WrapperOptionValue::Required {
-                attached:
-                    WrapperOptionAttachment::Dynamic {
-                        literal_after_dynamic_proves_nonempty,
-                        ..
-                    },
-                rule: WrapperValueRule::Any,
-            },
-        ..
-    } = &mut option
-    {
-        *literal_after_dynamic_proves_nonempty = dynamic_word_has_literal_after_dynamic(word);
-    }
     matches!(
         &option,
         EnvOption::Supported {
@@ -3829,11 +3798,7 @@ fn classify_dynamic_busybox_env_option(word: &shell::ShellWord) -> Option<EnvOpt
     .then_some(option)
 }
 
-fn classify_busybox_env_option_prefix(
-    word: &str,
-    dynamic_suffix: bool,
-    may_not_expand_to_exactly_one_argv: bool,
-) -> EnvOption {
+fn classify_busybox_env_option_prefix(word: &str, source: WrapperOptionSource<'_>) -> EnvOption {
     let Some(mut options) = word.strip_prefix('-') else {
         return EnvOption::Unsupported;
     };
@@ -3847,11 +3812,7 @@ fn classify_busybox_env_option_prefix(
             'u' => {
                 return EnvOption::Supported {
                     value: WrapperOptionValue::Required {
-                        attached: wrapper_option_attachment(
-                            options,
-                            dynamic_suffix,
-                            may_not_expand_to_exactly_one_argv,
-                        ),
+                        attached: wrapper_option_attachment(options, source),
                         rule: WrapperValueRule::Any,
                     },
                     child_context: true,
@@ -6314,11 +6275,82 @@ mod tests {
         }
     }
 
+    fn wrapper_test_word(
+        parts: Vec<shell::WordPart>,
+        may_not_expand_to_exactly_one_argv: bool,
+    ) -> shell::ShellWord {
+        shell::ShellWord {
+            raw: String::new(),
+            literal: None,
+            parts,
+            assign_default_invalidations: Vec::new(),
+            can_split_fields: false,
+            may_not_expand_to_exactly_one_argv,
+            may_mutate_shell_state: false,
+        }
+    }
+
+    #[test]
+    fn dynamic_wrapper_attachment_presence_is_centralized() {
+        let suffix = wrapper_test_word(
+            vec![
+                shell::WordPart::UnquotedLiteral("-f".into()),
+                shell::WordPart::Parameter {
+                    value: shell::ParameterUse::Named {
+                        name: "FORMAT".into(),
+                    },
+                    split_fields: false,
+                },
+                shell::WordPart::Literal("X".into()),
+            ],
+            false,
+        );
+        assert!(matches!(
+            wrapper_option_attachment("", WrapperOptionSource::Dynamic(&suffix)),
+            WrapperOptionAttachment::Dynamic {
+                presence: DynamicAttachmentPresence::Proven,
+                may_not_expand_to_exactly_one_argv: false,
+            }
+        ));
+
+        let no_suffix = wrapper_test_word(
+            vec![
+                shell::WordPart::UnquotedLiteral("-f".into()),
+                shell::WordPart::Parameter {
+                    value: shell::ParameterUse::Named {
+                        name: "FORMAT".into(),
+                    },
+                    split_fields: false,
+                },
+            ],
+            false,
+        );
+        assert!(matches!(
+            wrapper_option_attachment("", WrapperOptionSource::Dynamic(&no_suffix)),
+            WrapperOptionAttachment::Dynamic {
+                presence: DynamicAttachmentPresence::MayDisappear,
+                may_not_expand_to_exactly_one_argv: false,
+            }
+        ));
+
+        let unsafe_suffix = wrapper_test_word(suffix.parts, true);
+        assert!(matches!(
+            wrapper_option_attachment("", WrapperOptionSource::Dynamic(&unsafe_suffix)),
+            WrapperOptionAttachment::Dynamic {
+                presence: DynamicAttachmentPresence::Proven,
+                may_not_expand_to_exactly_one_argv: true,
+            }
+        ));
+    }
+
     #[test]
     fn attached_dynamic_wrapper_values_preserve_value_semantics() {
         for command in [
             "busybox time -o\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox time -f\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -o\"$LOG\"X sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/time -o\"$LOG\"X sh -c 'rm --no-preserve-root -rf /'",
+            "/usr/bin/env -u\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
             "/usr/bin/time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
             "/usr/bin/env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
@@ -6333,6 +6365,9 @@ mod tests {
         }
 
         for command in [
+            "busybox time -f\"$FORMAT\"X sh -c 'rm --no-preserve-root -rf /'",
+            "builtin command busybox time -vf\"$FORMAT\"X sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -f\"$OUTER\"X busybox time -vf\"$INNER\"Y sh -c 'rm --no-preserve-root -rf /'",
             "busybox time -vfX\"$FORMAT\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -uX\"$NAME\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -u\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
@@ -6344,6 +6379,9 @@ mod tests {
         }
 
         for command in [
+            "busybox time -f\"$@\"X sh -c 'rm --no-preserve-root -rf /'",
+            "builtin command busybox time -vf\"${VALUES[@]}\"X sh -c 'rm --no-preserve-root -rf /'",
+            "busybox time -\"$OPTION\"X sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -u\"$@\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -uX\"$@\" sh -c 'rm --no-preserve-root -rf /'",
             "busybox env -u\"$@\"X sh -c 'rm --no-preserve-root -rf /'",

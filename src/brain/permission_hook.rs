@@ -2206,6 +2206,34 @@ mod tests {
                 false,
             ),
             (
+                "busybox time -f\"$FORMAT\"X sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "builtin command busybox time -vf\"$FORMAT\"X sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox time -f\"$OUTER\"X busybox time -vf\"$INNER\"Y sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox time -o\"$LOG\"X sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "/usr/bin/env -u\"$NAME\"X sh -c 'rm --no-preserve-root -rf /'",
+                false,
+            ),
+            (
+                "busybox time -f\"$@\"X sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
+                "busybox time -\"$OPTION\"X sh -c 'rm --no-preserve-root -rf /'",
+                true,
+            ),
+            (
                 "/usr/bin/time -oX\"$LOG\" sh -c 'rm --no-preserve-root -rf /'",
                 false,
             ),
