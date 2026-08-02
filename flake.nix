@@ -32,6 +32,7 @@
           version = cargoToml.package.version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          checkType = "debug";
           nativeCheckInputs = [ pkgs.git ];
 
           meta = with pkgs.lib; {
