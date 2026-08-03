@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,11 +21,36 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Ensure Cargo version matches tag
+      - name: Ensure release inputs match tag
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
+          set -e
+          test -n "${CARGO_REGISTRY_TOKEN:-}" || { echo "::error::CARGO_REGISTRY_TOKEN is empty"; exit 1; }
+          test -n "${HOMEBREW_TAP_TOKEN:-}" || { echo "::error::HOMEBREW_TAP_TOKEN is empty"; exit 1; }
           TAG="${GITHUB_REF#refs/tags/v}"
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          test "$TAG" = "$VERSION"
+          for MANIFEST in Cargo.toml crates/coding-brain-core/Cargo.toml crates/coding-brain-tui/Cargo.toml; do
+            VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$MANIFEST" | head -n 1)
+            test "$TAG" = "$VERSION" || { echo "::error::${MANIFEST} version ${VERSION} does not match tag ${TAG}"; exit 1; }
+          done
+          NOTES=".github/releases/${GITHUB_REF_NAME}.md"
+          test -s "$NOTES" || { echo "::error::release notes are missing or empty: ${NOTES}"; exit 1; }
+
+      - name: Reject existing crates on first attempt
+        if: github.run_attempt == 1
+        run: |
+          set -e
+          for MANIFEST in Cargo.toml crates/coding-brain-core/Cargo.toml crates/coding-brain-tui/Cargo.toml; do
+            PACKAGE=$(sed -n 's/^name = "\(.*\)"/\1/p' "$MANIFEST" | head -n 1)
+            VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$MANIFEST" | head -n 1)
+            STATUS=$(curl -sS -o "$RUNNER_TEMP/${PACKAGE}.json" -w '%{http_code}' -A coding-brain-release-workflow "https://crates.io/api/v1/crates/${PACKAGE}/${VERSION}")
+            case "$STATUS" in
+              404) ;;
+              200) echo "::error::${PACKAGE} ${VERSION} is already published"; exit 1 ;;
+              *) echo "::error::crates.io HTTP ${STATUS} for ${PACKAGE}"; exit 1 ;;
+            esac
+          done
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -80,10 +105,17 @@ jobs:
       - name: Package
         run: |
           TAG=${GITHUB_REF#refs/tags/}
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          BINARY="target/${{ matrix.target }}/release/cbrain"
+          strings "$BINARY" | grep -F "$VERSION" >/dev/null
+          # shellcheck disable=SC2195 # actionlint substitutes the matrix expression before analysis
+          case "$(uname -m):${{ matrix.target }}" in
+            x86_64:x86_64-*|arm64:aarch64-apple-darwin|aarch64:aarch64-*) "$BINARY" --version | grep -F "$VERSION" >/dev/null ;;
+          esac
           cd target/${{ matrix.target }}/release
-          tar czf ../../../coding-brain-${TAG}-${{ matrix.target }}.tar.gz cbrain
+          tar czf "../../../coding-brain-${TAG}-${{ matrix.target }}.tar.gz" cbrain
           cd ../../..
-          shasum -a 256 coding-brain-${TAG}-${{ matrix.target }}.tar.gz > coding-brain-${TAG}-${{ matrix.target }}.tar.gz.sha256
+          shasum -a 256 "coding-brain-${TAG}-${{ matrix.target }}.tar.gz" > "coding-brain-${TAG}-${{ matrix.target }}.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -104,13 +136,19 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/coding-brain-core/Cargo.toml | head -n 1)
-          FOUND=$(curl -sS -A "coding-brain-release-workflow" "https://crates.io/api/v1/crates/coding-brain-core/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
-          if [ -n "$FOUND" ]; then
-            echo "coding-brain-core ${VERSION} already published"
-          else
-            cargo publish -p coding-brain-core --locked --token "$CARGO_REGISTRY_TOKEN"
-          fi
+          PACKAGE=coding-brain-core
+          CARGO_PACKAGE=coding-brain-core
+          MANIFEST=crates/coding-brain-core/Cargo.toml
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$MANIFEST" | head -n 1)
+          STATUS=$(curl -sS -o "$RUNNER_TEMP/${PACKAGE}.json" -w '%{http_code}' -A coding-brain-release-workflow "https://crates.io/api/v1/crates/${PACKAGE}/${VERSION}")
+          case "$STATUS" in
+            404) cargo publish -p "$CARGO_PACKAGE" --locked --registry crates-io ;;
+            200)
+              [ "$GITHUB_RUN_ATTEMPT" != 1 ] || { echo "::error::${PACKAGE} appeared during first attempt"; exit 1; }
+              echo "${PACKAGE} ${VERSION} already published; continuing rerun"
+              ;;
+            *) echo "::error::crates.io HTTP ${STATUS} for ${PACKAGE}"; exit 1 ;;
+          esac
 
   publish-tui:
     name: Publish coding-brain-tui
@@ -122,26 +160,41 @@ jobs:
       - name: Wait for coding-brain-core
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/coding-brain-core/Cargo.toml | head -n 1)
-          for i in $(seq 1 30); do
-            FOUND=$(curl -sS -A "coding-brain-release-workflow" "https://crates.io/api/v1/crates/coding-brain-core/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
-            [ -n "$FOUND" ] && exit 0
-            echo "waiting for coding-brain-core ${VERSION} (attempt ${i}/30)"
+          UPSTREAM_PACKAGE=coding-brain-core
+          UPSTREAM_MANIFEST=crates/coding-brain-core/Cargo.toml
+          DOWNSTREAM_PACKAGE=coding-brain-tui
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$UPSTREAM_MANIFEST" | head -n 1)
+          READINESS_CARGO_HOME=$(mktemp -d)
+          READINESS_LOG="$RUNNER_TEMP/cargo-info-${UPSTREAM_PACKAGE}.log"
+          trap 'rm -rf -- "$READINESS_CARGO_HOME"' EXIT
+          for ATTEMPT in $(seq 1 60); do
+            if CARGO_HOME="$READINESS_CARGO_HOME" cargo info "${UPSTREAM_PACKAGE}@${VERSION}" --registry crates-io >"$READINESS_LOG" 2>&1; then
+              cargo publish --dry-run -p "$DOWNSTREAM_PACKAGE" --locked --registry crates-io
+              exit 0
+            fi
+            echo "waiting for Cargo to resolve ${UPSTREAM_PACKAGE} ${VERSION} (attempt ${ATTEMPT}/60)"
             sleep 10
           done
+          cat "$READINESS_LOG" >&2
           exit 1
       - name: Publish coding-brain-tui
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/coding-brain-tui/Cargo.toml | head -n 1)
-          FOUND=$(curl -sS -A "coding-brain-release-workflow" "https://crates.io/api/v1/crates/coding-brain-tui/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
-          if [ -n "$FOUND" ]; then
-            echo "coding-brain-tui ${VERSION} already published"
-          else
-            cargo publish -p coding-brain-tui --locked --token "$CARGO_REGISTRY_TOKEN"
-          fi
+          PACKAGE=coding-brain-tui
+          CARGO_PACKAGE=coding-brain-tui
+          MANIFEST=crates/coding-brain-tui/Cargo.toml
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$MANIFEST" | head -n 1)
+          STATUS=$(curl -sS -o "$RUNNER_TEMP/${PACKAGE}.json" -w '%{http_code}' -A coding-brain-release-workflow "https://crates.io/api/v1/crates/${PACKAGE}/${VERSION}")
+          case "$STATUS" in
+            404) cargo publish -p "$CARGO_PACKAGE" --locked --registry crates-io ;;
+            200)
+              [ "$GITHUB_RUN_ATTEMPT" != 1 ] || { echo "::error::${PACKAGE} appeared during first attempt"; exit 1; }
+              echo "${PACKAGE} ${VERSION} already published; continuing rerun"
+              ;;
+            *) echo "::error::crates.io HTTP ${STATUS} for ${PACKAGE}"; exit 1 ;;
+          esac
 
   publish:
     name: Publish Coding Brain
@@ -153,18 +206,41 @@ jobs:
       - name: Wait for coding-brain-tui
         run: |
           set -e
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/coding-brain-tui/Cargo.toml | head -n 1)
-          for i in $(seq 1 30); do
-            FOUND=$(curl -sS -A "coding-brain-release-workflow" "https://crates.io/api/v1/crates/coding-brain-tui/${VERSION}" | grep -o "\"num\":\"${VERSION}\"" | head -n 1 || true)
-            [ -n "$FOUND" ] && exit 0
-            echo "waiting for coding-brain-tui ${VERSION} (attempt ${i}/30)"
+          UPSTREAM_PACKAGE=coding-brain-tui
+          UPSTREAM_MANIFEST=crates/coding-brain-tui/Cargo.toml
+          DOWNSTREAM_PACKAGE=coding-brain
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$UPSTREAM_MANIFEST" | head -n 1)
+          READINESS_CARGO_HOME=$(mktemp -d)
+          READINESS_LOG="$RUNNER_TEMP/cargo-info-${UPSTREAM_PACKAGE}.log"
+          trap 'rm -rf -- "$READINESS_CARGO_HOME"' EXIT
+          for ATTEMPT in $(seq 1 60); do
+            if CARGO_HOME="$READINESS_CARGO_HOME" cargo info "${UPSTREAM_PACKAGE}@${VERSION}" --registry crates-io >"$READINESS_LOG" 2>&1; then
+              cargo publish --dry-run -p "$DOWNSTREAM_PACKAGE" --locked --registry crates-io
+              exit 0
+            fi
+            echo "waiting for Cargo to resolve ${UPSTREAM_PACKAGE} ${VERSION} (attempt ${ATTEMPT}/60)"
             sleep 10
           done
+          cat "$READINESS_LOG" >&2
           exit 1
       - name: Publish Coding Brain
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p coding-brain --locked --token "$CARGO_REGISTRY_TOKEN"
+        run: |
+          set -e
+          PACKAGE=coding-brain
+          CARGO_PACKAGE=coding-brain
+          MANIFEST=Cargo.toml
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$MANIFEST" | head -n 1)
+          STATUS=$(curl -sS -o "$RUNNER_TEMP/${PACKAGE}.json" -w '%{http_code}' -A coding-brain-release-workflow "https://crates.io/api/v1/crates/${PACKAGE}/${VERSION}")
+          case "$STATUS" in
+            404) cargo publish -p "$CARGO_PACKAGE" --locked --registry crates-io ;;
+            200)
+              [ "$GITHUB_RUN_ATTEMPT" != 1 ] || { echo "::error::${PACKAGE} appeared during first attempt"; exit 1; }
+              echo "${PACKAGE} ${VERSION} already published; continuing rerun"
+              ;;
+            *) echo "::error::crates.io HTTP ${STATUS} for ${PACKAGE}"; exit 1 ;;
+          esac
 
   release:
     name: Create GitHub release
@@ -172,13 +248,17 @@ jobs:
       - build
       - publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: .github/releases/${{ github.ref_name }}.md
           generate_release_notes: true
           files: |
             artifacts/coding-brain-*.tar.gz
@@ -206,7 +286,7 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           VERSION="${TAG#v}"
           cd codexctl
-          ./scripts/render-homebrew-formula.sh "$VERSION" "$(awk '{print $1}' ../artifacts/coding-brain-${TAG}-aarch64-apple-darwin.tar.gz.sha256)" "$(awk '{print $1}' ../artifacts/coding-brain-${TAG}-x86_64-apple-darwin.tar.gz.sha256)" "$(awk '{print $1}' ../artifacts/coding-brain-${TAG}-x86_64-unknown-linux-musl.tar.gz.sha256)" "$(awk '{print $1}' ../artifacts/coding-brain-${TAG}-aarch64-unknown-linux-musl.tar.gz.sha256)" > ../homebrew-tap/Formula/coding-brain.rb
+          ./scripts/render-homebrew-formula.sh "$VERSION" "$(awk '{print $1}' "../artifacts/coding-brain-${TAG}-aarch64-apple-darwin.tar.gz.sha256")" "$(awk '{print $1}' "../artifacts/coding-brain-${TAG}-x86_64-apple-darwin.tar.gz.sha256")" "$(awk '{print $1}' "../artifacts/coding-brain-${TAG}-x86_64-unknown-linux-musl.tar.gz.sha256")" "$(awk '{print $1}' "../artifacts/coding-brain-${TAG}-aarch64-unknown-linux-musl.tar.gz.sha256")" > ../homebrew-tap/Formula/coding-brain.rb
       - name: Commit formula update
         run: |
           cd homebrew-tap
@@ -216,3 +296,57 @@ jobs:
           git diff --cached --quiet && exit 0
           git commit -m "coding-brain ${GITHUB_REF#refs/tags/v}"
           git push
+
+  notify-fixed-issues:
+    name: Comment on fixed issues
+    needs: update-homebrew
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Find and notify fixed issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+
+          # Find the previous tag
+          PREV_TAG=$(git tag --sort=-creatordate | grep -A1 "^${TAG}$" | tail -1)
+          if [ "$PREV_TAG" = "$TAG" ] || [ -z "$PREV_TAG" ]; then
+            echo "No previous tag found, checking all commits"
+            PREV_TAG=$(git rev-list --max-parents=0 HEAD | head -1)
+          fi
+
+          echo "Scanning commits between $PREV_TAG and $TAG"
+
+          # Extract issue numbers from commit messages (Closes #N, Fixes #N, etc.)
+          ISSUES=$(git log "$PREV_TAG".."$TAG" --format="%s %b" \
+            | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' \
+            | grep -oE '#[0-9]+' \
+            | sort -u \
+            | tr -d '#')
+
+          if [ -z "$ISSUES" ]; then
+            echo "No issues referenced in commits"
+            exit 0
+          fi
+
+          for ISSUE in $ISSUES; do
+            echo "Commenting on issue #$ISSUE"
+            gh issue comment "$ISSUE" --body "$(cat <<BODY
+          Fixed in [v${VERSION}](${RELEASE_URL}) — now available via:
+
+          \`\`\`
+          brew upgrade coding-brain     # Homebrew
+          cargo install coding-brain    # crates.io
+          \`\`\`
+          BODY
+            )"
+          done

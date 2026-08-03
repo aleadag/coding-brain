@@ -6,6 +6,8 @@ All notable changes to Coding Brain are documented here.
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-08-03
+
 ### Added
 
 - You can inspect metadata-only hook and correlation diagnostics, rejected or
