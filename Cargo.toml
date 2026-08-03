@@ -5,7 +5,7 @@ members = ["crates/coding-brain-core", "crates/coding-brain-tui"]
 
 [package]
 name = "coding-brain"
-version = "0.58.0"
+version = "0.59.0"
 edition = "2024"
 # MSRV — bumped to 1.88 in #328 so cargo-install on older toolchains
 # emits a clean "rustc too old" error instead of opaque transitive-dep
@@ -32,8 +32,8 @@ path = "src/lib.rs"
 # published to crates.io. Local builds always use the path; crates.io strips
 # the path and resolves the published version. Bump both when the workspace
 # crates change.
-coding-brain-core = { path = "crates/coding-brain-core", version = "0.53.0" }
-coding-brain-tui = { path = "crates/coding-brain-tui", version = "0.53.0" }
+coding-brain-core = { path = "crates/coding-brain-core", version = "0.59.0" }
+coding-brain-tui = { path = "crates/coding-brain-tui", version = "0.59.0" }
 brush-parser = "0.4.0"
 ratatui = "0.29"
 crossterm = "0.28"

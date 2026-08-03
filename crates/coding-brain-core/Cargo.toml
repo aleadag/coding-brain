@@ -1,11 +1,11 @@
 [package]
 name = "coding-brain-core"
-version = "0.53.0"
+version = "0.59.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Session types, transcript discovery, health checks, and runtime traits for Coding Brain."
 license = "MIT"
-repository = "https://github.com/aleadag/codexctl"
+repository = "https://github.com/aleadag/coding-brain"
 keywords = ["codex", "session-monitoring", "internals"]
 categories = ["command-line-utilities"]
 
