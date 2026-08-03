@@ -6,6 +6,14 @@ const ROOT_TUI_DEPENDENCY: &str =
     "coding-brain-tui = { path = \"crates/coding-brain-tui\", version = \"0.59.0\" }";
 const TUI_CORE_DEPENDENCY: &str =
     "coding-brain-core = { path = \"../coding-brain-core\", version = \"0.59.0\" }";
+const ROOT_PACKAGE_INCLUDE: &str = r#"include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]"#;
 
 fn field<'a>(manifest: &'a str, name: &str) -> &'a str {
     let prefix = format!("{name} = \"");
@@ -32,6 +40,13 @@ fn published_crates_use_the_current_repository() {
     let tui = include_str!("../crates/coding-brain-tui/Cargo.toml");
     assert_eq!(field(core, "repository"), REPOSITORY);
     assert_eq!(field(tui, "repository"), REPOSITORY);
+}
+
+#[test]
+fn root_package_uses_exact_publication_allowlist() {
+    let root = include_str!("../Cargo.toml");
+    assert!(root.contains(ROOT_PACKAGE_INCLUDE));
+    assert!(!root.lines().any(|line| line.starts_with("exclude = ")));
 }
 
 #[test]

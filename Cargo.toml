@@ -17,7 +17,14 @@ repository = "https://github.com/aleadag/coding-brain"
 homepage = "https://github.com/aleadag/coding-brain"
 keywords = ["coding-agents", "session-monitoring", "local-llm", "tui", "automation"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["*.gif", "*.cast", "codex-demo.*", ".github/"]
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
 
 [[bin]]
 name = "cbrain"
