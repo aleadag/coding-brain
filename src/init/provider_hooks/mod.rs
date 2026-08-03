@@ -47,7 +47,8 @@ pub(crate) enum ProviderHookState {
     Invalid,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderHookOwnership {
     Absent,
     Imperative,
@@ -56,10 +57,75 @@ pub(crate) enum ProviderHookOwnership {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+impl ProviderHookOwnership {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Imperative => "imperative",
+            Self::HomeManager => "home_manager",
+            Self::Mixed => "mixed",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderHookFileState {
+    Missing,
+    Current,
+    Stale,
+    Invalid,
+}
+
+#[allow(dead_code)]
+impl ProviderHookFileState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Current => "current",
+            Self::Stale => "stale",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderHookDiagnosticReason {
+    UnsupportedTopology,
+    Unreadable,
+    MalformedContent,
+    ContractMismatch,
+}
+
+#[allow(dead_code)]
+impl ProviderHookDiagnosticReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedTopology => "unsupported_topology",
+            Self::Unreadable => "unreadable",
+            Self::MalformedContent => "malformed_content",
+            Self::ContractMismatch => "contract_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderHookFileInspection {
+    pub(crate) path: PathBuf,
+    pub(crate) scope: HookScope,
+    pub(crate) state: ProviderHookFileState,
+    pub(crate) ownership: ProviderHookOwnership,
+    pub(crate) reason: Option<ProviderHookDiagnosticReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderHookInspection {
     pub(crate) state: ProviderHookState,
     pub(crate) ownership: ProviderHookOwnership,
+    pub(crate) files: Vec<ProviderHookFileInspection>,
 }
 
 #[derive(Debug)]
@@ -71,6 +137,7 @@ enum InspectedProviderFile {
     },
     Invalid {
         ownership: ProviderHookOwnership,
+        reason: ProviderHookDiagnosticReason,
     },
 }
 
@@ -98,10 +165,21 @@ impl From<io::Error> for ProviderHookComparisonError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HookScope {
     Global,
     Project,
+}
+
+#[allow(dead_code)]
+impl HookScope {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Project => "project",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,7 +301,7 @@ fn inspect_provider_hooks_at_with_store_and_executable(
         );
     }
     let mut seen_paths = BTreeSet::new();
-    let inspections = candidates
+    let files = candidates
         .into_iter()
         .filter_map(|(scope, directory)| {
             let path = provider_path(provider, scope, home, &directory);
@@ -232,25 +310,25 @@ fn inspect_provider_hooks_at_with_store_and_executable(
             })
         })
         .collect::<Vec<_>>();
-    let ownership = inspections
+    let ownership = files
         .iter()
-        .fold(ProviderHookOwnership::Absent, |ownership, inspection| {
-            combine_ownership(ownership, inspection.ownership)
+        .fold(ProviderHookOwnership::Absent, |ownership, file| {
+            combine_ownership(ownership, file.ownership)
         });
-    let state = if inspections
+    let state = if files
         .iter()
-        .any(|inspection| inspection.state == ProviderHookState::Invalid)
+        .any(|file| file.state == ProviderHookFileState::Invalid)
     {
         ProviderHookState::Invalid
-    } else if inspections
+    } else if files
         .iter()
-        .any(|inspection| inspection.state == ProviderHookState::Stale)
+        .any(|file| file.state == ProviderHookFileState::Stale)
     {
         ProviderHookState::Stale
     } else {
-        match inspections
+        match files
             .iter()
-            .filter(|inspection| inspection.state == ProviderHookState::Current)
+            .filter(|file| file.state == ProviderHookFileState::Current)
             .count()
         {
             0 => ProviderHookState::Missing,
@@ -258,7 +336,11 @@ fn inspect_provider_hooks_at_with_store_and_executable(
             _ => ProviderHookState::Duplicate,
         }
     };
-    ProviderHookInspection { state, ownership }
+    ProviderHookInspection {
+        state,
+        ownership,
+        files,
+    }
 }
 
 fn inspect_provider_hook_at(
@@ -267,28 +349,45 @@ fn inspect_provider_hook_at(
     path: &Path,
     nix_store_root: &Path,
     executable: &Path,
-) -> ProviderHookInspection {
-    match read_provider_file_for_inspection(path, provider, scope, nix_store_root) {
-        InspectedProviderFile::Missing => ProviderHookInspection {
-            state: ProviderHookState::Missing,
-            ownership: ProviderHookOwnership::Absent,
-        },
-        InspectedProviderFile::Readable { bytes, ownership } => {
-            let contract = match ownership {
-                ProviderHookOwnership::HomeManager => {
-                    ProviderHookComparisonContract::HomeManager { executable }
+) -> ProviderHookFileInspection {
+    let (state, ownership, reason) =
+        match read_provider_file_for_inspection(path, provider, scope, nix_store_root) {
+            InspectedProviderFile::Missing => (
+                ProviderHookFileState::Missing,
+                ProviderHookOwnership::Absent,
+                None,
+            ),
+            InspectedProviderFile::Readable { bytes, ownership } => {
+                let contract = match ownership {
+                    ProviderHookOwnership::HomeManager => {
+                        ProviderHookComparisonContract::HomeManager { executable }
+                    }
+                    _ => ProviderHookComparisonContract::Imperative,
+                };
+                match compare_provider_hook(provider, Some(&bytes), false, contract) {
+                    Ok(comparison) => {
+                        let state = state_from_comparison(&comparison, Some(&bytes));
+                        let reason = (state == ProviderHookFileState::Stale)
+                            .then_some(ProviderHookDiagnosticReason::ContractMismatch);
+                        (state, ownership, reason)
+                    }
+                    Err(_) => (
+                        ProviderHookFileState::Invalid,
+                        ownership,
+                        Some(ProviderHookDiagnosticReason::MalformedContent),
+                    ),
                 }
-                _ => ProviderHookComparisonContract::Imperative,
-            };
-            let state = compare_provider_hook(provider, Some(&bytes), false, contract)
-                .map(|comparison| state_from_comparison(&comparison, Some(&bytes)))
-                .unwrap_or(ProviderHookState::Invalid);
-            ProviderHookInspection { state, ownership }
-        }
-        InspectedProviderFile::Invalid { ownership } => ProviderHookInspection {
-            state: ProviderHookState::Invalid,
-            ownership,
-        },
+            }
+            InspectedProviderFile::Invalid { ownership, reason } => {
+                (ProviderHookFileState::Invalid, ownership, Some(reason))
+            }
+        };
+    ProviderHookFileInspection {
+        path: path.to_path_buf(),
+        scope,
+        state,
+        ownership,
+        reason,
     }
 }
 
@@ -313,28 +412,35 @@ fn expected_home_manager_suffix(provider: AgentProvider) -> &'static Path {
     }
 }
 
-fn invalid_inspected_file(ownership: ProviderHookOwnership) -> InspectedProviderFile {
-    InspectedProviderFile::Invalid { ownership }
+fn invalid_inspected_file(
+    ownership: ProviderHookOwnership,
+    reason: ProviderHookDiagnosticReason,
+) -> InspectedProviderFile {
+    InspectedProviderFile::Invalid { ownership, reason }
 }
 
 fn home_manager_parent_topology_is_supported(
     nix_store_root: &Path,
     relative_parent: &Path,
-) -> bool {
+) -> Result<(), ProviderHookDiagnosticReason> {
     let mut current = nix_store_root.to_path_buf();
-    if !fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-        return false;
+    match fs::symlink_metadata(&current) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(ProviderHookDiagnosticReason::UnsupportedTopology),
+        Err(_) => return Err(ProviderHookDiagnosticReason::Unreadable),
     }
     for component in relative_parent.components() {
         let std::path::Component::Normal(component) = component else {
-            return false;
+            return Err(ProviderHookDiagnosticReason::UnsupportedTopology);
         };
         current.push(component);
-        if !fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-            return false;
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Err(ProviderHookDiagnosticReason::UnsupportedTopology),
+            Err(_) => return Err(ProviderHookDiagnosticReason::Unreadable),
         }
     }
-    true
+    Ok(())
 }
 
 fn read_provider_file_for_inspection(
@@ -349,7 +455,10 @@ fn read_provider_file_for_inspection(
             return InspectedProviderFile::Missing;
         }
         Err(_) => {
-            return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+            return invalid_inspected_file(
+                ProviderHookOwnership::Unsupported,
+                ProviderHookDiagnosticReason::Unreadable,
+            );
         }
     };
     if metadata.file_type().is_file() {
@@ -358,31 +467,49 @@ fn read_provider_file_for_inspection(
                 bytes,
                 ownership: ProviderHookOwnership::Imperative,
             },
-            Ok((None, _)) | Err(_) => invalid_inspected_file(ProviderHookOwnership::Imperative),
+            Ok((None, _)) | Err(_) => invalid_inspected_file(
+                ProviderHookOwnership::Imperative,
+                ProviderHookDiagnosticReason::Unreadable,
+            ),
         };
     }
     if !metadata.file_type().is_symlink() || scope == HookScope::Project {
-        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+        return invalid_inspected_file(
+            ProviderHookOwnership::Unsupported,
+            ProviderHookDiagnosticReason::UnsupportedTopology,
+        );
     }
 
     let target = match fs::read_link(path) {
         Ok(target) => target,
         Err(_) => {
-            return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+            return invalid_inspected_file(
+                ProviderHookOwnership::Unsupported,
+                ProviderHookDiagnosticReason::Unreadable,
+            );
         }
     };
     let Some(raw_target) = target.to_str() else {
-        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+        return invalid_inspected_file(
+            ProviderHookOwnership::Unsupported,
+            ProviderHookDiagnosticReason::UnsupportedTopology,
+        );
     };
     if !raw_target.starts_with('/')
         || raw_target[1..]
             .split('/')
             .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
     {
-        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+        return invalid_inspected_file(
+            ProviderHookOwnership::Unsupported,
+            ProviderHookDiagnosticReason::UnsupportedTopology,
+        );
     }
     let Ok(relative) = target.strip_prefix(nix_store_root) else {
-        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+        return invalid_inspected_file(
+            ProviderHookOwnership::Unsupported,
+            ProviderHookDiagnosticReason::UnsupportedTopology,
+        );
     };
     let mut components = relative.components();
     let generation = components.next().and_then(|component| match component {
@@ -393,38 +520,66 @@ fn read_provider_file_for_inspection(
     if !generation.is_some_and(|generation| generation.ends_with("-home-manager-files"))
         || suffix != expected_home_manager_suffix(provider)
     {
-        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+        return invalid_inspected_file(
+            ProviderHookOwnership::Unsupported,
+            ProviderHookDiagnosticReason::UnsupportedTopology,
+        );
     }
     let Some(relative_parent) = relative.parent() else {
-        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+        return invalid_inspected_file(
+            ProviderHookOwnership::Unsupported,
+            ProviderHookDiagnosticReason::UnsupportedTopology,
+        );
     };
-    if !home_manager_parent_topology_is_supported(nix_store_root, relative_parent) {
-        return invalid_inspected_file(ProviderHookOwnership::Unsupported);
+    if let Err(reason) = home_manager_parent_topology_is_supported(nix_store_root, relative_parent)
+    {
+        return invalid_inspected_file(ProviderHookOwnership::Unsupported, reason);
     }
 
     let target_metadata = match fs::symlink_metadata(&target) {
         Ok(metadata) => metadata,
         Err(_) => {
-            return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+            return invalid_inspected_file(
+                ProviderHookOwnership::HomeManager,
+                ProviderHookDiagnosticReason::Unreadable,
+            );
         }
     };
     if target_metadata.file_type().is_symlink() || !target_metadata.file_type().is_file() {
-        return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+        return invalid_inspected_file(
+            ProviderHookOwnership::HomeManager,
+            ProviderHookDiagnosticReason::UnsupportedTopology,
+        );
     }
     let mut file = match File::open(&target) {
         Ok(file) => file,
         Err(_) => {
-            return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+            return invalid_inspected_file(
+                ProviderHookOwnership::HomeManager,
+                ProviderHookDiagnosticReason::Unreadable,
+            );
         }
     };
     let opened_metadata = match file.metadata() {
         Ok(metadata) => metadata,
         Err(_) => {
-            return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+            return invalid_inspected_file(
+                ProviderHookOwnership::HomeManager,
+                ProviderHookDiagnosticReason::Unreadable,
+            );
         }
     };
-    if !opened_metadata.file_type().is_file() || opened_metadata.len() > MAX_FILE_BYTES as u64 {
-        return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+    if !opened_metadata.file_type().is_file() {
+        return invalid_inspected_file(
+            ProviderHookOwnership::HomeManager,
+            ProviderHookDiagnosticReason::UnsupportedTopology,
+        );
+    }
+    if opened_metadata.len() > MAX_FILE_BYTES as u64 {
+        return invalid_inspected_file(
+            ProviderHookOwnership::HomeManager,
+            ProviderHookDiagnosticReason::Unreadable,
+        );
     }
     let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
     if Read::take(&mut file, (MAX_FILE_BYTES + 1) as u64)
@@ -432,7 +587,10 @@ fn read_provider_file_for_inspection(
         .is_err()
         || bytes.len() > MAX_FILE_BYTES
     {
-        return invalid_inspected_file(ProviderHookOwnership::HomeManager);
+        return invalid_inspected_file(
+            ProviderHookOwnership::HomeManager,
+            ProviderHookDiagnosticReason::Unreadable,
+        );
     }
     InspectedProviderFile::Readable {
         bytes,
@@ -715,20 +873,20 @@ fn provider_comparison_error_for_mutation(
 fn state_from_comparison(
     comparison: &ProviderHookComparison,
     original: Option<&[u8]>,
-) -> ProviderHookState {
+) -> ProviderHookFileState {
     if !comparison.preserved_modified_entries.is_empty() {
-        return ProviderHookState::Stale;
+        return ProviderHookFileState::Stale;
     }
     if comparison.replacement.is_none() {
-        return ProviderHookState::Current;
+        return ProviderHookFileState::Current;
     }
     let Some(original) = original else {
-        return ProviderHookState::Missing;
+        return ProviderHookFileState::Missing;
     };
     match serde_json::from_slice::<serde_json::Value>(original) {
-        Ok(root) if contains_managed_command(&root) => ProviderHookState::Stale,
-        Ok(_) => ProviderHookState::Missing,
-        Err(_) => ProviderHookState::Invalid,
+        Ok(root) if contains_managed_command(&root) => ProviderHookFileState::Stale,
+        Ok(_) => ProviderHookFileState::Missing,
+        Err(_) => ProviderHookFileState::Invalid,
     }
 }
 
@@ -2611,6 +2769,74 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn provider_inspection_reports_mixed_codex_and_claude_sources() {
+        for provider in [AgentProvider::Codex, AgentProvider::Claude] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            std::fs::create_dir_all(project.join(".git")).unwrap();
+            let bytes = exact_provider_bytes(&home, &project, provider);
+            write_home_manager_provider_file(&store, &home, &project, provider, &bytes);
+            let project_path = provider_path(provider, HookScope::Project, &home, &project);
+            std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+            std::fs::write(&project_path, &bytes).unwrap();
+
+            let inspection =
+                inspect_provider_hooks_at_with_store(provider, &home, &project, &store);
+
+            assert_eq!(inspection.state, ProviderHookState::Duplicate);
+            assert_eq!(inspection.ownership, ProviderHookOwnership::Mixed);
+            assert_eq!(
+                inspection.files,
+                vec![
+                    ProviderHookFileInspection {
+                        path: provider_path(provider, HookScope::Global, &home, &project),
+                        scope: HookScope::Global,
+                        state: ProviderHookFileState::Current,
+                        ownership: ProviderHookOwnership::HomeManager,
+                        reason: None,
+                    },
+                    ProviderHookFileInspection {
+                        path: project_path,
+                        scope: HookScope::Project,
+                        state: ProviderHookFileState::Current,
+                        ownership: ProviderHookOwnership::Imperative,
+                        reason: None,
+                    },
+                ]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_explains_invalid_home_manager_antigravity_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let store = temp.path().join("nix/store");
+        std::fs::create_dir_all(&project).unwrap();
+        write_home_manager_provider_file(&store, &home, &project, AgentProvider::Antigravity, b"[");
+
+        let inspection = inspect_provider_hooks_at_with_store(
+            AgentProvider::Antigravity,
+            &home,
+            &project,
+            &store,
+        );
+
+        assert_eq!(inspection.state, ProviderHookState::Invalid);
+        assert_eq!(inspection.ownership, ProviderHookOwnership::HomeManager);
+        assert_eq!(inspection.files.len(), 1);
+        assert_eq!(
+            inspection.files[0].reason,
+            Some(ProviderHookDiagnosticReason::MalformedContent)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn provider_inspection_accepts_home_manager_schema_variants() {
         let executable = Path::new("/nix/store/current-coding-brain/bin/coding-brain");
         for provider in [AgentProvider::Claude, AgentProvider::Antigravity] {
@@ -2622,14 +2848,13 @@ mod tests {
             let bytes = home_manager_schema_variant_bytes(&home, &project, provider, executable);
             write_home_manager_provider_file(&store, &home, &project, provider, &bytes);
 
+            let inspection = inspect_provider_hooks_at_with_store_and_executable(
+                provider, &home, &project, &store, executable,
+            );
+            assert_eq!(inspection.state, ProviderHookState::Current, "{provider:?}");
             assert_eq!(
-                inspect_provider_hooks_at_with_store_and_executable(
-                    provider, &home, &project, &store, executable,
-                ),
-                ProviderHookInspection {
-                    state: ProviderHookState::Current,
-                    ownership: ProviderHookOwnership::HomeManager,
-                },
+                inspection.ownership,
+                ProviderHookOwnership::HomeManager,
                 "{provider:?}"
             );
         }
@@ -2659,14 +2884,13 @@ mod tests {
             bytes.push(b'\n');
             write_home_manager_provider_file(&store, &home, &project, provider, &bytes);
 
+            let inspection = inspect_provider_hooks_at_with_store_and_executable(
+                provider, &home, &project, &store, executable,
+            );
+            assert_eq!(inspection.state, ProviderHookState::Stale, "{provider:?}");
             assert_eq!(
-                inspect_provider_hooks_at_with_store_and_executable(
-                    provider, &home, &project, &store, executable,
-                ),
-                ProviderHookInspection {
-                    state: ProviderHookState::Stale,
-                    ownership: ProviderHookOwnership::HomeManager,
-                },
+                inspection.ownership,
+                ProviderHookOwnership::HomeManager,
                 "{provider:?}"
             );
         }
@@ -2687,14 +2911,13 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, bytes).unwrap();
 
+            let inspection = inspect_provider_hooks_at_with_store_and_executable(
+                provider, &home, &project, &store, executable,
+            );
+            assert_eq!(inspection.state, ProviderHookState::Stale, "{provider:?}");
             assert_eq!(
-                inspect_provider_hooks_at_with_store_and_executable(
-                    provider, &home, &project, &store, executable,
-                ),
-                ProviderHookInspection {
-                    state: ProviderHookState::Stale,
-                    ownership: ProviderHookOwnership::Imperative,
-                },
+                inspection.ownership,
+                ProviderHookOwnership::Imperative,
                 "{provider:?}"
             );
             let plans =
@@ -2723,13 +2946,10 @@ mod tests {
             let bytes = exact_provider_bytes(&home, &project, provider);
             write_home_manager_provider_file(&store, &home, &project, provider, &bytes);
 
-            assert_eq!(
-                inspect_provider_hooks_at_with_store(provider, &home, &project, &store),
-                ProviderHookInspection {
-                    state: ProviderHookState::Current,
-                    ownership: ProviderHookOwnership::HomeManager,
-                }
-            );
+            let inspection =
+                inspect_provider_hooks_at_with_store(provider, &home, &project, &store);
+            assert_eq!(inspection.state, ProviderHookState::Current);
+            assert_eq!(inspection.ownership, ProviderHookOwnership::HomeManager);
         }
     }
 
@@ -2738,19 +2958,32 @@ mod tests {
     fn provider_inspection_classifies_home_manager_definition_failures() {
         let provider = AgentProvider::Claude;
         let cases = [
-            ("malformed", b"{".to_vec(), ProviderHookState::Invalid),
+            (
+                "malformed",
+                b"{".to_vec(),
+                ProviderHookState::Invalid,
+                Some(ProviderHookDiagnosticReason::MalformedContent),
+            ),
+            (
+                "non-object",
+                b"[]".to_vec(),
+                ProviderHookState::Invalid,
+                Some(ProviderHookDiagnosticReason::MalformedContent),
+            ),
             (
                 "missing",
                 br#"{"user":true}"#.to_vec(),
                 ProviderHookState::Missing,
+                None,
             ),
             (
                 "oversized",
                 vec![b' '; MAX_FILE_BYTES + 1],
                 ProviderHookState::Invalid,
+                Some(ProviderHookDiagnosticReason::Unreadable),
             ),
         ];
-        for (name, bytes, state) in cases {
+        for (name, bytes, state, reason) in cases {
             let temp = tempfile::tempdir().unwrap();
             let home = temp.path().join("home");
             let project = temp.path().join("project");
@@ -2758,14 +2991,15 @@ mod tests {
             std::fs::create_dir_all(&project).unwrap();
             write_home_manager_provider_file(&store, &home, &project, provider, &bytes);
 
+            let inspection =
+                inspect_provider_hooks_at_with_store(provider, &home, &project, &store);
+            assert_eq!(inspection.state, state, "{name}");
             assert_eq!(
-                inspect_provider_hooks_at_with_store(provider, &home, &project, &store),
-                ProviderHookInspection {
-                    state,
-                    ownership: ProviderHookOwnership::HomeManager,
-                },
+                inspection.ownership,
+                ProviderHookOwnership::HomeManager,
                 "{name}"
             );
+            assert_eq!(inspection.files[0].reason, reason, "{name}");
         }
 
         let temp = tempfile::tempdir().unwrap();
@@ -2777,11 +3011,43 @@ mod tests {
             .unwrap()
             .replace(" --provider claude", " --provider codex");
         write_home_manager_provider_file(&store, &home, &project, provider, stale.as_bytes());
+        let inspection = inspect_provider_hooks_at_with_store(provider, &home, &project, &store);
+        assert_eq!(inspection.state, ProviderHookState::Stale);
+        assert_eq!(inspection.ownership, ProviderHookOwnership::HomeManager);
         assert_eq!(
-            inspect_provider_hooks_at_with_store(provider, &home, &project, &store),
-            ProviderHookInspection {
-                state: ProviderHookState::Stale,
-                ownership: ProviderHookOwnership::HomeManager,
+            inspection.files[0].reason,
+            Some(ProviderHookDiagnosticReason::ContractMismatch)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_reports_unreadable_home_manager_parent_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let store = temp.path().join("nix/store");
+        let target = store
+            .join("0123456789abcdefghijklmnopqrstuv-home-manager-files")
+            .join(".codex/hooks.json");
+        let link = provider_path(AgentProvider::Codex, HookScope::Global, &home, &project);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let inspection =
+            inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store);
+
+        assert_eq!(inspection.state, ProviderHookState::Invalid);
+        assert_eq!(inspection.ownership, ProviderHookOwnership::Unsupported);
+        assert_eq!(
+            inspection.files[0],
+            ProviderHookFileInspection {
+                path: link,
+                scope: HookScope::Global,
+                state: ProviderHookFileState::Invalid,
+                ownership: ProviderHookOwnership::Unsupported,
+                reason: Some(ProviderHookDiagnosticReason::Unreadable),
             }
         );
     }
@@ -2915,14 +3181,29 @@ mod tests {
             std::fs::create_dir_all(link.parent().unwrap()).unwrap();
             std::os::unix::fs::symlink(target, link).unwrap();
 
-            assert_eq!(
-                inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store,),
-                ProviderHookInspection {
-                    state: ProviderHookState::Invalid,
-                    ownership,
-                },
-                "{fixture:?}"
-            );
+            let inspection =
+                inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store);
+            let expected_reason = match fixture {
+                Fixture::Broken => ProviderHookDiagnosticReason::Unreadable,
+                Fixture::NestedSymlink
+                | Fixture::Directory
+                | Fixture::ProjectLocal
+                | Fixture::Relative
+                | Fixture::Parent
+                | Fixture::CurrentDirectory
+                | Fixture::NonUtf8
+                | Fixture::NonStore
+                | Fixture::WrongSuffix
+                | Fixture::RepeatedSeparator => ProviderHookDiagnosticReason::UnsupportedTopology,
+            };
+            assert_eq!(inspection.state, ProviderHookState::Invalid, "{fixture:?}");
+            assert_eq!(inspection.ownership, ownership, "{fixture:?}");
+            let file = inspection
+                .files
+                .iter()
+                .find(|file| file.state == ProviderHookFileState::Invalid)
+                .unwrap();
+            assert_eq!(file.reason, Some(expected_reason), "{fixture:?}");
         }
     }
 
@@ -2950,13 +3231,10 @@ mod tests {
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        assert_eq!(
-            inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store),
-            ProviderHookInspection {
-                state: ProviderHookState::Invalid,
-                ownership: ProviderHookOwnership::Unsupported,
-            }
-        );
+        let inspection =
+            inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store);
+        assert_eq!(inspection.state, ProviderHookState::Invalid);
+        assert_eq!(inspection.ownership, ProviderHookOwnership::Unsupported);
     }
 
     #[cfg(unix)]
@@ -2984,13 +3262,10 @@ mod tests {
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        assert_eq!(
-            inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store),
-            ProviderHookInspection {
-                state: ProviderHookState::Invalid,
-                ownership: ProviderHookOwnership::Unsupported,
-            }
-        );
+        let inspection =
+            inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store);
+        assert_eq!(inspection.state, ProviderHookState::Invalid);
+        assert_eq!(inspection.ownership, ProviderHookOwnership::Unsupported);
     }
 
     #[cfg(unix)]
@@ -3004,41 +3279,31 @@ mod tests {
             Absent,
         }
 
-        for (fixture, expected) in [
+        for (fixture, state, ownership) in [
             (
                 Fixture::Duplicate,
-                ProviderHookInspection {
-                    state: ProviderHookState::Duplicate,
-                    ownership: ProviderHookOwnership::Mixed,
-                },
+                ProviderHookState::Duplicate,
+                ProviderHookOwnership::Mixed,
             ),
             (
                 Fixture::Stale,
-                ProviderHookInspection {
-                    state: ProviderHookState::Stale,
-                    ownership: ProviderHookOwnership::Mixed,
-                },
+                ProviderHookState::Stale,
+                ProviderHookOwnership::Mixed,
             ),
             (
                 Fixture::Invalid,
-                ProviderHookInspection {
-                    state: ProviderHookState::Invalid,
-                    ownership: ProviderHookOwnership::Mixed,
-                },
+                ProviderHookState::Invalid,
+                ProviderHookOwnership::Mixed,
             ),
             (
                 Fixture::Unsupported,
-                ProviderHookInspection {
-                    state: ProviderHookState::Invalid,
-                    ownership: ProviderHookOwnership::Unsupported,
-                },
+                ProviderHookState::Invalid,
+                ProviderHookOwnership::Unsupported,
             ),
             (
                 Fixture::Absent,
-                ProviderHookInspection {
-                    state: ProviderHookState::Current,
-                    ownership: ProviderHookOwnership::Imperative,
-                },
+                ProviderHookState::Current,
+                ProviderHookOwnership::Imperative,
             ),
         ] {
             let temp = tempfile::tempdir().unwrap();
@@ -3110,10 +3375,10 @@ mod tests {
                 }
             }
 
-            assert_eq!(
-                inspect_provider_hooks_at_with_store(provider, &home, &project, &store),
-                expected
-            );
+            let inspection =
+                inspect_provider_hooks_at_with_store(provider, &home, &project, &store);
+            assert_eq!(inspection.state, state);
+            assert_eq!(inspection.ownership, ownership);
         }
     }
 
@@ -3168,61 +3433,40 @@ mod tests {
             let home = temp.path().join("home");
             let project = temp.path().join("project");
             std::fs::create_dir_all(&project).unwrap();
-            assert_eq!(
-                inspect_provider_hooks_at(provider, &home, &project),
-                ProviderHookInspection {
-                    state: ProviderHookState::Missing,
-                    ownership: ProviderHookOwnership::Absent,
-                }
-            );
+            let inspection = inspect_provider_hooks_at(provider, &home, &project);
+            assert_eq!(inspection.state, ProviderHookState::Missing);
+            assert_eq!(inspection.ownership, ProviderHookOwnership::Absent);
 
             let plans =
                 stage_provider_hooks_at(&[provider], HookScope::Global, &home, &project).unwrap();
             let edit = &plans[0].edits[0];
             std::fs::create_dir_all(edit.path.parent().unwrap()).unwrap();
             std::fs::write(&edit.path, &edit.replacement).unwrap();
-            assert_eq!(
-                inspect_provider_hooks_at(provider, &home, &project),
-                ProviderHookInspection {
-                    state: ProviderHookState::Current,
-                    ownership: ProviderHookOwnership::Imperative,
-                }
-            );
-
+            let inspection = inspect_provider_hooks_at(provider, &home, &project);
+            assert_eq!(inspection.state, ProviderHookState::Current);
+            assert_eq!(inspection.ownership, ProviderHookOwnership::Imperative);
             let stale = String::from_utf8(edit.replacement.clone())
                 .unwrap()
                 .replacen("--lifecycle-hook", "--lifecycle-hook --changed", 1);
             std::fs::write(&edit.path, stale).unwrap();
-            assert_eq!(
-                inspect_provider_hooks_at(provider, &home, &project),
-                ProviderHookInspection {
-                    state: ProviderHookState::Stale,
-                    ownership: ProviderHookOwnership::Imperative,
-                }
-            );
+            let inspection = inspect_provider_hooks_at(provider, &home, &project);
+            assert_eq!(inspection.state, ProviderHookState::Stale);
+            assert_eq!(inspection.ownership, ProviderHookOwnership::Imperative);
 
             if provider != AgentProvider::Codex {
                 let providerless = String::from_utf8(edit.replacement.clone())
                     .unwrap()
                     .replace(&format!(" --provider {}", provider.as_str()), "");
                 std::fs::write(&edit.path, providerless).unwrap();
-                assert_eq!(
-                    inspect_provider_hooks_at(provider, &home, &project),
-                    ProviderHookInspection {
-                        state: ProviderHookState::Stale,
-                        ownership: ProviderHookOwnership::Imperative,
-                    }
-                );
+                let inspection = inspect_provider_hooks_at(provider, &home, &project);
+                assert_eq!(inspection.state, ProviderHookState::Stale);
+                assert_eq!(inspection.ownership, ProviderHookOwnership::Imperative);
             }
 
             std::fs::write(&edit.path, b"[]").unwrap();
-            assert_eq!(
-                inspect_provider_hooks_at(provider, &home, &project),
-                ProviderHookInspection {
-                    state: ProviderHookState::Invalid,
-                    ownership: ProviderHookOwnership::Imperative,
-                }
-            );
+            let inspection = inspect_provider_hooks_at(provider, &home, &project);
+            assert_eq!(inspection.state, ProviderHookState::Invalid);
+            assert_eq!(inspection.ownership, ProviderHookOwnership::Imperative);
         }
     }
 
@@ -3240,13 +3484,9 @@ mod tests {
             std::fs::write(&edit.path, &edit.replacement).unwrap();
         }
 
-        assert_eq!(
-            inspect_provider_hooks_at(AgentProvider::Claude, &home, &project),
-            ProviderHookInspection {
-                state: ProviderHookState::Duplicate,
-                ownership: ProviderHookOwnership::Imperative,
-            }
-        );
+        let inspection = inspect_provider_hooks_at(AgentProvider::Claude, &home, &project);
+        assert_eq!(inspection.state, ProviderHookState::Duplicate);
+        assert_eq!(inspection.ownership, ProviderHookOwnership::Imperative);
     }
 
     #[test]
@@ -3272,12 +3512,45 @@ mod tests {
 
             let inspection = inspect_provider_hooks_at(provider, &home, &cwd);
 
+            assert_eq!(inspection.state, ProviderHookState::Current);
+            assert_eq!(inspection.ownership, ProviderHookOwnership::Imperative);
             assert_eq!(
-                inspection,
-                ProviderHookInspection {
-                    state: ProviderHookState::Current,
-                    ownership: ProviderHookOwnership::Imperative,
-                }
+                inspection.files,
+                vec![
+                    ProviderHookFileInspection {
+                        path: provider_path(provider, HookScope::Global, &home, &cwd),
+                        scope: HookScope::Global,
+                        state: ProviderHookFileState::Missing,
+                        ownership: ProviderHookOwnership::Absent,
+                        reason: None,
+                    },
+                    ProviderHookFileInspection {
+                        path: provider_path(provider, HookScope::Project, &home, &root),
+                        scope: HookScope::Project,
+                        state: ProviderHookFileState::Current,
+                        ownership: ProviderHookOwnership::Imperative,
+                        reason: None,
+                    },
+                    ProviderHookFileInspection {
+                        path: provider_path(
+                            provider,
+                            HookScope::Project,
+                            &home,
+                            &root.join("nested"),
+                        ),
+                        scope: HookScope::Project,
+                        state: ProviderHookFileState::Missing,
+                        ownership: ProviderHookOwnership::Absent,
+                        reason: None,
+                    },
+                    ProviderHookFileInspection {
+                        path: provider_path(provider, HookScope::Project, &home, &cwd),
+                        scope: HookScope::Project,
+                        state: ProviderHookFileState::Missing,
+                        ownership: ProviderHookOwnership::Absent,
+                        reason: None,
+                    },
+                ]
             );
             assert_eq!(std::fs::read(outside).unwrap(), secret);
             assert!(!format!("{inspection:?}").contains("SECRET_OUTSIDE_PROJECT"));
@@ -3287,41 +3560,43 @@ mod tests {
     #[test]
     fn provider_inspection_deduplicates_home_project_aliases() {
         for provider in [AgentProvider::Codex, AgentProvider::Claude] {
-            for nested in [false, true] {
-                let temp = tempfile::tempdir().unwrap();
-                let home = temp.path().join("home");
-                let cwd = if nested {
-                    home.join("nested/work")
-                } else {
-                    home.clone()
-                };
-                std::fs::create_dir_all(home.join(".git")).unwrap();
-                std::fs::create_dir_all(&cwd).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let cwd = home.clone();
+            std::fs::create_dir_all(home.join(".git")).unwrap();
 
-                let plans =
-                    stage_provider_hooks_at(&[provider], HookScope::Global, &home, &cwd).unwrap();
-                let edit = &plans[0].edits[0];
-                std::fs::create_dir_all(edit.path.parent().unwrap()).unwrap();
-                std::fs::write(&edit.path, &edit.replacement).unwrap();
+            let plans =
+                stage_provider_hooks_at(&[provider], HookScope::Global, &home, &cwd).unwrap();
+            let edit = &plans[0].edits[0];
+            std::fs::create_dir_all(edit.path.parent().unwrap()).unwrap();
+            std::fs::write(&edit.path, &edit.replacement).unwrap();
 
-                let outside = provider_path(provider, HookScope::Project, &home, temp.path());
-                let secret = b"not-json SECRET_OUTSIDE_HOME_PROJECT";
-                std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
-                std::fs::write(&outside, secret).unwrap();
+            let outside = provider_path(provider, HookScope::Project, &home, temp.path());
+            let secret = b"not-json SECRET_OUTSIDE_HOME_PROJECT";
+            std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+            std::fs::write(&outside, secret).unwrap();
 
-                let inspection = inspect_provider_hooks_at(provider, &home, &cwd);
+            let inspection = inspect_provider_hooks_at(provider, &home, &cwd);
 
-                assert_eq!(
-                    inspection,
-                    ProviderHookInspection {
-                        state: ProviderHookState::Current,
-                        ownership: ProviderHookOwnership::Imperative,
-                    },
-                    "{provider} nested={nested}"
-                );
-                assert_eq!(std::fs::read(outside).unwrap(), secret);
-                assert!(!format!("{inspection:?}").contains("SECRET_OUTSIDE_HOME_PROJECT"));
-            }
+            assert_eq!(inspection.state, ProviderHookState::Current, "{provider}");
+            assert_eq!(
+                inspection.ownership,
+                ProviderHookOwnership::Imperative,
+                "{provider}"
+            );
+            assert_eq!(
+                inspection.files,
+                vec![ProviderHookFileInspection {
+                    path: provider_path(provider, HookScope::Global, &home, &cwd),
+                    scope: HookScope::Global,
+                    state: ProviderHookFileState::Current,
+                    ownership: ProviderHookOwnership::Imperative,
+                    reason: None,
+                }],
+                "{provider}"
+            );
+            assert_eq!(std::fs::read(outside).unwrap(), secret);
+            assert!(!format!("{inspection:?}").contains("SECRET_OUTSIDE_HOME_PROJECT"));
         }
     }
 }

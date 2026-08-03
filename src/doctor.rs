@@ -29,6 +29,7 @@ use crate::brain::permission_transaction::{
 use coding_brain_core::provider::AgentProvider;
 
 use crate::init::provider_hooks::{
+    HookScope, ProviderHookDiagnosticReason, ProviderHookFileInspection, ProviderHookFileState,
     ProviderHookInspection, ProviderHookOwnership, ProviderHookState,
 };
 
@@ -66,6 +67,39 @@ pub struct Check {
     /// Hint for fixing a Fail or following an Advisory. None when status
     /// is Pass.
     pub fix_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence: Option<CheckEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CheckEvidence {
+    provider_files: Vec<ProviderFileEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderFileEvidence {
+    path: String,
+    path_lossy: bool,
+    scope: HookScope,
+    ownership: ProviderHookOwnership,
+    state: ProviderHookFileState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<ProviderHookDiagnosticReason>,
+}
+
+impl From<&ProviderHookFileInspection> for ProviderFileEvidence {
+    fn from(file: &ProviderHookFileInspection) -> Self {
+        let path = file.path.to_string_lossy();
+        let path_lossy = matches!(path, std::borrow::Cow::Owned(_));
+        Self {
+            path: path.into_owned(),
+            path_lossy,
+            scope: file.scope,
+            ownership: file.ownership,
+            state: file.state,
+            reason: file.reason,
+        }
+    }
 }
 
 /// Run every health check, in display order. Order is meaningful: PATH
@@ -113,6 +147,7 @@ fn provider_hook_recovery_check(
                 report.concurrent_paths.len()
             ),
             fix_hint: Some("Review the preserved provider hook configuration files.".into()),
+            evidence: None,
         }),
         Err(_) => Some(Check {
             name: "Provider hook recovery".into(),
@@ -122,6 +157,7 @@ fn provider_hook_recovery_check(
                 "Inspect the provider configurations and hook transaction journal before retrying."
                     .into(),
             ),
+            evidence: None,
         }),
     }
 }
@@ -140,6 +176,7 @@ fn permission_transaction_recovery_check(
                     "Inspect the permission transaction journal directory and destination stores, then rerun `cbrain doctor`."
                         .into(),
                 ),
+                evidence: None,
             });
         }
     };
@@ -182,6 +219,7 @@ fn permission_transaction_recovery_check(
                 "Inspect the permission transaction journal directory and destination stores, then rerun `cbrain doctor`."
                     .into(),
             ),
+            evidence: None,
         });
     }
     if report.active != 0 {
@@ -195,6 +233,7 @@ fn permission_transaction_recovery_check(
             fix_hint: Some(
                 "Allow active permission hooks to finish, then rerun `cbrain doctor`.".into(),
             ),
+            evidence: None,
         });
     }
     debug_assert!(report.rollback_ready());
@@ -203,6 +242,7 @@ fn permission_transaction_recovery_check(
         status: CheckStatus::Pass,
         message: format!("recovered {} permission transaction(s)", report.completed),
         fix_hint: None,
+        evidence: None,
     })
 }
 
@@ -221,6 +261,28 @@ pub fn render_checks(checks: &[Check]) -> String {
             c.message,
             width = max_name
         ));
+        if let Some(evidence) = &c.evidence {
+            for file in &evidence.provider_files {
+                let mut classification = format!(
+                    "{}/{}/{}",
+                    file.scope.as_str(),
+                    file.ownership.as_str(),
+                    file.state.as_str(),
+                );
+                if let Some(reason) = file.reason {
+                    classification.push_str(", ");
+                    classification.push_str(reason.as_str());
+                }
+                if file.path_lossy {
+                    classification.push_str(", lossy path");
+                }
+                out.push_str(&format!(
+                    "      {} — {}\n",
+                    escape_provider_path(&file.path),
+                    classification,
+                ));
+            }
+        }
         if let Some(hint) = &c.fix_hint {
             out.push_str(&format!("      \u{2192} {hint}\n"));
         }
@@ -231,6 +293,27 @@ pub fn render_checks(checks: &[Check]) -> String {
         "{pass} passed, {advisory} advisory, {fail} failed.\n"
     ));
     out
+}
+
+fn escape_provider_path(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        let dangerous_format = matches!(
+            character,
+            '\u{061c}' | '\u{200e}' | '\u{200f}'
+                | '\u{200b}'..='\u{200d}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        );
+        if character.is_control() || dangerous_format {
+            escaped.extend(character.escape_unicode());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 pub fn render_checks_json(checks: &[Check]) -> io::Result<String> {
@@ -274,7 +357,7 @@ enum ProviderSetupState {
     Skipped,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ProviderSetupEvidence {
     recorded: bool,
     executable_available: bool,
@@ -325,6 +408,7 @@ fn check_antigravity_hook_contract_with(
             "Keep the native prompt authoritative; upgrade agy, then revalidate the real hook contract."
                 .into(),
         ),
+        evidence: None,
     })
 }
 
@@ -388,6 +472,7 @@ fn check_provider_setups() -> Vec<Check> {
                     hooks: ProviderHookInspection {
                         state: ProviderHookState::Invalid,
                         ownership: ProviderHookOwnership::Unsupported,
+                        files: Vec::new(),
                     },
                 },
             )
@@ -510,11 +595,15 @@ fn check_provider_setup(provider: AgentProvider, evidence: ProviderSetupEvidence
             provider.as_str()
         )),
     };
+    let evidence = (state != ProviderSetupState::Current).then(|| CheckEvidence {
+        provider_files: evidence.hooks.files.iter().map(Into::into).collect(),
+    });
     Check {
         name: format!("{} setup", provider.label()),
         status,
         message,
         fix_hint,
+        evidence,
     }
 }
 
@@ -542,6 +631,7 @@ fn check_binary_on_path() -> Check {
             status: CheckStatus::Pass,
             message: p.display().to_string(),
             fix_hint: None,
+            evidence: None,
         },
         (Some(r), Some(p)) => Check {
             name: "binary on PATH".into(),
@@ -551,6 +641,7 @@ fn check_binary_on_path() -> Check {
                 "Two installs detected. Re-run `cbrain init` so hooks use the running immutable executable."
                     .into(),
             ),
+            evidence: None,
         },
         (Some(r), None) => Check {
             name: "binary on PATH".into(),
@@ -559,12 +650,14 @@ fn check_binary_on_path() -> Check {
             fix_hint: Some(
                 "Add the install dir to PATH so `cbrain` is directly available.".into(),
             ),
+            evidence: None,
         },
         _ => Check {
             name: "binary on PATH".into(),
             status: CheckStatus::Advisory,
             message: "could not resolve running binary".into(),
             fix_hint: None,
+            evidence: None,
         },
     }
 }
@@ -577,6 +670,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
             status: CheckStatus::Fail,
             message: "HOME not set".into(),
             fix_hint: None,
+            evidence: None,
         };
     };
     let discovery = crate::init::hooks::discover_lifecycle_hooks_at(Some(home), cwd);
@@ -586,6 +680,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
             status: CheckStatus::Fail,
             message: "managed lifecycle definitions missing".into(),
             fix_hint: Some("Run `cbrain init` (or `cbrain init --plugin-only`).".into()),
+            evidence: None,
         };
     }
 
@@ -598,6 +693,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                 "Keep the managed hook set in one scope, restart Codex, and review `/hooks`."
                     .into(),
             ),
+            evidence: None,
         };
     }
 
@@ -614,6 +710,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                 status: CheckStatus::Fail,
                 message: format!("{} {} definition missing", scope.1, event.as_str()),
                 fix_hint: Some("Run `cbrain init`, restart Codex, and review `/hooks`.".into()),
+                evidence: None,
             };
         }
         if state.unavailable {
@@ -624,6 +721,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                 fix_hint: Some(
                     "Reinstall Coding Brain or rerun `cbrain init`, then review `/hooks`.".into(),
                 ),
+                evidence: None,
             };
         }
         if state.disabled {
@@ -634,6 +732,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                 fix_hint: Some(
                     "Enable the definition and review it through Codex `/hooks`.".into(),
                 ),
+                evidence: None,
             };
         }
         if state.stale || !state.current {
@@ -645,6 +744,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
                     "Run `cbrain init`, restart Codex, and review the changed definition with `/hooks`."
                         .into(),
                 ),
+                evidence: None,
             };
         }
     }
@@ -655,6 +755,7 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
         status: CheckStatus::Pass,
         message: format!("{} definitions current", scope.1),
         fix_hint: None,
+        evidence: None,
     }
 }
 
@@ -672,6 +773,7 @@ fn check_codex_hook_trust_at(home: Option<&std::path::Path>, cwd: &std::path::Pa
             status: CheckStatus::Skipped,
             message: "no enabled managed definitions".into(),
             fix_hint: None,
+            evidence: None,
         };
     }
 
@@ -680,6 +782,7 @@ fn check_codex_hook_trust_at(home: Option<&std::path::Path>, cwd: &std::path::Pa
         status: CheckStatus::Advisory,
         message: "trust unverified; review /hooks".into(),
         fix_hint: Some("Restart Codex and confirm the managed commands through `/hooks`.".into()),
+        evidence: None,
     }
 }
 
@@ -726,6 +829,7 @@ fn check_lifecycle_state_with_store(store: &LifecycleStore) -> Check {
         status,
         message,
         fix_hint,
+        evidence: None,
     }
 }
 
@@ -747,6 +851,7 @@ fn outcome_telemetry_unavailable() -> Check {
         status: CheckStatus::Advisory,
         message: "activity store unavailable".into(),
         fix_hint: Some("Check state-directory ownership and permissions.".into()),
+        evidence: None,
     }
 }
 
@@ -822,6 +927,7 @@ fn check_outcome_telemetry_with_store(store: &ActivityStore) -> Check {
             status: CheckStatus::Skipped,
             message: format!("insufficient activity ({pre_count}/10 tool invocations)"),
             fix_hint: None,
+            evidence: None,
         };
     }
 
@@ -838,6 +944,7 @@ fn check_outcome_telemetry_with_store(store: &ActivityStore) -> Check {
                 "Upgrade or restart Codex, review `/hooks`, complete local tools, and rerun `cbrain doctor`."
                     .into(),
             ),
+            evidence: None,
         };
     }
 
@@ -889,6 +996,7 @@ fn check_outcome_telemetry_with_store(store: &ActivityStore) -> Check {
             status: CheckStatus::Skipped,
             message: format!("insufficient decisions ({eligible_count}/5 eligible decisions)"),
             fix_hint: None,
+            evidence: None,
         };
     }
 
@@ -907,6 +1015,7 @@ fn check_outcome_telemetry_with_store(store: &ActivityStore) -> Check {
                 "Run current Codex hooks and inspect lifecycle-hook attribution diagnostics."
                     .into(),
             ),
+            evidence: None,
         };
     }
 
@@ -917,6 +1026,7 @@ fn check_outcome_telemetry_with_store(store: &ActivityStore) -> Check {
             "PostToolUse {post_count}/{pre_count} recent invocations; outcomes {outcome_count}/{eligible_count} recent decisions"
         ),
         fix_hint: None,
+        evidence: None,
     }
 }
 
@@ -938,6 +1048,7 @@ fn check_brain_endpoint() -> Check {
             status: CheckStatus::Pass,
             message: format!("local brain reachable at {endpoint}"),
             fix_hint: None,
+            evidence: None,
         },
         _ => Check {
             name: "brain endpoint".into(),
@@ -947,6 +1058,7 @@ fn check_brain_endpoint() -> Check {
                 "Brain is optional. To enable: `brew install ollama && ollama serve &` + `ollama pull gemma4:e4b`."
                     .into(),
             ),
+            evidence: None,
         },
     }
 }
@@ -962,6 +1074,7 @@ fn check_project_identity() -> Check {
                 status: CheckStatus::Advisory,
                 message: format!("path resolution failed: {error:?}"),
                 fix_hint: Some("Set HOME or absolute XDG config/state directories.".into()),
+                evidence: None,
             };
         }
     };
@@ -979,6 +1092,7 @@ fn check_project_identity_at(
             status: CheckStatus::Pass,
             message: "stable project identity loaded".into(),
             fix_hint: None,
+            evidence: None,
         },
         Ok(_) => Check {
             name: "project identity".into(),
@@ -988,6 +1102,7 @@ fn check_project_identity_at(
                 "Run `cbrain init` to create an explicit identity override at the project-root `.coding-brain/project.toml`. Removing the project-root `.coding-brain/project.toml` before rerunning init deliberately creates a new identity."
                     .into(),
             ),
+            evidence: None,
         },
         Err(error) => Check {
             name: "project identity".into(),
@@ -997,6 +1112,7 @@ fn check_project_identity_at(
                 "Fix the project-root `.coding-brain/project.toml`, or remove it before `cbrain init` to deliberately create a new identity."
                     .into(),
             ),
+            evidence: None,
         },
     }
 }
@@ -1025,6 +1141,7 @@ fn check_brain_endpoint_url(endpoint: &str) -> Check {
             status: CheckStatus::Pass,
             message: format!("{endpoint} is loopback-only"),
             fix_hint: None,
+            evidence: None,
         }
     } else {
         let message = endpoint_warning(endpoint).unwrap_or_default();
@@ -1035,6 +1152,7 @@ fn check_brain_endpoint_url(endpoint: &str) -> Check {
             fix_hint: Some(
                 "Use a loopback endpoint or confirm the remote endpoint's privacy policy.".into(),
             ),
+            evidence: None,
         }
     }
 }
@@ -1073,6 +1191,7 @@ fn check_session_discovery_for(sessions: &[coding_brain_core::session::AgentSess
             status: CheckStatus::Advisory,
             message,
             fix_hint: Some("Start a selected provider session and re-run `cbrain doctor`.".into()),
+            evidence: None,
         }
     } else {
         Check {
@@ -1080,6 +1199,7 @@ fn check_session_discovery_for(sessions: &[coding_brain_core::session::AgentSess
             status: CheckStatus::Pass,
             message,
             fix_hint: None,
+            evidence: None,
         }
     }
 }
@@ -1096,6 +1216,7 @@ fn check_terminal_capabilities() -> Vec<Check> {
             },
             message: capability.detail,
             fix_hint: capability.fix,
+            evidence: None,
         })
         .collect()
 }
@@ -1116,8 +1237,20 @@ mod tests {
         OverBudgetDetail, OverBudgetSource, RecoveryReport, TransactionError,
     };
     use crate::init::provider_hooks::{
+        HookScope, ProviderHookDiagnosticReason, ProviderHookFileInspection, ProviderHookFileState,
         ProviderHookInspection, ProviderHookOwnership, ProviderHookState,
     };
+
+    fn synthetic_inspection(
+        state: ProviderHookState,
+        ownership: ProviderHookOwnership,
+    ) -> ProviderHookInspection {
+        ProviderHookInspection {
+            state,
+            ownership,
+            files: Vec::new(),
+        }
+    }
 
     fn telemetry_event(
         activity_id: &str,
@@ -1539,6 +1672,7 @@ mod tests {
             status: CheckStatus::Pass,
             message: "ok".into(),
             fix_hint: None,
+            evidence: None,
         }];
         assert_eq!(exit_code(&checks), 0);
     }
@@ -1550,6 +1684,7 @@ mod tests {
             status: CheckStatus::Advisory,
             message: "not configured".into(),
             fix_hint: None,
+            evidence: None,
         }];
         assert_eq!(exit_code(&checks), 0);
     }
@@ -1562,12 +1697,14 @@ mod tests {
                 status: CheckStatus::Pass,
                 message: "ok".into(),
                 fix_hint: None,
+                evidence: None,
             },
             Check {
                 name: "b".into(),
                 status: CheckStatus::Fail,
                 message: "broken".into(),
                 fix_hint: Some("fix it".into()),
+                evidence: None,
             },
         ];
         assert_eq!(exit_code(&checks), 1);
@@ -1721,30 +1858,35 @@ mod tests {
                 status: CheckStatus::Pass,
                 message: "".into(),
                 fix_hint: None,
+                evidence: None,
             },
             Check {
                 name: "b".into(),
                 status: CheckStatus::Advisory,
                 message: "".into(),
                 fix_hint: None,
+                evidence: None,
             },
             Check {
                 name: "c".into(),
                 status: CheckStatus::Advisory,
                 message: "".into(),
                 fix_hint: None,
+                evidence: None,
             },
             Check {
                 name: "d".into(),
                 status: CheckStatus::Fail,
                 message: "".into(),
                 fix_hint: None,
+                evidence: None,
             },
             Check {
                 name: "e".into(),
                 status: CheckStatus::Skipped,
                 message: "".into(),
                 fix_hint: None,
+                evidence: None,
             },
         ];
         assert_eq!(counts(&checks), (1, 2, 1));
@@ -1757,6 +1899,7 @@ mod tests {
             status: CheckStatus::Fail,
             message: "broken".into(),
             fix_hint: Some("run this".into()),
+            evidence: None,
         }];
         let out = render_checks(&checks);
         assert!(out.contains("run this"));
@@ -1769,6 +1912,7 @@ mod tests {
             status: CheckStatus::Pass,
             message: "ok".into(),
             fix_hint: None,
+            evidence: None,
         }];
         let out = render_checks(&checks);
         // No arrow line.
@@ -1782,6 +1926,7 @@ mod tests {
             status: CheckStatus::Pass,
             message: "ok".into(),
             fix_hint: None,
+            evidence: None,
         }];
         let json = render_checks_json(&checks).unwrap();
         let parsed: Vec<Check> = serde_json::from_str(&json).unwrap();
@@ -1853,10 +1998,10 @@ mod tests {
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection {
-                    state: ProviderHookState::Current,
-                    ownership: ProviderHookOwnership::HomeManager,
-                },
+                hooks: synthetic_inspection(
+                    ProviderHookState::Current,
+                    ProviderHookOwnership::HomeManager,
+                ),
             },
         );
         let trust = check_codex_hook_trust_at(Some(&home), &cwd);
@@ -2028,10 +2173,10 @@ mod tests {
                             ProviderSetupEvidence {
                                 recorded,
                                 executable_available,
-                                hooks: ProviderHookInspection {
+                                hooks: synthetic_inspection(
                                     state,
-                                    ownership: ProviderHookOwnership::Imperative,
-                                },
+                                    ProviderHookOwnership::Imperative,
+                                ),
                             },
                         );
                         assert_eq!(check.name, format!("{} setup", provider.label()));
@@ -2188,7 +2333,7 @@ mod tests {
                 ProviderSetupEvidence {
                     recorded,
                     executable_available,
-                    hooks: ProviderHookInspection { state, ownership },
+                    hooks: synthetic_inspection(state, ownership),
                 },
             );
             assert_eq!(check.status, expected_status);
@@ -2214,10 +2359,10 @@ mod tests {
             ProviderSetupEvidence {
                 recorded: false,
                 executable_available: false,
-                hooks: ProviderHookInspection {
-                    state: ProviderHookState::Missing,
-                    ownership: ProviderHookOwnership::HomeManager,
-                },
+                hooks: synthetic_inspection(
+                    ProviderHookState::Missing,
+                    ProviderHookOwnership::HomeManager,
+                ),
             },
         );
 
@@ -2237,10 +2382,10 @@ mod tests {
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: false,
-                hooks: ProviderHookInspection {
-                    state: ProviderHookState::Current,
-                    ownership: ProviderHookOwnership::HomeManager,
-                },
+                hooks: synthetic_inspection(
+                    ProviderHookState::Current,
+                    ProviderHookOwnership::HomeManager,
+                ),
             },
         );
 
@@ -2263,10 +2408,7 @@ mod tests {
                 ProviderSetupEvidence {
                     recorded: false,
                     executable_available: false,
-                    hooks: ProviderHookInspection {
-                        state,
-                        ownership: ProviderHookOwnership::Imperative,
-                    },
+                    hooks: synthetic_inspection(state, ProviderHookOwnership::Imperative),
                 },
             );
             assert_eq!(check.status, CheckStatus::Fail);
@@ -2279,10 +2421,10 @@ mod tests {
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection {
-                    state: ProviderHookState::Current,
-                    ownership: ProviderHookOwnership::Imperative,
-                },
+                hooks: synthetic_inspection(
+                    ProviderHookState::Current,
+                    ProviderHookOwnership::Imperative,
+                ),
             },
             || Some([1, 1, 5]),
         )
@@ -2309,42 +2451,42 @@ mod tests {
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: false,
-                hooks: ProviderHookInspection {
-                    state: ProviderHookState::Current,
-                    ownership: ProviderHookOwnership::Imperative,
-                },
+                hooks: synthetic_inspection(
+                    ProviderHookState::Current,
+                    ProviderHookOwnership::Imperative,
+                ),
             },
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection {
-                    state: ProviderHookState::Missing,
-                    ownership: ProviderHookOwnership::Absent,
-                },
+                hooks: synthetic_inspection(
+                    ProviderHookState::Missing,
+                    ProviderHookOwnership::Absent,
+                ),
             },
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection {
-                    state: ProviderHookState::Stale,
-                    ownership: ProviderHookOwnership::Imperative,
-                },
+                hooks: synthetic_inspection(
+                    ProviderHookState::Stale,
+                    ProviderHookOwnership::Imperative,
+                ),
             },
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection {
-                    state: ProviderHookState::Duplicate,
-                    ownership: ProviderHookOwnership::Imperative,
-                },
+                hooks: synthetic_inspection(
+                    ProviderHookState::Duplicate,
+                    ProviderHookOwnership::Imperative,
+                ),
             },
             ProviderSetupEvidence {
                 recorded: true,
                 executable_available: true,
-                hooks: ProviderHookInspection {
-                    state: ProviderHookState::Invalid,
-                    ownership: ProviderHookOwnership::Imperative,
-                },
+                hooks: synthetic_inspection(
+                    ProviderHookState::Invalid,
+                    ProviderHookOwnership::Imperative,
+                ),
             },
         ] {
             let calls = Cell::new(0);
@@ -2364,10 +2506,10 @@ mod tests {
                 ProviderSetupEvidence {
                     recorded: true,
                     executable_available: true,
-                    hooks: ProviderHookInspection {
-                        state: ProviderHookState::Current,
-                        ownership: ProviderHookOwnership::Imperative,
-                    },
+                    hooks: synthetic_inspection(
+                        ProviderHookState::Current,
+                        ProviderHookOwnership::Imperative,
+                    ),
                 },
                 || version,
             );
@@ -2538,18 +2680,164 @@ mod tests {
         )
     }
 
+    fn provider_file(
+        path: &str,
+        scope: HookScope,
+        state: ProviderHookFileState,
+        ownership: ProviderHookOwnership,
+        reason: Option<ProviderHookDiagnosticReason>,
+    ) -> ProviderHookFileInspection {
+        ProviderHookFileInspection {
+            path: PathBuf::from(path),
+            scope,
+            state,
+            ownership,
+            reason,
+        }
+    }
+
     #[test]
-    fn human_and_json_provider_rows_are_deterministic_and_bounded() {
+    fn non_current_provider_rows_render_stable_file_evidence() {
+        let check = check_provider_setup(
+            AgentProvider::Claude,
+            ProviderSetupEvidence {
+                recorded: true,
+                executable_available: true,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Duplicate,
+                    ownership: ProviderHookOwnership::Mixed,
+                    files: vec![
+                        provider_file(
+                            "/home/example/.claude/settings.json",
+                            HookScope::Global,
+                            ProviderHookFileState::Current,
+                            ProviderHookOwnership::HomeManager,
+                            None,
+                        ),
+                        provider_file(
+                            "/work/project/.claude/settings.json",
+                            HookScope::Project,
+                            ProviderHookFileState::Current,
+                            ProviderHookOwnership::Imperative,
+                            None,
+                        ),
+                    ],
+                },
+            },
+        );
+
+        let value = serde_json::to_value(&check).unwrap();
+        assert_eq!(value["evidence"]["provider_files"][0]["scope"], "global");
+        assert_eq!(
+            value["evidence"]["provider_files"][0]["ownership"],
+            "home_manager"
+        );
+        assert_eq!(value["evidence"]["provider_files"][1]["scope"], "project");
+        assert_eq!(value["evidence"]["provider_files"][1]["state"], "current");
+        assert_eq!(value["evidence"]["provider_files"][1]["path_lossy"], false);
+        let human = render_checks(&[check]);
+        assert!(human.contains("global"));
+        assert!(human.contains("/home/example/.claude/settings.json"));
+        assert!(human.contains("project"));
+        assert!(human.contains("/work/project/.claude/settings.json"));
+    }
+
+    #[test]
+    fn current_setup_omits_evidence_but_unavailable_current_hooks_include_it() {
+        for (executable_available, expects_evidence) in [(true, false), (false, true)] {
+            let check = check_provider_setup(
+                AgentProvider::Codex,
+                ProviderSetupEvidence {
+                    recorded: true,
+                    executable_available,
+                    hooks: ProviderHookInspection {
+                        state: ProviderHookState::Current,
+                        ownership: ProviderHookOwnership::Imperative,
+                        files: vec![provider_file(
+                            "/home/example/.codex/hooks.json",
+                            HookScope::Global,
+                            ProviderHookFileState::Current,
+                            ProviderHookOwnership::Imperative,
+                            None,
+                        )],
+                    },
+                },
+            );
+            assert_eq!(check.evidence.is_some(), expects_evidence);
+            assert_eq!(
+                serde_json::to_value(check)
+                    .unwrap()
+                    .get("evidence")
+                    .is_some(),
+                expects_evidence
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_check_json_without_evidence_deserializes() {
+        let check: Check = serde_json::from_str(
+            r#"{"name":"Codex setup","status":"pass","message":"current","fix_hint":null}"#,
+        )
+        .unwrap();
+        assert!(check.evidence.is_none());
+    }
+
+    #[test]
+    fn human_provider_paths_escape_terminal_controls_and_bidi() {
+        let escaped =
+            escape_provider_path("/work/line\n\r\t\u{001b}\u{200d}\u{202e}\u{2060}\u{feff}界.json");
+        for character in [
+            '\n', '\r', '\t', '\u{001b}', '\u{200d}', '\u{202e}', '\u{2060}', '\u{feff}',
+        ] {
+            assert!(!escaped.contains(character));
+        }
+        for escape in [
+            "\\u{a}",
+            "\\u{d}",
+            "\\u{9}",
+            "\\u{1b}",
+            "\\u{200d}",
+            "\\u{202e}",
+            "\\u{2060}",
+            "\\u{feff}",
+        ] {
+            assert!(escaped.contains(escape), "{escaped}");
+        }
+        assert!(escaped.contains('界'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_provider_path_serializes_with_lossy_marker() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let file = ProviderHookFileInspection {
+            path: PathBuf::from(std::ffi::OsString::from_vec(
+                b"/work/invalid-\xff.json".to_vec(),
+            )),
+            scope: HookScope::Project,
+            state: ProviderHookFileState::Invalid,
+            ownership: ProviderHookOwnership::Unsupported,
+            reason: Some(ProviderHookDiagnosticReason::UnsupportedTopology),
+        };
+        let evidence = ProviderFileEvidence::from(&file);
+        assert!(evidence.path_lossy);
+        assert!(serde_json::to_string(&evidence).is_ok());
+    }
+
+    #[test]
+    fn human_and_json_provider_evidence_is_deterministic_and_safe() {
         let checks = [
             check_provider_setup(
                 AgentProvider::Codex,
                 ProviderSetupEvidence {
                     recorded: true,
                     executable_available: true,
-                    hooks: ProviderHookInspection {
-                        state: ProviderHookState::Current,
-                        ownership: ProviderHookOwnership::Imperative,
-                    },
+                    hooks: synthetic_inspection(
+                        ProviderHookState::Current,
+                        ProviderHookOwnership::Imperative,
+                    ),
                 },
             ),
             check_provider_setup(
@@ -2557,10 +2845,10 @@ mod tests {
                 ProviderSetupEvidence {
                     recorded: true,
                     executable_available: false,
-                    hooks: ProviderHookInspection {
-                        state: ProviderHookState::Current,
-                        ownership: ProviderHookOwnership::Imperative,
-                    },
+                    hooks: synthetic_inspection(
+                        ProviderHookState::Current,
+                        ProviderHookOwnership::Imperative,
+                    ),
                 },
             ),
             check_provider_setup(
@@ -2568,10 +2856,10 @@ mod tests {
                 ProviderSetupEvidence {
                     recorded: false,
                     executable_available: false,
-                    hooks: ProviderHookInspection {
-                        state: ProviderHookState::Missing,
-                        ownership: ProviderHookOwnership::Absent,
-                    },
+                    hooks: synthetic_inspection(
+                        ProviderHookState::Missing,
+                        ProviderHookOwnership::Absent,
+                    ),
                 },
             ),
         ];
@@ -2582,8 +2870,6 @@ mod tests {
         assert!(human.find("Codex setup").unwrap() < human.find("Claude setup").unwrap());
         assert!(human.find("Claude setup").unwrap() < human.find("Antigravity setup").unwrap());
         assert!(json.len() < 2_048);
-        assert!(!json.contains("hooks.json"));
-        assert!(!json.contains("/home/"));
         assert_eq!(json, render_checks_json(&checks).unwrap());
     }
 
