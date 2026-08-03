@@ -33,3 +33,26 @@ fn published_crates_use_the_current_repository() {
     assert_eq!(field(core, "repository"), REPOSITORY);
     assert_eq!(field(tui, "repository"), REPOSITORY);
 }
+
+#[test]
+fn changelog_is_cut_for_v0_59_0() {
+    let changelog = include_str!("../CHANGELOG.md");
+    assert!(changelog.contains("## [Unreleased]\n\n## [0.59.0] - 2026-08-03"));
+}
+
+#[test]
+fn release_body_covers_the_real_range_and_known_limitations() {
+    let notes = include_str!("../.github/releases/v0.59.0.md");
+    for required in [
+        "v0.57.2...v0.59.0",
+        "PreToolUse anchor",
+        "BusyBox `time -o`",
+        "cargo install coding-brain",
+        "brew upgrade coding-brain",
+        "https://raw.githubusercontent.com/aleadag/coding-brain/main/install.sh",
+    ] {
+        assert!(notes.contains(required), "missing {required}");
+    }
+    assert!(!notes.contains("codexctl-478t"));
+    assert!(!notes.contains("scheduler-sensitive"));
+}
