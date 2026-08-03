@@ -33,6 +33,11 @@ All notable changes to Coding Brain are documented here.
 
 ### Fixed
 
+- Non-current Doctor setup results now name each inspected provider file,
+  scope, ownership, state, and bounded reason when applicable in human output
+  and `--json`. Duplicate, stale, malformed, unreadable, and unsafe-topology
+  results point to the exact definitions involved without exposing file
+  contents.
 - Home Manager users can now run `cbrain doctor` against exact
   `home-manager-files` provider symlinks for Codex, Claude, and Antigravity.
   Current declarative definitions pass without an imperative init hint; stale

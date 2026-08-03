@@ -6,7 +6,7 @@ Start with:
 cbrain doctor
 ```
 
-Doctor reports separate `Codex setup`, `Claude setup`, and `Antigravity setup` rows. An unselected provider with no executable is skipped. A selected provider whose executable disappeared is advisory, while invalid, unsafe, or stale managed definitions fail. The report also keeps Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback separate so focus is never mistaken for input authority.
+Doctor reports separate `Codex setup`, `Claude setup`, and `Antigravity setup` rows. An unselected provider with no executable is skipped. A selected provider whose executable disappeared is advisory, while invalid, unsafe, or stale managed definitions fail. For a non-current setup, Doctor lists each resolved candidate in inspection order with its path, scope, ownership, state, and a bounded reason when applicable; the list is empty when no candidate path can be resolved, such as when `HOME` is unavailable. `cbrain doctor --json` exposes the same records under `evidence.provider_files`. The report also keeps Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback separate so focus is never mistaken for input authority.
 
 ## Hooks are missing or stale
 
