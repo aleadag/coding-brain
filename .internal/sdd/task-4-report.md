@@ -26,9 +26,10 @@ It failed to compile because `DecisionKind`, `DecisionIdentity`, `DecisionPayloa
 - Consumer tests feed SQLite page records through the pure baseline, briefing, retrieval, metrics, insights, and distillation seams without switching production storage selection.
 - Erasure deletes payloads, legacy decision/canonical/preference files, every published preference generation, the watermark, and the trigger while preserving activity, decision identity, and permission commit audit rows.
 - Payload reads and writes hold a shared gate derived from the database state root through materialization or commit. `LearningReadSession` retains it across pages and publication; erasure/resume uses the same gate exclusively, so it cannot begin while a supported reader or writer is in flight. This is erasure-boundary stability, not a frozen SQLite snapshot: concurrently committed decisions may appear in later cursor pages.
-- Erasure acquires sorted legacy decision locks before the derived erasure and distill locks. Roots, locks, and deletions use descriptor-relative no-follow validation of owner, type, mode, link count, and opened/path identity. Missing legacy roots remain absent; unsafe nested entries leave the durable generation incomplete.
+- Erasure acquires sorted legacy decision locks before the derived erasure and distill locks. It retains each validated legacy and brain directory descriptor for the complete generation and deletes only through those descriptors. A renamed or replaced root fails the final device/inode correspondence check without touching its replacement; a supplied legacy root that was initially absent must remain absent. Either race leaves the durable generation incomplete.
 - Descriptor-relative directory enumeration uses the portable `errno` crate around `readdir`, avoiding target-specific errno symbols and deprecated fixed-buffer enumeration APIs.
 - Each fresh erasure increments the durable generation. An interrupted generation remains unavailable to learning reads, resumes with the same generation, and becomes complete only after verified WAL truncation and directory sync.
+- A raw SQLite reader that bypasses the supported shared gate can pin the WAL and make truncation return busy. The generation remains in progress and learning stays unavailable until that reader releases its snapshot; reopening and resuming completes the same generation.
 - Process tests kill erasure after the in-progress marker, database deletion, external deletion, generation deletion, before and after WAL truncation, and before and after final completion.
 - Crash reopen accepts only validated SQLite `-wal`, `-shm`, and `-journal` sidecars. Creation still rejects all pre-existing sidecars, and reopen rejects unknown, linked, wrongly owned, or broadly accessible files.
 
@@ -38,7 +39,7 @@ All commands ran from the Task 4 worktree.
 
 ```text
 nix develop path:. --command cargo test --test sqlite_storage -- --test-threads=1
-73 passed; 0 failed
+76 passed; 0 failed
 
 nix develop path:. --command cargo test --test distill_process -- --test-threads=1
 4 passed; 0 failed; 1 release-only test ignored
@@ -63,4 +64,4 @@ Nix printed repeated `/nix/store/.links/... has maximum number of links` warning
 
 ## Scope boundary
 
-This task does not migrate JSONL, activate SQLite readers or writers, export downgrade data, change permission transaction ownership, or implement the later review/view-state cutovers. It does not claim erasure of external backups, filesystem snapshots, or physical media.
+This task does not migrate JSONL, activate SQLite readers or writers, export downgrade data, change permission transaction ownership, or implement the later review/view-state cutovers. It does not claim erasure of external backups, filesystem snapshots, physical media, or learning data written by an external process after erasure successfully completes.

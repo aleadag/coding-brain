@@ -36,7 +36,6 @@ impl From<io::Error> for SecureStateError {
 
 pub(crate) struct SecureStateDirectory {
     descriptor: File,
-    #[allow(dead_code)] // Retained for diagnostics once the review controller consumes the store.
     display_path: PathBuf,
 }
 
@@ -95,6 +94,18 @@ impl SecureStateDirectory {
 
     pub(crate) fn sync(&self) -> io::Result<()> {
         self.descriptor.sync_all()
+    }
+
+    pub(crate) fn validate_path_correspondence(&self) -> Result<(), SecureStateError> {
+        let current = Self::open_existing_strict(&self.display_path)?;
+        let retained = SecureEntryMetadata::from(&self.descriptor.metadata()?);
+        let reopened = SecureEntryMetadata::from(&current.descriptor.metadata()?);
+        if retained.dev != reopened.dev || retained.ino != reopened.ino {
+            return Err(SecureStateError::InvalidStorage(
+                "directory descriptor no longer matches its path",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn remove_regular_if_present(&self, name: &CStr) -> Result<(), SecureStateError> {

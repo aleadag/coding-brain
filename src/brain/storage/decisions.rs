@@ -533,7 +533,7 @@ impl BrainDb {
                 "erasure brain root does not match storage state",
             ));
         }
-        let _locks = ErasureLocks::acquire(paths, &self.learning_root)?;
+        let locks = ErasureLocks::acquire(paths, &self.learning_root)?;
         let current = self.erasure_state()?;
         if resume && current.complete {
             return Ok(current.generation);
@@ -562,9 +562,9 @@ impl BrainDb {
         self.connection
             .execute("DELETE FROM decision_payloads", [])?;
         erasure_stage(&paths.brain_root, "after-database-delete")?;
-        erase_legacy_sources(paths)?;
+        locks.erase_legacy_sources()?;
         erasure_stage(&paths.brain_root, "after-external-delete")?;
-        erase_published_preferences(&self.learning_root)?;
+        locks.erase_published_preferences()?;
         erasure_stage(&paths.brain_root, "after-generation-delete")?;
         erasure_stage(&paths.brain_root, "before-wal-truncate")?;
         checkpoint_truncate(&self.connection)?;
@@ -572,10 +572,9 @@ impl BrainDb {
         SecureStateDirectory::open_existing_strict(self.database_directory()?)
             .map_err(secure_storage_error)?
             .sync()?;
-        SecureStateDirectory::open_existing_strict(&self.learning_root)
-            .map_err(secure_storage_error)?
-            .sync()?;
+        locks.brain.sync()?;
         erasure_stage(&paths.brain_root, "before-complete")?;
+        locks.validate_path_correspondence()?;
         let updated = self.connection.execute(
             "UPDATE schema_meta SET erasure_state = 'complete'
              WHERE singleton = 1 AND erasure_generation = ?1 AND erasure_state = 'in_progress'",
@@ -987,16 +986,25 @@ fn deserialize_record(bytes: &[u8]) -> Result<DecisionRecord, StorageError> {
 }
 
 struct ErasureLocks {
+    legacy_sources: Vec<LegacyEraseRoot>,
+    brain: SecureStateDirectory,
     files: Vec<File>,
+}
+
+enum LegacyEraseRoot {
+    Present(SecureStateDirectory),
+    Missing(PathBuf),
 }
 
 impl ErasureLocks {
     fn acquire(paths: &LearningErasePaths, brain_root: &Path) -> Result<Self, StorageError> {
+        let mut legacy_sources = Vec::new();
         let mut files = Vec::new();
         for path in &paths.legacy_sources {
             let directory = match SecureStateDirectory::open_existing_strict(path) {
                 Ok(directory) => directory,
                 Err(SecureStateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    legacy_sources.push(LegacyEraseRoot::Missing(path.clone()));
                     continue;
                 }
                 Err(error) => return Err(secure_storage_error(error)),
@@ -1006,6 +1014,7 @@ impl ErasureLocks {
                     .open_regular_strict(c"decisions.lock", true)
                     .map_err(secure_storage_error)?,
             )?);
+            legacy_sources.push(LegacyEraseRoot::Present(directory));
         }
         let brain =
             SecureStateDirectory::open_or_create(brain_root).map_err(secure_storage_error)?;
@@ -1019,7 +1028,71 @@ impl ErasureLocks {
                 .open_regular_strict(c"distill.lock", true)
                 .map_err(secure_storage_error)?,
         )?);
-        Ok(Self { files })
+        Ok(Self {
+            legacy_sources,
+            brain,
+            files,
+        })
+    }
+
+    fn erase_legacy_sources(&self) -> Result<(), StorageError> {
+        for root in &self.legacy_sources {
+            let directory = match root {
+                LegacyEraseRoot::Present(directory) => directory,
+                LegacyEraseRoot::Missing(path) => {
+                    ensure_legacy_root_still_missing(path)?;
+                    continue;
+                }
+            };
+            for name in [c"decisions.jsonl", c"canonical.jsonl", c"preferences.json"] {
+                directory
+                    .remove_regular_if_present(name)
+                    .map_err(secure_storage_error)?;
+            }
+            directory
+                .remove_tree_if_present(c"preferences")
+                .map_err(secure_storage_error)?;
+            directory.sync()?;
+        }
+        Ok(())
+    }
+
+    fn erase_published_preferences(&self) -> Result<(), StorageError> {
+        self.brain
+            .remove_regular_if_present(c"distill-watermark.json")
+            .map_err(secure_storage_error)?;
+        self.brain
+            .remove_regular_if_present(c"distill-trigger")
+            .map_err(secure_storage_error)?;
+        self.brain
+            .remove_tree_if_present(c"preferences-generations")
+            .map_err(secure_storage_error)?;
+        self.brain.sync()?;
+        Ok(())
+    }
+
+    fn validate_path_correspondence(&self) -> Result<(), StorageError> {
+        for root in &self.legacy_sources {
+            match root {
+                LegacyEraseRoot::Present(directory) => directory
+                    .validate_path_correspondence()
+                    .map_err(secure_storage_error)?,
+                LegacyEraseRoot::Missing(path) => ensure_legacy_root_still_missing(path)?,
+            }
+        }
+        self.brain
+            .validate_path_correspondence()
+            .map_err(secure_storage_error)
+    }
+}
+
+fn ensure_legacy_root_still_missing(path: &Path) -> Result<(), StorageError> {
+    match SecureStateDirectory::open_existing_strict(path) {
+        Err(SecureStateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(StorageError::InvalidStorage(
+            "legacy state root appeared after erasure lock acquisition",
+        )),
+        Err(error) => Err(secure_storage_error(error)),
     }
 }
 
@@ -1065,42 +1138,6 @@ impl Drop for ErasureLocks {
     }
 }
 
-fn erase_legacy_sources(paths: &LearningErasePaths) -> Result<(), StorageError> {
-    for root in &paths.legacy_sources {
-        let directory = match SecureStateDirectory::open_existing_strict(root) {
-            Ok(directory) => directory,
-            Err(SecureStateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(secure_storage_error(error)),
-        };
-        for name in [c"decisions.jsonl", c"canonical.jsonl", c"preferences.json"] {
-            directory
-                .remove_regular_if_present(name)
-                .map_err(secure_storage_error)?;
-        }
-        directory
-            .remove_tree_if_present(c"preferences")
-            .map_err(secure_storage_error)?;
-        directory.sync()?;
-    }
-    Ok(())
-}
-
-fn erase_published_preferences(brain_root: &Path) -> Result<(), StorageError> {
-    let directory =
-        SecureStateDirectory::open_existing_strict(brain_root).map_err(secure_storage_error)?;
-    directory
-        .remove_regular_if_present(c"distill-watermark.json")
-        .map_err(secure_storage_error)?;
-    directory
-        .remove_regular_if_present(c"distill-trigger")
-        .map_err(secure_storage_error)?;
-    directory
-        .remove_tree_if_present(c"preferences-generations")
-        .map_err(secure_storage_error)?;
-    directory.sync()?;
-    Ok(())
-}
-
 fn checkpoint_truncate(connection: &rusqlite::Connection) -> Result<(), StorageError> {
     let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
         connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
@@ -1125,8 +1162,15 @@ fn erasure_stage(brain_root: &Path, stage: &'static str) -> Result<(), StorageEr
                     "erasure test marker is absent",
                 ))?;
             fs::write(marker, stage)?;
-            loop {
-                std::thread::park();
+            if let Some(release) = std::env::var_os("CODING_BRAIN_ERASURE_TEST_RELEASE") {
+                let release = PathBuf::from(release);
+                while !release.exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            } else {
+                loop {
+                    std::thread::park();
+                }
             }
         }
     }

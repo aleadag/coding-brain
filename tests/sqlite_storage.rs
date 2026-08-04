@@ -3026,6 +3026,149 @@ fn erasure_process_helper() {
     db.forget_learning(&erase).unwrap();
 }
 
+fn spawn_releasable_erasure(root: &std::path::Path) -> (std::process::Child, std::path::PathBuf) {
+    let marker = root.join("erasure-race-marker");
+    let release = root.join("erasure-race-release");
+    let child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("erasure_process_helper")
+        .arg("--nocapture")
+        .env("CODING_BRAIN_ERASURE_TEST_ROOT", root)
+        .env("CODING_BRAIN_ERASURE_TEST_PAUSE", "after-in-progress")
+        .env("CODING_BRAIN_ERASURE_TEST_MARKER", &marker)
+        .env("CODING_BRAIN_ERASURE_TEST_RELEASE", &release)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !marker.exists() {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        thread::sleep(Duration::from_millis(5));
+    }
+    (child, release)
+}
+
+#[test]
+fn erasure_never_reopens_a_replaced_locked_legacy_root() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let legacy = root.path().join("legacy");
+    let original = root.path().join("legacy-original");
+    create_managed_dir(&legacy);
+    write_managed_file(&legacy.join("decisions.jsonl"), b"original");
+
+    let (mut child, release) = spawn_releasable_erasure(root.path());
+    fs::rename(&legacy, &original).unwrap();
+    create_managed_dir(&legacy);
+    write_managed_file(&legacy.join("decisions.jsonl"), b"replacement");
+    fs::write(release, b"continue").unwrap();
+
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(
+        fs::read(legacy.join("decisions.jsonl")).unwrap(),
+        b"replacement"
+    );
+    assert!(!original.join("decisions.jsonl").exists());
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(2)),
+    )
+    .unwrap();
+    assert!(!db.erasure_state().unwrap().complete);
+}
+
+#[test]
+fn erasure_never_opens_a_supplied_legacy_root_that_appears_after_locking() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let legacy = root.path().join("legacy");
+
+    let (mut child, release) = spawn_releasable_erasure(root.path());
+    create_managed_dir(&legacy);
+    write_managed_file(&legacy.join("decisions.jsonl"), b"new");
+    fs::write(release, b"continue").unwrap();
+
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(fs::read(legacy.join("decisions.jsonl")).unwrap(), b"new");
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(2)),
+    )
+    .unwrap();
+    assert!(!db.erasure_state().unwrap().complete);
+}
+
+#[test]
+fn raw_wal_reader_keeps_erasure_incomplete_until_same_generation_resume() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let cursor = db
+        .append_activity(decision_activity_event(
+            "raw-reader",
+            "raw-reader-decision",
+            1,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    db.insert_decision(
+        &DecisionIdentity::observation("raw-reader-decision", AgentProvider::Codex, 1),
+        &DecisionPayload::new(
+            DecisionKind::Observation,
+            cursor,
+            complete_decision("raw-reader-decision", AgentProvider::Codex),
+        ),
+    )
+    .unwrap();
+
+    let raw = open_for_constraints(&paths.brain_db());
+    raw.execute_batch("BEGIN").unwrap();
+    assert_eq!(
+        raw.query_row("SELECT COUNT(*) FROM decision_payloads", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        1
+    );
+    let erase = LearningErasePaths::new(root.path().join("brain"), Vec::new());
+    assert!(matches!(
+        db.forget_learning(&erase),
+        Err(StorageError::Busy)
+    ));
+    let interrupted = db.erasure_state().unwrap();
+    assert!(!interrupted.complete);
+    assert!(matches!(
+        db.learning_decisions(10, 1024 * 1024),
+        Err(StorageError::MigrationRequired)
+    ));
+
+    raw.execute_batch("ROLLBACK").unwrap();
+    drop(raw);
+    drop(db);
+    let mut db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(2)),
+    )
+    .unwrap();
+    assert_eq!(
+        db.resume_forget_learning(&erase).unwrap(),
+        interrupted.generation
+    );
+    assert_eq!(
+        db.erasure_state().unwrap().generation,
+        interrupted.generation
+    );
+    assert!(db.erasure_state().unwrap().complete);
+}
+
 #[test]
 fn interrupted_erasure_fails_closed_and_resumes_at_the_same_generation() {
     for stage in [
