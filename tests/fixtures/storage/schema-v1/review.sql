@@ -1,14 +1,19 @@
 CREATE TABLE review_meta (
     surface TEXT PRIMARY KEY CHECK (surface IN ('attention', 'review', 'diagnostics', 'recent')),
     revision INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 0x7fffffffffffffff),
-    source_high_water INTEGER NOT NULL CHECK (source_high_water BETWEEN 0 AND 0x7fffffffffffffff)
+    source_high_water INTEGER NOT NULL CHECK (source_high_water BETWEEN 0 AND 0x7fffffffffffffff),
+    last_archive_revision INTEGER CHECK (
+        last_archive_revision IS NULL
+        OR last_archive_revision BETWEEN 1 AND revision
+    ),
+    CHECK (surface <> 'recent' OR last_archive_revision IS NULL)
 ) STRICT;
 
-INSERT INTO review_meta (surface, revision, source_high_water) VALUES
-    ('attention', 0, 0),
-    ('review', 0, 0),
-    ('diagnostics', 0, 0),
-    ('recent', 0, 0);
+INSERT INTO review_meta (surface, revision, source_high_water, last_archive_revision) VALUES
+    ('attention', 0, 0, NULL),
+    ('review', 0, 0, NULL),
+    ('diagnostics', 0, 0, NULL),
+    ('recent', 0, 0, NULL);
 
 CREATE TABLE review_marks (
     surface TEXT NOT NULL,

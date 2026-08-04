@@ -218,7 +218,12 @@ permission or topology authority remains in `hooks/lifecycle.json`.
 
 ### Review database: `review_meta` and `review_marks`
 
-Review metadata stores an independent optimistic revision for each surface.
+Review metadata stores an independent optimistic revision and source
+high-water for each surface. Its nullable `last_archive_revision` is either
+`1..=revision` or null and is always null for Recent. A nonempty archive batch
+records its new revision; undo restores only rows at that exact revision and
+clears the slot, so an older archived batch cannot become undoable again.
+Pruning clears the slot when no exact rows from the remembered batch remain.
 Review marks key the surface plus stable group identity and source cursor to a
 visibility disposition. They are joined before grouping, counts, ordering,
 overflow, and truncation.
@@ -228,7 +233,10 @@ tables. A review mutation validates an exact bounded group/cursor against a
 short Brain snapshot, then commits with an optimistic review revision. New
 activity naturally receives a greater cursor and resurfaces. Review reset
 replaces only `review.sqlite3` through the explicit
-`cbrain storage reset-review-state` operation.
+`cbrain storage reset-review-state` operation. Every Review connection holds a
+shared owner-only reset gate for its lifetime. Reset acquires the same gate
+exclusively before SQLite access, returns Busy while a connection remains
+alive, and holds it through validated deletion and direct recreation.
 
 ## Permission Data Flow
 

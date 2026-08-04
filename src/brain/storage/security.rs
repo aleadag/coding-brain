@@ -93,6 +93,46 @@ impl SecureDatabaseDirectory {
         Ok(file)
     }
 
+    pub(super) fn open_lock_file(&self, name: &CStr, create: bool) -> Result<File, SecurityError> {
+        let (descriptor, created) = if create {
+            let descriptor = unsafe {
+                libc::openat(
+                    self.descriptor.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600 as libc::c_uint,
+                )
+            };
+            if descriptor >= 0 {
+                (descriptor, true)
+            } else {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error.into());
+                }
+                (open_regular_at(&self.descriptor, name)?, false)
+            }
+        } else {
+            (open_regular_at(&self.descriptor, name)?, false)
+        };
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        if created && unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let opened = EntryMetadata::from(&file.metadata()?);
+        let at_path = metadata_at(&self.descriptor, name)?;
+        validate_private_file(&opened)?;
+        validate_private_file(&at_path)?;
+        if at_path.dev != opened.dev || at_path.ino != opened.ino {
+            return Err(SecurityError::Invalid("database lock changed during open"));
+        }
+        Ok(file)
+    }
+
     pub(super) fn validate_after_open(&self, database_name: &CStr) -> Result<(), SecurityError> {
         let metadata = metadata_at(&self.descriptor, database_name)?;
         validate_private_file(&metadata)?;
@@ -104,6 +144,39 @@ impl SecureDatabaseDirectory {
                 Err(error) => return Err(error.into()),
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn remove_database(&self, database_name: &CStr) -> Result<(), SecurityError> {
+        self.validate_existing_sidecars(database_name)?;
+        let database_exists = match metadata_at(&self.descriptor, database_name) {
+            Ok(metadata) => {
+                validate_private_file(&metadata)?;
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !database_exists {
+            let database_name = OsStr::from_bytes(database_name.to_bytes());
+            let mut sidecar_prefix = database_name.as_bytes().to_vec();
+            sidecar_prefix.push(b'-');
+            if fs::read_dir(&self.path)?.any(|entry| {
+                entry.is_ok_and(|entry| entry.file_name().as_bytes().starts_with(&sidecar_prefix))
+            }) {
+                return Err(SecurityError::Invalid(
+                    "SQLite sidecar exists without its database",
+                ));
+            }
+            return Ok(());
+        }
+
+        for suffix in ["-shm", "-wal", "-journal"] {
+            let name = sidecar_name(database_name, suffix)?;
+            unlink_if_present(&self.descriptor, &name)?;
+        }
+        unlink_if_present(&self.descriptor, database_name)?;
+        self.descriptor.sync_all()?;
         Ok(())
     }
 
@@ -143,6 +216,26 @@ impl SecureDatabaseDirectory {
             }
         }
         Ok(())
+    }
+}
+
+fn open_regular_at(directory: &File, name: &CStr) -> Result<libc::c_int, SecurityError> {
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor >= 0 {
+        Ok(descriptor)
+    } else {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ELOOP)) {
+            Err(SecurityError::Invalid("database lock is a symlink"))
+        } else {
+            Err(error.into())
+        }
     }
 }
 
@@ -389,6 +482,21 @@ fn metadata_at(directory: &File, name: &CStr) -> io::Result<EntryMetadata> {
         dev: stat.st_dev as u64,
         ino: stat.st_ino as u64,
     })
+}
+
+fn unlink_if_present(directory: &File, name: &CStr) -> Result<(), SecurityError> {
+    match metadata_at(directory, name) {
+        Ok(metadata) => validate_private_file(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 
 fn sidecar_name(database_name: &CStr, suffix: &str) -> Result<CString, SecurityError> {

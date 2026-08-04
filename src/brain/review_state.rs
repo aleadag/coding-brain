@@ -284,23 +284,18 @@ impl ReviewStateStore {
 
         let (revision, reviewed_count, archived_count, last_archive_count) = {
             let surface = state.surfaces.entry(request.surface).or_default();
-            prune_surface(surface, eligible);
-            if surface.revision != request.expected_surface_revision {
-                return Err(ReviewStateError::StaleRevision);
-            }
-            apply_mutation(surface, request, eligible)?;
-            if surface.items.len() > MAX_REVIEW_KEYS {
-                return Err(ReviewStateError::CapacityExceeded);
-            }
-            surface.revision = surface
-                .revision
-                .checked_add(1)
-                .ok_or(ReviewStateError::RevisionOverflow)?;
+            let result = mutate_surface(
+                request,
+                eligible,
+                &mut surface.revision,
+                &mut surface.items,
+                &mut surface.last_archive,
+            )?;
             (
-                surface.revision,
-                disposition_count(&surface.items, ReviewDisposition::Reviewed),
-                disposition_count(&surface.items, ReviewDisposition::Archived),
-                surface.last_archive.len(),
+                result.surface_revision,
+                result.reviewed_count,
+                result.archived_count,
+                result.last_archive_count,
             )
         };
 
@@ -347,19 +342,31 @@ fn disposition_count(
         .count()
 }
 
-fn prune_surface(surface: &mut PersistedSurface, eligible: &BTreeSet<ReviewKey>) {
-    surface.items.retain(|key, _| eligible.contains(key));
-    surface.last_archive.retain(|key| {
-        eligible.contains(key)
-            && surface.items.get(key).copied() == Some(ReviewDisposition::Archived)
+fn prune_surface(
+    items: &mut BTreeMap<ReviewKey, ReviewDisposition>,
+    last_archive: &mut BTreeSet<ReviewKey>,
+    eligible: &BTreeSet<ReviewKey>,
+) {
+    items.retain(|key, _| eligible.contains(key));
+    last_archive.retain(|key| {
+        eligible.contains(key) && items.get(key).copied() == Some(ReviewDisposition::Archived)
     });
 }
 
-fn apply_mutation(
-    surface: &mut PersistedSurface,
+pub(crate) fn mutate_surface(
     request: &ReviewMutationRequest,
     eligible: &BTreeSet<ReviewKey>,
-) -> Result<(), ReviewStateError> {
+    revision: &mut u64,
+    items: &mut BTreeMap<ReviewKey, ReviewDisposition>,
+    last_archive: &mut BTreeSet<ReviewKey>,
+) -> Result<ReviewMutationResult, ReviewStateError> {
+    request
+        .validate()
+        .map_err(ReviewStateError::InvalidRequest)?;
+    prune_surface(items, last_archive, eligible);
+    if *revision != request.expected_surface_revision {
+        return Err(ReviewStateError::StaleRevision);
+    }
     match &request.operation {
         ReviewMutation::SetDisposition { keys, disposition } => {
             if !keys.iter().all(|key| eligible.contains(key)) {
@@ -367,15 +374,13 @@ fn apply_mutation(
             }
             match disposition {
                 ReviewDisposition::Reviewed => {
-                    if keys.iter().any(|key| surface.items.contains_key(key)) {
+                    if keys.iter().any(|key| items.contains_key(key)) {
                         return Err(ReviewStateError::DispositionConflict);
                     }
-                    if surface.items.len().saturating_add(keys.len()) > MAX_REVIEW_KEYS {
+                    if items.len().saturating_add(keys.len()) > MAX_REVIEW_KEYS {
                         return Err(ReviewStateError::CapacityExceeded);
                     }
-                    surface
-                        .items
-                        .extend(keys.iter().map(|key| (*key, ReviewDisposition::Reviewed)));
+                    items.extend(keys.iter().map(|key| (*key, ReviewDisposition::Reviewed)));
                 }
                 ReviewDisposition::Archived => {
                     if !request.surface.supports_archive() {
@@ -383,21 +388,21 @@ fn apply_mutation(
                             ReviewRequestError::UnsupportedOperation,
                         ));
                     }
-                    if keys.iter().any(|key| {
-                        surface.items.get(key).copied() != Some(ReviewDisposition::Reviewed)
-                    }) {
+                    if keys
+                        .iter()
+                        .any(|key| items.get(key).copied() != Some(ReviewDisposition::Reviewed))
+                    {
                         return Err(ReviewStateError::DispositionConflict);
                     }
                     for key in keys {
-                        surface.items.insert(*key, ReviewDisposition::Archived);
+                        items.insert(*key, ReviewDisposition::Archived);
                     }
-                    surface.last_archive.clone_from(keys);
+                    last_archive.clone_from(keys);
                 }
             }
         }
         ReviewMutation::ArchiveAllReviewed { expected_count } => {
-            let reviewed = surface
-                .items
+            let reviewed = items
                 .iter()
                 .filter_map(|(key, disposition)| {
                     (*disposition == ReviewDisposition::Reviewed).then_some(*key)
@@ -407,28 +412,39 @@ fn apply_mutation(
                 return Err(ReviewStateError::CountMismatch);
             }
             for key in &reviewed {
-                surface.items.insert(*key, ReviewDisposition::Archived);
+                items.insert(*key, ReviewDisposition::Archived);
             }
-            surface.last_archive = reviewed;
+            *last_archive = reviewed;
         }
         ReviewMutation::UndoLastArchive { expected_count } => {
-            if surface.last_archive.len() != *expected_count {
+            if last_archive.len() != *expected_count {
                 return Err(ReviewStateError::CountMismatch);
             }
-            if surface
-                .last_archive
+            if last_archive
                 .iter()
-                .any(|key| surface.items.get(key).copied() != Some(ReviewDisposition::Archived))
+                .any(|key| items.get(key).copied() != Some(ReviewDisposition::Archived))
             {
                 return Err(ReviewStateError::DispositionConflict);
             }
-            for key in &surface.last_archive {
-                surface.items.insert(*key, ReviewDisposition::Reviewed);
+            for key in last_archive.iter() {
+                items.insert(*key, ReviewDisposition::Reviewed);
             }
-            surface.last_archive.clear();
+            last_archive.clear();
         }
     }
-    Ok(())
+    if items.len() > MAX_REVIEW_KEYS {
+        return Err(ReviewStateError::CapacityExceeded);
+    }
+    *revision = revision
+        .checked_add(1)
+        .ok_or(ReviewStateError::RevisionOverflow)?;
+    Ok(ReviewMutationResult {
+        surface: request.surface,
+        surface_revision: *revision,
+        reviewed_count: disposition_count(items, ReviewDisposition::Reviewed),
+        archived_count: disposition_count(items, ReviewDisposition::Archived),
+        last_archive_count: last_archive.len(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

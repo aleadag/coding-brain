@@ -29,6 +29,9 @@ use coding_brain_core::terminals::{
     execute_guarded_action_classified, probe_actionable_prompt_classified,
 };
 
+use crate::brain::storage::{
+    ActivityCursor, ReviewEligibility, ReviewEligibleOccurrence, StorageError,
+};
 use crate::{brain, config};
 use brain::review_state::ReviewStateSnapshot;
 
@@ -213,6 +216,32 @@ fn review_state_source_error(error: brain::review_state::ReviewStateError) -> Br
 
 struct OwnedSurfaceEvidence {
     eligible: BTreeSet<ReviewKey>,
+}
+
+#[allow(dead_code)] // Task 8 activates this pure seam when runtime storage selection changes.
+pub(crate) fn captured_sqlite_review_evidence<I, B>(
+    surface: ReviewSurface,
+    source_high_water: Option<ActivityCursor>,
+    occurrences: I,
+) -> Result<ReviewEligibility, StorageError>
+where
+    I: IntoIterator<Item = (B, ActivityCursor)>,
+    B: AsRef<[u8]>,
+{
+    ReviewEligibility::try_new(
+        surface,
+        source_high_water,
+        occurrences
+            .into_iter()
+            .map(|(source_identity, source_cursor)| {
+                ReviewEligibleOccurrence::new(
+                    surface,
+                    ReviewKey::derive(surface, source_identity.as_ref()),
+                    source_cursor,
+                )
+            })
+            .collect(),
+    )
 }
 
 fn fresh_surface_evidence(
@@ -1060,6 +1089,35 @@ mod tests {
 
     use super::*;
     use crate::brain::review_state::ReviewStateSnapshot;
+
+    #[test]
+    fn captured_sqlite_evidence_is_pure_inactive_and_preserves_opaque_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = ActivityCursor::try_from(1_u64).unwrap();
+        let second = ActivityCursor::try_from(2_u64).unwrap();
+        let opaque = vec![0xff; 32];
+        let evidence = captured_sqlite_review_evidence(
+            ReviewSurface::Review,
+            Some(second),
+            vec![(b"canonical".to_vec(), first), (opaque.clone(), second)],
+        )
+        .unwrap();
+
+        assert_eq!(evidence.source_high_water(), Some(second));
+        assert_eq!(evidence.occurrences().len(), 2);
+        assert_eq!(
+            evidence.occurrences()[1].key(),
+            ReviewKey::derive(ReviewSurface::Review, &opaque)
+        );
+        assert_eq!(
+            evidence.occurrences()[1].group_id(),
+            evidence.occurrences()[1].key().to_string()
+        );
+        assert!(
+            !temp.path().join("db/review.sqlite3").exists(),
+            "the Task 5 runtime seam must not select or create SQLite storage"
+        );
+    }
 
     #[test]
     fn live_brain_actions_reject_empty_canonical_ids() {

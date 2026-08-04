@@ -269,6 +269,10 @@ fn review_lifecycle_process_matrix_spans_all_four_surfaces() {
     assert_eq!(count(&reopened, "attention", "reviewed"), 1);
     assert_eq!(surface(&reopened, "attention")["rows"], 1);
     assert_eq!(reopened["scorecard"], original_scorecard);
+    assert!(
+        !state_root(root.path()).join("db/review.sqlite3").exists(),
+        "Task 5 keeps the production runtime on JSON review storage"
+    );
 
     fs::remove_file(state_root(root.path()).join("review-state.json")).unwrap();
     let reset = observe(root.path());

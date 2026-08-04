@@ -56,7 +56,12 @@ Store review revisions and per-surface cursor/disposition marks in
 `$XDG_STATE_HOME/coding-brain/db/review.sqlite3`. Never attach it to the Brain
 database or imply cross-database atomicity. Review failure disables review
 mutations without disabling coherent permission or audit state. Reset replaces
-only the review database.
+only the review database. Per-surface metadata remembers at most the revision
+of the newest nonempty archive batch. Undo restores exactly that revision and
+clears the slot; it never promotes older archived rows into a new undo target.
+The Recent surface cannot retain archive metadata. Each Review connection
+holds a shared owner-only reset gate for its lifetime; reset takes that gate
+exclusively and returns Busy instead of unlinking a live database.
 
 ### Migrate automatically outside hook deadlines
 

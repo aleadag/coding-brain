@@ -3,16 +3,20 @@
 mod activity;
 mod decisions;
 mod lifecycle;
+mod review;
 mod schema;
 mod security;
 
 use std::ffi::{CStr, OsStr};
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use coding_brain_core::review_state::ReviewRequestError;
+use fs2::FileExt;
 use rusqlite::config::DbConfig;
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -26,6 +30,8 @@ pub use decisions::{
     DecisionIdentity, DecisionKind, DecisionPayload, ErasureState, LearningDecisionPage,
     LearningErasePaths, LearningReadSession,
 };
+#[allow(unused_imports)]
+pub use review::{ReviewEligibility, ReviewEligibleOccurrence, ReviewSurfaceState};
 
 pub const BRAIN_APPLICATION_ID: i32 = 0x4342_524e;
 pub const BRAIN_SCHEMA_VERSION: i32 = 1;
@@ -34,6 +40,7 @@ pub const REVIEW_SCHEMA_VERSION: i32 = 1;
 
 const BRAIN_DATABASE_NAME: &CStr = c"brain.sqlite3";
 const REVIEW_DATABASE_NAME: &CStr = c"review.sqlite3";
+const REVIEW_RESET_GATE_NAME: &CStr = c"review-reset.lock";
 
 #[derive(Debug, Clone)]
 pub struct StoragePaths {
@@ -113,6 +120,13 @@ pub enum StorageError {
         schema_version: i32,
     },
     InvalidStorage(&'static str),
+    InvalidReviewRequest(ReviewRequestError),
+    StaleReviewRevision,
+    ReviewTargetNotEligible,
+    ReviewCountMismatch,
+    ReviewDispositionConflict,
+    ReviewCapacityExceeded,
+    ReviewRevisionOverflow,
     Sqlite(rusqlite::Error),
     Io(io::Error),
 }
@@ -130,6 +144,19 @@ impl fmt::Display for StorageError {
                 "unsupported SQLite application/schema {application_id:#x}/{schema_version}"
             ),
             Self::InvalidStorage(reason) => write!(formatter, "invalid SQLite storage: {reason}"),
+            Self::InvalidReviewRequest(error) => {
+                write!(formatter, "invalid review request: {error:?}")
+            }
+            Self::StaleReviewRevision => formatter.write_str("review surface revision changed"),
+            Self::ReviewTargetNotEligible => {
+                formatter.write_str("review target is no longer eligible")
+            }
+            Self::ReviewCountMismatch => formatter.write_str("review target count changed"),
+            Self::ReviewDispositionConflict => {
+                formatter.write_str("review target disposition changed")
+            }
+            Self::ReviewCapacityExceeded => formatter.write_str("review state key limit exceeded"),
+            Self::ReviewRevisionOverflow => formatter.write_str("review surface revision overflow"),
             Self::Sqlite(error) => write!(formatter, "SQLite storage failed: {error}"),
             Self::Io(error) => write!(formatter, "SQLite storage I/O failed: {error}"),
         }
@@ -288,6 +315,8 @@ impl BrainDb {
 
 pub struct ReviewDb {
     connection: Connection,
+    _reset_gate: File,
+    deadline: Option<StorageDeadline>,
 }
 
 impl fmt::Debug for ReviewDb {
@@ -298,8 +327,13 @@ impl fmt::Debug for ReviewDb {
 
 impl ReviewDb {
     pub fn create_current(paths: &StoragePaths) -> Result<Self, StorageError> {
+        let reset_gate = acquire_review_reset_gate(paths, true, false)?;
         let connection = create_current(paths, REVIEW_DATABASE_NAME, DatabaseKind::Review)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            _reset_gate: reset_gate,
+            deadline: None,
+        })
     }
 
     pub fn open_current(
@@ -307,8 +341,28 @@ impl ReviewDb {
         _role: OpenRole,
         deadline: StorageDeadline,
     ) -> Result<Self, StorageError> {
+        deadline.ensure_remaining()?;
+        let reset_gate = acquire_review_reset_gate(paths, false, false)?;
+        deadline.ensure_remaining()?;
         let connection = open_current(paths, REVIEW_DATABASE_NAME, DatabaseKind::Review, deadline)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            _reset_gate: reset_gate,
+            deadline: Some(deadline),
+        })
+    }
+
+    pub fn reset(paths: &StoragePaths) -> Result<(), StorageError> {
+        let directory = SecureDatabaseDirectory::prepare(&paths.state_root, true)?;
+        let reset_gate = directory.open_lock_file(REVIEW_RESET_GATE_NAME, true)?;
+        lock_review_reset_gate(&reset_gate, true)?;
+        directory.remove_database(REVIEW_DATABASE_NAME)?;
+        drop(create_current(
+            paths,
+            REVIEW_DATABASE_NAME,
+            DatabaseKind::Review,
+        )?);
+        Ok(())
     }
 
     pub fn schema_sql() -> &'static str {
@@ -326,6 +380,32 @@ impl ReviewDb {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))?)
     }
+}
+
+fn acquire_review_reset_gate(
+    paths: &StoragePaths,
+    create: bool,
+    exclusive: bool,
+) -> Result<File, StorageError> {
+    let directory = SecureDatabaseDirectory::prepare(&paths.state_root, create)?;
+    let gate = directory.open_lock_file(REVIEW_RESET_GATE_NAME, create)?;
+    lock_review_reset_gate(&gate, exclusive)?;
+    Ok(gate)
+}
+
+fn lock_review_reset_gate(gate: &File, exclusive: bool) -> Result<(), StorageError> {
+    let result = if exclusive {
+        gate.try_lock_exclusive()
+    } else {
+        FileExt::try_lock_shared(gate)
+    };
+    result.map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            StorageError::Busy
+        } else {
+            StorageError::Io(error)
+        }
+    })
 }
 
 fn create_current(

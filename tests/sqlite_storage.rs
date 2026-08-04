@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -13,7 +13,8 @@ use coding_brain::brain::decisions::{
 use coding_brain::brain::storage::{
     ActivityCursor, BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, DecisionIdentity,
     DecisionKind, DecisionPayload, LearningErasePaths, OpenRole, REVIEW_APPLICATION_ID,
-    REVIEW_SCHEMA_VERSION, ReviewDb, StorageDeadline, StorageError, StoragePaths,
+    REVIEW_SCHEMA_VERSION, ReviewDb, ReviewEligibility, ReviewEligibleOccurrence, StorageDeadline,
+    StorageError, StoragePaths,
 };
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivityState,
@@ -25,6 +26,10 @@ use coding_brain_core::lifecycle::{
 };
 use coding_brain_core::project::ProjectId;
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
+use coding_brain_core::review_state::{
+    MAX_REVIEW_KEYS, ReviewDisposition, ReviewKey, ReviewMutation, ReviewMutationRequest,
+    ReviewRequestError, ReviewSurface,
+};
 use fs2::FileExt;
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags, params};
@@ -58,6 +63,28 @@ fn create_managed_dir(path: &std::path::Path) {
 fn write_managed_file(path: &std::path::Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn review_eligibility(
+    surface: ReviewSurface,
+    source_high_water: u64,
+    occurrences: &[(&str, u64)],
+) -> ReviewEligibility {
+    ReviewEligibility::try_new(
+        surface,
+        (source_high_water != 0).then(|| ActivityCursor::try_from(source_high_water).unwrap()),
+        occurrences
+            .iter()
+            .map(|(group_id, source_cursor)| {
+                ReviewEligibleOccurrence::new(
+                    surface,
+                    ReviewKey::derive(surface, group_id.as_bytes()),
+                    ActivityCursor::try_from(*source_cursor).unwrap(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap()
 }
 
 fn complete_decision(decision_id: &str, provider: AgentProvider) -> DecisionRecord {
@@ -3898,6 +3925,9 @@ fn fresh_review_database_is_isolated_and_constrained() {
          VALUES ('unknown', 0, 0)",
         "UPDATE review_meta SET revision = -1 WHERE surface = 'review'",
         "UPDATE review_meta SET source_high_water = -1 WHERE surface = 'review'",
+        "UPDATE review_meta
+         SET revision = 1, last_archive_revision = 1
+         WHERE surface = 'recent'",
     ] {
         assert_statement_rejected(&connection, rejected);
     }
@@ -3940,4 +3970,1083 @@ fn fresh_review_database_is_isolated_and_constrained() {
             [],
         )
         .unwrap();
+}
+
+#[test]
+fn review_schema_remembers_only_the_latest_undoable_archive_revision() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(ReviewDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.review_db());
+
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT last_archive_revision FROM review_meta WHERE surface = 'review'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap(),
+        None
+    );
+    connection
+        .execute(
+            "UPDATE review_meta
+             SET revision = 1, last_archive_revision = 1
+             WHERE surface = 'review'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO review_marks (
+                surface, group_id, source_cursor, disposition, revision
+             ) VALUES ('review', 'older', 1, 'archived', 1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE review_meta
+             SET revision = 2, last_archive_revision = 2
+             WHERE surface = 'review'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO review_marks (
+                surface, group_id, source_cursor, disposition, revision
+             ) VALUES ('review', 'latest', 2, 'archived', 2)",
+            [],
+        )
+        .unwrap();
+
+    connection
+        .execute(
+            "UPDATE review_meta SET last_archive_revision = NULL WHERE surface = 'review'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT last_archive_revision FROM review_meta WHERE surface = 'review'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM review_marks
+                 WHERE surface = 'review' AND disposition = 'archived'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2,
+        "clearing the latest undo slot must not promote an older archive batch"
+    );
+}
+
+#[test]
+fn review_db_round_trips_one_surface_without_changing_other_revisions() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = ReviewDb::create_current(&paths).unwrap();
+    let attention = review_eligibility(ReviewSurface::Attention, 2, &[("attention-a", 1)]);
+    let diagnostics = review_eligibility(ReviewSurface::Diagnostics, 2, &[("diagnostic-a", 2)]);
+    let attention_key = ReviewKey::derive(ReviewSurface::Attention, b"attention-a");
+
+    let result = db
+        .mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [attention_key].into_iter().collect(),
+                    disposition: ReviewDisposition::Reviewed,
+                },
+            },
+            &attention,
+        )
+        .unwrap();
+    assert_eq!(result.surface_revision, 1);
+    assert_eq!(result.reviewed_count, 1);
+
+    let reopened = ReviewDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    let attention_state = reopened.read_surface(&attention).unwrap();
+    let diagnostics_state = reopened.read_surface(&diagnostics).unwrap();
+    assert_eq!(attention_state.surface_revision(), 1);
+    assert_eq!(
+        attention_state.disposition(&attention_key),
+        Some(ReviewDisposition::Reviewed)
+    );
+    assert_eq!(diagnostics_state.surface_revision(), 0);
+    assert_eq!(diagnostics_state.reviewed_count(), 0);
+}
+
+#[test]
+fn review_reset_recovers_corruption_without_changing_brain() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut brain = BrainDb::create_current(&paths).unwrap();
+    brain
+        .append_activity(activity_event("brain-authority", 1, ActivityState::Denied))
+        .unwrap();
+    drop(brain);
+    drop(ReviewDb::create_current(&paths).unwrap());
+    let brain_before = fs::read(paths.brain_db()).unwrap();
+    write_managed_file(&paths.review_db(), b"not sqlite");
+
+    ReviewDb::reset(&paths).unwrap();
+
+    assert_eq!(fs::read(paths.brain_db()).unwrap(), brain_before);
+    assert_eq!(
+        fs::metadata(paths.review_db())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let review = ReviewDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    let state = review
+        .read_surface(&review_eligibility(ReviewSurface::Attention, 1, &[]))
+        .unwrap();
+    assert_eq!(state.surface_revision(), 0);
+    let brain = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    assert_eq!(
+        brain
+            .activity_by_id("brain-authority", None, 10, 64 * 1024)
+            .unwrap()
+            .events
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn review_evidence_preserves_canonical_and_opaque_legacy_keys() {
+    let canonical = ReviewKey::derive(ReviewSurface::Attention, b"activity-1");
+    let legacy = ReviewKey::derive(ReviewSurface::Review, &[0xff; 32]);
+    let occurrences = [canonical, legacy]
+        .into_iter()
+        .enumerate()
+        .map(|(index, key)| {
+            ReviewEligibleOccurrence::new(
+                if index == 0 {
+                    ReviewSurface::Attention
+                } else {
+                    ReviewSurface::Review
+                },
+                key,
+                ActivityCursor::try_from(index as u64 + 1).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(occurrences[0].group_id(), canonical.to_string());
+    assert_eq!(occurrences[1].group_id(), legacy.to_string());
+    assert_ne!(
+        ReviewKey::derive(ReviewSurface::Review, occurrences[1].group_id().as_bytes()),
+        legacy,
+        "the stable SQL identity must preserve rather than re-derive the existing key"
+    );
+    ReviewEligibility::try_new(
+        ReviewSurface::Review,
+        Some(ActivityCursor::try_from(2_u64).unwrap()),
+        vec![occurrences[1].clone()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn review_evidence_rejects_cross_surface_keys_before_sql() {
+    let occurrence = ReviewEligibleOccurrence::new(
+        ReviewSurface::Recent,
+        ReviewKey::derive(ReviewSurface::Recent, b"activity-1"),
+        ActivityCursor::try_from(1_u64).unwrap(),
+    );
+
+    assert!(matches!(
+        ReviewEligibility::try_new(
+            ReviewSurface::Attention,
+            Some(ActivityCursor::try_from(1_u64).unwrap()),
+            vec![occurrence],
+        ),
+        Err(StorageError::InvalidStorage(
+            "review occurrence and evidence surfaces disagree"
+        ))
+    ));
+}
+
+#[test]
+fn review_revision_at_sqlite_limit_fails_without_wrapping() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(ReviewDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.review_db());
+    connection
+        .execute(
+            "UPDATE review_meta SET revision = ?1 WHERE surface = 'attention'",
+            [i64::MAX],
+        )
+        .unwrap();
+    drop(connection);
+    let mut db = ReviewDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: i64::MAX as u64,
+                operation: ReviewMutation::UndoLastArchive { expected_count: 0 },
+            },
+            &review_eligibility(ReviewSurface::Attention, 0, &[]),
+        ),
+        Err(StorageError::ReviewRevisionOverflow)
+    ));
+    assert_eq!(
+        open_for_constraints(&paths.review_db())
+            .query_row(
+                "SELECT revision FROM review_meta WHERE surface = 'attention'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        i64::MAX
+    );
+}
+
+#[test]
+fn review_recent_rejects_archive_metadata_even_without_marks() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(ReviewDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.review_db());
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE review_meta
+             SET revision = 1, last_archive_revision = 1
+             WHERE surface = 'recent'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let db = ReviewDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.read_surface(&review_eligibility(ReviewSurface::Recent, 0, &[])),
+        Err(StorageError::InvalidStorage(
+            "Recent contains archive metadata"
+        ))
+    ));
+}
+
+#[test]
+fn review_newer_cursor_resurfaces_the_same_key() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = ReviewDb::create_current(&paths).unwrap();
+    let key = ReviewKey::derive(ReviewSurface::Attention, b"shared-activity");
+    let first = ReviewEligibility::try_new(
+        ReviewSurface::Attention,
+        Some(ActivityCursor::try_from(1_u64).unwrap()),
+        vec![ReviewEligibleOccurrence::new(
+            ReviewSurface::Attention,
+            key,
+            ActivityCursor::try_from(1_u64).unwrap(),
+        )],
+    )
+    .unwrap();
+    db.mutate(
+        &ReviewMutationRequest {
+            surface: ReviewSurface::Attention,
+            expected_surface_revision: 0,
+            operation: ReviewMutation::SetDisposition {
+                keys: [key].into_iter().collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        },
+        &first,
+    )
+    .unwrap();
+    let newer = ReviewEligibility::try_new(
+        ReviewSurface::Attention,
+        Some(ActivityCursor::try_from(2_u64).unwrap()),
+        vec![ReviewEligibleOccurrence::new(
+            ReviewSurface::Attention,
+            key,
+            ActivityCursor::try_from(2_u64).unwrap(),
+        )],
+    )
+    .unwrap();
+
+    assert_eq!(db.read_surface(&newer).unwrap().disposition(&key), None);
+    let result = db
+        .mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: 1,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [key].into_iter().collect(),
+                    disposition: ReviewDisposition::Reviewed,
+                },
+            },
+            &newer,
+        )
+        .unwrap();
+    assert_eq!(result.surface_revision, 2);
+    assert_eq!(result.reviewed_count, 1);
+}
+
+#[test]
+fn review_only_the_latest_archive_batch_is_undoable() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = ReviewDb::create_current(&paths).unwrap();
+    let evidence = review_eligibility(
+        ReviewSurface::Diagnostics,
+        2,
+        &[("diagnostic-a", 1), ("diagnostic-b", 2)],
+    );
+    let a = ReviewKey::derive(ReviewSurface::Diagnostics, b"diagnostic-a");
+    let b = ReviewKey::derive(ReviewSurface::Diagnostics, b"diagnostic-b");
+    db.mutate(
+        &ReviewMutationRequest {
+            surface: ReviewSurface::Diagnostics,
+            expected_surface_revision: 0,
+            operation: ReviewMutation::SetDisposition {
+                keys: [a, b].into_iter().collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        },
+        &evidence,
+    )
+    .unwrap();
+    for (revision, key) in [(1, a), (2, b)] {
+        db.mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Diagnostics,
+                expected_surface_revision: revision,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [key].into_iter().collect(),
+                    disposition: ReviewDisposition::Archived,
+                },
+            },
+            &evidence,
+        )
+        .unwrap();
+    }
+
+    let result = db
+        .mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Diagnostics,
+                expected_surface_revision: 3,
+                operation: ReviewMutation::UndoLastArchive { expected_count: 1 },
+            },
+            &evidence,
+        )
+        .unwrap();
+    assert_eq!(result.archived_count, 1);
+    assert_eq!(result.reviewed_count, 1);
+    assert_eq!(result.last_archive_count, 0);
+    let state = db.read_surface(&evidence).unwrap();
+    assert_eq!(state.disposition(&a), Some(ReviewDisposition::Archived));
+    assert_eq!(state.disposition(&b), Some(ReviewDisposition::Reviewed));
+    assert!(matches!(
+        db.mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Diagnostics,
+                expected_surface_revision: 4,
+                operation: ReviewMutation::UndoLastArchive { expected_count: 1 },
+            },
+            &evidence,
+        ),
+        Err(StorageError::ReviewCountMismatch)
+    ));
+    let unchanged = db.read_surface(&evidence).unwrap();
+    assert_eq!(unchanged.surface_revision(), 4);
+    assert_eq!(unchanged.disposition(&a), Some(ReviewDisposition::Archived));
+}
+
+#[test]
+fn review_archive_all_and_second_archive_undo_cycle_match_pure_rules() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = ReviewDb::create_current(&paths).unwrap();
+    let evidence = review_eligibility(
+        ReviewSurface::Review,
+        2,
+        &[("review-a", 1), ("review-b", 2)],
+    );
+    let a = ReviewKey::derive(ReviewSurface::Review, b"review-a");
+    let b = ReviewKey::derive(ReviewSurface::Review, b"review-b");
+    db.mutate(
+        &ReviewMutationRequest {
+            surface: ReviewSurface::Review,
+            expected_surface_revision: 0,
+            operation: ReviewMutation::SetDisposition {
+                keys: [a, b].into_iter().collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        },
+        &evidence,
+    )
+    .unwrap();
+    let archived = db
+        .mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Review,
+                expected_surface_revision: 1,
+                operation: ReviewMutation::ArchiveAllReviewed { expected_count: 2 },
+            },
+            &evidence,
+        )
+        .unwrap();
+    assert_eq!(
+        (archived.archived_count, archived.last_archive_count),
+        (2, 2)
+    );
+    let first_undo = db
+        .mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Review,
+                expected_surface_revision: 2,
+                operation: ReviewMutation::UndoLastArchive { expected_count: 2 },
+            },
+            &evidence,
+        )
+        .unwrap();
+    assert_eq!(
+        (first_undo.reviewed_count, first_undo.last_archive_count),
+        (2, 0)
+    );
+    db.mutate(
+        &ReviewMutationRequest {
+            surface: ReviewSurface::Review,
+            expected_surface_revision: 3,
+            operation: ReviewMutation::SetDisposition {
+                keys: [a].into_iter().collect(),
+                disposition: ReviewDisposition::Archived,
+            },
+        },
+        &evidence,
+    )
+    .unwrap();
+    let second_undo = db
+        .mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Review,
+                expected_surface_revision: 4,
+                operation: ReviewMutation::UndoLastArchive { expected_count: 1 },
+            },
+            &evidence,
+        )
+        .unwrap();
+    assert_eq!(second_undo.surface_revision, 5);
+    assert_eq!(
+        (second_undo.reviewed_count, second_undo.last_archive_count),
+        (2, 0)
+    );
+}
+
+#[test]
+fn review_prunes_missing_exact_occurrences_and_never_decreases_high_water() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = ReviewDb::create_current(&paths).unwrap();
+    let first = review_eligibility(ReviewSurface::Review, 2, &[("review-a", 1)]);
+    let key = ReviewKey::derive(ReviewSurface::Review, b"review-a");
+    let diagnostics = review_eligibility(ReviewSurface::Diagnostics, 1, &[("diagnostic-a", 1)]);
+    let diagnostic_key = ReviewKey::derive(ReviewSurface::Diagnostics, b"diagnostic-a");
+    db.mutate(
+        &ReviewMutationRequest {
+            surface: ReviewSurface::Diagnostics,
+            expected_surface_revision: 0,
+            operation: ReviewMutation::SetDisposition {
+                keys: [diagnostic_key].into_iter().collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        },
+        &diagnostics,
+    )
+    .unwrap();
+    db.mutate(
+        &ReviewMutationRequest {
+            surface: ReviewSurface::Review,
+            expected_surface_revision: 0,
+            operation: ReviewMutation::SetDisposition {
+                keys: [key].into_iter().collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        },
+        &first,
+    )
+    .unwrap();
+    let missing = review_eligibility(ReviewSurface::Review, 3, &[]);
+    let result = db
+        .mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Review,
+                expected_surface_revision: 1,
+                operation: ReviewMutation::ArchiveAllReviewed { expected_count: 0 },
+            },
+            &missing,
+        )
+        .unwrap();
+    assert_eq!(result.reviewed_count, 0);
+    assert_eq!(result.archived_count, 0);
+    assert_eq!(db.read_surface(&missing).unwrap().source_high_water(), 3);
+    assert!(matches!(
+        db.read_surface(&review_eligibility(ReviewSurface::Review, 2, &[])),
+        Err(StorageError::InvalidStorage(
+            "review evidence source high-water decreased"
+        ))
+    ));
+    let diagnostics_state = db.read_surface(&diagnostics).unwrap();
+    assert_eq!(diagnostics_state.surface_revision(), 1);
+    assert_eq!(
+        diagnostics_state.disposition(&diagnostic_key),
+        Some(ReviewDisposition::Reviewed)
+    );
+}
+
+#[test]
+fn review_busy_deadline_does_not_change_brain_or_review() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut brain = BrainDb::create_current(&paths).unwrap();
+    brain
+        .append_activity(activity_event("brain-busy", 1, ActivityState::Denied))
+        .unwrap();
+    drop(brain);
+    drop(ReviewDb::create_current(&paths).unwrap());
+    let blocker = open_for_constraints(&paths.review_db());
+    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let mut review = ReviewDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(20)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        review.mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::UndoLastArchive { expected_count: 0 },
+            },
+            &review_eligibility(ReviewSurface::Attention, 0, &[]),
+        ),
+        Err(StorageError::Busy)
+    ));
+    let mut brain = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    brain
+        .append_activity(activity_event("brain-busy", 2, ActivityState::Observed))
+        .unwrap();
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    assert_eq!(
+        open_for_constraints(&paths.review_db())
+            .query_row(
+                "SELECT revision FROM review_meta WHERE surface = 'attention'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        brain
+            .activity_by_id("brain-busy", None, 10, 64 * 1024)
+            .unwrap()
+            .events
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn review_adapter_rejects_stale_count_conflict_and_recent_archive() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = ReviewDb::create_current(&paths).unwrap();
+    let evidence = review_eligibility(ReviewSurface::Attention, 1, &[("attention-a", 1)]);
+    let key = ReviewKey::derive(ReviewSurface::Attention, b"attention-a");
+    db.mutate(
+        &ReviewMutationRequest {
+            surface: ReviewSurface::Attention,
+            expected_surface_revision: 0,
+            operation: ReviewMutation::SetDisposition {
+                keys: [key].into_iter().collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        },
+        &evidence,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::ArchiveAllReviewed { expected_count: 1 },
+            },
+            &evidence,
+        ),
+        Err(StorageError::StaleReviewRevision)
+    ));
+    assert!(matches!(
+        db.mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: 1,
+                operation: ReviewMutation::ArchiveAllReviewed { expected_count: 2 },
+            },
+            &evidence,
+        ),
+        Err(StorageError::ReviewCountMismatch)
+    ));
+    assert!(matches!(
+        db.mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: 1,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [key].into_iter().collect(),
+                    disposition: ReviewDisposition::Reviewed,
+                },
+            },
+            &evidence,
+        ),
+        Err(StorageError::ReviewDispositionConflict)
+    ));
+    assert_eq!(db.read_surface(&evidence).unwrap().surface_revision(), 1);
+    assert!(matches!(
+        db.mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Diagnostics,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::UndoLastArchive { expected_count: 0 },
+            },
+            &evidence,
+        ),
+        Err(StorageError::InvalidStorage(
+            "review request and evidence surfaces disagree"
+        ))
+    ));
+
+    let recent = review_eligibility(ReviewSurface::Recent, 1, &[("recent-a", 1)]);
+    let recent_key = ReviewKey::derive(ReviewSurface::Recent, b"recent-a");
+    db.mutate(
+        &ReviewMutationRequest {
+            surface: ReviewSurface::Recent,
+            expected_surface_revision: 0,
+            operation: ReviewMutation::SetDisposition {
+                keys: [recent_key].into_iter().collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        },
+        &recent,
+    )
+    .unwrap();
+    assert!(matches!(
+        db.mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Recent,
+                expected_surface_revision: 1,
+                operation: ReviewMutation::ArchiveAllReviewed { expected_count: 1 },
+            },
+            &recent,
+        ),
+        Err(StorageError::InvalidReviewRequest(
+            ReviewRequestError::UnsupportedOperation
+        ))
+    ));
+}
+
+#[test]
+fn corrupt_review_open_fails_while_brain_remains_readable() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut brain = BrainDb::create_current(&paths).unwrap();
+    brain
+        .append_activity(activity_event(
+            "brain-corrupt-review",
+            1,
+            ActivityState::Denied,
+        ))
+        .unwrap();
+    drop(brain);
+    drop(ReviewDb::create_current(&paths).unwrap());
+    write_managed_file(&paths.review_db(), b"not sqlite");
+
+    assert!(
+        ReviewDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_millis(250)),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        BrainDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap()
+        .activity_by_id("brain-corrupt-review", None, 10, 64 * 1024)
+        .unwrap()
+        .events
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn review_mutation_uses_captured_cursor_when_brain_advances() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut brain = BrainDb::create_current(&paths).unwrap();
+    let first_cursor = brain
+        .append_activity(activity_event(
+            "racing-activity",
+            1,
+            ActivityState::Observed,
+        ))
+        .unwrap();
+    let key = ReviewKey::derive(ReviewSurface::Attention, b"racing-activity");
+    let captured = ReviewEligibility::try_new(
+        ReviewSurface::Attention,
+        Some(first_cursor),
+        vec![ReviewEligibleOccurrence::new(
+            ReviewSurface::Attention,
+            key,
+            first_cursor,
+        )],
+    )
+    .unwrap();
+    let newer_cursor = brain
+        .append_activity(activity_event("racing-activity", 2, ActivityState::Denied))
+        .unwrap();
+    let brain_after_append = fs::read(paths.brain_db()).unwrap();
+    let mut review = ReviewDb::create_current(&paths).unwrap();
+
+    review
+        .mutate(
+            &ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [key].into_iter().collect(),
+                    disposition: ReviewDisposition::Reviewed,
+                },
+            },
+            &captured,
+        )
+        .unwrap();
+    assert_eq!(fs::read(paths.brain_db()).unwrap(), brain_after_append);
+    assert_eq!(brain.activity_high_water().unwrap(), Some(newer_cursor));
+    assert_eq!(
+        review.read_surface(&captured).unwrap().source_high_water(),
+        1
+    );
+
+    let refreshed = ReviewEligibility::try_new(
+        ReviewSurface::Attention,
+        Some(newer_cursor),
+        vec![ReviewEligibleOccurrence::new(
+            ReviewSurface::Attention,
+            key,
+            newer_cursor,
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        review.read_surface(&refreshed).unwrap().disposition(&key),
+        None
+    );
+}
+
+#[test]
+fn review_evidence_capacity_is_rejected_before_sql() {
+    let occurrences = (0..=MAX_REVIEW_KEYS)
+        .map(|index| {
+            let cursor = ActivityCursor::try_from(index as u64 + 1).unwrap();
+            ReviewEligibleOccurrence::new(
+                ReviewSurface::Attention,
+                ReviewKey::derive(ReviewSurface::Attention, &index.to_le_bytes()),
+                cursor,
+            )
+        })
+        .collect();
+
+    assert!(matches!(
+        ReviewEligibility::try_new(
+            ReviewSurface::Attention,
+            Some(ActivityCursor::try_from(MAX_REVIEW_KEYS as u64 + 1).unwrap()),
+            occurrences,
+        ),
+        Err(StorageError::ReviewCapacityExceeded)
+    ));
+}
+
+#[test]
+fn review_evidence_rejects_duplicate_keys_and_cursors_above_high_water() {
+    let first_cursor = ActivityCursor::try_from(1_u64).unwrap();
+    let second_cursor = ActivityCursor::try_from(2_u64).unwrap();
+    let key = ReviewKey::derive(ReviewSurface::Attention, b"duplicate");
+    let occurrence = ReviewEligibleOccurrence::new(ReviewSurface::Attention, key, first_cursor);
+
+    assert!(matches!(
+        ReviewEligibility::try_new(
+            ReviewSurface::Attention,
+            Some(first_cursor),
+            vec![occurrence.clone(), occurrence],
+        ),
+        Err(StorageError::InvalidStorage(
+            "review evidence contains duplicate keys"
+        ))
+    ));
+    assert!(matches!(
+        ReviewEligibility::try_new(
+            ReviewSurface::Attention,
+            Some(first_cursor),
+            vec![ReviewEligibleOccurrence::new(
+                ReviewSurface::Attention,
+                ReviewKey::derive(ReviewSurface::Attention, b"too-new"),
+                second_cursor,
+            )],
+        ),
+        Err(StorageError::InvalidStorage(
+            "review cursor exceeds its source high-water"
+        ))
+    ));
+}
+
+#[test]
+fn review_surface_lookup_uses_the_bounded_primary_index() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(ReviewDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.review_db());
+    let detail = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT group_id, source_cursor, disposition, revision
+             FROM review_marks INDEXED BY sqlite_autoindex_review_marks_1
+             WHERE surface = ?1
+             ORDER BY group_id, source_cursor
+             LIMIT ?2",
+        )
+        .unwrap()
+        .query_map(params!["attention", MAX_REVIEW_KEYS as i64 + 1], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+
+    assert!(
+        detail.contains("sqlite_autoindex_review_marks_1"),
+        "{detail}"
+    );
+    assert!(detail.contains("surface=?"), "{detail}");
+}
+
+#[test]
+fn review_reset_rejects_unsafe_sidecars_and_path_substitution() {
+    for attack in [
+        "sidecar-symlink",
+        "sidecar-mode",
+        "sidecar-hardlink",
+        "gate-symlink",
+        "gate-mode",
+        "gate-hardlink",
+        "database-symlink",
+        "database-hardlink",
+    ] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        drop(ReviewDb::create_current(&paths).unwrap());
+        let brain_before = fs::read(paths.brain_db()).unwrap();
+        let outside = root.path().join("outside");
+        write_managed_file(&outside, b"outside");
+        match attack {
+            "sidecar-symlink" => {
+                symlink(&outside, paths.db_dir().join("review.sqlite3-wal")).unwrap();
+            }
+            "sidecar-mode" => {
+                let sidecar = paths.db_dir().join("review.sqlite3-journal");
+                fs::write(&sidecar, b"unsafe").unwrap();
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            "sidecar-hardlink" => {
+                fs::hard_link(&outside, paths.db_dir().join("review.sqlite3-journal")).unwrap();
+            }
+            "gate-symlink" => {
+                fs::remove_file(paths.db_dir().join("review-reset.lock")).unwrap();
+                symlink(&outside, paths.db_dir().join("review-reset.lock")).unwrap();
+            }
+            "gate-mode" => {
+                fs::set_permissions(
+                    paths.db_dir().join("review-reset.lock"),
+                    fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            }
+            "gate-hardlink" => {
+                fs::remove_file(&outside).unwrap();
+                fs::hard_link(paths.db_dir().join("review-reset.lock"), &outside).unwrap();
+            }
+            "database-symlink" => {
+                fs::remove_file(paths.review_db()).unwrap();
+                symlink(&outside, paths.review_db()).unwrap();
+            }
+            "database-hardlink" => {
+                fs::remove_file(&outside).unwrap();
+                fs::hard_link(paths.review_db(), &outside).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let outside_before = fs::read(&outside).unwrap();
+
+        assert!(matches!(
+            ReviewDb::reset(&paths),
+            Err(StorageError::InvalidStorage(_))
+        ));
+        assert_eq!(fs::read(&outside).unwrap(), outside_before);
+        assert_eq!(fs::read(paths.brain_db()).unwrap(), brain_before);
+    }
+}
+
+const REVIEW_GATE_CHILD_ROOT: &str = "CODING_BRAIN_REVIEW_GATE_CHILD_ROOT";
+
+#[test]
+#[ignore = "subprocess helper"]
+fn review_reset_gate_child() {
+    let Some(root) = std::env::var_os(REVIEW_GATE_CHILD_ROOT) else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let paths = StoragePaths::at(&root);
+    let _review = ReviewDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(5)),
+    )
+    .unwrap();
+    fs::write(root.join("review-gate-ready"), b"ready").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !root.join("review-gate-release").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "parent did not release gate child"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn review_reset_is_busy_while_another_process_holds_a_connection() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(ReviewDb::create_current(&paths).unwrap());
+    let inode_before = fs::metadata(paths.review_db()).unwrap().ino();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "review_reset_gate_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(REVIEW_GATE_CHILD_ROOT, root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while !root.path().join("review-gate-ready").exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "review gate child did not become ready"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let reset = ReviewDb::reset(&paths);
+    let inode_after = fs::metadata(paths.review_db()).unwrap().ino();
+    fs::write(root.path().join("review-gate-release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "gate child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(matches!(reset, Err(StorageError::Busy)));
+    assert_eq!(
+        inode_after, inode_before,
+        "Busy reset replaced the main inode"
+    );
+    ReviewDb::reset(&paths).unwrap();
+}
+
+#[test]
+fn review_reset_is_busy_while_a_local_connection_is_alive() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let review = ReviewDb::create_current(&paths).unwrap();
+    let inode_before = fs::metadata(paths.review_db()).unwrap().ino();
+
+    assert!(matches!(ReviewDb::reset(&paths), Err(StorageError::Busy)));
+    assert_eq!(fs::metadata(paths.review_db()).unwrap().ino(), inode_before);
+    assert_eq!(review.user_version().unwrap(), REVIEW_SCHEMA_VERSION);
+    drop(review);
+    ReviewDb::reset(&paths).unwrap();
 }

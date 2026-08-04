@@ -91,9 +91,9 @@ Record any pre-existing failure on `codexctl-dzlb9`; do not attribute it to the 
 | `activity_events` | Primary key `source_cursor` with `1..=i64::MAX` check; indexed, non-unique logical activity ID permits observed/terminal/delivery/outcome/correction rows for one activity; typed terminal action/identity columns retain the composite uniqueness required by permission-commit references. | Cursor pages, activity ID, permission identity, outcome, correction, and distillation indexes. |
 | `permission_commits` | One row per attempt; unique decision and terminal activity references; composite foreign keys require matching authority identity/action across attempt, decision, and terminal event; closed action/evidence/delivery domains; boolean `response_eligible` check. | Exact attempt/request authority and undelivered-audit lookup. |
 | lifecycle session/turn/invocation tables | Provider-qualified composite keys, bounded sequence values, and foreign keys from turns/invocations to sessions; no duplicate active identity. | Exact provider/session/turn and active-topology indexes. |
-| review `review_meta` / `review_marks` | Per-surface revision; exact surface/group/source-cursor key; closed disposition domain; no Brain tables or attachments. | Exact surface revision and bounded cursor-mark lookup. |
+| review `review_meta` / `review_marks` | Per-surface revision; nullable latest archive revision constrained to `1..=revision` and always null for Recent; exact surface/group/source-cursor key; closed disposition domain; no Brain tables or attachments. | Exact surface revision and bounded cursor-mark lookup. |
 
-The checked-in schema fixture is authoritative. Approved pre-activation corrections amend schema v1 because no production activation or migration has occurred: Task 3 removes only accidental single-column `activity_id` uniqueness while retaining the terminal-identity composite authority key; Task 4 adds typed non-authoritative observation identities and a bounded complete learning payload without weakening permission identity constraints. Any later DDL change must update its version, fixture, invariant tests, and supported-upgrade coverage before the same atomic commit.
+The checked-in schema fixture is authoritative. Approved pre-activation corrections amend schema v1 because no production activation or migration has occurred: Task 3 removes only accidental single-column `activity_id` uniqueness while retaining the terminal-identity composite authority key; Task 4 adds typed non-authoritative observation identities and a bounded complete learning payload without weakening permission identity constraints; Task 5 adds `review_meta.last_archive_revision` so undo cannot promote an older archived batch after the newest batch is undone. Any later DDL change must update its version, fixture, invariant tests, and supported-upgrade coverage before the same atomic commit.
 
 - [ ] **Step 1: Write failing foundation tests**
 
@@ -405,6 +405,8 @@ git commit -m "🔒 feat: make SQLite learning payload erasable (codexctl-2o9fo)
 - Revision conflicts, independent surfaces, archive/undo/reset, count validation, and new-occurrence resurfacing match current behavior.
 - Review corruption/busy state degrades review operations without disabling coherent Brain reads or permissions.
 - A review mark hides only its exact validated source cursor; later cursors always resurface and missing-cursor marks are harmless, pruneable orphans.
+- `last_archive_revision` records only a nonempty newest archive batch. Undo clears that slot, and pruning clears it when no exact rows from the remembered batch remain; older archived rows never become undoable again.
+- Every Review connection holds a shared owner-only reset gate. Reset takes it exclusively before SQLite access, returns Busy while any connection remains alive, and keeps it through deletion and direct recreation.
 
 - [ ] **Step 1: Add failing isolation tests**
 
