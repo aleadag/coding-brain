@@ -269,6 +269,7 @@ git commit -m "♻️ refactor: separate lifecycle state from persistence (codex
 **Interfaces:**
 - Produces: `BrainDb::{append_activity,append_activity_batch,read_activity_page,activity_by_id,activity_after_cursor}`.
 - Produces: `ActivityPage { events, next_cursor, serialized_bytes }` and `ActivityCursor(u64)`.
+- `activity_by_id` and ascending cursor reads accept an exclusive `after` cursor; recent reads accept an exclusive descending `before` cursor. `next_cursor` is present only when bounded lookahead proves another matching row remains.
 - Consumes: existing `ActivityEvent`, `ActivityLog`, projection limits, and redaction validation.
 
 **Acceptance Criteria:**

@@ -286,7 +286,9 @@ storage failure never turns a deterministic deny into native/model approval.
 All interactive and hook queries use exact keys or indexed cursors plus
 explicit row and serialized-byte limits. Live, Review, Scorecard, Diagnostics,
 distillation, outcome correlation, and Doctor must not rely on unbounded table
-scans.
+scans. Bounded activity pages expose an exclusive continuation cursor only when
+lookahead proves another matching row remains; logical activity-ID queries can
+continue from that cursor without conflating truncation and end-of-data.
 
 The implementation must inspect critical query plans and reject accidental
 full scans in regression tests. Permission commit cost must not grow with total

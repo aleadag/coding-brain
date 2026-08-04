@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::num::NonZeroU64;
 
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivitySnapshot,
     ActivityState, CorrectionDisposition, MAX_ACTIVITY_EVENT_BYTES, SnapshotLimits,
 };
-use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use super::{BrainDb, StorageDeadline, StorageError};
 
@@ -55,6 +56,7 @@ pub struct ActivityRecord {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ActivityPage {
     pub events: Vec<ActivityRecord>,
+    /// Exclusive boundary for the next page, or `None` when this query reached EOF.
     pub next_cursor: Option<ActivityCursor>,
     pub serialized_bytes: usize,
 }
@@ -63,7 +65,8 @@ impl ActivityPage {
     /// Projects a caller-assembled window whose logical activity sequences are complete.
     ///
     /// A single bounded page can end between events for one logical activity. Callers
-    /// must join the needed pages or use `activity_by_id` before using this seam.
+    /// must join the needed pages (including all needed `activity_by_id` pages)
+    /// before using this seam.
     pub fn project_complete_window(
         mut self,
         limits: SnapshotLimits,
@@ -154,9 +157,7 @@ impl BrainDb {
             insert_activity(&transaction, cursor, activity)?;
             cursors.push(ActivityCursor::try_from(cursor)?);
         }
-        ensure_deadline(self.deadline)?;
-        transaction.commit()?;
-        ensure_deadline(self.deadline)?;
+        commit_before_deadline(self.deadline, || transaction.commit())?;
         Ok(cursors)
     }
 
@@ -168,7 +169,7 @@ impl BrainDb {
     ) -> Result<ActivityPage, StorageError> {
         validate_page_limits(max_rows, max_bytes)?;
         apply_deadline(&self.connection, self.deadline)?;
-        let row_limit = sql_row_limit(max_rows)?;
+        let row_limit = sql_query_limit(max_rows)?;
         let mut statement = match before {
             Some(_) => self.connection.prepare(
                 "SELECT source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
@@ -190,12 +191,19 @@ impl BrainDb {
             Some(cursor) => statement.query(params![cursor_i64(cursor), row_limit])?,
             None => statement.query([row_limit])?,
         };
-        materialize_page(&mut rows, max_bytes, self.deadline)
+        materialize_page(
+            &self.connection,
+            &mut rows,
+            max_rows,
+            max_bytes,
+            self.deadline,
+        )
     }
 
     pub fn activity_by_id(
         &self,
         activity_id: &str,
+        after: Option<ActivityCursor>,
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<ActivityPage, StorageError> {
@@ -209,11 +217,21 @@ impl BrainDb {
                     terminal_provider, terminal_session_id, terminal_turn_id,
                     terminal_tool_use_id, terminal_action, outcome, correction, event_payload
              FROM activity_events INDEXED BY activity_events_activity_id
-             WHERE activity_id = ?1
-             ORDER BY source_cursor ASC LIMIT ?2",
+             WHERE activity_id = ?1 AND source_cursor > ?2
+             ORDER BY source_cursor ASC LIMIT ?3",
         )?;
-        let mut rows = statement.query(params![activity_id, sql_row_limit(max_rows)?])?;
-        materialize_page(&mut rows, max_bytes, self.deadline)
+        let mut rows = statement.query(params![
+            activity_id,
+            after.map_or(0, cursor_i64),
+            sql_query_limit(max_rows)?
+        ])?;
+        materialize_page(
+            &self.connection,
+            &mut rows,
+            max_rows,
+            max_bytes,
+            self.deadline,
+        )
     }
 
     pub fn activity_after_cursor(
@@ -233,8 +251,14 @@ impl BrainDb {
              WHERE source_cursor > ?1
              ORDER BY source_cursor ASC LIMIT ?2",
         )?;
-        let mut rows = statement.query(params![after, sql_row_limit(max_rows)?])?;
-        materialize_page(&mut rows, max_bytes, self.deadline)
+        let mut rows = statement.query(params![after, sql_query_limit(max_rows)?])?;
+        materialize_page(
+            &self.connection,
+            &mut rows,
+            max_rows,
+            max_bytes,
+            self.deadline,
+        )
     }
 
     pub fn activity_high_water(&self) -> Result<Option<ActivityCursor>, StorageError> {
@@ -255,13 +279,12 @@ impl BrainDb {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validated_high_water(&transaction)?;
         let deleted = transaction.execute(
             "DELETE FROM activity_events WHERE source_cursor < ?1",
             [cursor_i64(cursor)],
         )?;
-        ensure_deadline(self.deadline)?;
-        transaction.commit()?;
-        ensure_deadline(self.deadline)?;
+        commit_before_deadline(self.deadline, || transaction.commit())?;
         Ok(deleted)
     }
 
@@ -281,6 +304,16 @@ impl BrainDb {
             "EXPLAIN QUERY PLAN
              SELECT source_cursor FROM activity_events INDEXED BY activity_events_activity_id
              WHERE activity_id = 'query-plan-probe' ORDER BY source_cursor ASC LIMIT 100",
+            self.deadline,
+        )
+    }
+
+    pub fn explain_activity_after_cursor(&self) -> Result<String, StorageError> {
+        explain_query(
+            &self.connection,
+            "EXPLAIN QUERY PLAN
+             SELECT source_cursor FROM activity_events INDEXED BY activity_events_cursor
+             WHERE source_cursor > 0 ORDER BY source_cursor ASC LIMIT 100",
             self.deadline,
         )
     }
@@ -396,13 +429,20 @@ fn insert_activity(
 }
 
 fn materialize_page(
+    connection: &Connection,
     rows: &mut rusqlite::Rows<'_>,
+    max_rows: usize,
     max_bytes: usize,
     deadline: Option<StorageDeadline>,
 ) -> Result<ActivityPage, StorageError> {
     let mut page = ActivityPage::default();
+    let mut validated_activity_ids = HashSet::new();
     while let Some(row) = rows.next()? {
         ensure_deadline(deadline)?;
+        if page.events.len() == max_rows {
+            page.next_cursor = page.events.last().map(|record| record.cursor);
+            break;
+        }
         let payload = row.get::<_, Vec<u8>>(12)?;
         let next_bytes = page.serialized_bytes.checked_add(payload.len()).ok_or(
             StorageError::InvalidStorage("activity page byte count overflowed"),
@@ -413,10 +453,13 @@ fn materialize_page(
                     "activity byte limit cannot hold the next event",
                 ));
             }
+            page.next_cursor = page.events.last().map(|record| record.cursor);
             break;
         }
         let record = decode_activity_row(row, &payload)?;
-        page.next_cursor = Some(record.cursor);
+        if validated_activity_ids.insert(record.event.activity_id.clone()) {
+            ensure_single_activity_kind(connection, &record.event, deadline)?;
+        }
         page.events.push(record);
         page.serialized_bytes = next_bytes;
     }
@@ -487,9 +530,11 @@ fn validate_page_limits(max_rows: usize, max_bytes: usize) -> Result<(), Storage
     }
 }
 
-fn sql_row_limit(max_rows: usize) -> Result<i64, StorageError> {
-    i64::try_from(max_rows)
-        .map_err(|_| StorageError::InvalidStorage("activity row limit is out of range"))
+fn sql_query_limit(max_rows: usize) -> Result<i64, StorageError> {
+    i64::try_from(max_rows.checked_add(1).ok_or(StorageError::InvalidStorage(
+        "activity row limit is out of range",
+    ))?)
+    .map_err(|_| StorageError::InvalidStorage("activity row limit is out of range"))
 }
 
 fn cursor_i64(cursor: ActivityCursor) -> i64 {
@@ -498,6 +543,40 @@ fn cursor_i64(cursor: ActivityCursor) -> i64 {
 
 fn ensure_deadline(deadline: Option<StorageDeadline>) -> Result<(), StorageError> {
     deadline.map_or(Ok(()), StorageDeadline::ensure_remaining)
+}
+
+fn commit_before_deadline<T>(
+    deadline: Option<StorageDeadline>,
+    commit: impl FnOnce() -> rusqlite::Result<T>,
+) -> Result<T, StorageError> {
+    ensure_deadline(deadline)?;
+    // The deadline gates entry to commit. Once SQLite reports commit success, that
+    // durable result is authoritative even if the wall-clock deadline has crossed.
+    Ok(commit()?)
+}
+
+fn ensure_single_activity_kind(
+    connection: &Connection,
+    event: &ActivityEvent,
+    deadline: Option<StorageDeadline>,
+) -> Result<(), StorageError> {
+    ensure_deadline(deadline)?;
+    let conflict = connection
+        .query_row(
+            "SELECT 1 FROM activity_events INDEXED BY activity_events_activity_id
+             WHERE activity_id = ?1 AND event_kind <> ?2 LIMIT 1",
+            params![event.activity_id, activity_kind(event.kind)],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    ensure_deadline(deadline)?;
+    if conflict.is_some() {
+        Err(StorageError::InvalidStorage(
+            "one logical activity contains mixed event kinds",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn apply_deadline(

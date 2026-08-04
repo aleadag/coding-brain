@@ -64,9 +64,12 @@ fn sqlite_activity_scale_reads_use_frozen_indexes() {
     db.append_activity_batch(&events).unwrap();
 
     let recent_plan = db.explain_recent_activity().unwrap();
+    let after_plan = db.explain_activity_after_cursor().unwrap();
     let id_plan = db.explain_activity_by_id().unwrap();
     assert!(recent_plan.contains("activity_events_cursor"));
     assert!(recent_plan.contains("USING COVERING INDEX"));
+    assert!(after_plan.contains("activity_events_cursor"));
+    assert!(after_plan.contains("source_cursor>?"));
     assert!(id_plan.contains("activity_events_activity_id"));
     let recent = db.read_activity_page(None, 100, 1024 * 1024).unwrap();
     assert_eq!(recent.events.len(), 100);

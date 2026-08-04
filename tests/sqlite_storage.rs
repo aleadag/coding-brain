@@ -108,7 +108,7 @@ fn activity_cursor_allows_repeated_logical_ids_and_survives_delete() {
 
     assert!(second > first);
     assert_eq!(
-        db.activity_by_id("activity-1", 10, 64 * 1024)
+        db.activity_by_id("activity-1", None, 10, 64 * 1024)
             .unwrap()
             .events
             .len(),
@@ -131,11 +131,11 @@ fn activity_batch_is_atomic_and_keeps_high_water_on_failure() {
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     let mut db = BrainDb::create_current(&paths).unwrap();
-    let mut invalid = activity_event("invalid", 2, ActivityState::Denied);
-    invalid.schema_version = ACTIVITY_SCHEMA_VERSION + 1;
+    let duplicate =
+        identified_activity_event("duplicate", 1, ActivityState::Denied, AgentProvider::Codex);
 
     assert!(
-        db.append_activity_batch(&[activity_event("valid", 1, ActivityState::Denied), invalid,])
+        db.append_activity_batch(&[duplicate.clone(), duplicate])
             .is_err()
     );
     assert!(
@@ -214,6 +214,7 @@ fn activity_pages_are_bounded_and_ordered_by_cursor() {
             .collect::<Vec<_>>(),
         [cursors[0]]
     );
+    assert_eq!(older.next_cursor, None);
 
     let ascending = db.activity_after_cursor(None, 2, 128 * 1024).unwrap();
     assert_eq!(
@@ -231,6 +232,7 @@ fn activity_pages_are_bounded_and_ordered_by_cursor() {
         rest.events.iter().map(|row| row.cursor).collect::<Vec<_>>(),
         [cursors[2]]
     );
+    assert_eq!(rest.next_cursor, None);
     assert!(
         db.activity_after_cursor(Some(cursors[2]), 2, 128 * 1024)
             .unwrap()
@@ -246,13 +248,16 @@ fn activity_pages_are_bounded_and_ordered_by_cursor() {
         db.activity_after_cursor(None, 3, one_payload_bytes - 1),
         Err(StorageError::InvalidStorage(_))
     ));
-    assert_eq!(
-        db.activity_after_cursor(None, 3, one_payload_bytes)
-            .unwrap()
-            .events
-            .len(),
-        1
-    );
+    let byte_page = db
+        .activity_after_cursor(None, 3, one_payload_bytes)
+        .unwrap();
+    assert_eq!(byte_page.events.len(), 1);
+    assert_eq!(byte_page.next_cursor, Some(cursors[0]));
+    let byte_rest = db
+        .activity_after_cursor(byte_page.next_cursor, 3, 128 * 1024)
+        .unwrap();
+    assert_eq!(byte_rest.events.len(), 2);
+    assert_eq!(byte_rest.next_cursor, None);
     assert!(db.activity_after_cursor(None, 0, 1).is_err());
     assert!(db.activity_after_cursor(None, 1, 0).is_err());
 }
@@ -274,7 +279,7 @@ fn activity_terminal_identity_keeps_opposite_actions_and_rejects_same_action_dup
     db.append_activity(denied.clone()).unwrap();
     db.append_activity(allowed).unwrap();
     assert_eq!(
-        db.activity_by_id("permission", 10, 128 * 1024)
+        db.activity_by_id("permission", None, 10, 128 * 1024)
             .unwrap()
             .events
             .len(),
@@ -283,7 +288,7 @@ fn activity_terminal_identity_keeps_opposite_actions_and_rejects_same_action_dup
     assert!(db.append_activity(denied).is_err());
     assert_eq!(db.activity_high_water().unwrap().unwrap().get(), 2);
     assert_eq!(
-        db.activity_by_id("permission", 10, 128 * 1024)
+        db.activity_by_id("permission", None, 10, 128 * 1024)
             .unwrap()
             .project_complete_window(SnapshotLimits::default(), 3)
             .diagnostics
@@ -354,6 +359,143 @@ fn activity_high_water_rejects_a_value_below_retained_rows() {
     ));
     assert!(matches!(
         db.append_activity(activity_event("next", 2, ActivityState::Denied)),
+        Err(StorageError::InvalidStorage(_))
+    ));
+}
+
+#[test]
+fn activity_retention_cannot_hide_a_lowered_high_water() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    db.append_activity_batch(&[
+        activity_event("first", 1, ActivityState::Denied),
+        activity_event("second", 2, ActivityState::Denied),
+    ])
+    .unwrap();
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute("UPDATE schema_meta SET activity_high_water = 1", [])
+        .unwrap();
+    drop(connection);
+    let mut db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.delete_activity_before(ActivityCursor::try_from(3_u64).unwrap()),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert!(matches!(
+        db.append_activity(activity_event("third", 3, ActivityState::Denied)),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM activity_events", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn activity_id_pages_reconstruct_repeated_logical_sequence() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let mut observed = activity_event("sequence", 1, ActivityState::Observed);
+    observed.normalized_command = None;
+    observed.fingerprint = None;
+    observed.reasoning = None;
+    db.append_activity_batch(&[
+        observed,
+        activity_event("sequence", 2, ActivityState::Denied),
+        activity_event("sequence", 3, ActivityState::Delivered),
+    ])
+    .unwrap();
+
+    let mut after = None;
+    let mut states = Vec::new();
+    loop {
+        let page = db.activity_by_id("sequence", after, 1, 64 * 1024).unwrap();
+        states.extend(page.events.into_iter().map(|row| row.event.state));
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        after = Some(cursor);
+    }
+    assert_eq!(
+        states,
+        [
+            ActivityState::Observed,
+            ActivityState::Denied,
+            ActivityState::Delivered
+        ]
+    );
+
+    let first_bytes = db
+        .activity_by_id("sequence", None, 1, 64 * 1024)
+        .unwrap()
+        .serialized_bytes;
+    let first = db
+        .activity_by_id("sequence", None, 10, first_bytes)
+        .unwrap();
+    assert_eq!(first.events.len(), 1);
+    assert!(first.next_cursor.is_some());
+    let rest = db
+        .activity_by_id("sequence", first.next_cursor, 10, 64 * 1024)
+        .unwrap();
+    assert_eq!(rest.events.len(), 2);
+    assert_eq!(rest.next_cursor, None);
+}
+
+#[test]
+fn activity_read_rejects_mixed_kinds_even_when_rows_straddle_pages() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    db.append_activity(activity_event("mixed", 1, ActivityState::Denied))
+        .unwrap();
+    drop(db);
+    let mut diagnostic = activity_event("mixed", 2, ActivityState::Error);
+    diagnostic.kind = ActivityKind::Diagnostic;
+    diagnostic.decision_id = None;
+    let diagnostic = diagnostic.normalized();
+    let payload = serde_json::to_vec(&diagnostic).unwrap();
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute(
+            "INSERT INTO activity_events (
+                source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+                event_payload
+             ) VALUES (2, 'mixed', 'diagnostic', 'error', 2, ?1)",
+            [payload],
+        )
+        .unwrap();
+    connection
+        .execute("UPDATE schema_meta SET activity_high_water = 2", [])
+        .unwrap();
+    drop(connection);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.activity_by_id("mixed", None, 1, 64 * 1024),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert!(matches!(
+        db.activity_after_cursor(None, 1, 64 * 1024),
         Err(StorageError::InvalidStorage(_))
     ));
 }
@@ -432,6 +574,9 @@ fn activity_queries_use_frozen_indexes() {
             .unwrap()
             .contains("activity_events_activity_id")
     );
+    let after_plan = db.explain_activity_after_cursor().unwrap();
+    assert!(after_plan.contains("activity_events_cursor"));
+    assert!(after_plan.contains("source_cursor>?"));
     assert!(
         db.explain_recent_activity()
             .unwrap()
@@ -472,7 +617,17 @@ fn activity_round_trip_preserves_supported_kinds_states_and_providers() {
     correction.correction = Some(CorrectionDisposition::BrainWrong);
     correction.note = Some("token secret-value".into());
     events.push(correction);
-    let mut lifecycle = activity_event("lifecycle", 12, ActivityState::Abstained);
+    let mut cancelled = activity_event("cancelled", 12, ActivityState::Outcome);
+    cancelled.outcome = Some(ActivityOutcome::Cancelled);
+    events.push(cancelled);
+    let mut completed = activity_event("completed", 13, ActivityState::Outcome);
+    completed.outcome = Some(ActivityOutcome::Completed);
+    events.push(completed);
+    let mut exception = activity_event("exception", 14, ActivityState::Correction);
+    exception.correction = Some(CorrectionDisposition::Exception);
+    exception.note = Some("bounded exception".into());
+    events.push(exception);
+    let mut lifecycle = activity_event("lifecycle", 15, ActivityState::Abstained);
     lifecycle.kind = ActivityKind::Lifecycle;
     lifecycle.decision_id = None;
     lifecycle.normalized_command = None;
@@ -480,7 +635,7 @@ fn activity_round_trip_preserves_supported_kinds_states_and_providers() {
     lifecycle.confidence = None;
     lifecycle.threshold = None;
     events.push(lifecycle);
-    let mut diagnostic = activity_event("diagnostic", 13, ActivityState::Error);
+    let mut diagnostic = activity_event("diagnostic", 16, ActivityState::Error);
     diagnostic.kind = ActivityKind::Diagnostic;
     diagnostic.decision_id = None;
     events.push(diagnostic);
