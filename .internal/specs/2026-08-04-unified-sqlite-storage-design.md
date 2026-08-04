@@ -58,9 +58,6 @@ indexed, transactional storage and migration machinery.
   them.
 - Do not migrate `session-links.jsonl`. It remains bounded identity evidence
   shared by `coding-brain-core` navigation, guarded actions, and recovery.
-- Do not move non-permission provider topology out of
-  `hooks/lifecycle.json`. Only permission disposition and authority leave that
-  snapshot.
 - Do not continuously mirror SQLite writes into legacy JSONL.
 - Do not infer delivery, tool execution, or permission authority from missing
   events, transcripts, legacy proposals, or unresolved migration evidence.
@@ -69,9 +66,11 @@ indexed, transactional storage and migration machinery.
 
 ## Chosen Approach
 
-Use one relational SQLite database with typed and indexed columns for stable,
-query-critical fields. Retain bounded JSON only for provider-specific or
-evolving payloads that do not determine permission authority.
+Use one relational SQLite database for authoritative Brain and lifecycle state,
+plus a separate SQLite database for disposable operational review state. Use
+typed and indexed columns for stable, query-critical fields. Retain bounded JSON
+only for provider-specific or evolving payloads that do not determine
+permission authority.
 
 This is preferred over a single JSON event table because database constraints
 should enforce the permission boundary rather than merely store the existing
@@ -81,32 +80,37 @@ surface.
 
 ## Storage Boundary
 
-The canonical file is:
+The canonical files are:
 
 ```text
-$XDG_STATE_HOME/coding-brain/brain.sqlite3
+$XDG_STATE_HOME/coding-brain/db/brain.sqlite3
+$XDG_STATE_HOME/coding-brain/db/review.sqlite3
 ```
 
-with the existing fallback to `~/.local/state/coding-brain/brain.sqlite3`.
-The containing directory remains owner-only. The database, rollback journal,
-WAL, and shared-memory files must be regular, single-link, current-user files
-with owner-only permissions.
+with the existing fallback under `~/.local/state/coding-brain/db/`. The
+dedicated database directory remains owner-only and contains only
+SQLite-managed files. The databases, rollback journals, WALs, and shared-memory
+files must be regular, single-link, current-user files with owner-only
+permissions.
 
 The binary Brain storage layer owns database creation, migrations, queries,
 permission commits, activity appends, learning reads, review state, and
 exports. Core activity and lifecycle types remain reusable data contracts.
-Non-permission `LifecycleStore` topology and `SessionLinkStore` stay in
-`coding-brain-core`.
+`coding-brain-core` retains pure lifecycle types and projection logic, while
+the binary store owns persistence for the complete lifecycle snapshot.
+`SessionLinkStore` remains in `coding-brain-core` and stays JSONL-backed.
 
-Use `rusqlite` with bundled SQLite so Linux, musl artifacts, and macOS do not
-depend on an ambient runtime SQLite library. Enable foreign keys on every
-connection. Use WAL after canonical publication; use a self-contained journal
-mode for a migration staging database and checkpoint it fully before rename.
+Use `rusqlite` only in the root binary crate, with bundled SQLite so Linux, musl
+artifacts, and macOS do not depend on an ambient runtime SQLite library. Enable
+foreign keys on every connection. Use WAL after canonical publication; use a
+self-contained journal mode for migration staging databases and checkpoint them
+fully before rename. Never `ATTACH` the Brain and review databases or imply
+cross-database atomicity.
 
 ## Logical Schema
 
-The implementation plan will spell out exact SQL, but the following tables and
-constraints are part of the design contract.
+The implementation plan will spell out exact SQL, but the following Brain and
+review tables and constraints are part of the design contract.
 
 ### `schema_meta`
 
@@ -118,8 +122,10 @@ One row records:
 - legacy schema versions imported;
 - migration completion timestamp.
 
-The database is usable only when the application identifier and supported
-schema version match and the migration generation is complete.
+The database is usable only when SQLite `application_id`, `user_version`, the
+richer metadata, and the supported schema version agree and the migration
+generation is complete. The metadata also stores a nondecreasing activity
+high-water cursor and the frozen legacy export profile.
 
 ### `permission_attempts`
 
@@ -127,36 +133,43 @@ Each row represents one exact permission request. It stores a canonical,
 validated request-identity key plus typed provider, session, provider-session,
 turn, request-key, project, tool, activity ID, state, and timestamps.
 
-The request-identity key is unique and includes the complete validated
-lifecycle identity plus request key. It avoids nullable-column uniqueness
-ambiguity and selects one winner across processes. Attempt states distinguish
-evaluation in progress, native/needs-input disposition, committed decision,
-and legacy incomplete evidence. An attempt state alone never grants executable
-authority.
+The request-identity key includes the complete validated lifecycle identity
+plus request key and is indexed but not permanently unique. Every invocation
+has a unique attempt ID. The existing owner-only per-request OS advisory lock
+selects one concurrently active winner; it stores no authority. A later
+sequential invocation with identical request content may create another
+attempt. Attempt states distinguish evaluation in progress,
+native/needs-input disposition, committed decision, and legacy incomplete
+evidence. An attempt state alone never grants executable authority.
 
 The winner transaction also appends the initial `Observed` and `Evaluating`
 activity rows. Model inference runs only after that transaction commits and
 outside all database transactions. A stale evaluation remains a projection as
 `Incomplete`; elapsed time does not serialize an execution outcome.
 
-### `decisions`
+### `decision_identities` and `decision_payloads`
 
-Each decision or learning-evidence row has a unique decision ID and typed record
-kind, provider, session, turn, project, tool, normalized command, action,
-confidence, threshold, source, reasoning, user action, decision type, and
-timestamps. This includes hook proposals and the existing non-hook learning
-records carried by `decisions.jsonl`. Bounded JSON may retain validated provider
-metadata that is not part of authority.
+Each identity row has a unique decision ID and only the immutable correlation
+and authority facts required by the audit. Each optional payload row contains
+the typed record kind, provider, session, turn, project, tool, normalized
+command, action, confidence, threshold, source, reasoning, user action,
+decision type, timestamps, and bounded provider metadata used for learning.
+This includes hook proposals and the existing non-hook learning records carried
+by `decisions.jsonl`.
 
 Proposal existence does not grant permission authority and does not prove that
-the provider received a response or executed a tool.
+the provider received a response or executed a tool. `forget()` deletes
+payloads and learning marks while retaining the minimal identities required by
+immutable permission and activity audit relationships.
 
 ### `permission_commits`
 
 Each row is an immutable authoritative permission commit. It has a one-to-one
-relationship with a permission attempt and references exactly one proposal and
-one terminal activity event. It stores the immutable `Allow` or `Deny` action,
-the exact authority identity, commit timestamp, and transaction identifier.
+relationship with a permission attempt and references exactly one decision
+identity and one terminal activity event. It stores the immutable `Allow` or
+`Deny` action, the exact authority identity, commit timestamp, transaction
+identifier, evidence basis, and whether the current invocation is eligible to
+emit a response.
 
 Foreign keys and uniqueness constraints require the attempt identity,
 proposal, authority action, decision ID, activity ID, and terminal state to
@@ -165,10 +178,15 @@ rows commit in the same SQLite transaction.
 
 ### `activity_events`
 
-This is the append-ordered audit ledger. An integer primary key is the stable
-source cursor. Rows contain typed event kind, activity ID, recorded time,
+This is the append-ordered audit ledger. A strictly increasing 64-bit integer is
+the stable source cursor. Rows contain typed event kind, activity ID, recorded time,
 provider/session/turn/tool-use identity, project, state, decision ID, outcome,
 correction, supersession, and bounded payload fields.
+
+Cursor allocation and event insertion share one transaction. The high-water
+value never decreases or reuses a cursor after retention, rebuild, or restore;
+overflow fails closed. Wall-clock time is presentation evidence, not an
+authority or ordering substitute.
 
 Indexes cover:
 
@@ -183,17 +201,28 @@ Permission terminal events referenced from `permission_commits` are immutable.
 Later delivery, outcome, correction, lifecycle, and diagnostic rows remain
 append-only evidence.
 
-### `review_meta` and `review_marks`
+### Lifecycle tables
+
+The Brain database stores the complete current lifecycle snapshot: sessions,
+turn sequence and lease state, permission disposition/authority, active
+subagent topology, provider invocation state, and the bounded recent continuity
+required by reconciliation. Core applies pure lifecycle transitions; the
+binary store loads and persists their relational representation. No live
+permission or topology authority remains in `hooks/lifecycle.json`.
+
+### Review database: `review_meta` and `review_marks`
 
 Review metadata stores an independent optimistic revision for each surface.
 Review marks key the surface plus stable group identity and source cursor to a
 visibility disposition. They are joined before grouping, counts, ordering,
 overflow, and truncation.
 
-No foreign-key direction permits a review mutation to update or delete
-decisions, permission commits, or activity. Review reset is an explicit
-`cbrain storage reset-review-state` operation rather than deletion of the
-database.
+The review database contains no permission, activity, decision, or lifecycle
+tables. A review mutation validates an exact bounded group/cursor against a
+short Brain snapshot, then commits with an optimistic review revision. New
+activity naturally receives a greater cursor and resurfaces. Review reset
+replaces only `review.sqlite3` through the explicit
+`cbrain storage reset-review-state` operation.
 
 ## Permission Data Flow
 
@@ -201,11 +230,13 @@ database.
 
 1. Parse and validate the provider request and exact lifecycle identity.
 2. Run deterministic safety classification before model inference.
-3. Open a bounded database connection and begin a short admission transaction.
-4. Insert the exact `permission_attempts` row and its initial activity events.
-   The unique request identity selects one winner. A contender performs no
-   inference and emits no model-derived response.
-5. Commit admission, close the transaction, then run inference.
+3. Acquire the exact-request advisory lock before persistent mutation,
+   deterministic-deny auditing, or model inference. A concurrent contender
+   performs no mutation or inference and emits no model-derived response.
+4. Open a bounded database connection and begin a short admission transaction.
+5. Insert the unique attempt ID, indexed request identity, and initial activity
+   events.
+6. Commit admission, close the transaction, then run inference.
 
 Independent requests may infer concurrently. SQLite serializes only the short
 admission and commit writes.
@@ -223,7 +254,10 @@ For a model-derived allow or deny, one `BEGIN IMMEDIATE` transaction:
 
 No filesystem transaction journal is needed. A crash before commit leaves no
 authority. A crash after commit leaves one complete committed permission with
-delivery unknown.
+delivery unknown. A failed or uncertain SQLite commit never permits the current
+hook to emit a model-derived response. A later fresh connection determines
+whether the complete transaction exists; recovery never turns that observation
+into response replay.
 
 ### Response delivery
 
@@ -234,9 +268,11 @@ response. The response pipe remains outside SQLite:
 2. write and flush stdout;
 3. append `Delivered` or `DeliveryFailed` in a second short transaction.
 
-A crash or uncertain flush after commit leaves `DeliveryUnknown`. Recovery
-never replays stdout. Only later exact lifecycle or outcome evidence may claim
-tool execution.
+A crash or uncertain flush after commit leaves `DeliveryUnknown`. A stdout
+error records `DeliveryFailed` best-effort. Successful stdout followed by a
+failed delivery-event transaction remains `DeliveryUnknown`, because the
+provider may have received the response. Recovery never replays stdout. Only
+later exact lifecycle or outcome evidence may claim tool execution.
 
 Deterministic safety denies continue to fail closed when persistence is
 unavailable. Their audit failure is reported through a bounded diagnostic, but
@@ -253,12 +289,22 @@ The implementation must inspect critical query plans and reject accidental
 full scans in regression tests. Permission commit cost must not grow with total
 decision or activity history.
 
-Hook processes never run `VACUUM`, bulk retention, full integrity checks, or
-unbounded WAL checkpoints. Retention, checkpointing, and compaction run only in
-bounded non-hook maintenance. Retention preserves all fresh incomplete
-lifecycles, bounded interrupted history, current review/correction semantics,
-and all activity at or after the distillation cursor. It cannot delete evidence
-needed for permission authority or unprocessed learning.
+Use WAL with `synchronous=FULL`. Every hook has one monotonic storage deadline
+shared by connection opening, busy retries, admission, commit, and delivery
+evidence; no operation resets it. A fixed page-based auto-checkpoint threshold
+serves ordinary headless operation. Checkpoint failure does not undo an already
+committed WAL transaction.
+
+Track WAL size. Doctor and the TUI warn at a tested degradation threshold; at a
+conservative hard threshold, model inference pauses until bounded non-hook
+maintenance checkpoints it. Deterministic denies remain available. Hook
+processes never run `VACUUM`, bulk retention, full integrity checks, or
+unbounded manual checkpoints. Non-hook maintenance performs bounded
+checkpointing, incremental vacuum, retention, and compaction. Retention
+preserves all fresh incomplete lifecycles, bounded interrupted history, current
+review/correction semantics, and all activity after the cursor stored in the
+last successfully published immutable preference generation. It cannot delete
+evidence needed for permission authority or unprocessed learning.
 
 ## Automatic Legacy Migration
 
@@ -266,7 +312,7 @@ needed for permission authority or unprocessed learning.
 
 Automatic migration runs only from a non-hook `cbrain` startup path, including
 the TUI and Doctor. Permission and lifecycle hook entrypoints never perform a
-legacy import. If legacy state exists but `brain.sqlite3` does not, hooks return
+legacy import. If legacy state exists but `db/brain.sqlite3` does not, hooks return
 promptly to native provider handling with a bounded migration-required
 diagnostic and perform no model inference. Hooks also do not initialize a fresh
 schema; `cbrain init` or another non-hook startup publishes an empty database on
@@ -285,20 +331,22 @@ The migrator recognizes and validates the complete supported legacy set:
 
 - `brain/decisions.jsonl`;
 - `activity.jsonl`;
-- permission disposition and authority in `hooks/lifecycle.json`;
+- the complete `hooks/lifecycle.json` snapshot;
 - `brain/permission-transactions/` journals;
 - `review-state.json`.
 
-`session-links.jsonl` and non-permission lifecycle topology are not imported.
-Legacy inputs remain unchanged after success.
+`session-links.jsonl` is not imported. Legacy file contents remain unchanged
+after success, but the migrated mutable stores are frozen read-only at cutover
+so an older process cannot silently create a second live history.
 
 ### Staging and publication
 
-One owner-only migration lock selects the migrator. It creates a unique,
-owner-only, same-directory staging database such as:
+One owner-only migration lock selects the migrator. It creates unique,
+owner-only, same-directory staging databases such as:
 
 ```text
 .brain.sqlite3.migrate-<random>
+.review.sqlite3.migrate-<random>
 ```
 
 The file is not created under `/tmp`. Legacy rows are streamed with established
@@ -310,29 +358,44 @@ Before publication it:
 1. validates every imported critical record;
 2. runs foreign-key and SQLite integrity checks;
 3. verifies source/import counts and stable-order cursors;
-4. verifies permission and review-state invariants;
-5. checkpoints and closes the staging database;
-6. flushes the database and containing directory; and
-7. atomically renames it to `brain.sqlite3`.
+4. verifies permission, lifecycle, and review-state invariants;
+5. checkpoints and closes the staging databases;
+6. acquires every legacy store lock in one fixed order and revalidates source
+   fingerprints;
+7. flushes the databases and containing directory;
+8. atomically publishes `brain.sqlite3` with its migration generation still
+   incomplete, independently publishes `review.sqlite3`, freezes the migrated
+   legacy stores read-only, then marks the Brain generation complete before
+   releasing their locks.
 
-The canonical filename is absent until all checks pass. A crash leaves legacy
-state canonical and the staging artifact noncanonical. A later migrator may
-remove or replace an artifact only after validating its exact bounded name,
-regular-file type, ownership, mode, link count, and location.
+The canonical Brain filename is absent until all authority checks pass, and
+hooks reject a published database whose migration generation is incomplete.
+Brain publication does not depend on review publication: failed review migration
+preserves `review-state.json` and reports review unavailable rather than
+discarding marks or blocking permission handling. A crash leaves staging
+artifacts noncanonical; explicit migration state makes cutover restartable. A
+later migrator may remove or replace an artifact only after validating its
+exact bounded name, regular-file type, ownership, mode, link count, and
+location. Any recreated or mutated legacy path after cutover is a split-brain
+error that disables model-derived responses and is never auto-merged.
 
 ### Legacy permission reconciliation
 
-A legacy proposal, matching exact lifecycle authority, and matching terminal
-activity become one permission commit. Proposal-only or nonterminal activity
-becomes an incomplete attempt without authority.
+A legacy proposal and exact matching terminal `Allowed` or `Denied` activity
+become one historical permission commit under ADR-0003's existing contract that
+activity is the authoritative decision-commit audit. A matching validated
+journal or still-retained lifecycle authority corroborates the import but is not
+required after lifecycle compaction. Migrated commits record their evidence
+basis and `response_eligible = false`, so no imported row can emit or replay a
+provider response. Proposal-only or nonterminal activity becomes an incomplete
+attempt without authority.
 
-Pending journal evidence is reconciled inside the staging database. A legacy
-`Allowed` row without current exact lifecycle authority is preserved as
-historical audit evidence but does not create `permission_commits`. It gains a
-bounded integrity diagnostic and is excluded from committed learning
-authority. This covers the `codexctl-4vh58` shape without deleting the source
-journal, inventing delivery, replaying a response, or blocking projection of
-unrelated coherent activity.
+Pending journal evidence is reconciled inside the staging database. This
+preserves the `codexctl-4vh58` proposal, `Allowed`, delivery-unknown, and later
+outcome relationship without deleting the source journal, inventing delivery,
+replaying a response, or blocking projection of unrelated coherent activity.
+Mismatched or conflicting journal/activity evidence remains incomplete or
+diagnostic and creates no commit.
 
 Malformed, conflicting, oversized, unsupported, or newer-schema critical
 evidence aborts migration. Non-authoritative malformed audit rows retain the
@@ -348,12 +411,18 @@ stable source-cursor order using the established JSONL audit schemas and
 redaction limits. It does not expose review state or private internal authority
 beyond the established audit contract.
 
-`cbrain storage export-legacy <directory>` additionally reconstructs the
-immediately preceding supported legacy layout, including lifecycle permission
-fields and `review-state.json`. Export writes a new owner-only directory and
-refuses to overwrite existing targets. It verifies the result by reading it
-through the legacy readers and comparing its semantic projections with the
-SQLite source, including delivery-unknown state.
+`cbrain storage export-legacy <directory>` reconstructs one named, immutable
+compatibility profile for the final pre-SQLite layout. The profile is currently
+`legacy-v0.59.1` and changes only if another JSONL release ships before this
+feature. It includes lifecycle state and `review-state.json`. Export writes a
+new owner-only directory and refuses to overwrite existing targets. It verifies
+the result with frozen readers/fixtures for that exact profile and rejects
+SQLite evidence that cannot be represented losslessly, including
+delivery-unknown state.
+
+The legacy profile remains supported for at least one complete release cycle.
+Removing it requires a separate ADR and release note. Audit export is a
+versioned archival format and is never presented as executable rollback state.
 
 Downgrade procedure:
 
@@ -369,11 +438,23 @@ compatibility protocol.
 
 ## Busy, Corruption, and Security Behavior
 
-Every process validates the state directory and database family before open.
-Existing database, WAL, shared-memory, journal, and migration paths must not be
-symlinks, directories, multi-link files, foreign-owned files, or broader than
-the owner-only mode contract. SQLite no-follow opening is used where supported;
-post-open identity is revalidated where the API permits it.
+Every process validates the state directory and dedicated database directory
+before open. Existing database, WAL, shared-memory, journal, and migration paths
+must not be symlinks, directories, multi-link files, foreign-owned files, or
+broader than the owner-only mode contract. Use `SQLITE_OPEN_NOFOLLOW` for the
+main database and revalidate identity where the API permits it.
+
+SQLite creates VFS-managed sidecars whose complete set is not an application
+contract. The supported threat boundary therefore rejects other-user access and
+pre-existing unsafe paths but does not claim containment against a concurrently
+malicious process with the same UID. A custom SQLite VFS is out of scope. The
+database requires a local filesystem with working WAL and lock semantics;
+unsupported or network-like behavior fails closed.
+
+Disable extension loading and URI-controlled open options. Enable foreign keys,
+defensive mode, `trusted_schema=OFF`, explicit SQLite resource limits,
+memory-backed temporary tables, and secure deletion. SQL statements are static;
+stored content is always bound data.
 
 Permission hooks share one total storage-wait budget rather than resetting a
 timeout for every statement or retry:
@@ -395,15 +476,59 @@ database from stale legacy files.
 Doctor performs bounded schema and foreign-key checks during normal diagnosis
 and offers an explicit deeper integrity check. Repair, restore, or salvage is
 an operator action against a verified backup/export. Uncertain evidence remains
-preserved. Physical database or schema corruption disables every database
-domain; a structurally valid but invalid review mark disables review operations
-without changing permission authority or otherwise hiding coherent audit data.
+preserved. Physical Brain database or schema corruption disables every Brain
+database domain. Review database damage disables review operations without
+changing permission authority or otherwise hiding coherent audit data.
 
 Bounded JSON is validated before writes and after reads. Invalid authoritative
 data fails the operation. A malformed non-authoritative audit payload becomes a
 bounded integrity diagnostic only when its row boundary and typed identity are
 still trustworthy; otherwise the affected read fails. It never becomes
 executable evidence.
+
+### Privacy erasure
+
+`forget()` takes one global erasure gate and the established distillation lock
+order. It transactionally removes decision payloads and learning/canonical
+marks while retaining only minimal decision identities required by immutable
+audit relationships. It removes every published preference generation and
+pointer and securely erases matching legacy decision/preference snapshots.
+Activity evidence remains retained under the existing contract.
+
+After erasure, secure deletion is followed by a WAL checkpoint/truncation. Any
+uncertain durable erasure is reported as failure. Downgrade export cannot
+resurrect forgotten payloads.
+
+### Disk exhaustion and I/O failure
+
+`SQLITE_FULL` and relevant `SQLITE_IOERR` results preserve operation-specific
+semantics:
+
+- admission failure performs no inference;
+- permission commit failure or uncertainty emits no model-derived response;
+- delivery-event failure after stdout leaves `DeliveryUnknown`;
+- checkpoint failure retains authoritative WAL data and enters degraded mode;
+- deterministic safety denies still deny.
+
+Free-space and WAL thresholds can pause new model attempts but are not treated
+as proof a commit will succeed. Coding Brain never deletes WAL, staging files,
+audit rows, or journals automatically to make room. Migration and export publish
+only fully flushed staging targets. After space is restored, a fresh connection
+lets SQLite resolve transaction state without replaying provider output.
+
+## Schema Evolution
+
+Hooks open only the exact current `application_id` and `user_version`. Older,
+newer, incomplete, or migrating schemas return promptly to native handling.
+Only non-hook startup upgrades schemas. Compatible changes run in one exclusive
+SQLite transaction; rebuild-required changes use verified staging and atomic
+publication. There are no automatic down-migrations.
+
+Authority invariants use `CHECK`, unique, and composite foreign-key constraints
+rather than correctness-critical triggers alone. Every released schema is kept
+as a frozen database fixture. Bundled SQLite is pinned through `Cargo.lock`, its
+effective version is visible in diagnostics, and security updates follow the
+normal release process.
 
 ## Testing
 
@@ -416,8 +541,13 @@ executable evidence.
 - Include the exact `codexctl-4vh58` pending-journal relationship.
 - Kill migration during staging writes, verification, flush, and publication;
   prove canonical state is always entirely legacy or entirely SQLite.
+- Race a legacy writer at final fingerprinting, prove the fixed-order lock
+  protocol prevents publication over changed input, and prove frozen legacy
+  stores cannot silently diverge after cutover.
 - Re-import audit and legacy exports through the corresponding legacy readers
   and compare semantic projections and stable ordering.
+- Verify the frozen final-JSONL compatibility profile and reject an
+  unrepresentable downgrade rather than producing a lossy export.
 
 ### Permission atomicity and delivery
 
@@ -425,6 +555,8 @@ executable evidence.
   during permission writes, before commit, after commit, during stdout, and
   before delivery recording.
 - Prove no partial transaction grants authority and no restart replays stdout.
+- Inject an uncertain commit result, then test both possible fresh-connection
+  outcomes without allowing the original hook to emit a response.
 - Preserve committed, delivery-unknown, delivery-failed, delivered, and exact
   outcome-confirmed projections across Codex, Claude, and Antigravity.
 - Preserve deterministic-deny behavior during busy, corrupt, and unavailable
@@ -440,6 +572,11 @@ executable evidence.
   budget and prove permission commits and indexed reads do not scan history.
 - Assert intended indexes with SQLite query-plan tests for permission,
   projection, Scorecard, distillation, review, and outcome paths.
+- Pin WAL readers and grow headless hook traffic through warning and hard
+  thresholds; prove normal auto-checkpoints, bounded commit latency, degraded
+  reporting, and fail-closed inference suspension.
+- Delete retained rows and rebuild/upgrade fixtures while proving source cursor
+  and high-water values never decrease or reuse an identity.
 
 ### Review state
 
@@ -447,6 +584,8 @@ executable evidence.
 - Preserve count/conflict/reset behavior.
 - Prove review mutations cannot change audit, learning, permission, delivery,
   or execution authority.
+- Corrupt or block `review.sqlite3` and prove permission/audit access through
+  `brain.sqlite3` remains coherent.
 
 ### Corruption and filesystem security
 
@@ -455,6 +594,13 @@ executable evidence.
   sidecars, and maliciously named staging artifacts.
 - Prove a bad database leaves provider-native handling intact and the TUI's
   last coherent view visible with an explicit error.
+- Cover local-filesystem/WAL capability rejection, disabled extension/URI
+  controls, defensive schema behavior, and bounded SQLite resource limits.
+- Exercise `forget()` across decision payloads, immutable preference
+  generations, WAL pages, and frozen legacy snapshots; prove audit identity is
+  retained and forgotten learning content cannot reappear in downgrade export.
+- Inject page-limit, disk-full, write, flush, directory-sync, and checkpoint
+  failures at every admission, commit, delivery, migration, and export boundary.
 
 ### Release gates
 
@@ -462,6 +608,8 @@ executable evidence.
 - Verify Linux, macOS, and musl packaging.
 - Verify the packaged application does not require a system SQLite library.
 - Verify crates.io packageability separately from workspace builds.
+- Exercise frozen schema fixtures through every supported upgrade and reject
+  newer, older, and partially migrated schemas from hook paths.
 
 ## Documentation and ADR
 
@@ -472,12 +620,16 @@ ADR index, configuration, reference, troubleshooting, architecture, and release
 documentation for:
 
 - the canonical database path;
+- the separate Brain/review database failure domains;
 - automatic non-hook migration;
 - hook behavior before migration;
 - audit and downgrade export;
 - review-state reset;
 - corruption/Doctor behavior; and
-- the unchanged `session-links.jsonl` boundary.
+- the unchanged `session-links.jsonl` boundary;
+- the frozen legacy export profile and support window;
+- WAL maintenance thresholds and local-filesystem requirement; and
+- privacy erasure across SQLite, preferences, and frozen legacy snapshots.
 
 ## Acceptance Criteria
 
@@ -494,9 +646,68 @@ The design is satisfied when:
 6. automatic migration is atomic, non-hook-only, restartable, and preserves
    legacy inputs;
 7. audit and downgrade exports are stable, bounded, and verified;
-8. review state is transactional but remains visibility-only;
-9. `session-links.jsonl` and non-permission lifecycle topology remain separate;
+8. review state is transactional, isolated in its own database, and remains
+   visibility-only;
+9. `session-links.jsonl` remains separate while complete lifecycle persistence
+   moves into the Brain database;
 10. the `codexctl-4vh58` fixture no longer blocks coherent Brain projection or
     response handling; and
 11. an approved ADR and implementation plan record the final schema and rollout
     sequence before code changes begin.
+
+## Stress Test Results: Unified SQLite Brain Storage
+
+### Resolved Decisions
+
+- Keep `rusqlite` and persistence in the root binary crate; core retains pure
+  lifecycle and activity contracts.
+- Retain per-request OS locks for concurrent admission, but use unique attempt
+  IDs so sequential identical requests are not permanently deduplicated.
+- Treat commit errors as response-ineligible uncertainty and never reconstruct
+  provider delivery.
+- Migrate complete lifecycle persistence and freeze legacy mutable stores to
+  prevent a post-cutover split brain.
+- Preserve exact historical `Allowed`/`Denied` activity as migrated commitment
+  without making it response-eligible.
+- Support one frozen final-JSONL downgrade profile rather than arbitrary old
+  versions.
+- Use full-synchronous WAL with bounded headless checkpointing and hard
+  fail-closed growth limits.
+- Use an implementable dedicated-directory security boundary rather than claim
+  no-follow guarantees for every SQLite VFS sidecar.
+- Isolate operational review state in `review.sqlite3`.
+- Make schema upgrades non-hook-only, versioned, fixture-backed, and never
+  partial across permission stores.
+- Split immutable decision identity from erasable learning payload and extend
+  privacy erasure to WAL and preserved legacy snapshots.
+- Define disk-full behavior at admission, commit, delivery, checkpoint,
+  migration, and export boundaries.
+- Preserve a nondecreasing activity high-water cursor across retention,
+  rebuilds, and distillation publication.
+
+### Changes Made
+
+- Expanded migration from permission-only lifecycle data to the complete
+  lifecycle snapshot.
+- Split authoritative Brain and operational review state into two SQLite
+  databases under a dedicated owner-only directory.
+- Replaced permanent request-identity uniqueness with live advisory admission
+  and per-invocation attempt identity.
+- Added commit-uncertainty, split-brain prevention, fixed legacy export,
+  headless WAL, privacy erasure, disk-full, schema-evolution, and monotonic
+  cursor contracts.
+
+### Deferred / Parking Lot
+
+- No custom SQLite VFS. The same-UID adversary is outside the supported local
+  state threat boundary.
+- No arbitrary historical downgrade formats; only the frozen final-JSONL
+  profile is supported.
+- `session-links.jsonl` remains a separate bounded evidence store.
+
+### Confidence Assessment
+
+- Overall: High
+- Areas of concern: the implementation plan must keep cutover, frozen legacy
+  handling, privacy erasure, and cross-platform SQLite filesystem behavior in
+  independently testable stages; none may be deferred past runtime cutover.
