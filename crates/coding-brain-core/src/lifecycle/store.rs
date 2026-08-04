@@ -18,6 +18,7 @@ use super::{
     LIFECYCLE_SCHEMA_VERSION, LifecycleEvent, LifecycleIdentity, LifecycleSnapshot,
     MAX_ACTIVE_SUBAGENTS, MAX_ANTIGRAVITY_INVOCATION_STEPS, MAX_PERMISSION_REQUESTS_PER_TURN,
     MAX_RECENT_TURNS, PERMISSION_BITS, PermissionDecision, PermissionDisposition,
+    RecordedLifecycleEvent,
 };
 
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
@@ -30,12 +31,6 @@ const MAX_CORRUPT_FILES: usize = 3;
 #[derive(Clone, Debug)]
 pub struct LifecycleStore {
     root: PathBuf,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RecordedLifecycleEvent {
-    pub outcome: ApplyOutcome,
-    pub sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -403,20 +398,9 @@ impl LifecycleStore {
         let lock = self.open_lock()?;
         let _guard = lock_with_timeout(&lock, LockKind::Exclusive)?;
         let mut snapshot = self.load_for_locked_update(received_at_ms)?;
-        let session_key =
-            AgentSessionKey::native(event.identity().provider(), event.identity().session_id())
-                .storage_key();
-        let outcome = snapshot.apply(event, received_at_ms);
-        let sequence = match outcome {
-            ApplyOutcome::Applied => snapshot
-                .sessions
-                .get(&session_key)
-                .map(|state| state.latest_sequence)
-                .ok_or(StoreError::Serialization)?,
-            ApplyOutcome::Ignored(_) => 0,
-        };
+        let recorded = snapshot.record_at(event, received_at_ms);
         self.persist_locked_snapshot(&snapshot)?;
-        Ok(RecordedLifecycleEvent { outcome, sequence })
+        Ok(recorded)
     }
 
     fn load_for_locked_update(&self, received_at_ms: u64) -> Result<LifecycleSnapshot, StoreError> {

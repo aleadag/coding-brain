@@ -6,6 +6,11 @@ use coding_brain::brain::storage::{
     BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, OpenRole, REVIEW_APPLICATION_ID,
     REVIEW_SCHEMA_VERSION, ReviewDb, StorageDeadline, StorageError, StoragePaths,
 };
+use coding_brain_core::lifecycle::{
+    LifecycleEvent, LifecycleEventKind, LifecycleIdentity, LifecycleSnapshot, PermissionAction,
+    PermissionAuthority,
+};
+use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags, params};
 
@@ -28,6 +33,395 @@ fn private_tempdir() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     root
+}
+
+#[test]
+fn lifecycle_round_trip_preserves_topology_without_permission_authority() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let codex_parent = LifecycleIdentity::try_new(
+        AgentProvider::Codex,
+        "codex-parent".into(),
+        Some("codex-turn".into()),
+        None,
+        "/work/project".into(),
+    )
+    .unwrap();
+    let codex_child = LifecycleIdentity::try_new_with_provider_session(
+        AgentProvider::Codex,
+        "codex-child".into(),
+        Some("codex-parent".into()),
+        Some("codex-turn".into()),
+        Some("/tmp/child-rollout.jsonl".into()),
+        "/work/project".into(),
+    )
+    .unwrap();
+    let claude = LifecycleIdentity::try_new(
+        AgentProvider::Claude,
+        "claude-session".into(),
+        Some("claude-turn".into()),
+        None,
+        "/work/claude".into(),
+    )
+    .unwrap();
+    let antigravity_invocation = LifecycleIdentity::try_new(
+        AgentProvider::Antigravity,
+        "agy-session".into(),
+        Some("invocation-7".into()),
+        None,
+        "/work/agy".into(),
+    )
+    .unwrap();
+    let antigravity_step = |step: &str| {
+        LifecycleIdentity::try_new(
+            AgentProvider::Antigravity,
+            "agy-session".into(),
+            Some(step.into()),
+            None,
+            "/work/agy".into(),
+        )
+        .unwrap()
+    };
+    let events = vec![
+        LifecycleEvent::from_parts(
+            codex_parent,
+            LifecycleEventKind::SubagentStart {
+                agent_id: "codex-child".into(),
+            },
+        )
+        .unwrap(),
+        LifecycleEvent::from_parts(codex_child, LifecycleEventKind::PreToolUse).unwrap(),
+        LifecycleEvent::from_parts(
+            claude,
+            LifecycleEventKind::SubagentStart {
+                agent_id: "claude-session".into(),
+            },
+        )
+        .unwrap(),
+        LifecycleEvent::from_parts(
+            antigravity_step("setup-turn"),
+            LifecycleEventKind::SubagentStart {
+                agent_id: "agy-session".into(),
+            },
+        )
+        .unwrap(),
+        LifecycleEvent::from_parts_with_turn_initial_step(
+            antigravity_invocation,
+            LifecycleEventKind::UserPromptSubmit,
+            Some(5),
+        )
+        .unwrap(),
+        LifecycleEvent::from_parts(antigravity_step("step-5"), LifecycleEventKind::PreToolUse)
+            .unwrap(),
+        LifecycleEvent::from_parts(antigravity_step("step-5"), LifecycleEventKind::PostToolUse)
+            .unwrap(),
+        LifecycleEvent::permission_with_authority(
+            antigravity_step("step-6"),
+            "a".repeat(64),
+            PermissionAuthority {
+                transaction_id: "transaction-secret".into(),
+                action: PermissionAction::Allow,
+            },
+        )
+        .unwrap(),
+    ];
+    let mut expected = LifecycleSnapshot::default();
+    for (offset, event) in events.into_iter().enumerate() {
+        let received_at_ms = 100 + offset as u64;
+        expected.record_at(event.clone(), received_at_ms);
+        db.record_lifecycle(event, received_at_ms).unwrap();
+    }
+    expected.remove_permission_state();
+    let snapshot = db.read_lifecycle().unwrap();
+
+    assert_eq!(snapshot, expected);
+    let agy = &snapshot.sessions
+        [&AgentSessionKey::native(AgentProvider::Antigravity, "agy-session").storage_key()];
+    assert_eq!(
+        agy.latest_event,
+        Some(coding_brain_core::lifecycle::LifecycleEventName::PermissionRequest)
+    );
+    assert!(agy.status_event.is_some());
+    assert!(agy.permission_request_events.is_empty());
+    assert!(agy.permission_authorities.is_empty());
+    assert!(agy.antigravity_permission_requests.is_empty());
+    assert!(!format!("{snapshot:?}").contains("transaction-secret"));
+}
+
+#[test]
+fn lifecycle_stop_round_trip_preserves_closed_current_continuity() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Codex,
+        "session-1".into(),
+        Some("turn-1".into()),
+        None,
+        "/work/project".into(),
+    )
+    .unwrap();
+    db.record_lifecycle(
+        LifecycleEvent::from_parts(identity.clone(), LifecycleEventKind::UserPromptSubmit).unwrap(),
+        100,
+    )
+    .unwrap();
+
+    db.record_lifecycle(
+        LifecycleEvent::from_parts(identity, LifecycleEventKind::Stop).unwrap(),
+        101,
+    )
+    .unwrap();
+    let snapshot = db.read_lifecycle().unwrap();
+    let state = snapshot.sessions.values().next().unwrap();
+
+    assert_eq!(state.current_turn.as_deref(), Some("turn-1"));
+    assert!(!state.turn_open);
+    assert_eq!(
+        state.recent_turns.front().map(String::as_str),
+        Some("turn-1")
+    );
+}
+
+#[test]
+fn lifecycle_round_trip_inserts_parent_before_lexically_earlier_child() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let parent = LifecycleIdentity::try_new(
+        AgentProvider::Codex,
+        "z-parent".into(),
+        Some("turn-1".into()),
+        None,
+        "/work/project".into(),
+    )
+    .unwrap();
+    db.record_lifecycle(
+        LifecycleEvent::from_parts(
+            parent,
+            LifecycleEventKind::SubagentStart {
+                agent_id: "a-child".into(),
+            },
+        )
+        .unwrap(),
+        100,
+    )
+    .unwrap();
+    let child = LifecycleIdentity::try_new_with_provider_session(
+        AgentProvider::Codex,
+        "a-child".into(),
+        Some("z-parent".into()),
+        Some("turn-1".into()),
+        None,
+        "/work/project".into(),
+    )
+    .unwrap();
+
+    db.record_lifecycle(
+        LifecycleEvent::from_parts(child, LifecycleEventKind::PreToolUse).unwrap(),
+        101,
+    )
+    .unwrap();
+
+    assert_eq!(db.read_lifecycle().unwrap().sessions.len(), 2);
+}
+
+#[test]
+fn lifecycle_load_rejects_mismatched_active_invocation() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Antigravity,
+        "agy-1".into(),
+        Some("invocation-1".into()),
+        None,
+        "/work/project".into(),
+    )
+    .unwrap();
+    db.record_lifecycle(
+        LifecycleEvent::from_parts_with_turn_initial_step(
+            identity,
+            LifecycleEventKind::UserPromptSubmit,
+            Some(1),
+        )
+        .unwrap(),
+        100,
+    )
+    .unwrap();
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute(
+            "UPDATE lifecycle_invocations SET invocation_id = 'invocation-wrong'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.read_lifecycle(),
+        Err(StorageError::InvalidStorage(_))
+    ));
+}
+
+#[test]
+fn lifecycle_load_rejects_invocation_sequence_at_next_sequence() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Antigravity,
+        "agy-1".into(),
+        Some("invocation-1".into()),
+        None,
+        "/work/project".into(),
+    )
+    .unwrap();
+    db.record_lifecycle(
+        LifecycleEvent::from_parts_with_turn_initial_step(
+            identity,
+            LifecycleEventKind::UserPromptSubmit,
+            Some(1),
+        )
+        .unwrap(),
+        100,
+    )
+    .unwrap();
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute("UPDATE lifecycle_invocations SET state_sequence = 2", [])
+        .unwrap();
+    drop(connection);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.read_lifecycle(),
+        Err(StorageError::InvalidStorage(_))
+    ));
+}
+
+#[test]
+fn lifecycle_load_rejects_cross_row_sequence_lease_topology_and_cardinality_corruption() {
+    for mutation in [
+        "UPDATE lifecycle_meta SET next_sequence = 1",
+        "UPDATE lifecycle_meta SET next_sequence = 3;
+         UPDATE lifecycle_leases SET status_sequence = 2",
+        "PRAGMA ignore_check_constraints = ON;
+         UPDATE lifecycle_sessions SET signature_detail_id = 'smuggled-detail'",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, provider_session_id, latest_event,
+            latest_sequence, latest_received_at_ms, signature_event, signature_turn_id
+         ) VALUES (
+            'codex', 'unowned-child', X'2F', 'session-1', 'pre_tool_use',
+            1, 1, 'pre_tool_use', 'turn-1'
+         )",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, provider_session_id, latest_event,
+            latest_sequence, latest_received_at_ms, signature_event, signature_turn_id
+         ) VALUES (
+            'codex', 'mismatched-child', X'2F', 'session-1', 'pre_tool_use',
+            1, 1, 'pre_tool_use', 'child-turn'
+         );
+         INSERT INTO lifecycle_turns (
+            provider, session_id, continuity_state, turn_id, turn_open
+         ) VALUES ('codex', 'mismatched-child', 'current', 'child-turn', 1);
+         INSERT INTO lifecycle_subagents (
+            provider, parent_session_id, agent_id, turn_id, subagent_state,
+            topology_slot, state_sequence, received_at_ms
+         ) VALUES ('codex', 'session-1', 'mismatched-child', 'owner-turn',
+                   'active', 0, 1, 1)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence,
+            latest_received_at_ms, signature_event, signature_turn_id
+         ) VALUES (
+            'codex', 'unrelated-parent', X'2F', 'pre_tool_use', 1, 1,
+            'pre_tool_use', 'turn-1'
+         );
+         INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, provider_session_id, latest_event,
+            latest_sequence, latest_received_at_ms, signature_event, signature_turn_id
+         ) VALUES (
+            'codex', 'wrong-tree-child', X'2F', 'unrelated-parent', 'pre_tool_use',
+            1, 1, 'pre_tool_use', 'owner-turn'
+         );
+         INSERT INTO lifecycle_turns (
+            provider, session_id, continuity_state, turn_id, turn_open
+         ) VALUES ('codex', 'wrong-tree-child', 'current', 'owner-turn', 1);
+         INSERT INTO lifecycle_subagents (
+            provider, parent_session_id, agent_id, turn_id, subagent_state,
+            topology_slot, state_sequence, received_at_ms
+         ) VALUES ('codex', 'session-1', 'wrong-tree-child', 'owner-turn',
+                   'active', 0, 1, 1)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence,
+            latest_received_at_ms, signature_event, signature_turn_id
+         ) VALUES (
+            'codex', 'session-2', X'2F', 'pre_tool_use', 1, 1,
+            'pre_tool_use', 'turn-2'
+         );
+         INSERT INTO lifecycle_subagents (
+            provider, parent_session_id, agent_id, turn_id, subagent_state,
+            topology_slot, state_sequence, received_at_ms
+         ) VALUES
+            ('codex', 'session-1', 'session-2', 'turn-1', 'active', 0, 1, 1),
+            ('codex', 'session-2', 'session-1', 'turn-2', 'active', 0, 1, 1)",
+        "PRAGMA ignore_check_constraints = ON;
+         WITH RECURSIVE slots(value) AS (
+            VALUES(0) UNION ALL SELECT value + 1 FROM slots WHERE value < 64
+         )
+         INSERT INTO lifecycle_subagents (
+            provider, parent_session_id, agent_id, turn_id, subagent_state,
+            topology_slot, state_sequence, received_at_ms
+         )
+         SELECT 'codex', 'session-1', printf('child-%d', value), 'turn-1',
+                'active', value, 1, 1 FROM slots",
+    ] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        let mut db = BrainDb::create_current(&paths).unwrap();
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "session-1".into(),
+            Some("turn-1".into()),
+            None,
+            "/work/project".into(),
+        )
+        .unwrap();
+        db.record_lifecycle(
+            LifecycleEvent::from_parts(identity, LifecycleEventKind::UserPromptSubmit).unwrap(),
+            1,
+        )
+        .unwrap();
+        drop(db);
+        let connection = open_for_constraints(&paths.brain_db());
+        connection.execute_batch(mutation).unwrap();
+        drop(connection);
+        let db = BrainDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(db.read_lifecycle(), Err(StorageError::InvalidStorage(_))),
+            "mutation unexpectedly loaded: {mutation}"
+        );
+    }
 }
 
 fn insert_attempt(connection: &Connection, attempt_id: &str, request_key: &str) {

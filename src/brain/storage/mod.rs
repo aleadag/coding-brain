@@ -1,5 +1,6 @@
 #![allow(dead_code)] // The SQLite foundation stays inactive until the runtime cutover task.
 
+mod lifecycle;
 mod schema;
 mod security;
 
@@ -181,6 +182,7 @@ impl DatabaseKind {
 
 pub struct BrainDb {
     connection: Connection,
+    deadline: Option<StorageDeadline>,
 }
 
 impl fmt::Debug for BrainDb {
@@ -192,7 +194,10 @@ impl fmt::Debug for BrainDb {
 impl BrainDb {
     pub fn create_current(paths: &StoragePaths) -> Result<Self, StorageError> {
         let connection = create_current(paths, BRAIN_DATABASE_NAME, DatabaseKind::Brain)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            deadline: None,
+        })
     }
 
     pub fn open_current(
@@ -201,7 +206,10 @@ impl BrainDb {
         deadline: StorageDeadline,
     ) -> Result<Self, StorageError> {
         let connection = open_current(paths, BRAIN_DATABASE_NAME, DatabaseKind::Brain, deadline)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            deadline: Some(deadline),
+        })
     }
 
     pub fn schema_sql() -> &'static str {
