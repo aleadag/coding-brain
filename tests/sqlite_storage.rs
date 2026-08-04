@@ -883,6 +883,14 @@ fn lifecycle_schema_enforces_provider_qualified_topology() {
                 provider, parent_session_id, agent_id, turn_id, subagent_state,
                 topology_slot, state_sequence, received_at_ms
              ) VALUES ('codex', 'root-1', 'stopped-child', 'turn-0', 'stopped', 0, 1, 1);
+             INSERT INTO lifecycle_subagents (
+                provider, parent_session_id, agent_id, turn_id, subagent_state,
+                topology_slot, state_sequence, received_at_ms
+             ) VALUES ('claude', 'claude-1', 'claude-1', 'turn-1', 'active', 0, 1, 1);
+             INSERT INTO lifecycle_subagents (
+                provider, parent_session_id, agent_id, turn_id, subagent_state,
+                topology_slot, state_sequence, received_at_ms
+             ) VALUES ('antigravity', 'agy-1', 'agy-1', 'turn-1', 'active', 0, 1, 1);
              INSERT INTO lifecycle_invocations (
                 provider, session_id, invocation_id, invocation_state,
                 initial_step, state_sequence, received_at_ms
@@ -915,6 +923,10 @@ fn lifecycle_schema_enforces_provider_qualified_topology() {
             provider, parent_session_id, agent_id, turn_id, subagent_state,
             topology_slot, state_sequence, received_at_ms
          ) VALUES ('codex', 'root-1', 'overflow', 'turn-1', 'active', 64, 1, 1)",
+        "INSERT INTO lifecycle_subagents (
+            provider, parent_session_id, agent_id, turn_id, subagent_state,
+            topology_slot, state_sequence, received_at_ms
+         ) VALUES ('codex', 'root-2', 'root-2', 'turn-1', 'active', 0, 1, 1)",
         "INSERT INTO lifecycle_subagents (
             provider, parent_session_id, agent_id, turn_id, subagent_state,
             topology_slot, state_sequence, received_at_ms

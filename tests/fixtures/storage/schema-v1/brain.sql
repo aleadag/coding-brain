@@ -332,7 +332,7 @@ CREATE TABLE lifecycle_subagents (
     parent_session_id TEXT NOT NULL,
     agent_id TEXT NOT NULL CHECK (
         length(CAST(agent_id AS BLOB)) BETWEEN 1 AND 512
-        AND agent_id != parent_session_id
+        AND (provider != 'codex' OR agent_id != parent_session_id)
     ),
     turn_id TEXT NOT NULL CHECK (length(CAST(turn_id AS BLOB)) BETWEEN 1 AND 512),
     subagent_state TEXT NOT NULL CHECK (subagent_state IN ('active', 'stopped')),
