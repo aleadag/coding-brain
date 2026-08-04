@@ -2,7 +2,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
+
+use coding_brain_core::review_state::{ReviewSurface, ReviewTarget, SurfaceReviewProjection};
+use coding_brain_core::theme::Theme;
 
 use crate::brain_app::{BrainApp, BrainTab};
 
@@ -12,12 +16,13 @@ pub mod review;
 pub mod scorecard;
 
 pub fn render(frame: &mut Frame<'_>, app: &BrainApp) {
+    let footer_height = footer_height(app, frame.area().width);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(2),
+            Constraint::Length(footer_height),
         ])
         .split(frame.area());
     render_header(frame, areas[0], app);
@@ -105,26 +110,190 @@ fn render_footer(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &Brain
     let text = app.input_prompt().unwrap_or_else(|| {
         app.status()
             .map(str::to_owned)
-            .unwrap_or_else(|| match app.tab() {
-                BrainTab::Live => {
-                    "j/k select  J/K lists  PgUp/PgDn evidence  Enter switch  x action  c correct  Tab tabs  r refresh  q quit"
-                        .into()
-                }
-                BrainTab::Review => {
-                    "j/k select  m mark  n note+mark  s skip  Tab tabs  q quit".into()
-                }
-                BrainTab::Scorecard => "Tab tabs  r refresh  q quit".into(),
-                BrainTab::Diagnostics => {
-                    "j/k select  PgUp/PgDn evidence  Tab tabs  r refresh  q quit".into()
-                }
-            })
+            .unwrap_or_else(|| footer_help(app, area.width))
     });
     frame.render_widget(
         Paragraph::new(text)
             .style(Style::default().fg(theme.footer))
+            .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::TOP)),
         area,
     );
+}
+
+fn footer_height(app: &BrainApp, width: u16) -> u16 {
+    if app.tab() == BrainTab::Scorecard {
+        return 2;
+    }
+    if app.input_prompt().is_none() && app.status().is_none() && !normal_footer_fits(app, width) {
+        return compact_footer_help(app).lines().count() as u16 + 1;
+    }
+    3
+}
+
+fn footer_help(app: &BrainApp, width: u16) -> String {
+    if app.tab() == BrainTab::Scorecard {
+        return normal_footer_help(app);
+    }
+    packed_normal_footer_help(app, width).unwrap_or_else(|| compact_footer_help(app))
+}
+
+fn normal_footer_fits(app: &BrainApp, width: u16) -> bool {
+    packed_normal_footer_help(app, width).is_some()
+}
+
+fn packed_normal_footer_help(app: &BrainApp, width: u16) -> Option<String> {
+    let width = usize::from(width.max(1));
+    let help = normal_footer_help(app);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for control in help.split("  ").filter(|control| !control.is_empty()) {
+        let control_width = UnicodeWidthStr::width(control);
+        if control_width > width {
+            return None;
+        }
+        let separator_width = usize::from(!line.is_empty()) * 2;
+        if UnicodeWidthStr::width(line.as_str()) + separator_width + control_width > width {
+            lines.push(line);
+            line = control.to_owned();
+        } else {
+            if !line.is_empty() {
+                line.push_str("  ");
+            }
+            line.push_str(control);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    (lines.len() <= 2).then(|| lines.join("\n"))
+}
+
+fn normal_footer_help(app: &BrainApp) -> String {
+    match app.tab() {
+        BrainTab::Live => match app.current_review_surface() {
+            Some(ReviewSurface::Attention) => lifecycle_footer(
+                "j/k select  J/K lists  PgUp/PgDn evidence  x action  c correct  a review  A review all  d archive  D archive reviewed",
+                "Enter switch  Tab tabs  r refresh  q quit",
+                app.review_projection(ReviewSurface::Attention),
+            ),
+            Some(ReviewSurface::Recent) => {
+                "j/k select  J/K lists  PgUp/PgDn evidence  x action  c correct  a seen  A seen all  Enter switch  Tab tabs  r refresh  q quit".into()
+            }
+            _ => unreachable!("Live always has an active itemized surface"),
+        },
+        BrainTab::Review => lifecycle_footer(
+            "j/k select  a review  A review all  d archive  D archive reviewed",
+            "m canonical  n note+mark  s review+next  Tab tabs  r refresh  q quit",
+            app.review_projection(ReviewSurface::Review),
+        ),
+        BrainTab::Scorecard => "Tab tabs  r refresh  q quit".into(),
+        BrainTab::Diagnostics => lifecycle_footer(
+            "j/k select  a review  A review all  d archive  D archive reviewed",
+            "PgUp/PgDn evidence  Tab tabs  r refresh  q quit",
+            app.review_projection(ReviewSurface::Diagnostics),
+        ),
+    }
+}
+
+fn compact_footer_help(app: &BrainApp) -> String {
+    let with_undo = |mut lines: Vec<&str>, surface| {
+        if app.review_projection(surface).last_archive_count > 0 {
+            lines[1] = match surface {
+                ReviewSurface::Attention | ReviewSurface::Review => "A review all  u undo",
+                ReviewSurface::Diagnostics => "A review all  u undo",
+                ReviewSurface::Recent => unreachable!("Recent cannot be archived"),
+            };
+        }
+        lines.join("\n")
+    };
+
+    match app.tab() {
+        BrainTab::Live => match app.current_review_surface() {
+            Some(ReviewSurface::Attention) => with_undo(
+                vec![
+                    "j/k select  J/K lists",
+                    "A review all",
+                    "PgUp/PgDn evidence  x action",
+                    "c correct  a review",
+                    "d archive  D archive reviewed",
+                    "Enter switch  Tab tabs",
+                    "r refresh  q quit",
+                ],
+                ReviewSurface::Attention,
+            ),
+            Some(ReviewSurface::Recent) => [
+                "j/k select  J/K lists",
+                "PgUp/PgDn evidence  x action",
+                "c correct  a seen",
+                "A seen all  Enter switch",
+                "Tab tabs  r refresh  q quit",
+            ]
+            .join("\n"),
+            _ => unreachable!("Live always has an active itemized surface"),
+        },
+        BrainTab::Review => with_undo(
+            vec![
+                "j/k select  a review",
+                "A review all",
+                "d archive  D archive reviewed",
+                "m canonical  n note+mark",
+                "s review+next  Tab tabs",
+                "r refresh  q quit",
+            ],
+            ReviewSurface::Review,
+        ),
+        BrainTab::Scorecard => "Tab tabs  r refresh  q quit".into(),
+        BrainTab::Diagnostics => with_undo(
+            vec![
+                "j/k select  a review",
+                "A review all",
+                "d archive  D archive reviewed",
+                "PgUp/PgDn evidence",
+                "Tab tabs  r refresh  q quit",
+            ],
+            ReviewSurface::Diagnostics,
+        ),
+    }
+}
+
+fn lifecycle_footer(actions: &str, existing: &str, projection: &SurfaceReviewProjection) -> String {
+    if projection.last_archive_count > 0 {
+        format!("{actions}  u undo  {existing}")
+    } else {
+        format!("{actions}  {existing}")
+    }
+}
+
+pub(super) fn review_prefix(target: &ReviewTarget, unseen_label: &str) -> &'static str {
+    if target.new_member_keys.is_empty() {
+        if unseen_label == "unseen" {
+            "seen     "
+        } else {
+            "reviewed "
+        }
+    } else if unseen_label == "unseen" {
+        "unseen   "
+    } else {
+        "NEW      "
+    }
+}
+
+pub(super) fn review_title(label: &str, projection: &SurfaceReviewProjection) -> String {
+    format!(
+        " {label} ({} new, {} reviewed) ",
+        projection.new_count, projection.reviewed_count
+    )
+}
+
+pub(super) fn review_style(target: &ReviewTarget, theme: &Theme) -> Style {
+    if target.new_member_keys.is_empty() {
+        Style::default().fg(theme.text_muted)
+    } else {
+        Style::default()
+            .fg(theme.header)
+            .add_modifier(Modifier::BOLD)
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +307,9 @@ mod tests {
         SessionTarget,
     };
     use coding_brain_core::project::ProjectId;
+    use coding_brain_core::review_state::{
+        BrainReviewProjection, ReviewKey, ReviewSurface, ReviewTarget, SurfaceReviewProjection,
+    };
     use coding_brain_core::runtime::{
         BrainRuntime, DecisionSummary, EndpointHealth, MockBrainRuntime, ReviewItemSummary,
         RiskTierSummary, ScorecardSummary,
@@ -203,6 +375,402 @@ mod tests {
     }
 
     #[test]
+    fn all_itemized_surfaces_share_new_and_reviewed_language() {
+        let mut app = lifecycle_render_app(1);
+
+        let live = render_text_at(&app, 140, 38);
+        assert!(live.contains("NEW"), "missing NEW marker:\n{live}");
+        assert!(
+            live.contains("x5 · 2 new"),
+            "missing mixed Attention count:\n{live}"
+        );
+        assert!(
+            live.contains("Recent (2 unseen)"),
+            "missing Recent unseen count:\n{live}"
+        );
+
+        app.handle_key(key(KeyCode::Tab));
+        let review = render_text_at(&app, 140, 38);
+        assert!(
+            review.contains("Review Queue (1 new, 1 reviewed)"),
+            "missing Review lifecycle title:\n{review}"
+        );
+        assert!(
+            review.contains("NEW"),
+            "missing Review NEW marker:\n{review}"
+        );
+        assert!(
+            review.contains("reviewed"),
+            "missing Review reviewed marker:\n{review}"
+        );
+
+        app.handle_key(key(KeyCode::Tab));
+        let scorecard = render_text_at(&app, 140, 38);
+        assert!(
+            !scorecard.contains("NEW"),
+            "Scorecard changed:\n{scorecard}"
+        );
+
+        app.handle_key(key(KeyCode::Tab));
+        let diagnostics = render_text_at(&app, 140, 38);
+        assert!(
+            diagnostics.contains("Diagnostics (1 new, 1 reviewed)"),
+            "missing Diagnostics lifecycle title:\n{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("NEW") && diagnostics.contains("reviewed"),
+            "missing Diagnostics lifecycle markers:\n{diagnostics}"
+        );
+    }
+
+    #[test]
+    fn recent_has_no_archive_or_undo_affordance() {
+        let mut app = lifecycle_render_app(1);
+        app.handle_key(key(KeyCode::Char('J')));
+
+        let text = render_text_at(&app, 140, 38);
+
+        assert!(text.contains("Recent (2 unseen)"), "{text}");
+        assert!(text.contains("a seen  A seen all"), "{text}");
+        for forbidden in ["d archive", "D archive reviewed", "u undo"] {
+            assert!(!text.contains(forbidden), "found {forbidden}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_rows_keep_layout_and_reviewed_rows_are_deemphasized() {
+        for width in [119, 120, 140] {
+            let text = render_text_at(&lifecycle_render_app(1), width, 38);
+            assert!(text.contains("NEW"), "missing NEW at {width}:\n{text}");
+            assert!(
+                text.contains("x5 · 2 new"),
+                "missing mixed count at {width}:\n{text}"
+            );
+            assert!(
+                text.contains("Recent (2 unseen)"),
+                "missing Recent title at {width}:\n{text}"
+            );
+            assert!(
+                text.contains("x2 · 0 new"),
+                "missing fully reviewed Attention count at {width}:\n{text}"
+            );
+        }
+
+        let mut app = lifecycle_render_app(1);
+        let live_theme = *app.theme();
+        let live_buffer = render_buffer_at(&app, 140, 38);
+        let live_text = buffer_text(&live_buffer);
+        let live_reviewed_row = live_text
+            .lines()
+            .position(|line| line.contains("attention-reviewed"))
+            .unwrap();
+        let live_reviewed_content =
+            content_column(&live_text, "attention-reviewed", "attention-reviewed");
+        assert_eq!(
+            live_buffer[(live_reviewed_content as u16, live_reviewed_row as u16)].fg,
+            live_theme.text_muted
+        );
+
+        app.handle_key(key(KeyCode::Tab));
+        let theme = *app.theme();
+        let before = render_buffer_at(&app, 140, 38);
+        let before_text = buffer_text(&before);
+        let reviewed_row = before_text
+            .lines()
+            .position(|line| line.contains("review-reviewed"))
+            .unwrap();
+        let reviewed_prefix = content_column(&before_text, "review-reviewed", "reviewed");
+        let reviewed_content = content_column(&before_text, "review-reviewed", "review-reviewed");
+        assert_eq!(
+            before[(reviewed_prefix as u16, reviewed_row as u16)].fg,
+            theme.text_muted
+        );
+        assert_eq!(
+            before[(reviewed_content as u16, reviewed_row as u16)].fg,
+            theme.text_muted
+        );
+
+        app.handle_key(key(KeyCode::Char('j')));
+        let after_text = render_text_at(&app, 140, 38);
+        assert_eq!(
+            reviewed_content,
+            content_column(&after_text, "review-reviewed", "review-reviewed")
+        );
+    }
+
+    #[test]
+    fn footer_shows_only_surface_valid_lifecycle_controls_and_available_undo() {
+        let mut available = lifecycle_render_app(1);
+        let attention = render_text_at(&available, 160, 38);
+        for expected in [
+            "a review",
+            "A review all",
+            "d archive",
+            "D archive reviewed",
+            "u undo",
+        ] {
+            assert!(
+                attention.contains(expected),
+                "missing {expected}:\n{attention}"
+            );
+        }
+
+        available.handle_key(key(KeyCode::Char('J')));
+        let recent = render_text_at(&available, 160, 38);
+        assert!(recent.contains("a seen  A seen all"), "{recent}");
+        for forbidden in ["d archive", "D archive reviewed", "u undo"] {
+            assert!(!recent.contains(forbidden), "found {forbidden}:\n{recent}");
+        }
+
+        available.handle_key(key(KeyCode::Tab));
+        let review = render_text_at(&available, 160, 38);
+        assert!(review.contains("u undo"), "{review}");
+        assert!(review.contains("s review+next"), "{review}");
+
+        let unavailable = render_text_at(&lifecycle_render_app(0), 160, 38);
+        assert!(!unavailable.contains("u undo"), "{unavailable}");
+    }
+
+    #[test]
+    fn scorecard_rendering_does_not_gain_lifecycle_language_or_controls() {
+        let mut app = lifecycle_render_app(1);
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+
+        let text = render_text_at(&app, 140, 38);
+
+        assert!(text.contains("[ Scorecard ]"), "{text}");
+        for forbidden in ["NEW", "unseen", "reviewed", "d archive", "u undo"] {
+            assert!(!text.contains(forbidden), "found {forbidden}:\n{text}");
+        }
+        assert!(text.contains("Tab tabs  r refresh  q quit"), "{text}");
+    }
+
+    #[test]
+    fn scorecard_preserves_pre_lifecycle_content_and_footer_geometry() {
+        let mut app = lifecycle_render_app(1);
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+
+        let text = render_text_at(&app, 140, 38);
+        let rows = text.lines().collect::<Vec<_>>();
+
+        assert!(
+            rows[35].starts_with('└') && rows[35].ends_with('┘'),
+            "{text}"
+        );
+        assert!(rows[36].chars().all(|character| character == '─'), "{text}");
+        assert!(rows[37].contains("Tab tabs  r refresh  q quit"), "{text}");
+    }
+
+    #[test]
+    fn extreme_narrow_lifecycle_footers_show_all_valid_controls() {
+        assert_lifecycle_footer_controls_at_width(30);
+    }
+
+    #[test]
+    fn width_41_lifecycle_footers_show_all_valid_controls() {
+        assert_lifecycle_footer_controls_at_width(41);
+    }
+
+    #[test]
+    fn itemized_footer_fit_transitions_preserve_controls_and_content() {
+        let mut app = lifecycle_render_app(1);
+        assert_footer_fit_transition(
+            &app,
+            &[
+                "j/k select",
+                "J/K lists",
+                "PgUp/PgDn evidence",
+                "x action",
+                "c correct",
+                "a review",
+                "A review all",
+                "d archive",
+                "D archive reviewed",
+                "u undo",
+                "Enter switch",
+                "Tab tabs",
+                "r refresh",
+                "q quit",
+            ],
+            &[],
+            &[
+                "Needs Attention",
+                "+1 more unresolved",
+                "Recent (2 unseen)",
+                "Evidence",
+                "> NEW",
+            ],
+        );
+
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_footer_fit_transition(
+            &app,
+            &[
+                "j/k select",
+                "J/K lists",
+                "PgUp/PgDn evidence",
+                "x action",
+                "c correct",
+                "a seen",
+                "A seen all",
+                "Enter switch",
+                "Tab tabs",
+                "r refresh",
+                "q quit",
+            ],
+            &["d archive", "D archive reviewed", "u undo"],
+            &[
+                "Needs Attention",
+                "Recent (2 unseen)",
+                "Evidence",
+                "> unseen",
+            ],
+        );
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_footer_fit_transition(
+            &app,
+            &[
+                "j/k select",
+                "a review",
+                "A review all",
+                "d archive",
+                "D archive reviewed",
+                "u undo",
+                "m canonical",
+                "n note+mark",
+                "s review+next",
+                "Tab tabs",
+                "r refresh",
+                "q quit",
+            ],
+            &[],
+            &["Review Queue", "Teaching", "> NEW"],
+        );
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+        assert_footer_fit_transition(
+            &app,
+            &[
+                "j/k select",
+                "a review",
+                "A review all",
+                "d archive",
+                "D archive reviewed",
+                "u undo",
+                "PgUp/PgDn evidence",
+                "Tab tabs",
+                "r refresh",
+                "q quit",
+            ],
+            &[],
+            &["Store integrity", "Diagnostics", "Evidence", "> NEW"],
+        );
+    }
+
+    fn assert_lifecycle_footer_controls_at_width(width: u16) {
+        let mut app = lifecycle_render_app(1);
+
+        let attention = render_text_at(&app, width, 38);
+        assert_footer_controls(
+            &attention,
+            &[
+                "j/k select",
+                "J/K lists",
+                "PgUp/PgDn evidence",
+                "x action",
+                "c correct",
+                "a review",
+                "A review all",
+                "d archive",
+                "D archive reviewed",
+                "u undo",
+                "Enter switch",
+                "Tab tabs",
+                "r refresh",
+                "q quit",
+            ],
+            &[],
+        );
+
+        app.handle_key(key(KeyCode::Char('J')));
+        let recent = render_text_at(&app, width, 38);
+        assert_footer_controls(
+            &recent,
+            &[
+                "j/k select",
+                "J/K lists",
+                "PgUp/PgDn evidence",
+                "x action",
+                "c correct",
+                "a seen",
+                "A seen all",
+                "Enter switch",
+                "Tab tabs",
+                "r refresh",
+                "q quit",
+            ],
+            &["d archive", "D archive reviewed", "u undo"],
+        );
+
+        app.handle_key(key(KeyCode::Tab));
+        let review = render_text_at(&app, width, 38);
+        assert_footer_controls(
+            &review,
+            &[
+                "j/k select",
+                "a review",
+                "A review all",
+                "d archive",
+                "D archive reviewed",
+                "u undo",
+                "m canonical",
+                "n note+mark",
+                "s review+next",
+                "Tab tabs",
+                "r refresh",
+                "q quit",
+            ],
+            &[],
+        );
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+        let diagnostics = render_text_at(&app, width, 38);
+        assert_footer_controls(
+            &diagnostics,
+            &[
+                "j/k select",
+                "a review",
+                "A review all",
+                "d archive",
+                "D archive reviewed",
+                "u undo",
+                "PgUp/PgDn evidence",
+                "Tab tabs",
+                "r refresh",
+                "q quit",
+            ],
+            &[],
+        );
+    }
+
+    #[test]
+    fn extreme_narrow_archivable_footers_hide_unavailable_undo() {
+        let mut app = lifecycle_render_app(0);
+        for tab_steps in [0, 1, 3] {
+            while app.tab() as usize != tab_steps {
+                app.handle_key(key(KeyCode::Tab));
+            }
+            let text = render_text_at(&app, 30, 38);
+            assert!(!text.contains("u undo"), "{text}");
+        }
+    }
+
+    #[test]
     fn header_describes_off_as_model_off() {
         let mock = MockBrainRuntime {
             gate_mode: std::sync::Mutex::new(Some(coding_brain_core::runtime::BrainGateMode::Off)),
@@ -230,7 +798,7 @@ mod tests {
             "duplicate terminals: 1",
             "truncated tails: 1",
             "discarded bytes: 17",
-            "Recent Diagnostics (2)",
+            "Diagnostics (2 new, 0 reviewed)",
             "Codex  project  Bash",
             "Activity: diagnostic-1",
             "Provider: Codex",
@@ -350,7 +918,7 @@ mod tests {
 
         assert!(text.contains("\\u{1b}"), "missing escaped control:\n{text}");
         assert!(!text.contains('\u{1b}'), "raw control:\n{text}");
-        assert!(text.contains("Codex  project  Bash"), "{text}");
+        assert!(text.contains("NEW      Codex  project"), "{text}");
         for expected in [
             "malformed rows: 2",
             "duplicate terminals: 1",
@@ -404,7 +972,7 @@ mod tests {
                 .join(" ");
             for expected in [
                 "[ Diagnostics ]",
-                "Recent Diagnostics (2)",
+                "Diagnostics (2 new, 0 reviewed)",
                 "Store integrity",
                 "Codex  project  Bash",
                 "Activity: diagnostic-1",
@@ -636,7 +1204,7 @@ mod tests {
             .find(|line| line.contains("SEND ?"))
             .unwrap_or_else(|| panic!("missing condition row:\n{text}"));
 
-        assert!(row.contains("project"), "{row}");
+        assert!(row.contains("proje"), "{row}");
         assert!(!row.contains("Codex"), "{row}");
     }
 
@@ -781,7 +1349,9 @@ mod tests {
         let attention = render_text_at(&app, 120, 38);
         assert_eq!(attention.matches("> ").count(), 1);
         assert!(
-            attention.lines().any(|line| line.contains("> SEND ?")),
+            attention
+                .lines()
+                .any(|line| line.contains("> NEW      SEND ?")),
             "{attention}"
         );
         assert!(attention.contains("Activity    attention-1"));
@@ -1069,11 +1639,248 @@ mod tests {
     }
 
     fn fixture_app_with_theme(mock: MockBrainRuntime, mode: ThemeMode) -> BrainApp {
-        let mock = Arc::new(mock);
+        let mock = Arc::new(aligned_mock(mock));
         BrainApp::new(
             BrainRuntime::new(mock.clone(), mock),
             Theme::from_mode(mode),
         )
+    }
+
+    fn lifecycle_render_app(last_archive_count: usize) -> BrainApp {
+        let attention = AttentionItem {
+            activity: activity("attention-mixed", DeliveryState::Unknown),
+            occurrences: 5,
+            unresolved_occurrences: 5,
+        };
+        let reviewed_attention = AttentionItem {
+            activity: activity("attention-reviewed", DeliveryState::Unknown),
+            occurrences: 2,
+            unresolved_occurrences: 2,
+        };
+        let mut recent_first = activity("recent-new-1", DeliveryState::Delivered);
+        recent_first.state = ActivityState::Allowed;
+        let mut recent_second = activity("recent-new-2", DeliveryState::Delivered);
+        recent_second.state = ActivityState::Allowed;
+        let mut diagnostic_first = activity("diagnostic-new", DeliveryState::NotApplicable);
+        diagnostic_first.kind = ActivityKind::Diagnostic;
+        let mut diagnostic_second = activity("diagnostic-reviewed", DeliveryState::NotApplicable);
+        diagnostic_second.kind = ActivityKind::Diagnostic;
+
+        let mut review_first = decision();
+        review_first.id = "review-new".into();
+        let mut review_second = decision();
+        review_second.id = "review-reviewed".into();
+        let review_queue = vec![
+            ReviewItemSummary {
+                decision: review_first,
+                reason: "new review reason".into(),
+                score: 90.0,
+            },
+            ReviewItemSummary {
+                decision: review_second,
+                reason: "reviewed reason".into(),
+                score: 80.0,
+            },
+        ];
+        let snapshot = ActivitySnapshot {
+            attention: vec![attention.clone(), reviewed_attention.clone()],
+            recent: vec![recent_first, recent_second],
+            diagnostic_events: vec![diagnostic_first, diagnostic_second],
+            unresolved_count: 8,
+            diagnostics: Default::default(),
+        };
+        let review_state = BrainReviewProjection {
+            attention: lifecycle_projection(
+                ReviewSurface::Attention,
+                vec![
+                    (attention.review_display_id(), 2, 3),
+                    (reviewed_attention.review_display_id(), 0, 2),
+                ],
+                2,
+                5,
+                last_archive_count,
+            ),
+            review: lifecycle_projection(
+                ReviewSurface::Review,
+                vec![
+                    (review_queue[0].review_display_id(), 1, 0),
+                    (review_queue[1].review_display_id(), 0, 1),
+                ],
+                1,
+                1,
+                last_archive_count,
+            ),
+            diagnostics: lifecycle_projection(
+                ReviewSurface::Diagnostics,
+                vec![
+                    ("diagnostic-new".into(), 1, 0),
+                    ("diagnostic-reviewed".into(), 0, 1),
+                ],
+                1,
+                1,
+                last_archive_count,
+            ),
+            recent: lifecycle_projection(
+                ReviewSurface::Recent,
+                vec![("recent-new-1".into(), 1, 0), ("recent-new-2".into(), 1, 0)],
+                2,
+                0,
+                0,
+            ),
+        };
+        let mock = Arc::new(MockBrainRuntime {
+            activity_snapshot: snapshot,
+            review_queue,
+            review_state,
+            endpoint_health: online(),
+            ..MockBrainRuntime::default()
+        });
+        BrainApp::new(
+            BrainRuntime::new(mock.clone(), mock),
+            Theme::from_mode(ThemeMode::Dark),
+        )
+    }
+
+    fn lifecycle_projection(
+        surface: ReviewSurface,
+        rows: Vec<(String, usize, usize)>,
+        new_count: usize,
+        reviewed_count: usize,
+        last_archive_count: usize,
+    ) -> SurfaceReviewProjection {
+        let visible_items = rows.len();
+        let targets = rows
+            .into_iter()
+            .map(|(display_id, new_members, reviewed_members)| ReviewTarget {
+                surface,
+                new_member_keys: (0..new_members)
+                    .map(|index| {
+                        ReviewKey::derive(surface, format!("{display_id}:new:{index}").as_bytes())
+                    })
+                    .collect(),
+                reviewed_member_keys: (0..reviewed_members)
+                    .map(|index| {
+                        ReviewKey::derive(
+                            surface,
+                            format!("{display_id}:reviewed:{index}").as_bytes(),
+                        )
+                    })
+                    .collect(),
+                display_id,
+            })
+            .collect();
+        SurfaceReviewProjection::from_items(
+            surface,
+            7,
+            targets,
+            visible_items,
+            new_count,
+            reviewed_count,
+            last_archive_count,
+        )
+        .unwrap()
+    }
+
+    fn aligned_mock(mut mock: MockBrainRuntime) -> MockBrainRuntime {
+        mock.review_state = aligned_review_state(&mock.activity_snapshot, &mock.review_queue);
+        mock
+    }
+
+    fn aligned_review_state(
+        snapshot: &ActivitySnapshot,
+        review_queue: &[ReviewItemSummary],
+    ) -> BrainReviewProjection {
+        BrainReviewProjection {
+            attention: fixture_attention_projection(&snapshot.attention),
+            review: fixture_review_projection(review_queue),
+            diagnostics: fixture_projection(
+                ReviewSurface::Diagnostics,
+                snapshot
+                    .diagnostic_events
+                    .iter()
+                    .map(|item| item.activity_id.as_str()),
+            ),
+            recent: fixture_projection(
+                ReviewSurface::Recent,
+                snapshot.recent.iter().map(|item| item.activity_id.as_str()),
+            ),
+        }
+    }
+
+    fn fixture_attention_projection(items: &[AttentionItem]) -> SurfaceReviewProjection {
+        let targets = items
+            .iter()
+            .map(|item| ReviewTarget {
+                surface: ReviewSurface::Attention,
+                display_id: item.review_display_id(),
+                new_member_keys: (0..item.occurrences)
+                    .map(|occurrence| {
+                        ReviewKey::derive(
+                            ReviewSurface::Attention,
+                            format!("{}:{occurrence}", item.activity_id).as_bytes(),
+                        )
+                    })
+                    .collect(),
+                reviewed_member_keys: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let new_count = targets
+            .iter()
+            .map(|target| target.new_member_keys.len())
+            .sum();
+        SurfaceReviewProjection::from_items(
+            ReviewSurface::Attention,
+            0,
+            targets,
+            items.len(),
+            new_count,
+            0,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn fixture_review_projection(items: &[ReviewItemSummary]) -> SurfaceReviewProjection {
+        let targets = items
+            .iter()
+            .map(|item| ReviewTarget {
+                surface: ReviewSurface::Review,
+                display_id: item.review_display_id(),
+                new_member_keys: vec![ReviewKey::derive(
+                    ReviewSurface::Review,
+                    &item.decision.review_source_identity(),
+                )],
+                reviewed_member_keys: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        SurfaceReviewProjection::from_items(
+            ReviewSurface::Review,
+            0,
+            targets,
+            items.len(),
+            items.len(),
+            0,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn fixture_projection<'a>(
+        surface: ReviewSurface,
+        display_ids: impl IntoIterator<Item = &'a str>,
+    ) -> SurfaceReviewProjection {
+        let items = display_ids
+            .into_iter()
+            .map(|display_id| ReviewTarget {
+                surface,
+                display_id: display_id.into(),
+                new_member_keys: vec![ReviewKey::derive(surface, display_id.as_bytes())],
+                reviewed_member_keys: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let visible_items = items.len();
+        SurfaceReviewProjection::from_items(surface, 0, items, visible_items, visible_items, 0, 0)
+            .unwrap()
     }
 
     fn populated_diagnostics_app(mode: ThemeMode) -> BrainApp {
@@ -1216,6 +2023,46 @@ mod tests {
             .find(content)
             .unwrap_or_else(|| panic!("missing content {content} in row {row_id}:\n{line}"));
         line[..byte_index].chars().count()
+    }
+
+    fn assert_footer_controls(text: &str, expected: &[&str], forbidden: &[&str]) {
+        for control in expected {
+            assert!(text.contains(control), "missing {control}:\n{text}");
+        }
+        for control in forbidden {
+            assert!(!text.contains(control), "found {control}:\n{text}");
+        }
+    }
+
+    fn assert_footer_fit_transition(
+        app: &BrainApp,
+        expected_controls: &[&str],
+        forbidden_controls: &[&str],
+        expected_content: &[&str],
+    ) {
+        let transition = (30..=200)
+            .find(|width| normal_footer_fits(app, *width))
+            .expect("normal footer should fit by 200 columns");
+        assert!(transition > 30);
+        assert!(!normal_footer_fits(app, transition - 1));
+        assert!(normal_footer_fits(app, transition));
+        assert!(normal_footer_fits(app, transition + 1));
+
+        for width in [transition - 1, transition, transition + 1] {
+            let text = render_text_at(app, width, 38);
+            assert_footer_controls(&text, expected_controls, forbidden_controls);
+            for content in expected_content {
+                assert!(
+                    text.contains(content),
+                    "missing {content} at {width}:\n{text}"
+                );
+            }
+            if width < transition {
+                assert!(footer_height(app, width) > 3);
+            } else {
+                assert_eq!(footer_height(app, width), 3);
+            }
+        }
     }
 
     fn online() -> EndpointHealth {

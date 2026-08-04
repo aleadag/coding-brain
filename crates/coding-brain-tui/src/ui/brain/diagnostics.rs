@@ -1,4 +1,5 @@
 use coding_brain_core::brain_activity::{ActivityItem, MAX_ACTIVITY_FIELD_BYTES};
+use coding_brain_core::review_state::{ReviewSurface, ReviewTarget};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -10,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::brain_app::BrainApp;
 
-use super::live;
+use super::{live, review_prefix, review_style, review_title};
 
 const WIDE_BREAKPOINT: u16 = 120;
 const MAX_NARROW_EVIDENCE_HEIGHT: u16 = 12;
@@ -132,19 +133,23 @@ fn evidence_height(app: &BrainApp, width: u16) -> u16 {
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
     let events = &app.snapshot().diagnostic_events;
+    let projection = app.review_projection(ReviewSurface::Diagnostics);
     let row_width = usize::from(area.width.saturating_sub(4));
     let items = if events.is_empty() {
         vec![ListItem::new("No recent diagnostic events")]
     } else {
         events
             .iter()
-            .map(|item| ListItem::new(diagnostic_row(item, row_width)))
+            .zip(&projection.items)
+            .map(|(item, target)| {
+                ListItem::new(diagnostic_row(item, target, row_width, app.theme()))
+            })
             .collect()
     };
     let list = List::new(items)
         .block(
             Block::default()
-                .title(format!(" Recent Diagnostics ({}) ", events.len()))
+                .title(review_title("Diagnostics", projection))
                 .borders(Borders::ALL),
         )
         .highlight_style(
@@ -161,7 +166,12 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn diagnostic_row(item: &ActivityItem, width: usize) -> Line<'static> {
+fn diagnostic_row(
+    item: &ActivityItem,
+    target: &ReviewTarget,
+    width: usize,
+    theme: &coding_brain_core::theme::Theme,
+) -> Line<'static> {
     let provider = item
         .session
         .as_ref()
@@ -175,12 +185,22 @@ fn diagnostic_row(item: &ActivityItem, width: usize) -> Line<'static> {
         project,
         live::safe_row_text(tool),
     );
-    let text = if UnicodeWidthStr::width(text.as_str()) > width {
-        live::truncate_display(&text, width)
+    let prefix = review_prefix(target, "NEW");
+    let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix));
+    let text = if UnicodeWidthStr::width(text.as_str()) > content_width {
+        live::truncate_display(&text, content_width)
     } else {
         text
     };
-    Line::raw(text)
+    let content_style = if target.new_member_keys.is_empty() {
+        review_style(target, theme)
+    } else {
+        Style::default().fg(theme.text_primary)
+    };
+    Line::from(vec![
+        Span::styled(prefix, review_style(target, theme)),
+        Span::styled(text, content_style),
+    ])
 }
 
 fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {

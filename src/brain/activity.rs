@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -19,14 +19,62 @@ use coding_brain_core::brain_activity::{
     DeliveryState, MAX_ACTIVITY_EVENT_BYTES, MIN_ACTIVITY_SCHEMA_VERSION, SnapshotLimits,
 };
 use coding_brain_core::durable_file::durable_replace;
+use coding_brain_core::project::ProjectId;
+use coding_brain_core::review_state::{
+    ReviewDisposition, ReviewKey, ReviewKeySetError, ReviewSurface, ReviewTarget,
+    SurfaceReviewProjection, derive_review_key_set,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use super::decisions::EnsureRecord;
+use super::review_state::ReviewStateSnapshot;
 
 const LOCK_RETRY: Duration = Duration::from_millis(5);
 const MAX_DIAGNOSTIC_OFFSETS: usize = 100;
 const MAX_RETAINED_INTERRUPTED_LIFECYCLES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttentionOrder {
+    SeverityFirst,
+    RecencyFirst,
+}
+
+/// `attention`, `recent`, and `diagnostics` items are positionally aligned with
+/// their corresponding visible vectors in `snapshot`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ActivityReviewProjection {
+    pub(crate) snapshot: ActivitySnapshot,
+    pub(crate) attention: SurfaceReviewProjection,
+    pub(crate) recent: SurfaceReviewProjection,
+    pub(crate) diagnostics: SurfaceReviewProjection,
+    pub(crate) eligible: BTreeMap<ReviewSurface, BTreeSet<ReviewKey>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OccurrenceReviewState {
+    New,
+    Reviewed,
+    Archived,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedOccurrence {
+    item: ActivityItem,
+    needs_attention: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AttentionGroupKey {
+    project_id: ProjectId,
+    rule_id: String,
+    fingerprint: String,
+}
+
+struct AttentionGroup {
+    item: AttentionItem,
+    target: ReviewTarget,
+}
 
 #[derive(Debug, Clone)]
 pub struct ActivityLimits {
@@ -467,6 +515,19 @@ impl ActivityStore {
         lock_with_timeout(lock, self.limits.lock_timeout_ms, LockKind::Exclusive)
     }
 
+    #[cfg(test)]
+    fn lock_for_read<'a>(&self, lock: &'a File) -> Result<LockGuard<'a>, ActivityStoreError> {
+        if let Some(probe) = &self.lock_contention_probe {
+            return lock_with_timeout_observed(
+                lock,
+                self.limits.lock_timeout_ms,
+                LockKind::Shared,
+                || probe.notify(),
+            );
+        }
+        lock_with_timeout(lock, self.limits.lock_timeout_ms, LockKind::Shared)
+    }
+
     pub(crate) fn append_from_snapshot<F>(&self, build: F) -> Result<(), ActivityStoreError>
     where
         F: FnOnce(&ActivityLog) -> Vec<ActivityEvent>,
@@ -654,6 +715,9 @@ impl ActivityStore {
     pub fn read(&self) -> Result<ActivityLog, ActivityStoreError> {
         let contents = {
             let lock = self.open_lock()?;
+            #[cfg(test)]
+            let _guard = self.lock_for_read(&lock)?;
+            #[cfg(not(test))]
             let _guard = lock_with_timeout(&lock, self.limits.lock_timeout_ms, LockKind::Shared)?;
             self.read_bytes_unlocked()?
         };
@@ -1013,6 +1077,24 @@ fn find_tail_start(file: &mut File, length: u64) -> io::Result<u64> {
 }
 
 fn project_snapshot(log: &ActivityLog, limits: SnapshotLimits, now_ms: u64) -> ActivitySnapshot {
+    project_snapshot_with_review(
+        log,
+        limits,
+        now_ms,
+        &ReviewStateSnapshot::default(),
+        AttentionOrder::SeverityFirst,
+    )
+    .expect("activity lifecycle IDs are unique after grouping")
+    .snapshot
+}
+
+pub(crate) fn project_snapshot_with_review(
+    log: &ActivityLog,
+    limits: SnapshotLimits,
+    now_ms: u64,
+    review_state: &ReviewStateSnapshot,
+    attention_order: AttentionOrder,
+) -> Result<ActivityReviewProjection, ReviewKeySetError> {
     let mut groups = HashMap::<String, Vec<&ActivityEvent>>::new();
     for event in &log.events {
         groups
@@ -1035,8 +1117,7 @@ fn project_snapshot(log: &ActivityLog, limits: SnapshotLimits, now_ms: u64) -> A
         );
     }
 
-    let mut unresolved_count = 0;
-    let mut attention = HashMap::<String, AttentionItem>::new();
+    let mut attention_occurrences = Vec::new();
     let mut recent = Vec::new();
     let mut diagnostic_events = Vec::new();
     for events in groups.into_values() {
@@ -1073,67 +1154,264 @@ fn project_snapshot(log: &ActivityLog, limits: SnapshotLimits, now_ms: u64) -> A
             Some(coding_brain_core::brain_activity::ActivityOutcome::Failed)
         );
         if needs_attention || failed_outcome {
-            if needs_attention {
-                unresolved_count += 1;
-            }
-            let key = attention_key(&item);
-            attention
-                .entry(key)
-                .and_modify(|existing| {
-                    existing.occurrences += 1;
-                    if needs_attention {
-                        existing.unresolved_occurrences += 1;
-                    }
-                    let item_rank = activity_rank(&item);
-                    let existing_rank = activity_rank(&existing.activity);
-                    if item_rank > existing_rank
-                        || (item_rank == existing_rank
-                            && (item.recorded_at_ms > existing.recorded_at_ms
-                                || (item.recorded_at_ms == existing.recorded_at_ms
-                                    && item.activity_id < existing.activity_id)))
-                    {
-                        existing.activity = item.clone();
-                    }
-                })
-                .or_insert(AttentionItem {
-                    activity: item,
-                    occurrences: 1,
-                    unresolved_occurrences: usize::from(needs_attention),
-                });
+            attention_occurrences.push(ProjectedOccurrence {
+                item,
+                needs_attention,
+            });
         } else {
             recent.push(item);
         }
     }
 
-    let mut attention = attention.into_values().collect::<Vec<_>>();
-    attention.sort_by(|left, right| {
-        attention_rank(right)
-            .cmp(&attention_rank(left))
-            .then_with(|| right.recorded_at_ms.cmp(&left.recorded_at_ms))
-            .then_with(|| left.activity_id.cmp(&right.activity_id))
-    });
-    attention.truncate(limits.attention);
-    recent.sort_by(|left, right| {
-        right
-            .recorded_at_ms
-            .cmp(&left.recorded_at_ms)
-            .then_with(|| left.activity_id.cmp(&right.activity_id))
-    });
-    recent.truncate(limits.recent);
-    diagnostic_events.sort_by(|left, right| {
-        right
-            .recorded_at_ms
-            .cmp(&left.recorded_at_ms)
-            .then_with(|| left.activity_id.cmp(&right.activity_id))
-    });
-    diagnostic_events.truncate(limits.diagnostic_events);
-    ActivitySnapshot {
-        attention,
-        recent,
-        diagnostic_events,
-        unresolved_count,
-        diagnostics: log.diagnostics.clone(),
+    let attention_eligible = derive_surface_eligibility(
+        ReviewSurface::Attention,
+        attention_occurrences
+            .iter()
+            .map(|occurrence| &occurrence.item),
+    )?;
+    let recent_eligible = derive_surface_eligibility(ReviewSurface::Recent, recent.iter())?;
+    let diagnostics_eligible =
+        derive_surface_eligibility(ReviewSurface::Diagnostics, diagnostic_events.iter())?;
+
+    let mut attention = HashMap::<AttentionGroupKey, AttentionGroup>::new();
+    let mut unresolved_count = 0;
+    let mut attention_new_count = 0;
+    let mut attention_reviewed_count = 0;
+    for occurrence in attention_occurrences {
+        let member_key = ReviewKey::derive(
+            ReviewSurface::Attention,
+            occurrence.item.activity_id.as_bytes(),
+        );
+        let review = occurrence_review_state(review_state, ReviewSurface::Attention, &member_key);
+        if review == OccurrenceReviewState::Archived {
+            continue;
+        }
+        unresolved_count += usize::from(occurrence.needs_attention);
+        match review {
+            OccurrenceReviewState::New => attention_new_count += 1,
+            OccurrenceReviewState::Reviewed => attention_reviewed_count += 1,
+            OccurrenceReviewState::Archived => unreachable!("archived occurrences were removed"),
+        }
+
+        let group_key = attention_group_key(&occurrence.item);
+        let display_id = occurrence.item.attention_review_display_id();
+        attention
+            .entry(group_key)
+            .and_modify(|group| {
+                group.item.occurrences += 1;
+                group.item.unresolved_occurrences += usize::from(occurrence.needs_attention);
+                match review {
+                    OccurrenceReviewState::New => group.target.new_member_keys.push(member_key),
+                    OccurrenceReviewState::Reviewed => {
+                        group.target.reviewed_member_keys.push(member_key);
+                    }
+                    OccurrenceReviewState::Archived => {
+                        unreachable!("archived occurrences were removed")
+                    }
+                }
+                if attention_representative_precedes(&occurrence.item, &group.item.activity) {
+                    group.item.activity = occurrence.item.clone();
+                }
+            })
+            .or_insert_with(|| AttentionGroup {
+                item: AttentionItem {
+                    activity: occurrence.item,
+                    occurrences: 1,
+                    unresolved_occurrences: usize::from(occurrence.needs_attention),
+                },
+                target: ReviewTarget {
+                    surface: ReviewSurface::Attention,
+                    display_id,
+                    new_member_keys: (review == OccurrenceReviewState::New)
+                        .then_some(member_key)
+                        .into_iter()
+                        .collect(),
+                    reviewed_member_keys: (review == OccurrenceReviewState::Reviewed)
+                        .then_some(member_key)
+                        .into_iter()
+                        .collect(),
+                },
+            });
     }
+
+    let mut attention = attention.into_values().collect::<Vec<_>>();
+    for group in &mut attention {
+        group.target.new_member_keys.sort_unstable();
+        group.target.reviewed_member_keys.sort_unstable();
+    }
+    attention.sort_by(|left, right| compare_attention_groups(left, right, attention_order));
+    attention.truncate(limits.attention);
+    let (attention_rows, attention_items) = attention
+        .into_iter()
+        .map(|group| (group.item, group.target))
+        .unzip();
+    let (recent, recent_projection) = project_chronological_surface(
+        recent,
+        ReviewSurface::Recent,
+        limits.recent,
+        review_state,
+        &recent_eligible,
+    );
+    let (diagnostic_events, diagnostics_projection) = project_chronological_surface(
+        diagnostic_events,
+        ReviewSurface::Diagnostics,
+        limits.diagnostic_events,
+        review_state,
+        &diagnostics_eligible,
+    );
+    let attention_projection = SurfaceReviewProjection {
+        revision: review_state.surface_revision(ReviewSurface::Attention),
+        items: attention_items,
+        new_count: attention_new_count,
+        reviewed_count: attention_reviewed_count,
+        last_archive_count: review_state
+            .last_archive(ReviewSurface::Attention)
+            .intersection(&attention_eligible)
+            .count(),
+    };
+    Ok(ActivityReviewProjection {
+        snapshot: ActivitySnapshot {
+            attention: attention_rows,
+            recent,
+            diagnostic_events,
+            unresolved_count,
+            diagnostics: log.diagnostics.clone(),
+        },
+        attention: attention_projection,
+        recent: recent_projection,
+        diagnostics: diagnostics_projection,
+        eligible: [
+            (ReviewSurface::Attention, attention_eligible),
+            (ReviewSurface::Recent, recent_eligible),
+            (ReviewSurface::Diagnostics, diagnostics_eligible),
+        ]
+        .into_iter()
+        .collect(),
+    })
+}
+
+fn project_chronological_surface(
+    items: Vec<ActivityItem>,
+    surface: ReviewSurface,
+    limit: usize,
+    review_state: &ReviewStateSnapshot,
+    eligible: &BTreeSet<ReviewKey>,
+) -> (Vec<ActivityItem>, SurfaceReviewProjection) {
+    let mut visible = Vec::new();
+    let mut new_count = 0;
+    let mut reviewed_count = 0;
+    for item in items {
+        let key = ReviewKey::derive(surface, item.activity_id.as_bytes());
+        let review = occurrence_review_state(review_state, surface, &key);
+        if review == OccurrenceReviewState::Archived {
+            continue;
+        }
+        match review {
+            OccurrenceReviewState::New => new_count += 1,
+            OccurrenceReviewState::Reviewed => reviewed_count += 1,
+            OccurrenceReviewState::Archived => unreachable!("archived items were removed"),
+        }
+        let target = ReviewTarget {
+            surface,
+            display_id: item.activity_id.clone(),
+            new_member_keys: (review == OccurrenceReviewState::New)
+                .then_some(key)
+                .into_iter()
+                .collect(),
+            reviewed_member_keys: (review == OccurrenceReviewState::Reviewed)
+                .then_some(key)
+                .into_iter()
+                .collect(),
+        };
+        visible.push((item, target));
+    }
+    visible.sort_by(|(left, _), (right, _)| {
+        right
+            .recorded_at_ms
+            .cmp(&left.recorded_at_ms)
+            .then_with(|| left.activity_id.cmp(&right.activity_id))
+    });
+    visible.truncate(limit);
+    let (items, targets) = visible.into_iter().unzip();
+    (
+        items,
+        SurfaceReviewProjection {
+            revision: review_state.surface_revision(surface),
+            items: targets,
+            new_count,
+            reviewed_count,
+            last_archive_count: review_state
+                .last_archive(surface)
+                .intersection(eligible)
+                .count(),
+        },
+    )
+}
+
+fn derive_surface_eligibility<'a>(
+    surface: ReviewSurface,
+    items: impl IntoIterator<Item = &'a ActivityItem>,
+) -> Result<BTreeSet<ReviewKey>, ReviewKeySetError> {
+    derive_review_key_set(
+        surface,
+        items.into_iter().map(|item| item.activity_id.as_bytes()),
+    )
+}
+
+fn occurrence_review_state(
+    snapshot: &ReviewStateSnapshot,
+    surface: ReviewSurface,
+    key: &ReviewKey,
+) -> OccurrenceReviewState {
+    match snapshot.disposition(surface, key) {
+        None => OccurrenceReviewState::New,
+        Some(ReviewDisposition::Reviewed) => OccurrenceReviewState::Reviewed,
+        Some(ReviewDisposition::Archived) => OccurrenceReviewState::Archived,
+    }
+}
+
+fn attention_group_key(item: &ActivityItem) -> AttentionGroupKey {
+    AttentionGroupKey {
+        project_id: item.project.project_id.clone(),
+        rule_id: item.rule_id.clone().unwrap_or_default(),
+        fingerprint: item
+            .fingerprint
+            .clone()
+            .or_else(|| item.normalized_command.clone())
+            .unwrap_or_else(|| item.activity_id.clone()),
+    }
+}
+
+fn attention_representative_precedes(candidate: &ActivityItem, current: &ActivityItem) -> bool {
+    let candidate_rank = activity_rank(candidate);
+    let current_rank = activity_rank(current);
+    candidate_rank > current_rank
+        || (candidate_rank == current_rank
+            && (candidate.recorded_at_ms > current.recorded_at_ms
+                || (candidate.recorded_at_ms == current.recorded_at_ms
+                    && candidate.activity_id < current.activity_id)))
+}
+
+fn compare_attention_groups(
+    left: &AttentionGroup,
+    right: &AttentionGroup,
+    order: AttentionOrder,
+) -> std::cmp::Ordering {
+    let left_is_new = !left.target.new_member_keys.is_empty();
+    let right_is_new = !right.target.new_member_keys.is_empty();
+    right_is_new
+        .cmp(&left_is_new)
+        .then_with(|| match order {
+            AttentionOrder::SeverityFirst => attention_rank(&right.item)
+                .cmp(&attention_rank(&left.item))
+                .then_with(|| right.item.recorded_at_ms.cmp(&left.item.recorded_at_ms)),
+            AttentionOrder::RecencyFirst => right
+                .item
+                .recorded_at_ms
+                .cmp(&left.item.recorded_at_ms)
+                .then_with(|| attention_rank(&right.item).cmp(&attention_rank(&left.item))),
+        })
+        .then_with(|| left.item.activity_id.cmp(&right.item.activity_id))
 }
 
 fn project_activity(events: &[&ActivityEvent], stale_after_ms: u64, now_ms: u64) -> ActivityItem {
@@ -1215,18 +1493,6 @@ fn project_activity(events: &[&ActivityEvent], stale_after_ms: u64, now_ms: u64)
         note,
         tool_execution_confirmed: outcome.is_some(),
     }
-}
-
-fn attention_key(item: &ActivityItem) -> String {
-    format!(
-        "{:?}\u{1f}{}\u{1f}{}",
-        item.project.project_id,
-        item.rule_id.as_deref().unwrap_or(""),
-        item.fingerprint
-            .as_deref()
-            .or(item.normalized_command.as_deref())
-            .unwrap_or(&item.activity_id)
-    )
 }
 
 fn attention_rank(item: &AttentionItem) -> u8 {
@@ -1349,8 +1615,12 @@ mod tests {
         ProjectEvidence,
     };
     use coding_brain_core::project::ProjectId;
+    use coding_brain_core::review_state::{
+        ReviewDisposition, ReviewKey, ReviewMutation, ReviewMutationRequest, ReviewSurface,
+    };
 
     use super::*;
+    use crate::brain::review_state::{ReviewStateSnapshot, ReviewStateStore};
 
     fn fixture_store() -> (tempfile::TempDir, ActivityStore) {
         let root = tempfile::tempdir().unwrap();
@@ -1396,6 +1666,410 @@ mod tests {
 
     fn event(activity_id: &str, state: ActivityState) -> ActivityEvent {
         event_at(activity_id, state, 100)
+    }
+
+    fn log_with_same_fingerprint<const N: usize>(occurrences: [(&str, u64); N]) -> ActivityLog {
+        let events = occurrences
+            .into_iter()
+            .map(|(activity_id, recorded_at_ms)| {
+                let mut event = event_at(activity_id, ActivityState::Denied, recorded_at_ms);
+                event.normalized_command = Some("same command".into());
+                event.fingerprint = Some("same-fingerprint".into());
+                event
+            })
+            .collect();
+        ActivityLog {
+            events,
+            diagnostics: ActivityDiagnostics::default(),
+        }
+    }
+
+    fn attention_log(count: usize) -> ActivityLog {
+        ActivityLog {
+            events: (0..count)
+                .map(|index| {
+                    event_at(
+                        &format!("attention-{index}"),
+                        ActivityState::Denied,
+                        index as u64,
+                    )
+                })
+                .collect(),
+            diagnostics: ActivityDiagnostics::default(),
+        }
+    }
+
+    fn scorecard_input_events(log: &ActivityLog) -> &[ActivityEvent] {
+        log.events()
+    }
+
+    fn review_snapshot<R, A, S, T>(
+        surface: ReviewSurface,
+        reviewed: R,
+        archived: A,
+    ) -> ReviewStateSnapshot
+    where
+        R: IntoIterator<Item = S>,
+        A: IntoIterator<Item = T>,
+        S: AsRef<str>,
+        T: AsRef<str>,
+    {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store = ReviewStateStore::at(root.path());
+        let reviewed = reviewed
+            .into_iter()
+            .map(|identity| ReviewKey::derive(surface, identity.as_ref().as_bytes()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let archived = archived
+            .into_iter()
+            .map(|identity| ReviewKey::derive(surface, identity.as_ref().as_bytes()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let eligible = reviewed
+            .union(&archived)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut revision = 0;
+        if !eligible.is_empty() {
+            revision = store
+                .mutate(
+                    &ReviewMutationRequest {
+                        surface,
+                        expected_surface_revision: revision,
+                        operation: ReviewMutation::SetDisposition {
+                            keys: eligible.clone(),
+                            disposition: ReviewDisposition::Reviewed,
+                        },
+                    },
+                    &eligible,
+                )
+                .unwrap()
+                .surface_revision;
+        }
+        if !archived.is_empty() {
+            store
+                .mutate(
+                    &ReviewMutationRequest {
+                        surface,
+                        expected_surface_revision: revision,
+                        operation: ReviewMutation::SetDisposition {
+                            keys: archived,
+                            disposition: ReviewDisposition::Archived,
+                        },
+                    },
+                    &eligible,
+                )
+                .unwrap();
+        }
+        store.read().unwrap()
+    }
+
+    #[test]
+    fn reviewed_group_reopens_when_a_new_occurrence_arrives() {
+        let log = log_with_same_fingerprint([("old", 10), ("new", 20)]);
+        let reviewed = review_snapshot(ReviewSurface::Attention, ["old"], [] as [&str; 0]);
+        let projected = project_snapshot_with_review(
+            &log,
+            SnapshotLimits::default(),
+            30,
+            &reviewed,
+            AttentionOrder::SeverityFirst,
+        )
+        .unwrap();
+
+        assert_eq!(projected.snapshot.attention.len(), 1);
+        assert_eq!(
+            projected.snapshot.attention.len(),
+            projected.attention.items.len()
+        );
+        assert_eq!(projected.snapshot.attention[0].occurrences, 2);
+        assert_eq!(projected.attention.items[0].new_member_keys.len(), 1);
+        assert_eq!(projected.attention.items[0].reviewed_member_keys.len(), 1);
+    }
+
+    #[test]
+    fn archived_occurrences_do_not_inflate_counts_or_overflow() {
+        let log = attention_log(105);
+        let archived = (95..105)
+            .map(|index| format!("attention-{index}"))
+            .collect::<Vec<_>>();
+        let state = review_snapshot(
+            ReviewSurface::Attention,
+            std::iter::empty::<String>(),
+            archived,
+        );
+        let projected = project_snapshot_with_review(
+            &log,
+            SnapshotLimits::default(),
+            200,
+            &state,
+            AttentionOrder::SeverityFirst,
+        )
+        .unwrap();
+
+        assert_eq!(projected.snapshot.unresolved_count, 95);
+        assert_eq!(projected.snapshot.attention.len(), 95);
+        assert_eq!(projected.attention.new_count, 95);
+        assert_eq!(projected.eligible[&ReviewSurface::Attention].len(), 105);
+    }
+
+    #[test]
+    fn review_projection_recent_exposes_unseen_and_seen_counts_in_chronological_order() {
+        let mut log = ActivityLog::default();
+        for (activity_id, recorded_at_ms) in [("seen", 10), ("unseen", 20)] {
+            log.events.push(event_at(
+                activity_id,
+                ActivityState::Allowed,
+                recorded_at_ms,
+            ));
+            log.events.push(event_at(
+                activity_id,
+                ActivityState::Delivered,
+                recorded_at_ms + 1,
+            ));
+        }
+        let state = review_snapshot(ReviewSurface::Recent, ["seen"], [] as [&str; 0]);
+        let projected = project_snapshot_with_review(
+            &log,
+            SnapshotLimits {
+                recent: 2,
+                ..SnapshotLimits::default()
+            },
+            30,
+            &state,
+            AttentionOrder::SeverityFirst,
+        )
+        .unwrap();
+
+        assert_eq!(projected.recent.new_count, 1);
+        assert_eq!(projected.recent.reviewed_count, 1);
+        assert_eq!(
+            projected.snapshot.recent.len(),
+            projected.recent.items.len()
+        );
+        assert_eq!(
+            projected
+                .snapshot
+                .recent
+                .iter()
+                .map(|item| item.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["unseen", "seen"]
+        );
+        assert_eq!(
+            projected
+                .recent
+                .items
+                .iter()
+                .map(|target| target.display_id.as_str())
+                .collect::<Vec<_>>(),
+            ["unseen", "seen"]
+        );
+    }
+
+    #[test]
+    fn review_projection_diagnostics_filters_archive_before_chronological_limit() {
+        let mut log = ActivityLog::default();
+        for (activity_id, recorded_at_ms) in [
+            ("new-diagnostic", 10),
+            ("reviewed-diagnostic", 20),
+            ("archived", 30),
+        ] {
+            let mut event = event_at(activity_id, ActivityState::Error, recorded_at_ms);
+            event.kind = ActivityKind::Diagnostic;
+            event.decision_id = None;
+            log.events.push(event);
+        }
+        let state = review_snapshot(
+            ReviewSurface::Diagnostics,
+            ["reviewed-diagnostic"],
+            ["archived"],
+        );
+        let projected = project_snapshot_with_review(
+            &log,
+            SnapshotLimits {
+                diagnostic_events: 2,
+                ..SnapshotLimits::default()
+            },
+            40,
+            &state,
+            AttentionOrder::SeverityFirst,
+        )
+        .unwrap();
+
+        assert_eq!(projected.diagnostics.new_count, 1);
+        assert_eq!(projected.diagnostics.reviewed_count, 1);
+        assert_eq!(projected.diagnostics.last_archive_count, 1);
+        assert_eq!(projected.eligible[&ReviewSurface::Diagnostics].len(), 3);
+        assert_eq!(
+            projected.snapshot.diagnostic_events.len(),
+            projected.diagnostics.items.len()
+        );
+        assert_eq!(
+            projected
+                .snapshot
+                .diagnostic_events
+                .iter()
+                .map(|item| item.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["reviewed-diagnostic", "new-diagnostic"]
+        );
+        assert!(
+            projected
+                .snapshot
+                .diagnostic_events
+                .iter()
+                .all(|item| item.activity_id != "archived")
+        );
+    }
+
+    #[test]
+    fn review_projection_resolved_failed_outcome_preserves_evidence_and_unresolved_count() {
+        let mut log = ActivityLog::default();
+        log.events
+            .push(event_at("failed", ActivityState::Allowed, 10));
+        log.events
+            .push(event_at("failed", ActivityState::Delivered, 11));
+        let mut outcome = event_at("failed", ActivityState::Outcome, 12);
+        outcome.outcome = Some(ActivityOutcome::Failed);
+        log.events.push(outcome);
+        let source_events = log.events.clone();
+
+        let reviewed = review_snapshot(ReviewSurface::Attention, ["failed"], [] as [&str; 0]);
+        let projected = project_snapshot_with_review(
+            &log,
+            SnapshotLimits::default(),
+            20,
+            &reviewed,
+            AttentionOrder::SeverityFirst,
+        )
+        .unwrap();
+        assert_eq!(projected.snapshot.unresolved_count, 0);
+        assert_eq!(projected.snapshot.attention.len(), 1);
+        assert_eq!(
+            projected.snapshot.attention[0].outcome,
+            Some(ActivityOutcome::Failed)
+        );
+        assert_eq!(projected.attention.reviewed_count, 1);
+
+        let archived = review_snapshot(ReviewSurface::Attention, [] as [&str; 0], ["failed"]);
+        let projected = project_snapshot_with_review(
+            &log,
+            SnapshotLimits::default(),
+            20,
+            &archived,
+            AttentionOrder::SeverityFirst,
+        )
+        .unwrap();
+        assert_eq!(projected.snapshot.unresolved_count, 0);
+        assert!(projected.snapshot.attention.is_empty());
+        assert!(
+            projected.eligible[&ReviewSurface::Attention]
+                .contains(&ReviewKey::derive(ReviewSurface::Attention, b"failed"))
+        );
+        assert_eq!(scorecard_input_events(&log), source_events);
+    }
+
+    #[test]
+    fn review_projection_new_partition_precedes_reviewed_under_both_orders() {
+        let log = ActivityLog {
+            events: vec![
+                event_at("new-severe", ActivityState::DeliveryFailed, 100),
+                event_at("new-recent", ActivityState::Abstained, 200),
+                event_at("reviewed", ActivityState::Denied, 300),
+            ],
+            diagnostics: ActivityDiagnostics::default(),
+        };
+        let state = review_snapshot(ReviewSurface::Attention, ["reviewed"], [] as [&str; 0]);
+        let severity = project_snapshot_with_review(
+            &log,
+            SnapshotLimits::default(),
+            400,
+            &state,
+            AttentionOrder::SeverityFirst,
+        )
+        .unwrap();
+        let recency = project_snapshot_with_review(
+            &log,
+            SnapshotLimits::default(),
+            400,
+            &state,
+            AttentionOrder::RecencyFirst,
+        )
+        .unwrap();
+
+        assert_eq!(
+            severity
+                .snapshot
+                .attention
+                .iter()
+                .map(|item| item.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["new-severe", "new-recent", "reviewed"]
+        );
+        assert_eq!(
+            recency
+                .snapshot
+                .attention
+                .iter()
+                .map(|item| item.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["new-recent", "new-severe", "reviewed"]
+        );
+        assert_eq!(
+            severity.attention.items[0].display_id,
+            recency.attention.items[1].display_id
+        );
+        assert_eq!(severity.attention.new_count, 2);
+        assert_eq!(severity.attention.reviewed_count, 1);
+        let display_id = &severity.attention.items[0].display_id;
+        assert_eq!(display_id.len(), 64);
+        assert!(!display_id.contains("new-severe"));
+    }
+
+    #[test]
+    fn review_projection_duplicate_fresh_identities_are_rejected() {
+        let event = event("duplicate", ActivityState::Denied);
+        let item = project_activity(
+            &[&event],
+            SnapshotLimits::default().interrupted_after_ms,
+            200,
+        );
+
+        assert_eq!(
+            derive_surface_eligibility(ReviewSurface::Attention, [&item, &item]),
+            Err(ReviewKeySetError::DuplicateKey)
+        );
+    }
+
+    #[test]
+    fn review_projection_archived_member_cannot_be_group_representative() {
+        let mut archived = event_at("archived", ActivityState::DeliveryFailed, 20);
+        archived.fingerprint = Some("shared".into());
+        let mut active = event_at("active", ActivityState::Abstained, 10);
+        active.fingerprint = Some("shared".into());
+        let log = ActivityLog {
+            events: vec![archived, active],
+            diagnostics: ActivityDiagnostics::default(),
+        };
+        let state = review_snapshot(ReviewSurface::Attention, [] as [&str; 0], ["archived"]);
+        let projected = project_snapshot_with_review(
+            &log,
+            SnapshotLimits::default(),
+            30,
+            &state,
+            AttentionOrder::SeverityFirst,
+        )
+        .unwrap();
+
+        assert_eq!(projected.snapshot.attention.len(), 1);
+        assert_eq!(projected.snapshot.attention[0].activity_id, "active");
+        assert_eq!(projected.snapshot.attention[0].occurrences, 1);
     }
 
     #[test]

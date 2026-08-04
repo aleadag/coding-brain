@@ -10,6 +10,12 @@ All notable changes to Coding Brain are documented here.
 
 ### Added
 
+- You can review new items consistently across Live Needs Attention, Review,
+  Diagnostics, and Recent with `a`/`A`; archivable views also use `d`/`D` and
+  `u` for durable archive and undo. This surface-local state survives restarts
+  without deleting evidence or changing Scorecard results. See the
+  [review lifecycle state guide](docs/configuration.md#review-lifecycle-state)
+  for first-run cleanup and safe reset steps.
 - You can inspect metadata-only hook and correlation diagnostics, rejected or
   uncertain session actions and recovery, plus activity-store integrity in a
   read-only Diagnostics tab. Use `j`/`k` or the arrow keys to select events and

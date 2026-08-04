@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::project::ProjectId;
 use crate::provider::AgentProvider;
@@ -11,6 +12,7 @@ pub const DEFAULT_INTERRUPTED_AFTER_MS: u64 = 30_000;
 pub const MAX_ACTIVITY_EVENT_BYTES: usize = 64 * 1024;
 pub const MAX_ACTIVITY_FIELD_BYTES: usize = 4_096;
 pub const MAX_PROVIDER_HINTS: usize = 16;
+const ATTENTION_GROUP_ID_DOMAIN: &[u8] = b"attention-group:v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectEvidence {
@@ -350,6 +352,36 @@ pub struct ActivityItem {
     pub tool_execution_confirmed: bool,
 }
 
+impl ActivityItem {
+    pub fn attention_review_display_id(&self) -> String {
+        let mut hash = Sha256::new();
+        hash.update(ATTENTION_GROUP_ID_DOMAIN);
+        match &self.project.project_id {
+            ProjectId::Stable(value) => {
+                hash_attention_field(&mut hash, b"stable");
+                hash_attention_field(&mut hash, value.as_bytes());
+            }
+            ProjectId::Temporary(value) => {
+                hash_attention_field(&mut hash, b"temporary");
+                hash_attention_field(&mut hash, value.as_bytes());
+            }
+        }
+        hash_attention_field(
+            &mut hash,
+            self.rule_id.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_attention_field(
+            &mut hash,
+            self.fingerprint
+                .as_deref()
+                .or(self.normalized_command.as_deref())
+                .unwrap_or(&self.activity_id)
+                .as_bytes(),
+        );
+        hex_digest(hash.finalize().into())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionItem {
     pub activity: ActivityItem,
@@ -363,6 +395,27 @@ impl std::ops::Deref for AttentionItem {
     fn deref(&self) -> &Self::Target {
         &self.activity
     }
+}
+
+impl AttentionItem {
+    pub fn review_display_id(&self) -> String {
+        self.activity.attention_review_display_id()
+    }
+}
+
+fn hash_attention_field(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

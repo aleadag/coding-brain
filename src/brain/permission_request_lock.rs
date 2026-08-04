@@ -1,18 +1,18 @@
 #![allow(dead_code)] // The hook integration task consumes these Task 2 interfaces.
 
-use std::borrow::Cow;
 use std::ffi::CString;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use coding_brain_core::lifecycle::LifecycleIdentity;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
+
+pub(super) use super::secure_state::state_root_for_traversal;
+use super::secure_state::{SecureStateDirectory, SecureStateError, open_or_create_nested};
 
 const LOCK_DIRECTORY: &str = "brain/permission-request-locks";
 const SHARD_COUNT: usize = 256;
@@ -43,6 +43,15 @@ impl std::error::Error for RequestLockError {}
 impl From<io::Error> for RequestLockError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<SecureStateError> for RequestLockError {
+    fn from(error: SecureStateError) -> Self {
+        match error {
+            SecureStateError::Io(error) => Self::Io(error),
+            SecureStateError::InvalidStorage(reason) => Self::InvalidStorage(reason),
+        }
     }
 }
 
@@ -87,38 +96,19 @@ impl PermissionRequestLockStore {
         self.initialize().map(drop)
     }
 
-    fn initialize(&self) -> Result<File, RequestLockError> {
+    fn initialize(&self) -> Result<SecureStateDirectory, RequestLockError> {
         let state_root = self
             .directory
             .parent()
             .and_then(Path::parent)
             .ok_or(RequestLockError::InvalidStorage("missing state root"))?;
-        let state_root = state_root_for_traversal(state_root);
-        let mut directory = open_directory(if state_root.is_absolute() {
-            Path::new("/")
-        } else {
-            Path::new(".")
-        })?;
-        for (component, private) in state_root
-            .components()
-            .map(|component| (component, false))
-            .chain([(Component::Normal(std::ffi::OsStr::new("brain")), true)])
-            .chain([(
-                Component::Normal(std::ffi::OsStr::new("permission-request-locks")),
-                true,
-            )])
-        {
-            let name = match component {
-                Component::RootDir | Component::CurDir => continue,
-                Component::Normal(name) => name,
-                Component::ParentDir | Component::Prefix(_) => {
-                    return Err(RequestLockError::InvalidStorage(
-                        "invalid lock directory path",
-                    ));
-                }
-            };
-            directory = open_or_create_directory_at(&directory, name, private)?;
-        }
+        let directory = open_or_create_nested(
+            state_root,
+            &[
+                std::ffi::OsStr::new("brain"),
+                std::ffi::OsStr::new("permission-request-locks"),
+            ],
+        )?;
         for shard in 0..SHARD_COUNT {
             open_valid_shard(&directory, &shard_name(shard as u8))?;
         }
@@ -184,392 +174,32 @@ fn shard_name(shard: u8) -> String {
     format!("permission-request-lock-{shard:02x}")
 }
 
-fn open_directory(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-}
-
-fn open_or_create_directory_at(
-    parent: &File,
-    name: &std::ffi::OsStr,
-    private: bool,
+fn open_valid_shard(
+    directory: &SecureStateDirectory,
+    name: &str,
 ) -> Result<File, RequestLockError> {
-    open_or_create_directory_at_with_hook(parent, name, private, || {})
-}
-
-fn open_or_create_directory_at_with_hook(
-    parent: &File,
-    name: &std::ffi::OsStr,
-    private: bool,
-    after_created_metadata: impl FnOnce(),
-) -> Result<File, RequestLockError> {
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| RequestLockError::InvalidStorage("invalid directory name"))?;
-    let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0;
-    if !created {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(error.into());
-        }
-    }
-    let created_metadata = if created {
-        let initial = metadata_at(parent, &name)?;
-        after_created_metadata();
-        repair_created_directory(parent, &name, &initial)?;
-        let repaired = metadata_at(parent, &name)?;
-        if repaired.mode & 0o777 != 0o700
-            || repaired.uid != unsafe { libc::geteuid() }
-            || repaired.dev != initial.dev
-            || repaired.ino != initial.ino
-        {
-            return Err(RequestLockError::InvalidStorage(
-                "created directory changed during mode repair",
-            ));
-        }
-        Some(repaired)
-    } else {
-        None
-    };
-    let before = metadata_at(parent, &name)?;
-    let descriptor = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if descriptor < 0 {
-        return Err(RequestLockError::InvalidStorage("open directory component"));
-    }
-    let child = unsafe { File::from_raw_fd(descriptor) };
-    let opened_metadata = child.metadata()?;
-    let opened = ShardMetadata::from(&opened_metadata);
-    if before.dev != opened.dev
-        || before.ino != opened.ino
-        || !opened_metadata.file_type().is_dir()
-        || (private && opened.uid != unsafe { libc::geteuid() })
-    {
-        return Err(RequestLockError::InvalidStorage(
-            "directory changed during open",
-        ));
-    }
-    if let Some(created) = created_metadata.as_ref() {
-        if created.dev != opened.dev || created.ino != opened.ino {
-            return Err(RequestLockError::InvalidStorage(
-                "created directory changed before final validation",
-            ));
-        }
-    }
-    if private && !created && opened.mode & 0o700 != 0o700 {
-        return Err(RequestLockError::InvalidStorage(
-            "private directory lacks owner permissions",
-        ));
-    }
-    if private && opened.mode & 0o777 != 0o700 {
-        child.set_permissions(fs::Permissions::from_mode(0o700))?;
-    }
-    let after = ShardMetadata::from(&child.metadata()?);
-    if private
-        && (after.mode & 0o777 != 0o700
-            || after.uid != unsafe { libc::geteuid() }
-            || after.dev != opened.dev
-            || after.ino != opened.ino)
-    {
-        return Err(RequestLockError::InvalidStorage(
-            "invalid private directory",
-        ));
-    }
-    Ok(child)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod created_directory_platform {
-    use std::fs::File;
-    use std::io;
-    use std::os::fd::AsRawFd;
-
-    pub(super) const OPEN_FLAGS: libc::c_int =
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-
-    pub(super) fn chmod(directory: &File) -> io::Result<()> {
-        // Linux assigns 452 to fchmodat2; the locked libc omits the named
-        // constant on supported aarch64 and Android targets.
-        const SYS_FCHMODAT2: libc::c_long = 452;
-        let result = unsafe {
-            libc::syscall(
-                SYS_FCHMODAT2,
-                directory.as_raw_fd(),
-                c"".as_ptr(),
-                0o700 as libc::mode_t,
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        (result == 0)
-            .then_some(())
-            .ok_or_else(io::Error::last_os_error)
-    }
-}
-
-#[cfg(target_vendor = "apple")]
-mod created_directory_platform {
-    use std::fs::File;
-    use std::io;
-    use std::os::fd::AsRawFd;
-
-    pub(super) const OPEN_FLAGS: libc::c_int = libc::O_SEARCH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-
-    pub(super) fn chmod(directory: &File) -> io::Result<()> {
-        let result = unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) };
-        (result == 0)
-            .then_some(())
-            .ok_or_else(io::Error::last_os_error)
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-mod created_directory_platform {
-    use std::fs::File;
-    use std::io;
-    use std::os::fd::AsRawFd;
-
-    pub(super) const OPEN_FLAGS: libc::c_int =
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-
-    pub(super) fn chmod(directory: &File) -> io::Result<()> {
-        let result = unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) };
-        (result == 0)
-            .then_some(())
-            .ok_or_else(io::Error::last_os_error)
-    }
-}
-
-pub(super) fn state_root_for_traversal(state_root: &Path) -> Cow<'_, Path> {
-    #[cfg(target_vendor = "apple")]
-    // These are fixed root-owned Darwin compatibility aliases. The remaining
-    // caller-selected suffix is still traversed component-by-component without following symlinks.
-    for (alias, target) in [
-        (Path::new("/var"), Path::new("/private/var")),
-        (Path::new("/tmp"), Path::new("/private/tmp")),
-    ] {
-        if let Ok(suffix) = state_root.strip_prefix(alias) {
-            return Cow::Owned(target.join(suffix));
-        }
-    }
-
-    Cow::Borrowed(state_root)
-}
-
-fn repair_created_directory(
-    parent: &File,
-    name: &CString,
-    initial: &ShardMetadata,
-) -> Result<(), RequestLockError> {
-    let descriptor = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            created_directory_platform::OPEN_FLAGS,
-        )
-    };
-    if descriptor < 0 {
-        return Err(RequestLockError::InvalidStorage(
-            "open created directory for mode repair",
-        ));
-    }
-    let directory = unsafe { File::from_raw_fd(descriptor) };
-    validate_created_directory_descriptor(&directory, initial)?;
-    if initial.mode & 0o777 != 0o700 {
-        created_directory_platform::chmod(&directory)?;
-    }
-    validate_repaired_directory_descriptor(&directory, initial)
-}
-
-fn validate_created_directory_descriptor(
-    directory: &File,
-    initial: &ShardMetadata,
-) -> Result<(), RequestLockError> {
-    let metadata = directory.metadata()?;
-    let opened = ShardMetadata::from(&metadata);
-    if !metadata.file_type().is_dir()
-        || opened.uid != unsafe { libc::geteuid() }
-        || opened.dev != initial.dev
-        || opened.ino != initial.ino
-    {
-        return Err(RequestLockError::InvalidStorage(
-            "created directory changed before mode repair",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_repaired_directory_descriptor(
-    directory: &File,
-    initial: &ShardMetadata,
-) -> Result<(), RequestLockError> {
-    let metadata = directory.metadata()?;
-    let repaired = ShardMetadata::from(&metadata);
-    if repaired.mode & 0o777 != 0o700
-        || !metadata.file_type().is_dir()
-        || repaired.uid != unsafe { libc::geteuid() }
-        || repaired.dev != initial.dev
-        || repaired.ino != initial.ino
-    {
-        return Err(RequestLockError::InvalidStorage(
-            "invalid created directory after mode repair",
-        ));
-    }
-    Ok(())
-}
-
-fn open_valid_shard(directory: &File, name: &str) -> Result<File, RequestLockError> {
     open_valid_shard_with_hook(directory, name, || {})
 }
 
 fn open_valid_shard_with_hook(
-    directory: &File,
+    directory: &SecureStateDirectory,
     name: &str,
     after_open: impl FnOnce(),
 ) -> Result<File, RequestLockError> {
     let name = CString::new(name).expect("fixed shard name contains no NUL");
-    let mut created = false;
-    let mut descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if descriptor < 0 && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
-        descriptor = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        created = descriptor >= 0;
-        if descriptor < 0 && io::Error::last_os_error().kind() == io::ErrorKind::AlreadyExists {
-            descriptor = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
+    match directory.metadata(&name) {
+        Ok(metadata) if metadata.len != 0 => {
+            return Err(RequestLockError::InvalidStorage("shard content"));
         }
+        Ok(_) => {}
+        Err(SecureStateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    if descriptor < 0 {
-        let error = io::Error::last_os_error();
-        return if matches!(error.raw_os_error(), Some(libc::ELOOP)) {
-            Err(RequestLockError::InvalidStorage("shard symlink"))
-        } else {
-            Err(error.into())
-        };
-    }
-    let file = unsafe { File::from_raw_fd(descriptor) };
-    if created {
-        let result = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
-        if result != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-    }
-    after_open();
-    let before = metadata_at(directory, &name)?;
-    validate_shard_metadata(&before)?;
-    let opened = ShardMetadata::from(&file.metadata()?);
-    validate_shard_metadata(&opened)?;
-    if before.dev != opened.dev || before.ino != opened.ino {
-        return Err(RequestLockError::InvalidStorage(
-            "shard replaced during open",
-        ));
-    }
-    if !created && opened.mode & 0o600 != 0o600 {
-        return Err(RequestLockError::InvalidStorage(
-            "shard lacks owner permissions",
-        ));
-    }
-    if opened.mode & 0o777 != 0o600 {
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    let after = metadata_at(directory, &name)?;
-    let opened_after = ShardMetadata::from(&file.metadata()?);
-    validate_shard_metadata(&after)?;
-    validate_shard_metadata(&opened_after)?;
-    if after.mode & 0o777 != 0o600
-        || opened_after.mode & 0o777 != 0o600
-        || after.dev != opened_after.dev
-        || after.ino != opened_after.ino
-        || before.dev != after.dev
-        || before.ino != after.ino
-    {
-        return Err(RequestLockError::InvalidStorage("unstable shard inode"));
+    let file = directory.open_regular_with_hook(&name, true, after_open)?;
+    if file.metadata()?.len() != 0 {
+        return Err(RequestLockError::InvalidStorage("shard content"));
     }
     Ok(file)
-}
-
-#[derive(Clone, Copy)]
-struct ShardMetadata {
-    mode: u32,
-    uid: u32,
-    len: u64,
-    nlink: u64,
-    dev: u64,
-    ino: u64,
-}
-
-impl From<&fs::Metadata> for ShardMetadata {
-    fn from(metadata: &fs::Metadata) -> Self {
-        Self {
-            mode: metadata.mode(),
-            uid: metadata.uid(),
-            len: metadata.len(),
-            nlink: metadata.nlink(),
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        }
-    }
-}
-
-#[allow(clippy::unnecessary_cast)]
-fn metadata_at(directory: &File, name: &CString) -> io::Result<ShardMetadata> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let result = unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stat = unsafe { stat.assume_init() };
-    Ok(ShardMetadata {
-        mode: stat.st_mode as u32,
-        uid: stat.st_uid as u32,
-        len: stat.st_size as u64,
-        nlink: stat.st_nlink as u64,
-        dev: stat.st_dev as u64,
-        ino: stat.st_ino as u64,
-    })
-}
-
-#[allow(clippy::unnecessary_cast)]
-fn validate_shard_metadata(metadata: &ShardMetadata) -> Result<(), RequestLockError> {
-    if metadata.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32
-        || metadata.uid != unsafe { libc::geteuid() }
-        || metadata.len != 0
-        || metadata.nlink != 1
-    {
-        return Err(RequestLockError::InvalidStorage(
-            "shard owner, type, content, or links",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -588,10 +218,12 @@ mod tests {
     use coding_brain_core::provider::AgentProvider;
 
     #[cfg(target_vendor = "apple")]
-    use super::state_root_for_traversal;
+    use super::super::secure_state::state_root_for_traversal;
+    use super::super::secure_state::{
+        SecureStateError, open_directory, open_or_create_directory_at_with_hook,
+    };
     use super::{
-        PermissionRequestLockStore, RequestLockError, open_directory,
-        open_or_create_directory_at_with_hook, open_valid_shard_with_hook, shard_name,
+        PermissionRequestLockStore, RequestLockError, open_valid_shard_with_hook, shard_name,
     };
 
     const HELPER_ENV: &str = "CODING_BRAIN_PERMISSION_LOCK_HELPER";
@@ -757,7 +389,7 @@ mod tests {
 
     #[test]
     fn directory_repair_source_cfg_contains_platform_specific_apis() {
-        let source = include_str!("permission_request_lock.rs");
+        let source = include_str!("secure_state.rs");
         let linux_start = source
             .find("#[cfg(any(target_os = \"linux\", target_os = \"android\"))]")
             .unwrap();
@@ -824,7 +456,7 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(RequestLockError::InvalidStorage(_))));
+        assert!(matches!(result, Err(SecureStateError::InvalidStorage(_))));
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o500

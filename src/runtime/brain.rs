@@ -1,6 +1,6 @@
 //! Bind Brain read contracts to the binary's brain subsystem.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,13 +10,17 @@ use coding_brain_core::brain_activity::{
     ProjectEvidence, SessionTargetProvenance, SnapshotLimits,
 };
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
+use coding_brain_core::review_state::{
+    BrainReviewProjection, ReviewDisposition, ReviewKey, ReviewKeySetError, ReviewSurface,
+    ReviewTarget, SurfaceReviewProjection, derive_review_key_set,
+};
 use coding_brain_core::runtime::{
     BrainActions, BrainGateMode, BrainRefresh, BrainSource, BrainSourceError, CacheSummary,
     CorrectionInput, CounterfactualSummary, DecisionSummary, EndpointHealth, LatencySummary,
-    ProviderScoreSummary, ReviewItemSummary, RiskTierSummary, ScorecardSummary,
-    SessionActionAttempt, SessionActionAvailability, SessionActionCapability, SessionActionFailure,
-    SessionActionFailureCategory, SessionActionPreflightRequest, SessionActionRequest,
-    SessionActionTarget,
+    ProviderScoreSummary, ReviewItemSummary, ReviewMutationError, RiskTierSummary,
+    ScorecardSummary, SessionActionAttempt, SessionActionAvailability, SessionActionCapability,
+    SessionActionFailure, SessionActionFailureCategory, SessionActionPreflightRequest,
+    SessionActionRequest, SessionActionTarget,
 };
 use coding_brain_core::session::AgentSession;
 use coding_brain_core::session_links::SessionIdentityProjection;
@@ -26,6 +30,7 @@ use coding_brain_core::terminals::{
 };
 
 use crate::{brain, config};
+use brain::review_state::ReviewStateSnapshot;
 
 pub struct LiveBrainSource {
     endpoint_probe: Arc<Mutex<EndpointProbeState>>,
@@ -166,12 +171,171 @@ impl LiveBrainSource {
             .iter()
             .map(DecisionSummary::from)
             .collect::<Vec<_>>();
+        let review_state = brain::review_state::ReviewStateStore::at(state_root)
+            .read()
+            .map_err(review_state_source_error)?;
+        let activity_projection = brain::activity::project_snapshot_with_review(
+            &activity,
+            limits,
+            epoch_ms(),
+            &review_state,
+            brain::activity::AttentionOrder::SeverityFirst,
+        )
+        .map_err(|_| BrainSourceError::Other("duplicate activity review identity".into()))?;
+        let (review_queue, review_projection, _) =
+            review_queue_from(records, activity.events(), &review_state)
+                .map_err(|_| BrainSourceError::Other("duplicate Review identity".into()))?;
+        let scorecard = scorecard_from(&decisions, activity.events());
+        let refresh = BrainRefresh {
+            snapshot: activity_projection.snapshot,
+            review_queue,
+            scorecard,
+            review_state: BrainReviewProjection {
+                attention: activity_projection.attention,
+                review: review_projection,
+                diagnostics: activity_projection.diagnostics,
+                recent: activity_projection.recent,
+            },
+        };
+        refresh
+            .validate_review_alignment()
+            .map_err(|error| BrainSourceError::Other(error.to_string()))?;
+        Ok(refresh)
+    }
+}
 
-        Ok(BrainRefresh {
-            snapshot: store.project_snapshot(&activity, limits),
-            review_queue: review_queue_from(records, activity.events()),
-            scorecard: scorecard_from(&decisions, activity.events()),
-        })
+fn review_state_source_error(error: brain::review_state::ReviewStateError) -> BrainSourceError {
+    match error {
+        brain::review_state::ReviewStateError::Busy => BrainSourceError::Busy,
+        other => BrainSourceError::Other(bounded_display(&other.to_string())),
+    }
+}
+
+struct OwnedSurfaceEvidence {
+    eligible: BTreeSet<ReviewKey>,
+}
+
+fn fresh_surface_evidence(
+    state_root: &Path,
+    surface: ReviewSurface,
+) -> Result<OwnedSurfaceEvidence, ReviewMutationError> {
+    fresh_surface_evidence_with_activity_store(
+        state_root,
+        surface,
+        brain::activity::ActivityStore::at(state_root.join("activity.jsonl")),
+    )
+}
+
+fn fresh_surface_evidence_with_activity_store(
+    state_root: &Path,
+    surface: ReviewSurface,
+    activity_store: brain::activity::ActivityStore,
+) -> Result<OwnedSurfaceEvidence, ReviewMutationError> {
+    let recovery = brain::permission_transaction::recover_pending(
+        state_root,
+        brain::permission_transaction::RecoveryLimits::startup(),
+    )
+    .map_err(|error| ReviewMutationError::Other(bounded_display(&error.to_string())))?;
+    if recovery.invalid != 0
+        || recovery.over_budget != 0
+        || recovery.removal_sync_uncertain != 0
+        || recovery.pending != 0
+    {
+        return Err(ReviewMutationError::Other(
+            "permission transaction recovery remains unresolved".into(),
+        ));
+    }
+    let activity = activity_store.read().map_err(review_activity_error)?;
+    let records = brain::decisions::read_learning_decisions_from_activity(activity.events());
+    let empty_review_state = ReviewStateSnapshot::default();
+    let eligible = match surface {
+        ReviewSurface::Review => review_queue_from(records, activity.events(), &empty_review_state)
+            .map(|(_, _, eligible)| eligible)
+            .map_err(|_| ReviewMutationError::Other("duplicate Review identity".into()))?,
+        ReviewSurface::Attention | ReviewSurface::Diagnostics | ReviewSurface::Recent => {
+            let projection = brain::activity::project_snapshot_with_review(
+                &activity,
+                SnapshotLimits::default(),
+                epoch_ms(),
+                &empty_review_state,
+                brain::activity::AttentionOrder::SeverityFirst,
+            )
+            .map_err(|_| ReviewMutationError::Other("duplicate activity review identity".into()))?;
+            projection
+                .eligible
+                .get(&surface)
+                .cloned()
+                .expect("activity projection includes every activity review surface")
+        }
+    };
+    Ok(OwnedSurfaceEvidence { eligible })
+}
+
+pub(crate) fn fresh_eligible_review_keys(
+    state_root: &Path,
+    surface: ReviewSurface,
+) -> Result<BTreeSet<ReviewKey>, ReviewMutationError> {
+    Ok(fresh_surface_evidence(state_root, surface)?.eligible)
+}
+
+fn mutate_review_state_at(
+    state_root: &Path,
+    request: &coding_brain_core::review_state::ReviewMutationRequest,
+) -> Result<coding_brain_core::review_state::ReviewMutationResult, ReviewMutationError> {
+    request
+        .validate()
+        .map_err(ReviewMutationError::InvalidRequest)?;
+    let eligible = fresh_eligible_review_keys(state_root, request.surface)?;
+    brain::review_state::ReviewStateStore::at(state_root)
+        .mutate(request, &eligible)
+        .map_err(review_mutation_error)
+}
+
+#[cfg(test)]
+fn mutate_review_state_at_with_activity_store(
+    state_root: &Path,
+    request: &coding_brain_core::review_state::ReviewMutationRequest,
+    activity_store: brain::activity::ActivityStore,
+) -> Result<coding_brain_core::review_state::ReviewMutationResult, ReviewMutationError> {
+    request
+        .validate()
+        .map_err(ReviewMutationError::InvalidRequest)?;
+    let eligible =
+        fresh_surface_evidence_with_activity_store(state_root, request.surface, activity_store)?
+            .eligible;
+    brain::review_state::ReviewStateStore::at(state_root)
+        .mutate(request, &eligible)
+        .map_err(review_mutation_error)
+}
+
+fn review_activity_error(error: brain::activity::ActivityStoreError) -> ReviewMutationError {
+    match error {
+        brain::activity::ActivityStoreError::LockTimeout => ReviewMutationError::Busy,
+        other => ReviewMutationError::Other(bounded_display(&other.to_string())),
+    }
+}
+
+fn review_mutation_error(error: brain::review_state::ReviewStateError) -> ReviewMutationError {
+    match error {
+        brain::review_state::ReviewStateError::Busy => ReviewMutationError::Busy,
+        brain::review_state::ReviewStateError::DurabilityUncertain => {
+            ReviewMutationError::DurabilityUncertain
+        }
+        brain::review_state::ReviewStateError::InvalidRequest(error) => {
+            ReviewMutationError::InvalidRequest(error)
+        }
+        brain::review_state::ReviewStateError::StaleRevision => ReviewMutationError::StaleRevision,
+        brain::review_state::ReviewStateError::TargetNotEligible => {
+            ReviewMutationError::TargetNoLongerEligible
+        }
+        brain::review_state::ReviewStateError::CountMismatch => ReviewMutationError::CountMismatch,
+        brain::review_state::ReviewStateError::DispositionConflict => {
+            ReviewMutationError::DispositionConflict
+        }
+        brain::review_state::ReviewStateError::CapacityExceeded => {
+            ReviewMutationError::CapacityExceeded
+        }
+        other => ReviewMutationError::Other(bounded_display(&other.to_string())),
     }
 }
 
@@ -341,7 +505,15 @@ fn scorecard_from(decisions: &[DecisionSummary], events: &[ActivityEvent]) -> Sc
 fn review_queue_from(
     mut records: Vec<brain::decisions::DecisionRecord>,
     events: &[ActivityEvent],
-) -> Vec<ReviewItemSummary> {
+    review_state: &ReviewStateSnapshot,
+) -> Result<
+    (
+        Vec<ReviewItemSummary>,
+        SurfaceReviewProjection,
+        BTreeSet<ReviewKey>,
+    ),
+    ReviewKeySetError,
+> {
     let corrections = latest_corrections(events);
     for record in &mut records {
         if let Some(correction) = record
@@ -352,10 +524,58 @@ fn review_queue_from(
             record.user_action = correction_user_action(*correction).into();
         }
     }
-    brain::review::build_queue(&records)
-        .into_iter()
-        .map(item_summary_from)
-        .collect()
+    derive_review_key_set(
+        ReviewSurface::Review,
+        records.iter().map(brain::review::review_source_identity),
+    )?;
+    let candidates = brain::review::build_queue(&records);
+    let identities = candidates
+        .iter()
+        .map(|item| brain::review::review_source_identity(&item.record))
+        .collect::<Vec<_>>();
+    let eligible = derive_review_key_set(ReviewSurface::Review, &identities)?;
+    let mut queue = Vec::new();
+    let mut targets = Vec::new();
+    let mut new_count = 0;
+    let mut reviewed_count = 0;
+    for (item, source_identity) in candidates.into_iter().zip(identities) {
+        let key = ReviewKey::derive(ReviewSurface::Review, &source_identity);
+        let disposition = review_state.disposition(ReviewSurface::Review, &key);
+        if disposition == Some(ReviewDisposition::Archived) {
+            continue;
+        }
+        let target = ReviewTarget {
+            surface: ReviewSurface::Review,
+            display_id: brain::review::review_display_id(&item.record, &source_identity),
+            new_member_keys: (disposition.is_none()).then_some(key).into_iter().collect(),
+            reviewed_member_keys: (disposition == Some(ReviewDisposition::Reviewed))
+                .then_some(key)
+                .into_iter()
+                .collect(),
+        };
+        if disposition.is_none() {
+            new_count += 1;
+        } else {
+            reviewed_count += 1;
+        }
+        queue.push(item_summary_from(item));
+        targets.push(target);
+    }
+    let visible_items = queue.len();
+    let projection = SurfaceReviewProjection::from_items(
+        ReviewSurface::Review,
+        review_state.surface_revision(ReviewSurface::Review),
+        targets,
+        visible_items,
+        new_count,
+        reviewed_count,
+        review_state
+            .last_archive(ReviewSurface::Review)
+            .intersection(&eligible)
+            .count(),
+    )
+    .expect("Review rows and metadata are built by the same ordered loop");
+    Ok((queue, projection, eligible))
 }
 
 fn item_summary_from(item: brain::review::ReviewItem) -> ReviewItemSummary {
@@ -416,6 +636,15 @@ pub struct LiveBrainActions {
 }
 
 impl BrainActions for LiveBrainActions {
+    fn mutate_review_state(
+        &self,
+        request: coding_brain_core::review_state::ReviewMutationRequest,
+    ) -> Result<coding_brain_core::review_state::ReviewMutationResult, ReviewMutationError> {
+        let paths = brain::distill::current_paths()
+            .map_err(|error| ReviewMutationError::Other(bounded_display(&error.to_string())))?;
+        mutate_review_state_at(paths.state_root(), &request)
+    }
+
     fn poll_recovery(&self) -> Vec<String> {
         self.recovery.poll()
     }
@@ -817,13 +1046,552 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt;
 
+    use coding_brain_core::review_state::{
+        ReviewDisposition, ReviewKey, ReviewKeySetError, ReviewMutation, ReviewMutationRequest,
+        ReviewSurface,
+    };
     use coding_brain_core::session_links::{
         SESSION_IDENTITY_LINK_SCHEMA_VERSION, SessionIdentityLink, SessionLinkStore,
     };
     use fs2::FileExt;
 
     use super::*;
+    use crate::brain::review_state::ReviewStateSnapshot;
+
+    #[test]
+    fn live_brain_actions_reject_empty_canonical_ids() {
+        let actions = LiveBrainActions::default();
+
+        assert!(actions.mark_canonical("", None).is_err());
+        assert!(actions.mark_canonical("   ", None).is_err());
+    }
+
+    #[test]
+    fn attention_action_is_rejected_after_item_resolves_into_recent() {
+        let _env_lock = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let state_home = temp.path().join("state");
+        let state_root = state_home.join("coding-brain");
+        let _env = RefreshEnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+        };
+        // SAFETY: this test holds HOME_ENV_LOCK and the guard restores all values.
+        unsafe {
+            std::env::set_var("HOME", temp.path().join("home"));
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join("config"));
+            std::env::set_var("XDG_STATE_HOME", &state_home);
+        }
+        let store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
+        store.append(source_event(ActivityKind::Decision)).unwrap();
+        let refresh =
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).unwrap();
+        let target = &refresh.review_state.attention.items[0];
+        let request = ReviewMutationRequest {
+            surface: ReviewSurface::Attention,
+            expected_surface_revision: refresh.review_state.attention.revision,
+            operation: ReviewMutation::SetDisposition {
+                keys: target.new_member_keys.iter().copied().collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        };
+        let mut resolved = source_event(ActivityKind::Decision);
+        resolved.recorded_at_ms = 2;
+        resolved.state = ActivityState::Outcome;
+        resolved.outcome = Some(coding_brain_core::brain_activity::ActivityOutcome::Succeeded);
+        store.append(resolved).unwrap();
+
+        let error = LiveBrainActions::default()
+            .mutate_review_state(request)
+            .unwrap_err();
+
+        assert_eq!(error, ReviewMutationError::TargetNoLongerEligible);
+        let refreshed =
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).unwrap();
+        assert_eq!(refreshed.review_state.recent.new_count, 1);
+        assert_eq!(refreshed.review_state.recent.reviewed_count, 0);
+    }
+
+    #[test]
+    fn successful_attention_mutation_prunes_reviewed_keys_that_are_no_longer_eligible() {
+        let _env_lock = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let state_home = temp.path().join("state");
+        let state_root = state_home.join("coding-brain");
+        let _env = RefreshEnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+        };
+        // SAFETY: this test holds HOME_ENV_LOCK and the guard restores all values.
+        unsafe {
+            std::env::set_var("HOME", temp.path().join("home"));
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join("config"));
+            std::env::set_var("XDG_STATE_HOME", &state_home);
+        }
+        let store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
+        let mut first = source_event(ActivityKind::Decision);
+        first.activity_id = "first".into();
+        first.decision_id = Some("first-decision".into());
+        store.append(first).unwrap();
+        let mut second = source_event(ActivityKind::Decision);
+        second.activity_id = "second".into();
+        second.decision_id = Some("second-decision".into());
+        second.recorded_at_ms = 2;
+        store.append(second).unwrap();
+        let first_key = ReviewKey::derive(ReviewSurface::Attention, b"first");
+        let second_key = ReviewKey::derive(ReviewSurface::Attention, b"second");
+        let actions = LiveBrainActions::default();
+        actions
+            .mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [first_key].into_iter().collect(),
+                    disposition: ReviewDisposition::Reviewed,
+                },
+            })
+            .unwrap();
+        let mut resolved = source_event(ActivityKind::Decision);
+        resolved.activity_id = "first".into();
+        resolved.decision_id = Some("first-decision".into());
+        resolved.recorded_at_ms = 3;
+        resolved.state = ActivityState::Outcome;
+        resolved.outcome = Some(coding_brain_core::brain_activity::ActivityOutcome::Succeeded);
+        store.append(resolved).unwrap();
+
+        actions
+            .mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: 1,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [second_key].into_iter().collect(),
+                    disposition: ReviewDisposition::Reviewed,
+                },
+            })
+            .unwrap();
+
+        let snapshot = brain::review_state::ReviewStateStore::at(&state_root)
+            .read()
+            .unwrap();
+        assert_eq!(
+            snapshot.disposition(ReviewSurface::Attention, &first_key),
+            None
+        );
+        assert_eq!(
+            snapshot.disposition(ReviewSurface::Attention, &second_key),
+            Some(ReviewDisposition::Reviewed)
+        );
+    }
+
+    #[test]
+    fn archive_all_rejects_same_surface_revision_change() {
+        let _env_lock = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let state_home = temp.path().join("state");
+        let state_root = state_home.join("coding-brain");
+        let _env = RefreshEnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+        };
+        // SAFETY: this test holds HOME_ENV_LOCK and the guard restores all values.
+        unsafe {
+            std::env::set_var("HOME", temp.path().join("home"));
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join("config"));
+            std::env::set_var("XDG_STATE_HOME", &state_home);
+        }
+        let store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
+        for index in 0..101 {
+            let mut event = source_event(ActivityKind::Decision);
+            event.activity_id = format!("activity-{index}");
+            event.decision_id = Some(format!("decision-{index}"));
+            event.recorded_at_ms = index;
+            store.append(event).unwrap();
+        }
+        let actions = LiveBrainActions::default();
+        let all_keys = (0..101)
+            .map(|index| {
+                ReviewKey::derive(
+                    ReviewSurface::Attention,
+                    format!("activity-{index}").as_bytes(),
+                )
+            })
+            .collect();
+        actions
+            .mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::SetDisposition {
+                    keys: all_keys,
+                    disposition: ReviewDisposition::Reviewed,
+                },
+            })
+            .unwrap();
+        let reviewed = LiveBrainSource::refresh_from_store(
+            &state_root,
+            SnapshotLimits {
+                attention: 100,
+                ..SnapshotLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reviewed.review_state.attention.reviewed_count, 101);
+        assert_eq!(reviewed.review_state.attention.items.len(), 100);
+        let stale = ReviewMutationRequest {
+            surface: ReviewSurface::Attention,
+            expected_surface_revision: reviewed.review_state.attention.revision,
+            operation: ReviewMutation::ArchiveAllReviewed {
+                expected_count: reviewed.review_state.attention.reviewed_count,
+            },
+        };
+        let new_key = ReviewKey::derive(ReviewSurface::Attention, b"activity-new");
+        let mut event = source_event(ActivityKind::Decision);
+        event.activity_id = "activity-new".into();
+        event.decision_id = Some("decision-new".into());
+        event.recorded_at_ms = 102;
+        store.append(event).unwrap();
+        actions
+            .mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: reviewed.review_state.attention.revision,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [new_key].into_iter().collect(),
+                    disposition: ReviewDisposition::Reviewed,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(
+            actions.mutate_review_state(stale),
+            Err(ReviewMutationError::StaleRevision)
+        );
+        let current = LiveBrainSource::refresh_from_store(
+            &state_root,
+            SnapshotLimits {
+                attention: 100,
+                ..SnapshotLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(current.review_state.attention.reviewed_count, 102);
+        assert_eq!(current.review_state.attention.items.len(), 100);
+        let archived = actions
+            .mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Attention,
+                expected_surface_revision: current.review_state.attention.revision,
+                operation: ReviewMutation::ArchiveAllReviewed {
+                    expected_count: current.review_state.attention.reviewed_count,
+                },
+            })
+            .unwrap();
+        assert_eq!(archived.archived_count, 102);
+        assert_eq!(archived.last_archive_count, 102);
+    }
+
+    #[test]
+    fn recent_review_does_not_invalidate_attention_and_rejects_archive_operations() {
+        let _env_lock = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let state_home = temp.path().join("state");
+        let state_root = state_home.join("coding-brain");
+        let _env = RefreshEnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+        };
+        // SAFETY: this test holds HOME_ENV_LOCK and the guard restores all values.
+        unsafe {
+            std::env::set_var("HOME", temp.path().join("home"));
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join("config"));
+            std::env::set_var("XDG_STATE_HOME", &state_home);
+        }
+        let store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
+        let mut attention = source_event(ActivityKind::Decision);
+        attention.activity_id = "attention".into();
+        attention.decision_id = Some("attention-decision".into());
+        store.append(attention).unwrap();
+        let mut recent = source_event(ActivityKind::Decision);
+        recent.activity_id = "recent".into();
+        recent.decision_id = Some("recent-decision".into());
+        recent.recorded_at_ms = 2;
+        recent.state = ActivityState::Outcome;
+        recent.outcome = Some(coding_brain_core::brain_activity::ActivityOutcome::Succeeded);
+        store.append(recent).unwrap();
+        let refresh =
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).unwrap();
+        let attention_request = ReviewMutationRequest {
+            surface: ReviewSurface::Attention,
+            expected_surface_revision: refresh.review_state.attention.revision,
+            operation: ReviewMutation::SetDisposition {
+                keys: refresh.review_state.attention.items[0]
+                    .new_member_keys
+                    .iter()
+                    .copied()
+                    .collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        };
+        let recent_key = refresh.review_state.recent.items[0].new_member_keys[0];
+        let actions = LiveBrainActions::default();
+
+        assert_eq!(
+            actions.mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Recent,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [recent_key].into_iter().collect(),
+                    disposition: ReviewDisposition::Archived,
+                },
+            }),
+            Err(ReviewMutationError::InvalidRequest(
+                coding_brain_core::review_state::ReviewRequestError::UnsupportedOperation
+            ))
+        );
+        assert_eq!(
+            actions.mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Recent,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::UndoLastArchive { expected_count: 0 },
+            }),
+            Err(ReviewMutationError::InvalidRequest(
+                coding_brain_core::review_state::ReviewRequestError::UnsupportedOperation
+            ))
+        );
+        actions
+            .mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Recent,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [recent_key].into_iter().collect(),
+                    disposition: ReviewDisposition::Reviewed,
+                },
+            })
+            .unwrap();
+        let attention_result = actions.mutate_review_state(attention_request).unwrap();
+
+        assert_eq!(attention_result.surface_revision, 1);
+        let refreshed =
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).unwrap();
+        assert_eq!(refreshed.review_state.recent.revision, 1);
+        assert_eq!(refreshed.review_state.attention.revision, 1);
+    }
+
+    #[test]
+    fn later_archive_replaces_durable_undo_slot() {
+        let _env_lock = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let state_home = temp.path().join("state");
+        let state_root = state_home.join("coding-brain");
+        let _env = RefreshEnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+        };
+        // SAFETY: this test holds HOME_ENV_LOCK and the guard restores all values.
+        unsafe {
+            std::env::set_var("HOME", temp.path().join("home"));
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join("config"));
+            std::env::set_var("XDG_STATE_HOME", &state_home);
+        }
+        let store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
+        for index in 0..2 {
+            let mut diagnostic = source_event(ActivityKind::Diagnostic);
+            diagnostic.activity_id = format!("diagnostic-{index}");
+            diagnostic.recorded_at_ms = index;
+            store.append(diagnostic).unwrap();
+        }
+        let keys = (0..2)
+            .map(|index| {
+                ReviewKey::derive(
+                    ReviewSurface::Diagnostics,
+                    format!("diagnostic-{index}").as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let actions = LiveBrainActions::default();
+        actions
+            .mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Diagnostics,
+                expected_surface_revision: 0,
+                operation: ReviewMutation::SetDisposition {
+                    keys: keys.iter().copied().collect(),
+                    disposition: ReviewDisposition::Reviewed,
+                },
+            })
+            .unwrap();
+        actions
+            .mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Diagnostics,
+                expected_surface_revision: 1,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [keys[0]].into_iter().collect(),
+                    disposition: ReviewDisposition::Archived,
+                },
+            })
+            .unwrap();
+        let obsolete_undo = ReviewMutationRequest {
+            surface: ReviewSurface::Diagnostics,
+            expected_surface_revision: 2,
+            operation: ReviewMutation::UndoLastArchive { expected_count: 1 },
+        };
+        actions
+            .mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Diagnostics,
+                expected_surface_revision: 2,
+                operation: ReviewMutation::SetDisposition {
+                    keys: [keys[1]].into_iter().collect(),
+                    disposition: ReviewDisposition::Archived,
+                },
+            })
+            .unwrap();
+
+        let restarted_actions = LiveBrainActions::default();
+        assert_eq!(
+            restarted_actions.mutate_review_state(obsolete_undo),
+            Err(ReviewMutationError::StaleRevision)
+        );
+        let undone = restarted_actions
+            .mutate_review_state(ReviewMutationRequest {
+                surface: ReviewSurface::Diagnostics,
+                expected_surface_revision: 3,
+                operation: ReviewMutation::UndoLastArchive { expected_count: 1 },
+            })
+            .unwrap();
+
+        assert_eq!(undone.reviewed_count, 1);
+        assert_eq!(undone.archived_count, 1);
+        assert_eq!(undone.last_archive_count, 0);
+        let snapshot = brain::review_state::ReviewStateStore::at(&state_root)
+            .read()
+            .unwrap();
+        assert_eq!(
+            snapshot.disposition(ReviewSurface::Diagnostics, &keys[0]),
+            Some(ReviewDisposition::Archived)
+        );
+        assert_eq!(
+            snapshot.disposition(ReviewSurface::Diagnostics, &keys[1]),
+            Some(ReviewDisposition::Reviewed)
+        );
+    }
+
+    #[test]
+    fn mutation_does_not_acquire_review_lock_while_authoritative_lock_is_contended() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("coding-brain");
+        let store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
+        store.append(source_event(ActivityKind::Decision)).unwrap();
+        let contention = Arc::new(brain::activity::LockContentionProbe::default());
+        let observed_store = store
+            .clone()
+            .with_lock_contention_probe(Arc::clone(&contention));
+        brain::review_state::ReviewStateStore::at(&state_root)
+            .read()
+            .unwrap();
+        let activity_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_root.join("activity.lock"))
+            .unwrap();
+        activity_lock.lock_exclusive().unwrap();
+        let review_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_root.join("review-state.lock"))
+            .unwrap();
+        let key = ReviewKey::derive(ReviewSurface::Attention, b"activity-1");
+        let request = ReviewMutationRequest {
+            surface: ReviewSurface::Attention,
+            expected_surface_revision: 0,
+            operation: ReviewMutation::SetDisposition {
+                keys: [key].into_iter().collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        };
+        let thread_root = state_root.clone();
+        let started = Instant::now();
+        let mutation = std::thread::spawn(move || {
+            mutate_review_state_at_with_activity_store(&thread_root, &request, observed_store)
+        });
+
+        assert!(contention.wait_until_contended(Duration::from_secs(1)));
+        review_lock.try_lock_exclusive().unwrap();
+        FileExt::unlock(&review_lock).unwrap();
+        let result = mutation.join().unwrap();
+
+        assert_eq!(result, Err(ReviewMutationError::Busy));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        FileExt::unlock(&activity_lock).unwrap();
+    }
+
+    #[test]
+    fn mutation_releases_authoritative_lock_before_waiting_on_review_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("coding-brain");
+        let gate = Arc::new(brain::activity::ReadParseGate::default());
+        let store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
+        store.append(source_event(ActivityKind::Decision)).unwrap();
+        let gated_store = store.clone().with_read_parse_gate(Arc::clone(&gate));
+        brain::review_state::ReviewStateStore::at(&state_root)
+            .read()
+            .unwrap();
+        let review_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_root.join("review-state.lock"))
+            .unwrap();
+        review_lock.lock_exclusive().unwrap();
+        let key = ReviewKey::derive(ReviewSurface::Attention, b"activity-1");
+        let request = ReviewMutationRequest {
+            surface: ReviewSurface::Attention,
+            expected_surface_revision: 0,
+            operation: ReviewMutation::SetDisposition {
+                keys: [key].into_iter().collect(),
+                disposition: ReviewDisposition::Reviewed,
+            },
+        };
+        let thread_root = state_root.clone();
+        let thread_request = request.clone();
+        let started = Instant::now();
+        let mutation = std::thread::spawn(move || {
+            mutate_review_state_at_with_activity_store(&thread_root, &thread_request, gated_store)
+        });
+
+        assert!(gate.wait_until_reached(Duration::from_secs(1)));
+        let mut resolved = source_event(ActivityKind::Decision);
+        resolved.recorded_at_ms = 2;
+        resolved.state = ActivityState::Outcome;
+        resolved.outcome = Some(coding_brain_core::brain_activity::ActivityOutcome::Succeeded);
+        store.append(resolved).unwrap();
+        gate.release();
+        let result = mutation.join().unwrap();
+
+        assert_eq!(result, Err(ReviewMutationError::Busy));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        FileExt::unlock(&review_lock).unwrap();
+        assert_eq!(
+            mutate_review_state_at(&state_root, &request),
+            Err(ReviewMutationError::TargetNoLongerEligible)
+        );
+        let review = brain::review_state::ReviewStateStore::at(&state_root)
+            .read()
+            .unwrap();
+        assert_eq!(review.disposition(ReviewSurface::Attention, &key), None);
+    }
 
     struct RefreshEnvGuard {
         home: Option<std::ffi::OsString>,
@@ -980,6 +1748,250 @@ mod tests {
         ));
         FileExt::unlock(&lock).unwrap();
         assert!(source.refresh(SnapshotLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn live_brain_refresh_applies_review_state_and_aligns_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("coding-brain");
+        let review_store = brain::review_state::ReviewStateStore::at(&state_root);
+        review_store.read().unwrap();
+        let activity_store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
+        activity_store
+            .append(source_event(ActivityKind::Diagnostic))
+            .unwrap();
+        let key = ReviewKey::derive(ReviewSurface::Diagnostics, b"activity-1");
+        let eligible = [key].into_iter().collect();
+
+        let baseline =
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).unwrap();
+        review_store
+            .mutate(
+                &ReviewMutationRequest {
+                    surface: ReviewSurface::Diagnostics,
+                    expected_surface_revision: 0,
+                    operation: ReviewMutation::SetDisposition {
+                        keys: [key].into_iter().collect(),
+                        disposition: ReviewDisposition::Reviewed,
+                    },
+                },
+                &eligible,
+            )
+            .unwrap();
+        let reviewed =
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).unwrap();
+        review_store
+            .mutate(
+                &ReviewMutationRequest {
+                    surface: ReviewSurface::Diagnostics,
+                    expected_surface_revision: 1,
+                    operation: ReviewMutation::SetDisposition {
+                        keys: [key].into_iter().collect(),
+                        disposition: ReviewDisposition::Archived,
+                    },
+                },
+                &eligible,
+            )
+            .unwrap();
+        let archived =
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).unwrap();
+
+        assert_eq!(reviewed.snapshot.diagnostic_events.len(), 1);
+        assert_eq!(reviewed.review_state.diagnostics.reviewed_count, 1);
+        assert_eq!(reviewed.review_state.diagnostics.revision, 1);
+        assert!(archived.snapshot.diagnostic_events.is_empty());
+        assert!(archived.review_state.diagnostics.items.is_empty());
+        assert_eq!(archived.review_state.diagnostics.revision, 2);
+        assert_eq!(archived.review_state.diagnostics.last_archive_count, 1);
+        assert_eq!(baseline.scorecard, reviewed.scorecard);
+        assert_eq!(reviewed.scorecard, archived.scorecard);
+        baseline.validate_review_alignment().unwrap();
+        reviewed.validate_review_alignment().unwrap();
+        archived.validate_review_alignment().unwrap();
+    }
+
+    #[test]
+    fn live_brain_refresh_preserves_scorecard_across_review_dispositions() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("coding-brain");
+        let review_store = brain::review_state::ReviewStateStore::at(&state_root);
+        review_store.read().unwrap();
+        let activity_store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
+        let mut activity = source_event(ActivityKind::Decision);
+        activity.decision_id = Some("review".into());
+        activity_store.append(activity).unwrap();
+        let decisions_path = brain::decisions::decisions_path();
+        std::fs::create_dir_all(decisions_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            decisions_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "provider": "codex",
+                    "ts": "1",
+                    "pid": 1,
+                    "project": "project",
+                    "tool": "Bash",
+                    "command": "rm -rf /tmp/build",
+                    "brain_action": "approve",
+                    "brain_confidence": 0.95,
+                    "brain_reasoning": "fixture",
+                    "user_action": "deny_rule_override",
+                    "decision_type": "session",
+                    "decision_id": "review"
+                })
+            ),
+        )
+        .unwrap();
+        let key = ReviewKey::derive(ReviewSurface::Review, b"review");
+        let eligible = [key].into_iter().collect();
+
+        let baseline =
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).unwrap();
+        review_store
+            .mutate(
+                &ReviewMutationRequest {
+                    surface: ReviewSurface::Review,
+                    expected_surface_revision: 0,
+                    operation: ReviewMutation::SetDisposition {
+                        keys: [key].into_iter().collect(),
+                        disposition: ReviewDisposition::Reviewed,
+                    },
+                },
+                &eligible,
+            )
+            .unwrap();
+        let reviewed =
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).unwrap();
+        review_store
+            .mutate(
+                &ReviewMutationRequest {
+                    surface: ReviewSurface::Review,
+                    expected_surface_revision: 1,
+                    operation: ReviewMutation::SetDisposition {
+                        keys: [key].into_iter().collect(),
+                        disposition: ReviewDisposition::Archived,
+                    },
+                },
+                &eligible,
+            )
+            .unwrap();
+        let archived =
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).unwrap();
+
+        assert_eq!(baseline.scorecard.total_decisions, 1);
+        assert_eq!(baseline.review_queue.len(), 1);
+        assert_eq!(reviewed.review_queue.len(), 1);
+        assert_eq!(reviewed.review_state.review.reviewed_count, 1);
+        assert!(archived.review_queue.is_empty());
+        assert!(archived.review_state.review.items.is_empty());
+        assert_eq!(baseline.scorecard, reviewed.scorecard);
+        assert_eq!(reviewed.scorecard, archived.scorecard);
+        baseline.validate_review_alignment().unwrap();
+        reviewed.validate_review_alignment().unwrap();
+        archived.validate_review_alignment().unwrap();
+    }
+
+    #[test]
+    fn live_brain_refresh_aligns_capped_activity_surfaces_with_retained_totals() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("coding-brain");
+        let store = brain::activity::ActivityStore::at(state_root.join("activity.jsonl"));
+        for index in 0..2 {
+            let mut attention = source_event(ActivityKind::Decision);
+            attention.activity_id = format!("attention-{index}");
+            attention.decision_id = Some(format!("attention-decision-{index}"));
+            attention.recorded_at_ms = index * 10 + 1;
+            store.append(attention).unwrap();
+
+            let mut recent = source_event(ActivityKind::Decision);
+            recent.activity_id = format!("recent-{index}");
+            recent.decision_id = Some(format!("recent-decision-{index}"));
+            recent.recorded_at_ms = index * 10 + 2;
+            store.append(recent.clone()).unwrap();
+            recent.state = ActivityState::Delivered;
+            recent.recorded_at_ms += 1;
+            store.append(recent).unwrap();
+
+            let mut diagnostic = source_event(ActivityKind::Diagnostic);
+            diagnostic.activity_id = format!("diagnostic-{index}");
+            diagnostic.recorded_at_ms = index * 10 + 4;
+            store.append(diagnostic).unwrap();
+        }
+
+        let refresh = LiveBrainSource::refresh_from_store(
+            &state_root,
+            SnapshotLimits {
+                attention: 1,
+                recent: 1,
+                diagnostic_events: 1,
+                ..SnapshotLimits::default()
+            },
+        )
+        .unwrap();
+
+        for (visible_items, projection) in [
+            (
+                refresh.snapshot.attention.len(),
+                &refresh.review_state.attention,
+            ),
+            (refresh.snapshot.recent.len(), &refresh.review_state.recent),
+            (
+                refresh.snapshot.diagnostic_events.len(),
+                &refresh.review_state.diagnostics,
+            ),
+        ] {
+            assert_eq!(visible_items, 1);
+            assert_eq!(projection.items.len(), 1);
+            assert_eq!(projection.new_count, 2);
+        }
+        refresh.validate_review_alignment().unwrap();
+    }
+
+    #[test]
+    fn live_brain_refresh_maps_review_lock_contention_to_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("coding-brain");
+        brain::review_state::ReviewStateStore::at(&state_root)
+            .read()
+            .unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_root.join("review-state.lock"))
+            .unwrap();
+        lock.try_lock_exclusive().unwrap();
+
+        assert!(matches!(
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()),
+            Err(BrainSourceError::Busy)
+        ));
+
+        FileExt::unlock(&lock).unwrap();
+        assert!(
+            LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default()).is_ok()
+        );
+    }
+
+    #[test]
+    fn live_brain_refresh_bounds_invalid_review_storage_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("coding-brain");
+        brain::review_state::ReviewStateStore::at(&state_root)
+            .read()
+            .unwrap();
+        let state_path = state_root.join("review-state.json");
+        std::fs::write(&state_path, b"{ invalid review state").unwrap();
+        std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = LiveBrainSource::refresh_from_store(&state_root, SnapshotLimits::default())
+            .unwrap_err();
+
+        let BrainSourceError::Other(message) = error else {
+            panic!("invalid review storage must not be treated as busy");
+        };
+        assert!(message.starts_with("invalid review state JSON"));
+        assert!(message.chars().count() <= 80);
     }
 
     #[test]
@@ -1367,11 +2379,114 @@ mod tests {
     }
 
     #[test]
+    fn archived_review_candidate_leaves_queue_but_not_scorecard() {
+        let records = vec![review_record()];
+        let decisions = records
+            .iter()
+            .map(DecisionSummary::from)
+            .collect::<Vec<_>>();
+        let events = vec![correction("review", CorrectionDisposition::BrainWrong)];
+        let key = ReviewKey::derive(ReviewSurface::Review, b"review");
+        let empty = ReviewStateSnapshot::default();
+        let reviewed = review_snapshot([key], []);
+        let archived = review_snapshot([], [key]);
+        let baseline = scorecard_from(&decisions, &events);
+
+        let (new_queue, new_projection, _) =
+            review_queue_from(records.clone(), &events, &empty).unwrap();
+        let (reviewed_queue, reviewed_projection, _) =
+            review_queue_from(records.clone(), &events, &reviewed).unwrap();
+        let (archived_queue, archived_projection, _) =
+            review_queue_from(records, &events, &archived).unwrap();
+
+        assert_eq!(new_queue.len(), 1);
+        assert_eq!(new_projection.new_count, 1);
+        assert_eq!(reviewed_queue.len(), 1);
+        assert_eq!(reviewed_projection.reviewed_count, 1);
+        assert!(archived_queue.is_empty());
+        assert!(archived_projection.items.is_empty());
+        assert_eq!(scorecard_from(&decisions, &events), baseline);
+    }
+
+    #[test]
+    fn legacy_review_candidate_has_stable_noncanonical_identity() {
+        let mut record = review_record();
+        record.decision_id = None;
+        record.user_action = "reject".into();
+        let identity = brain::review::review_source_identity(&record);
+        let key = ReviewKey::derive(ReviewSurface::Review, &identity);
+        let mut mutable_fields_changed = record.clone();
+        mutable_fields_changed.user_action = "accept".into();
+        mutable_fields_changed.brain_reasoning = "corrected reasoning".into();
+        mutable_fields_changed.override_reason = Some("corrected override".into());
+        mutable_fields_changed.canonical = Some(true);
+        assert_eq!(
+            brain::review::review_source_identity(&mutable_fields_changed),
+            identity
+        );
+        for changed in legacy_identity_field_variants(&record) {
+            assert_ne!(brain::review::review_source_identity(&changed), identity);
+        }
+
+        let (new_queue, new_projection, _) = review_queue_from(
+            vec![record.clone()],
+            &[correction("unused", CorrectionDisposition::BrainWrong)],
+            &ReviewStateSnapshot::default(),
+        )
+        .unwrap();
+        let (same_queue, same_projection, _) = review_queue_from(
+            vec![record.clone()],
+            &[correction("unused", CorrectionDisposition::BrainWrong)],
+            &ReviewStateSnapshot::default(),
+        )
+        .unwrap();
+        let (reviewed_queue, reviewed_projection, _) = review_queue_from(
+            vec![record.clone()],
+            &[correction("unused", CorrectionDisposition::BrainWrong)],
+            &review_snapshot([key], []),
+        )
+        .unwrap();
+        let (archived_queue, archived_projection, _) = review_queue_from(
+            vec![record],
+            &[correction("unused", CorrectionDisposition::BrainWrong)],
+            &review_snapshot([], [key]),
+        )
+        .unwrap();
+
+        assert_eq!(new_queue.len(), 1);
+        assert!(!new_queue[0].canonical_available());
+        assert!(!new_projection.items[0].display_id.is_empty());
+        assert_eq!(new_projection.items[0], same_projection.items[0]);
+        assert_eq!(new_queue[0].decision.id, same_queue[0].decision.id);
+        assert_eq!(reviewed_queue.len(), 1);
+        assert_eq!(reviewed_projection.reviewed_count, 1);
+        assert!(archived_queue.is_empty());
+        assert!(archived_projection.items.is_empty());
+    }
+
+    #[test]
+    fn duplicate_review_source_identities_fail_closed() {
+        let record = review_record();
+
+        assert_eq!(
+            review_queue_from(
+                vec![record.clone(), record],
+                &[],
+                &ReviewStateSnapshot::default(),
+            )
+            .unwrap_err(),
+            ReviewKeySetError::DuplicateKey
+        );
+    }
+
+    #[test]
     fn brain_wrong_correction_enters_review_but_brain_right_does_not() {
-        let wrong = review_queue_from(
+        let (wrong, _, _) = review_queue_from(
             vec![review_record()],
             &[correction("review", CorrectionDisposition::BrainWrong)],
-        );
+            &ReviewStateSnapshot::default(),
+        )
+        .unwrap();
         assert_eq!(wrong.len(), 1);
         assert_eq!(wrong[0].decision.id, "review");
         assert_eq!(
@@ -1379,10 +2494,12 @@ mod tests {
             "Critical-tier false-approve (safety review)"
         );
 
-        let right = review_queue_from(
+        let (right, _, _) = review_queue_from(
             vec![review_record()],
             &[correction("review", CorrectionDisposition::BrainRight)],
-        );
+            &ReviewStateSnapshot::default(),
+        )
+        .unwrap();
         assert!(right.is_empty());
     }
 
@@ -1406,7 +2523,12 @@ mod tests {
         .unwrap();
 
         let events = store.read().unwrap();
-        let review = review_queue_from(vec![review_record()], events.events());
+        let (review, _, _) = review_queue_from(
+            vec![review_record()],
+            events.events(),
+            &ReviewStateSnapshot::default(),
+        )
+        .unwrap();
         let scorecard = scorecard_from(
             &[summary(
                 "review",
@@ -1431,10 +2553,12 @@ mod tests {
         let mut record = review_record();
         record.provider = AgentProvider::Antigravity;
 
-        let queue = review_queue_from(
+        let (queue, _, _) = review_queue_from(
             vec![record],
             &[correction("review", CorrectionDisposition::BrainWrong)],
-        );
+            &ReviewStateSnapshot::default(),
+        )
+        .unwrap();
 
         assert_eq!(queue[0].decision.provider, AgentProvider::Antigravity);
     }
@@ -1726,6 +2850,82 @@ mod tests {
             cache_hit: None,
             canonical: None,
         }
+    }
+
+    fn legacy_identity_field_variants(
+        record: &brain::decisions::DecisionRecord,
+    ) -> Vec<brain::decisions::DecisionRecord> {
+        let mut variants = Vec::new();
+        let mut changed = record.clone();
+        changed.provider = AgentProvider::Claude;
+        variants.push(changed);
+        let mut changed = record.clone();
+        changed.timestamp = "2".into();
+        variants.push(changed);
+        let mut changed = record.clone();
+        changed.pid = 2;
+        variants.push(changed);
+        let mut changed = record.clone();
+        changed.project = "other-project".into();
+        variants.push(changed);
+        let mut changed = record.clone();
+        changed.tool = Some("Read".into());
+        variants.push(changed);
+        let mut changed = record.clone();
+        changed.command = Some("cargo test".into());
+        variants.push(changed);
+        let mut changed = record.clone();
+        changed.brain_action = "deny".into();
+        variants.push(changed);
+        let mut changed = record.clone();
+        changed.brain_confidence = 0.5;
+        variants.push(changed);
+        variants
+    }
+
+    fn review_snapshot<const R: usize, const A: usize>(
+        reviewed: [ReviewKey; R],
+        archived: [ReviewKey; A],
+    ) -> ReviewStateSnapshot {
+        let temp = tempfile::tempdir().unwrap();
+        let store = brain::review_state::ReviewStateStore::at(&temp.path().join("coding-brain"));
+        let eligible = reviewed
+            .iter()
+            .chain(&archived)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let all = eligible.clone();
+        if !all.is_empty() {
+            store
+                .mutate(
+                    &ReviewMutationRequest {
+                        surface: ReviewSurface::Review,
+                        expected_surface_revision: 0,
+                        operation: ReviewMutation::SetDisposition {
+                            keys: all,
+                            disposition: ReviewDisposition::Reviewed,
+                        },
+                    },
+                    &eligible,
+                )
+                .unwrap();
+        }
+        if !archived.is_empty() {
+            store
+                .mutate(
+                    &ReviewMutationRequest {
+                        surface: ReviewSurface::Review,
+                        expected_surface_revision: 1,
+                        operation: ReviewMutation::SetDisposition {
+                            keys: archived.into_iter().collect(),
+                            disposition: ReviewDisposition::Archived,
+                        },
+                    },
+                    &eligible,
+                )
+                .unwrap();
+        }
+        store.read().unwrap()
     }
 
     fn discovered_session(provider: AgentProvider, id: &str) -> AgentSession {

@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use coding_brain_core::review_state::{
+    BrainReviewProjection, ReviewKey, ReviewSurface, ReviewTarget, SurfaceReviewProjection,
+};
 use coding_brain_core::runtime::{
     BrainEffect, BrainRuntime, DecisionSummary, EndpointHealth, MockBrainAction, MockBrainRuntime,
     ReviewItemSummary,
@@ -23,6 +26,24 @@ fn offline_brain_opens_live_keeps_review_and_exits_cleanly() {
             reason: "high-confidence miss".into(),
             score: 80.0,
         }],
+        review_state: BrainReviewProjection {
+            review: SurfaceReviewProjection::from_items(
+                ReviewSurface::Review,
+                0,
+                vec![ReviewTarget {
+                    surface: ReviewSurface::Review,
+                    display_id: "decision-1".into(),
+                    new_member_keys: vec![ReviewKey::derive(ReviewSurface::Review, b"decision-1")],
+                    reviewed_member_keys: Vec::new(),
+                }],
+                1,
+                1,
+                0,
+                0,
+            )
+            .unwrap(),
+            ..BrainReviewProjection::default()
+        },
         ..MockBrainRuntime::default()
     });
     let runtime = BrainRuntime::new(mock.clone(), mock.clone());

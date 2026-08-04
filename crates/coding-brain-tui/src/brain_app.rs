@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
@@ -7,11 +8,15 @@ use coding_brain_core::brain_activity::{
     ActivityItem, ActivitySnapshot, AttentionItem, CorrectionDisposition, SessionTargetProvenance,
     SnapshotLimits, redact_activity_text,
 };
+use coding_brain_core::review_state::{
+    BrainReviewProjection, ReviewDisposition, ReviewKey, ReviewMutation, ReviewMutationRequest,
+    ReviewSurface, ReviewTarget, SurfaceReviewProjection,
+};
 use coding_brain_core::runtime::{
     BrainEffect, BrainGateMode, BrainRuntime, BrainSourceError, CorrectionInput, EndpointHealth,
-    ReviewItemSummary, ScorecardSummary, SessionActionAttempt, SessionActionAvailability,
-    SessionActionCapability, SessionActionFailure, SessionActionPreflightRequest,
-    SessionActionRequest, SessionActionTarget, SessionNavigation,
+    ReviewItemSummary, ReviewMutationError, ScorecardSummary, SessionActionAttempt,
+    SessionActionAvailability, SessionActionCapability, SessionActionFailure,
+    SessionActionPreflightRequest, SessionActionRequest, SessionActionTarget, SessionNavigation,
 };
 use coding_brain_core::terminals::TerminalSessionAction;
 use coding_brain_core::theme::Theme;
@@ -110,6 +115,10 @@ enum BrainInput {
         capabilities: Vec<SessionActionCapability>,
         text: Option<String>,
     },
+    ReviewConfirmation {
+        request: ReviewMutationRequest,
+        prompt: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -165,6 +174,7 @@ pub struct BrainApp {
     snapshot: ActivitySnapshot,
     review_queue: Vec<ReviewItemSummary>,
     scorecard: ScorecardSummary,
+    review_state: BrainReviewProjection,
     gate_mode: BrainGateMode,
     endpoint_health: EndpointHealth,
     selection: usize,
@@ -178,6 +188,7 @@ pub struct BrainApp {
     pending_action_status: Option<String>,
     status: Option<String>,
     has_successful_refresh: bool,
+    review_mutations_blocked_until_refresh: bool,
     refreshed_at: Instant,
 }
 
@@ -190,6 +201,7 @@ impl BrainApp {
             snapshot: ActivitySnapshot::default(),
             review_queue: Vec::new(),
             scorecard: ScorecardSummary::default(),
+            review_state: BrainReviewProjection::default(),
             gate_mode: BrainGateMode::On,
             endpoint_health: EndpointHealth::default(),
             selection: 0,
@@ -203,6 +215,7 @@ impl BrainApp {
             pending_action_status: None,
             status: None,
             has_successful_refresh: false,
+            review_mutations_blocked_until_refresh: false,
             refreshed_at: Instant::now() - REFRESH_INTERVAL,
         };
         app.refresh();
@@ -220,26 +233,47 @@ impl BrainApp {
         }
         let mut source_error = None;
         let mut busy_status = None;
+        let selected_attention_display_id = self
+            .selected_display_id(ReviewSurface::Attention)
+            .map(str::to_owned);
+        let selected_attention_index = self.live_attention_selection;
+        let selected_recent_display_id = self
+            .selected_display_id(ReviewSurface::Recent)
+            .map(str::to_owned);
+        let selected_recent_index = self.live_recent_selection;
+        let selected_non_live = match self.tab {
+            BrainTab::Review => Some(ReviewSurface::Review),
+            BrainTab::Diagnostics => Some(ReviewSurface::Diagnostics),
+            BrainTab::Live | BrainTab::Scorecard => None,
+        }
+        .map(|surface| {
+            (
+                surface,
+                self.selected_display_id(surface).map(str::to_owned),
+                self.selection,
+            )
+        });
         match self.runtime.source.refresh(SnapshotLimits::default()) {
             Ok(refresh) => {
-                let selected_recent_activity_id = self
-                    .snapshot
-                    .recent
-                    .get(self.live_recent_selection)
-                    .map(|item| item.activity_id.clone());
                 self.snapshot = refresh.snapshot;
-                if let Some(selected_recent_activity_id) = selected_recent_activity_id
-                    && let Some(index) = self
-                        .snapshot
-                        .recent
-                        .iter()
-                        .position(|item| item.activity_id == selected_recent_activity_id)
-                {
-                    self.live_recent_selection = index;
-                }
                 self.review_queue = refresh.review_queue;
                 self.scorecard = refresh.scorecard;
+                self.review_state = refresh.review_state;
+                self.restore_surface_selection(
+                    ReviewSurface::Attention,
+                    selected_attention_display_id.as_deref(),
+                    selected_attention_index,
+                );
+                self.restore_surface_selection(
+                    ReviewSurface::Recent,
+                    selected_recent_display_id.as_deref(),
+                    selected_recent_index,
+                );
+                if let Some((surface, display_id, index)) = selected_non_live {
+                    self.restore_surface_selection(surface, display_id.as_deref(), index);
+                }
                 self.has_successful_refresh = true;
+                self.review_mutations_blocked_until_refresh = false;
                 if matches!(
                     self.status.as_deref(),
                     Some(BUSY_RETRYING_STATUS | BUSY_STALE_STATUS)
@@ -405,24 +439,46 @@ impl BrainApp {
                 self.begin_correction();
                 None
             }
+            KeyCode::Char('a') => {
+                self.review_selected(false);
+                None
+            }
+            KeyCode::Char('A') => {
+                self.review_all_visible();
+                None
+            }
+            KeyCode::Char('d') => {
+                self.archive_selected();
+                None
+            }
+            KeyCode::Char('D') => {
+                self.archive_all_reviewed();
+                None
+            }
+            KeyCode::Char('u') => {
+                self.undo_last_archive();
+                None
+            }
             KeyCode::Char('m') if self.tab == BrainTab::Review => {
                 self.mark_selected_canonical(None);
                 None
             }
             KeyCode::Char('n') if self.tab == BrainTab::Review => {
                 if let Some(item) = self.review_queue.get(self.selection) {
-                    self.input = Some(BrainInput::Canonical {
-                        decision_id: item.decision.id.clone(),
-                        note: String::new(),
-                    });
+                    if item.canonical_available() {
+                        self.input = Some(BrainInput::Canonical {
+                            decision_id: item.decision.id.clone(),
+                            note: String::new(),
+                        });
+                    } else {
+                        self.status =
+                            Some("Canonical marking unavailable for legacy decision".into());
+                    }
                 }
                 None
             }
             KeyCode::Char('s') if self.tab == BrainTab::Review => {
-                let len = self.review_queue.len();
-                if len > 0 {
-                    self.selection = (self.selection + 1).min(len - 1);
-                }
+                self.review_selected(true);
                 None
             }
             _ => None,
@@ -617,6 +673,21 @@ impl BrainApp {
     }
 
     fn handle_input(&mut self, code: KeyCode) -> Option<BrainEffect> {
+        if matches!(self.input, Some(BrainInput::ReviewConfirmation { .. })) {
+            let Some(BrainInput::ReviewConfirmation { request, prompt }) = self.input.take() else {
+                unreachable!();
+            };
+            return match code {
+                KeyCode::Char('y') => {
+                    self.submit_review_mutation(request, Some(prompt));
+                    None
+                }
+                KeyCode::Tab | KeyCode::Char('r') => {
+                    self.handle_key(KeyEvent::new(code, crossterm::event::KeyModifiers::NONE))
+                }
+                _ => None,
+            };
+        }
         if self.discard_stale_session_action_input() {
             self.status = Some("Selection changed; action cancelled".into());
             return None;
@@ -634,6 +705,7 @@ impl BrainApp {
                     text.pop();
                 }
                 None => {}
+                Some(BrainInput::ReviewConfirmation { .. }) => unreachable!(),
                 Some(BrainInput::SessionAction { text: None, .. }) => {}
             },
             KeyCode::Enter => match self.input.clone() {
@@ -664,6 +736,7 @@ impl BrainApp {
                     self.status = Some("Manual text cannot be empty".into());
                 }
                 Some(BrainInput::SessionAction { text: None, .. }) => {}
+                Some(BrainInput::ReviewConfirmation { .. }) => unreachable!(),
                 None => {}
             },
             KeyCode::Char(character) => match self.input.clone() {
@@ -720,6 +793,7 @@ impl BrainApp {
                     Some(BrainInput::Correction { note, .. })
                     | Some(BrainInput::Canonical { note, .. }) => push_bounded(note, character),
                     None | Some(BrainInput::SessionAction { .. }) => {}
+                    Some(BrainInput::ReviewConfirmation { .. }) => unreachable!(),
                 },
             },
             _ => {}
@@ -771,10 +845,307 @@ impl BrainApp {
         let Some(item) = self.review_queue.get(self.selection) else {
             return;
         };
-        self.mark_canonical(&item.decision.id.clone(), note);
+        if !item.canonical_available() {
+            self.status = Some("Canonical marking unavailable for legacy decision".into());
+            return;
+        }
+        let decision_id = item.decision.id.clone();
+        self.mark_canonical(&decision_id, note);
+    }
+
+    pub(crate) fn current_review_surface(&self) -> Option<ReviewSurface> {
+        match self.tab {
+            BrainTab::Live => Some(match self.live_list {
+                LiveList::Attention => ReviewSurface::Attention,
+                LiveList::Recent => ReviewSurface::Recent,
+            }),
+            BrainTab::Review => Some(ReviewSurface::Review),
+            BrainTab::Diagnostics => Some(ReviewSurface::Diagnostics),
+            BrainTab::Scorecard => None,
+        }
+    }
+
+    pub(crate) fn review_projection(&self, surface: ReviewSurface) -> &SurfaceReviewProjection {
+        match surface {
+            ReviewSurface::Attention => &self.review_state.attention,
+            ReviewSurface::Review => &self.review_state.review,
+            ReviewSurface::Diagnostics => &self.review_state.diagnostics,
+            ReviewSurface::Recent => &self.review_state.recent,
+        }
+    }
+
+    fn selected_display_id(&self, surface: ReviewSurface) -> Option<&str> {
+        self.review_projection(surface)
+            .items
+            .get(match surface {
+                ReviewSurface::Attention => self.live_attention_selection,
+                ReviewSurface::Recent => self.live_recent_selection,
+                ReviewSurface::Review | ReviewSurface::Diagnostics => self.selection,
+            })
+            .map(|target| target.display_id.as_str())
+    }
+
+    fn restore_surface_selection(
+        &mut self,
+        surface: ReviewSurface,
+        previous_display_id: Option<&str>,
+        previous_index: usize,
+    ) {
+        let items = &self.review_projection(surface).items;
+        let restored = previous_display_id
+            .and_then(|display_id| {
+                items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, target)| target.display_id == display_id)
+                    .min_by_key(|(index, _)| index.abs_diff(previous_index))
+                    .map(|(index, _)| index)
+            })
+            .unwrap_or_else(|| previous_index.min(items.len().saturating_sub(1)));
+        match surface {
+            ReviewSurface::Attention => self.live_attention_selection = restored,
+            ReviewSurface::Recent => self.live_recent_selection = restored,
+            ReviewSurface::Review | ReviewSurface::Diagnostics => self.selection = restored,
+        }
+    }
+
+    pub(crate) fn selected_review_target(
+        &self,
+    ) -> Option<(&SurfaceReviewProjection, &ReviewTarget)> {
+        let surface = self.current_review_surface()?;
+        let projection = self.review_projection(surface);
+        projection
+            .items
+            .get(self.selection())
+            .map(|item| (projection, item))
+    }
+
+    fn visible_new_keys(&self) -> BTreeSet<ReviewKey> {
+        self.current_review_surface()
+            .map(|surface| self.review_projection(surface))
+            .into_iter()
+            .flat_map(|projection| &projection.items)
+            .flat_map(|target| target.new_member_keys.iter().copied())
+            .collect()
+    }
+
+    fn lifecycle_action_is_blocked(&mut self) -> bool {
+        if self.session_action_worker.is_in_flight() {
+            self.status = Some("Session action is still in progress".into());
+            return true;
+        }
+        if self.review_mutations_blocked_until_refresh {
+            self.status = Some("Review state requires a fresh refresh".into());
+            return true;
+        }
+        false
+    }
+
+    fn review_selected(&mut self, advance_after_success: bool) {
+        if self.lifecycle_action_is_blocked() {
+            return;
+        }
+        let Some((projection, target)) = self.selected_review_target() else {
+            return;
+        };
+        let keys = target
+            .new_member_keys
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if keys.is_empty() {
+            self.status = Some("No NEW items on this selection".into());
+            return;
+        }
+        let next_display_id = advance_after_success
+            .then(|| projection.items.get(self.selection() + 1))
+            .flatten()
+            .map(|target| target.display_id.clone());
+        let request = ReviewMutationRequest {
+            surface: target.surface,
+            expected_surface_revision: projection.revision,
+            operation: ReviewMutation::SetDisposition {
+                keys,
+                disposition: ReviewDisposition::Reviewed,
+            },
+        };
+        if self.submit_review_mutation(request, None)
+            && let Some(next_display_id) = next_display_id
+            && let Some(index) = self
+                .review_state
+                .review
+                .items
+                .iter()
+                .position(|target| target.display_id == next_display_id)
+        {
+            self.selection = index;
+        }
+    }
+
+    fn review_all_visible(&mut self) {
+        if self.lifecycle_action_is_blocked() {
+            return;
+        }
+        let Some(surface) = self.current_review_surface() else {
+            return;
+        };
+        let keys = self.visible_new_keys();
+        if keys.is_empty() {
+            self.status = Some(format!("No NEW {} items", review_surface_label(surface)));
+            return;
+        }
+        let request = ReviewMutationRequest {
+            surface,
+            expected_surface_revision: self.review_projection(surface).revision,
+            operation: ReviewMutation::SetDisposition {
+                keys,
+                disposition: ReviewDisposition::Reviewed,
+            },
+        };
+        self.begin_review_confirmation(request);
+    }
+
+    fn archive_selected(&mut self) {
+        if self.lifecycle_action_is_blocked() {
+            return;
+        }
+        let Some((projection, target)) = self.selected_review_target() else {
+            return;
+        };
+        if !target.surface.supports_archive() {
+            return;
+        }
+        let keys = target
+            .reviewed_member_keys
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if keys.is_empty() {
+            self.status = Some("No reviewed items on this selection".into());
+            return;
+        }
+        self.begin_review_confirmation(ReviewMutationRequest {
+            surface: target.surface,
+            expected_surface_revision: projection.revision,
+            operation: ReviewMutation::SetDisposition {
+                keys,
+                disposition: ReviewDisposition::Archived,
+            },
+        });
+    }
+
+    fn archive_all_reviewed(&mut self) {
+        if self.lifecycle_action_is_blocked() {
+            return;
+        }
+        let Some(surface) = self
+            .current_review_surface()
+            .filter(|surface| surface.supports_archive())
+        else {
+            return;
+        };
+        let projection = self.review_projection(surface);
+        if projection.reviewed_count == 0 {
+            self.status = Some(format!(
+                "No reviewed {} items",
+                review_surface_label(surface)
+            ));
+            return;
+        }
+        self.begin_review_confirmation(ReviewMutationRequest {
+            surface,
+            expected_surface_revision: projection.revision,
+            operation: ReviewMutation::ArchiveAllReviewed {
+                expected_count: projection.reviewed_count,
+            },
+        });
+    }
+
+    fn undo_last_archive(&mut self) {
+        if self.lifecycle_action_is_blocked() {
+            return;
+        }
+        let Some(surface) = self
+            .current_review_surface()
+            .filter(|surface| surface.supports_archive())
+        else {
+            return;
+        };
+        let projection = self.review_projection(surface);
+        if projection.last_archive_count == 0 {
+            self.status = Some(format!(
+                "Nothing to restore in {}",
+                review_surface_label(surface)
+            ));
+            return;
+        }
+        self.submit_review_mutation(
+            ReviewMutationRequest {
+                surface,
+                expected_surface_revision: projection.revision,
+                operation: ReviewMutation::UndoLastArchive {
+                    expected_count: projection.last_archive_count,
+                },
+            },
+            None,
+        );
+    }
+
+    fn begin_review_confirmation(&mut self, request: ReviewMutationRequest) {
+        let prompt = review_confirmation_prompt(&request);
+        self.input = Some(BrainInput::ReviewConfirmation { request, prompt });
+    }
+
+    fn submit_review_mutation(
+        &mut self,
+        request: ReviewMutationRequest,
+        retry_prompt: Option<String>,
+    ) -> bool {
+        let success_status = review_success_status(&request);
+        match self.runtime.actions.mutate_review_state(request.clone()) {
+            Ok(_) => {
+                self.refresh();
+                self.status = Some(success_status);
+                true
+            }
+            Err(ReviewMutationError::Busy) => {
+                self.status = Some("Review state is busy; retry when ready".into());
+                if let Some(prompt) = retry_prompt {
+                    self.input = Some(BrainInput::ReviewConfirmation { request, prompt });
+                }
+                false
+            }
+            Err(ReviewMutationError::DurabilityUncertain) => {
+                self.review_mutations_blocked_until_refresh = true;
+                self.status = Some("Review state durability is uncertain; refresh required".into());
+                false
+            }
+            Err(
+                ReviewMutationError::StaleRevision
+                | ReviewMutationError::TargetNoLongerEligible
+                | ReviewMutationError::CountMismatch
+                | ReviewMutationError::DispositionConflict,
+            ) => {
+                self.refresh();
+                self.status = Some("Review state changed; refresh and retry".into());
+                false
+            }
+            Err(error) => {
+                self.status = Some(format!(
+                    "Could not update review state: {}",
+                    bounded_status(&error.to_string())
+                ));
+                false
+            }
+        }
     }
 
     fn mark_canonical(&mut self, decision_id: &str, note: Option<String>) {
+        if decision_id.trim().is_empty() {
+            self.status = Some("Canonical marking unavailable for legacy decision".into());
+            self.input = None;
+            return;
+        }
         let note = note.and_then(|note| bounded_note(&note));
         match self.runtime.actions.mark_canonical(decision_id, note) {
             Ok(()) => {
@@ -869,16 +1240,27 @@ impl BrainApp {
 
     fn reset_live_evidence_scroll_if_selection_changed(&mut self) {
         let selected = self
-            .selected_live_activity()
-            .map(|item| item.activity_id.clone());
+            .current_review_surface()
+            .filter(|_| self.tab == BrainTab::Live)
+            .and_then(|surface| self.selected_display_id(surface))
+            .map(str::to_owned)
+            .or_else(|| {
+                self.selected_live_activity()
+                    .map(|item| item.activity_id.clone())
+            });
         self.live_evidence
             .reset_if_selection_changed(selected.as_deref());
     }
 
     fn reset_diagnostics_evidence_scroll_if_selection_changed(&mut self) {
-        let selected = self
-            .selected_diagnostic()
-            .map(|item| item.activity_id.clone());
+        let selected = (self.tab == BrainTab::Diagnostics)
+            .then(|| self.selected_display_id(ReviewSurface::Diagnostics))
+            .flatten()
+            .map(str::to_owned)
+            .or_else(|| {
+                self.selected_diagnostic()
+                    .map(|item| item.activity_id.clone())
+            });
         self.diagnostics_evidence
             .reset_if_selection_changed(selected.as_deref());
     }
@@ -995,6 +1377,7 @@ impl BrainApp {
                 "Manual text: {} bytes / {MAX_MANUAL_TEXT_BYTES} [hidden]",
                 text.len()
             )),
+            Some(BrainInput::ReviewConfirmation { prompt, .. }) => Some(prompt.clone()),
             None => None,
         }
     }
@@ -1002,6 +1385,67 @@ impl BrainApp {
     pub fn selected_attention(&self) -> Option<&AttentionItem> {
         self.selected_attention_index()
             .and_then(|index| self.snapshot.attention.get(index))
+    }
+}
+
+fn review_surface_label(surface: ReviewSurface) -> &'static str {
+    match surface {
+        ReviewSurface::Attention => "Attention",
+        ReviewSurface::Review => "Review",
+        ReviewSurface::Diagnostics => "Diagnostics",
+        ReviewSurface::Recent => "Recent",
+    }
+}
+
+fn review_confirmation_prompt(request: &ReviewMutationRequest) -> String {
+    let surface = review_surface_label(request.surface);
+    match &request.operation {
+        ReviewMutation::SetDisposition {
+            keys,
+            disposition: ReviewDisposition::Reviewed,
+        } => {
+            let verb = if request.surface == ReviewSurface::Recent {
+                "Mark"
+            } else {
+                "Review"
+            };
+            let noun = if request.surface == ReviewSurface::Recent {
+                "items seen"
+            } else {
+                "NEW items"
+            };
+            format!("{verb} {} {surface} {noun}? y/Esc", keys.len())
+        }
+        ReviewMutation::SetDisposition {
+            keys,
+            disposition: ReviewDisposition::Archived,
+        } => format!("Archive {} reviewed {surface} items? y/Esc", keys.len()),
+        ReviewMutation::ArchiveAllReviewed { expected_count } => {
+            format!("Archive {expected_count} reviewed {surface} items? y/Esc")
+        }
+        ReviewMutation::UndoLastArchive { expected_count } => {
+            format!("Restore {expected_count} archived {surface} items? y/Esc")
+        }
+    }
+}
+
+fn review_success_status(request: &ReviewMutationRequest) -> String {
+    let surface = review_surface_label(request.surface);
+    match &request.operation {
+        ReviewMutation::SetDisposition {
+            keys,
+            disposition: ReviewDisposition::Reviewed,
+        } => format!("Reviewed {} {surface} items", keys.len()),
+        ReviewMutation::SetDisposition {
+            keys,
+            disposition: ReviewDisposition::Archived,
+        } => format!("Archived {} {surface} items", keys.len()),
+        ReviewMutation::ArchiveAllReviewed { expected_count } => {
+            format!("Archived {expected_count} {surface} items")
+        }
+        ReviewMutation::UndoLastArchive { expected_count } => {
+            format!("Restored {expected_count} {surface} items")
+        }
     }
 }
 
@@ -1084,12 +1528,16 @@ mod tests {
         SessionTargetProvenance,
     };
     use coding_brain_core::project::ProjectId;
+    use coding_brain_core::review_state::{
+        BrainReviewProjection, ReviewDisposition, ReviewKey, ReviewMutation, ReviewSurface,
+        ReviewTarget, SurfaceReviewProjection,
+    };
     use coding_brain_core::runtime::{
         BrainActions, BrainEffect, BrainRefresh, BrainRuntime, BrainSource, BrainSourceError,
         CorrectionInput, DecisionSummary, EndpointHealth, MockBrainAction, MockBrainRuntime,
-        ReviewItemSummary, SessionActionAvailability, SessionActionCapability,
-        SessionActionFailure, SessionActionFailureCategory, SessionActionPreflightRequest,
-        SessionActionRequest, SessionActionTarget,
+        MockReviewSurfaceState, ReviewItemSummary, ReviewMutationError, SessionActionAvailability,
+        SessionActionCapability, SessionActionFailure, SessionActionFailureCategory,
+        SessionActionPreflightRequest, SessionActionRequest, SessionActionTarget,
     };
     use coding_brain_core::terminals::TerminalSessionAction;
     use coding_brain_core::theme::{Theme, ThemeMode};
@@ -1098,6 +1546,114 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+
+    fn aligned_mock(mut mock: MockBrainRuntime) -> MockBrainRuntime {
+        mock.review_state = aligned_review_state(&mock.activity_snapshot, &mock.review_queue);
+        mock
+    }
+
+    fn aligned_refresh(mut refresh: BrainRefresh) -> BrainRefresh {
+        refresh.review_state = aligned_review_state(&refresh.snapshot, &refresh.review_queue);
+        refresh.validate_review_alignment().unwrap();
+        refresh
+    }
+
+    fn aligned_review_state(
+        snapshot: &ActivitySnapshot,
+        review_queue: &[ReviewItemSummary],
+    ) -> BrainReviewProjection {
+        BrainReviewProjection {
+            attention: fixture_attention_projection(&snapshot.attention),
+            review: fixture_review_projection(review_queue),
+            diagnostics: fixture_projection(
+                ReviewSurface::Diagnostics,
+                snapshot
+                    .diagnostic_events
+                    .iter()
+                    .map(|item| item.activity_id.as_str()),
+            ),
+            recent: fixture_projection(
+                ReviewSurface::Recent,
+                snapshot.recent.iter().map(|item| item.activity_id.as_str()),
+            ),
+        }
+    }
+
+    fn fixture_attention_projection(items: &[AttentionItem]) -> SurfaceReviewProjection {
+        let targets = items
+            .iter()
+            .map(|item| ReviewTarget {
+                surface: ReviewSurface::Attention,
+                display_id: item.review_display_id(),
+                new_member_keys: (0..item.occurrences)
+                    .map(|occurrence| {
+                        ReviewKey::derive(
+                            ReviewSurface::Attention,
+                            format!("{}:{occurrence}", item.activity_id).as_bytes(),
+                        )
+                    })
+                    .collect(),
+                reviewed_member_keys: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let new_count = targets
+            .iter()
+            .map(|target| target.new_member_keys.len())
+            .sum();
+        SurfaceReviewProjection::from_items(
+            ReviewSurface::Attention,
+            0,
+            targets,
+            items.len(),
+            new_count,
+            0,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn fixture_review_projection(items: &[ReviewItemSummary]) -> SurfaceReviewProjection {
+        let targets = items
+            .iter()
+            .map(|item| ReviewTarget {
+                surface: ReviewSurface::Review,
+                display_id: item.review_display_id(),
+                new_member_keys: vec![ReviewKey::derive(
+                    ReviewSurface::Review,
+                    &item.decision.review_source_identity(),
+                )],
+                reviewed_member_keys: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        SurfaceReviewProjection::from_items(
+            ReviewSurface::Review,
+            0,
+            targets,
+            items.len(),
+            items.len(),
+            0,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn fixture_projection<'a>(
+        surface: ReviewSurface,
+        display_ids: impl IntoIterator<Item = &'a str>,
+    ) -> SurfaceReviewProjection {
+        let items = display_ids
+            .into_iter()
+            .map(|display_id| ReviewTarget {
+                surface,
+                display_id: display_id.into(),
+                new_member_keys: vec![ReviewKey::derive(surface, display_id.as_bytes())],
+                reviewed_member_keys: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let visible_items = items.len();
+        SurfaceReviewProjection::from_items(surface, 0, items, visible_items, visible_items, 0, 0)
+            .unwrap()
+    }
 
     #[test]
     fn defaults_to_live_and_cycles_all_tabs() {
@@ -1653,7 +2209,7 @@ mod tests {
 
     #[test]
     fn manual_text_is_bounded_hidden_and_dropped_after_failure() {
-        let mock = Arc::new(MockBrainRuntime {
+        let mock = Arc::new(aligned_mock(MockBrainRuntime {
             activity_snapshot: ActivitySnapshot {
                 attention: vec![AttentionItem {
                     activity: activity(),
@@ -1667,7 +2223,7 @@ mod tests {
                 "delivery failed for top-secret-literal".into(),
             )),
             ..MockBrainRuntime::default()
-        });
+        }));
         let runtime = BrainRuntime::new(mock.clone(), mock.clone());
         let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
 
@@ -1720,7 +2276,7 @@ mod tests {
 
     #[test]
     fn semantic_delivery_failure_is_bounded_status() {
-        let mock = Arc::new(MockBrainRuntime {
+        let mock = Arc::new(aligned_mock(MockBrainRuntime {
             activity_snapshot: ActivitySnapshot {
                 attention: vec![AttentionItem {
                     activity: activity(),
@@ -1732,7 +2288,7 @@ mod tests {
             },
             session_action_error: std::sync::Mutex::new(Some("x".repeat(700))),
             ..MockBrainRuntime::default()
-        });
+        }));
         let runtime = BrainRuntime::new(mock.clone(), mock);
         let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
 
@@ -1753,7 +2309,7 @@ mod tests {
                 "Could not send manual text (18 bytes)",
             ),
         ] {
-            let source = MockBrainRuntime {
+            let source = aligned_mock(MockBrainRuntime {
                 activity_snapshot: ActivitySnapshot {
                     attention: vec![AttentionItem {
                         activity: activity(),
@@ -1764,7 +2320,7 @@ mod tests {
                     ..ActivitySnapshot::default()
                 },
                 ..MockBrainRuntime::default()
-            };
+            });
             let source = Arc::new(source);
             let actions = Arc::new(SlowBrainActions {
                 error,
@@ -2095,7 +2651,7 @@ mod tests {
 
     #[test]
     fn navigation_completion_restores_tab_selection_and_bounded_status() {
-        let mock = Arc::new(MockBrainRuntime {
+        let mock = Arc::new(aligned_mock(MockBrainRuntime {
             review_queue: vec![
                 ReviewItemSummary {
                     decision: decision(),
@@ -2112,7 +2668,7 @@ mod tests {
                 },
             ],
             ..MockBrainRuntime::default()
-        });
+        }));
         let runtime = BrainRuntime::new(mock.clone(), mock);
         let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
         app.handle_key(key(KeyCode::Tab));
@@ -2218,7 +2774,7 @@ mod tests {
         diagnostic.kind = ActivityKind::Diagnostic;
         diagnostic.state = ActivityState::Error;
         diagnostic.decision_id = None;
-        let mock = Arc::new(MockBrainRuntime {
+        let mock = Arc::new(aligned_mock(MockBrainRuntime {
             activity_snapshot: ActivitySnapshot {
                 attention: vec![AttentionItem {
                     activity: diagnostic,
@@ -2231,7 +2787,7 @@ mod tests {
                 diagnostics: Default::default(),
             },
             ..MockBrainRuntime::default()
-        });
+        }));
         let runtime = BrainRuntime::new(mock.clone(), mock.clone());
         let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
 
@@ -2247,14 +2803,14 @@ mod tests {
 
     #[test]
     fn review_mark_records_exact_decision_id_without_dashboard_actions() {
-        let mock = MockBrainRuntime {
+        let mock = aligned_mock(MockBrainRuntime {
             review_queue: vec![ReviewItemSummary {
                 decision: decision(),
                 reason: "high-confidence miss".into(),
                 score: 80.0,
             }],
             ..MockBrainRuntime::default()
-        };
+        });
         let mock = Arc::new(mock);
         let runtime = BrainRuntime::new(mock.clone(), mock.clone());
         let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
@@ -2269,6 +2825,519 @@ mod tests {
                 note: None,
             }]
         );
+    }
+
+    #[test]
+    fn review_mark_and_note_report_unavailable_for_legacy_ids() {
+        for (decision_id, key_code) in ["", "   "].into_iter().flat_map(|decision_id| {
+            [KeyCode::Char('m'), KeyCode::Char('n')]
+                .into_iter()
+                .map(move |key_code| (decision_id, key_code))
+        }) {
+            let mut legacy = decision();
+            legacy.id = decision_id.into();
+            let mock = aligned_mock(MockBrainRuntime {
+                review_queue: vec![ReviewItemSummary {
+                    decision: legacy,
+                    reason: "legacy".into(),
+                    score: 1.0,
+                }],
+                ..MockBrainRuntime::default()
+            });
+            let mock = Arc::new(mock);
+            let runtime = BrainRuntime::new(mock.clone(), mock.clone());
+            let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+
+            app.handle_key(key(KeyCode::Tab));
+            app.handle_key(key(key_code));
+
+            assert!(non_poll_actions(&mock).is_empty());
+            assert_eq!(app.input_prompt(), None);
+            assert_eq!(
+                app.status(),
+                Some("Canonical marking unavailable for legacy decision")
+            );
+        }
+    }
+
+    #[test]
+    fn review_mark_and_note_are_noops_for_empty_queue() {
+        for key_code in [KeyCode::Char('m'), KeyCode::Char('n')] {
+            let mock = Arc::new(aligned_mock(MockBrainRuntime::default()));
+            let runtime = BrainRuntime::new(mock.clone(), mock.clone());
+            let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+            app.handle_key(key(KeyCode::Tab));
+            let prior_status = app.status().map(str::to_owned);
+
+            app.handle_key(key(key_code));
+
+            assert!(non_poll_actions(&mock).is_empty());
+            assert_eq!(app.input_prompt(), None);
+            assert_eq!(app.status(), prior_status.as_deref());
+        }
+    }
+
+    #[test]
+    fn bulk_confirmation_keeps_captured_surface_revision_and_count() {
+        let (mut app, mock) = review_fixture(ReviewSurface::Attention, 3, 2);
+
+        app.handle_key(key(KeyCode::Char('D')));
+
+        assert_eq!(
+            app.input_prompt(),
+            Some("Archive 2 reviewed Attention items? y/Esc".into())
+        );
+        app.handle_key(key(KeyCode::Char('y')));
+        let request = non_poll_actions(&mock)
+            .into_iter()
+            .find_map(|action| match action {
+                MockBrainAction::ReviewMutation(request) => Some(request),
+                _ => None,
+            })
+            .expect("confirmation submits a review mutation");
+        assert_eq!(request.surface, ReviewSurface::Attention);
+        assert_eq!(request.expected_surface_revision, 7);
+        assert_eq!(
+            request.operation,
+            ReviewMutation::ArchiveAllReviewed { expected_count: 2 }
+        );
+    }
+
+    #[test]
+    fn recent_rejects_archive_keys_but_supports_mark_all_seen() {
+        let (mut app, mock) = review_fixture(ReviewSurface::Recent, 2, 0);
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(non_poll_actions(&mock).is_empty());
+
+        app.handle_key(key(KeyCode::Char('A')));
+        assert_eq!(
+            app.input_prompt(),
+            Some("Mark 2 Recent items seen? y/Esc".into())
+        );
+    }
+
+    #[test]
+    fn review_selected_new_keys_is_immediate() {
+        let (mut app, mock) = review_fixture(ReviewSurface::Diagnostics, 1, 0);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        let mutations = review_mutations(&mock);
+        assert_eq!(mutations.len(), 1);
+        assert!(matches!(
+            mutations[0].operation,
+            ReviewMutation::SetDisposition {
+                disposition: ReviewDisposition::Reviewed,
+                ..
+            }
+        ));
+        assert_eq!(mutations[0].surface, ReviewSurface::Diagnostics);
+    }
+
+    #[test]
+    fn review_skip_persists_then_advances_and_failure_preserves_selection() {
+        let (mut app, mock) = review_fixture(ReviewSurface::Review, 2, 0);
+
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.selection(), 1);
+        assert_eq!(review_mutations(&mock).len(), 1);
+
+        let (mut failed, failed_mock) = review_fixture(ReviewSurface::Review, 2, 0);
+        failed_mock.fail_next_review_mutation(ReviewMutationError::Busy);
+        failed.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(failed.selection(), 0);
+        assert!(review_mutations(&failed_mock).is_empty());
+    }
+
+    #[test]
+    fn undo_restores_latest_archive_immediately() {
+        let archived_key = ReviewKey::derive(ReviewSurface::Attention, b"archived");
+        let mock = Arc::new(
+            MockBrainRuntime {
+                review_state: BrainReviewProjection {
+                    attention: SurfaceReviewProjection::from_items(
+                        ReviewSurface::Attention,
+                        4,
+                        Vec::new(),
+                        0,
+                        0,
+                        0,
+                        1,
+                    )
+                    .unwrap(),
+                    ..BrainReviewProjection::default()
+                },
+                ..MockBrainRuntime::default()
+            }
+            .with_review_surface_state(
+                ReviewSurface::Attention,
+                MockReviewSurfaceState {
+                    eligible_keys: [archived_key].into_iter().collect(),
+                    dispositions: [(archived_key, ReviewDisposition::Archived)]
+                        .into_iter()
+                        .collect(),
+                    last_archive: [archived_key].into_iter().collect(),
+                },
+            ),
+        );
+        let runtime = BrainRuntime::new(mock.clone(), mock.clone());
+        let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+
+        app.handle_key(key(KeyCode::Char('u')));
+
+        assert_eq!(
+            review_mutations(&mock)[0].operation,
+            ReviewMutation::UndoLastArchive { expected_count: 1 }
+        );
+        assert_eq!(app.input_prompt(), None);
+    }
+
+    #[test]
+    fn confirmation_escape_non_yes_and_repeated_yes_cannot_submit() {
+        for cancel in [KeyCode::Esc, KeyCode::Char('n')] {
+            let (mut app, mock) = review_fixture(ReviewSurface::Attention, 0, 1);
+            app.handle_key(key(KeyCode::Char('D')));
+            app.handle_key(key(cancel));
+            assert!(review_mutations(&mock).is_empty());
+            assert_eq!(app.input_prompt(), None);
+        }
+
+        let (mut app, mock) = review_fixture(ReviewSurface::Attention, 0, 1);
+        app.handle_key(key(KeyCode::Char('D')));
+        app.handle_key(key(KeyCode::Char('y')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(review_mutations(&mock).len(), 1);
+    }
+
+    #[test]
+    fn zero_targets_and_scorecard_do_not_submit_review_actions() {
+        let (mut app, mock) = review_fixture(ReviewSurface::Attention, 0, 0);
+        app.handle_key(key(KeyCode::Char('A')));
+        assert_eq!(app.status(), Some("No NEW Attention items"));
+        assert!(review_mutations(&mock).is_empty());
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+        for code in ['a', 'A', 'd', 'D', 'u'] {
+            app.handle_key(key(KeyCode::Char(code)));
+        }
+        assert!(review_mutations(&mock).is_empty());
+    }
+
+    #[test]
+    fn in_flight_session_action_blocks_review_lifecycle_keys() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let (mut app, actions) = slow_preflight_fixture(Duration::from_millis(200), completed);
+        app.handle_key(key(KeyCode::Char('x')));
+        wait_for_preflight_call(&actions);
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        assert_eq!(app.status(), Some("Session action is still in progress"));
+    }
+
+    #[test]
+    fn stale_confirmation_fails_visibly_and_surface_change_is_not_swallowed() {
+        let (mut app, mock) = review_fixture(ReviewSurface::Attention, 0, 1);
+        app.handle_key(key(KeyCode::Char('D')));
+        mock.fail_next_review_mutation(ReviewMutationError::StaleRevision);
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(
+            app.status(),
+            Some("Review state changed; refresh and retry")
+        );
+        assert_eq!(app.input_prompt(), None);
+
+        let (mut app, _) = review_fixture(ReviewSurface::Attention, 0, 1);
+        app.handle_key(key(KeyCode::Char('D')));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.tab(), BrainTab::Review);
+        assert_eq!(app.input_prompt(), None);
+    }
+
+    #[test]
+    fn busy_retries_exact_prompt_but_durability_uncertain_requires_refresh() {
+        let (mut busy, busy_mock) = review_fixture(ReviewSurface::Attention, 0, 1);
+        busy.handle_key(key(KeyCode::Char('D')));
+        let prompt = busy.input_prompt();
+        busy_mock.fail_next_review_mutation(ReviewMutationError::Busy);
+        busy.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(busy.input_prompt(), prompt);
+        assert!(review_mutations(&busy_mock).is_empty());
+
+        let (mut uncertain, uncertain_mock) = review_fixture(ReviewSurface::Attention, 1, 0);
+        uncertain_mock.fail_next_review_mutation(ReviewMutationError::DurabilityUncertain);
+        uncertain.handle_key(key(KeyCode::Char('A')));
+        uncertain.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(uncertain.input_prompt(), None);
+        uncertain.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(
+            uncertain.status(),
+            Some("Review state requires a fresh refresh")
+        );
+        assert!(review_mutations(&uncertain_mock).is_empty());
+        uncertain.refresh();
+        uncertain.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(review_mutations(&uncertain_mock).len(), 1);
+    }
+
+    #[test]
+    fn refresh_preserves_attention_selection_and_scroll_by_display_identity() {
+        let first = attention_refresh("activity-old");
+        let second = attention_refresh("activity-new");
+        let expected_display_id = first.review_state.attention.items[0].display_id.clone();
+        let mut app = scripted_app([Ok(first), Ok(second)]);
+        app.update_live_evidence_metrics(5, 12);
+        app.handle_key(key(KeyCode::PageDown));
+
+        app.refresh();
+
+        assert_eq!(app.live_evidence_scroll(), 5);
+        assert_eq!(
+            app.review_state.attention.items[0].display_id,
+            expected_display_id
+        );
+    }
+
+    #[test]
+    fn refresh_restores_inactive_recent_selection_without_resetting_attention_scroll() {
+        let first = mixed_live_refresh(&["attention-a"], &["recent-a", "recent-b"]);
+        let second = mixed_live_refresh(&["attention-a"], &["recent-b", "recent-a"]);
+        let mut app = scripted_app([Ok(first), Ok(second)]);
+        app.handle_key(key(KeyCode::Char('J')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "recent-b"
+        );
+        app.handle_key(key(KeyCode::Char('K')));
+        app.update_live_evidence_metrics(5, 12);
+        app.handle_key(key(KeyCode::PageDown));
+
+        app.refresh();
+
+        assert_eq!(app.live_evidence_scroll(), 5);
+        app.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "recent-b"
+        );
+        assert_eq!(app.selection(), 0);
+        assert_eq!(app.live_evidence_scroll(), 0);
+    }
+
+    #[test]
+    fn refresh_restores_inactive_attention_selection_without_resetting_recent_scroll() {
+        let first = mixed_live_refresh(&["attention-a", "attention-b"], &["recent-a"]);
+        let second = mixed_live_refresh(&["attention-b", "attention-a"], &["recent-a"]);
+        let mut app = scripted_app([Ok(first), Ok(second)]);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "attention-b"
+        );
+        app.handle_key(key(KeyCode::Char('J')));
+        app.update_live_evidence_metrics(5, 12);
+        app.handle_key(key(KeyCode::PageDown));
+
+        app.refresh();
+
+        assert_eq!(app.live_evidence_scroll(), 5);
+        app.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(
+            app.selected_live_activity().unwrap().activity_id,
+            "attention-b"
+        );
+        assert_eq!(app.selection(), 0);
+        assert_eq!(app.live_evidence_scroll(), 0);
+    }
+
+    #[test]
+    fn refresh_restores_diagnostics_selection_by_display_identity_after_reorder() {
+        let first = diagnostics_refresh(&["diagnostic-a", "diagnostic-b"]);
+        let second = diagnostics_refresh(&["diagnostic-b", "diagnostic-a"]);
+        let mut app = scripted_app([Ok(first), Ok(second)]);
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Tab));
+        }
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.selected_diagnostic().unwrap().activity_id,
+            "diagnostic-b"
+        );
+
+        app.refresh();
+
+        assert_eq!(
+            app.selected_diagnostic().unwrap().activity_id,
+            "diagnostic-b"
+        );
+        assert_eq!(app.selection(), 0);
+    }
+
+    fn review_fixture(
+        surface: ReviewSurface,
+        new_count: usize,
+        reviewed_count: usize,
+    ) -> (BrainApp, Arc<MockBrainRuntime>) {
+        let total = new_count + reviewed_count;
+        let mut mock = MockBrainRuntime::default();
+        match surface {
+            ReviewSurface::Attention => {
+                mock.activity_snapshot.attention = (0..total)
+                    .map(|index| {
+                        let mut activity = activity();
+                        activity.activity_id = format!("attention-{index}");
+                        activity.normalized_command = Some(format!("cargo test {index}"));
+                        AttentionItem {
+                            activity,
+                            occurrences: 1,
+                            unresolved_occurrences: 1,
+                        }
+                    })
+                    .collect();
+                mock.activity_snapshot.unresolved_count = total;
+            }
+            ReviewSurface::Review => {
+                mock.review_queue = (0..total)
+                    .map(|index| {
+                        let mut decision = decision();
+                        decision.id = format!("decision-{index}");
+                        ReviewItemSummary {
+                            decision,
+                            reason: "fixture".into(),
+                            score: 1.0,
+                        }
+                    })
+                    .collect();
+            }
+            ReviewSurface::Diagnostics => {
+                mock.activity_snapshot.diagnostic_events = (0..total)
+                    .map(|index| diagnostic_activity(&format!("diagnostic-{index}"), index as u64))
+                    .collect();
+            }
+            ReviewSurface::Recent => {
+                mock.activity_snapshot.recent = (0..total)
+                    .map(|index| {
+                        let mut activity = activity();
+                        activity.activity_id = format!("recent-{index}");
+                        activity
+                    })
+                    .collect();
+            }
+        }
+        mock.review_state = aligned_review_state(&mock.activity_snapshot, &mock.review_queue);
+        let projection = match surface {
+            ReviewSurface::Attention => &mut mock.review_state.attention,
+            ReviewSurface::Review => &mut mock.review_state.review,
+            ReviewSurface::Diagnostics => &mut mock.review_state.diagnostics,
+            ReviewSurface::Recent => &mut mock.review_state.recent,
+        };
+        projection.revision = 7;
+        for target in projection.items.iter_mut().skip(new_count) {
+            target.reviewed_member_keys = target.new_member_keys.drain(..).collect();
+        }
+        projection.new_count = new_count;
+        projection.reviewed_count = reviewed_count;
+        let mock = Arc::new(mock);
+        let runtime = BrainRuntime::new(mock.clone(), mock.clone());
+        let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+        match surface {
+            ReviewSurface::Attention => {}
+            ReviewSurface::Recent => {
+                app.handle_key(key(KeyCode::Char('J')));
+            }
+            ReviewSurface::Review => {
+                app.handle_key(key(KeyCode::Tab));
+            }
+            ReviewSurface::Diagnostics => {
+                for _ in 0..3 {
+                    app.handle_key(key(KeyCode::Tab));
+                }
+            }
+        };
+        (app, mock)
+    }
+
+    fn review_mutations(mock: &MockBrainRuntime) -> Vec<ReviewMutationRequest> {
+        non_poll_actions(mock)
+            .into_iter()
+            .filter_map(|action| match action {
+                MockBrainAction::ReviewMutation(request) => Some(request),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn wait_for_preflight_call(actions: &SlowBrainActions) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while actions.preflight_calls.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(actions.preflight_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn attention_refresh(activity_id: &str) -> BrainRefresh {
+        let mut activity = activity();
+        activity.activity_id = activity_id.into();
+        aligned_refresh(BrainRefresh {
+            snapshot: ActivitySnapshot {
+                attention: vec![AttentionItem {
+                    activity,
+                    occurrences: 1,
+                    unresolved_occurrences: 1,
+                }],
+                unresolved_count: 1,
+                ..ActivitySnapshot::default()
+            },
+            ..BrainRefresh::default()
+        })
+    }
+
+    fn diagnostics_refresh(activity_ids: &[&str]) -> BrainRefresh {
+        aligned_refresh(BrainRefresh {
+            snapshot: ActivitySnapshot {
+                diagnostic_events: activity_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, activity_id)| diagnostic_activity(activity_id, index as u64))
+                    .collect(),
+                ..ActivitySnapshot::default()
+            },
+            ..BrainRefresh::default()
+        })
+    }
+
+    fn mixed_live_refresh(attention_ids: &[&str], recent_ids: &[&str]) -> BrainRefresh {
+        aligned_refresh(BrainRefresh {
+            snapshot: ActivitySnapshot {
+                attention: attention_ids
+                    .iter()
+                    .map(|activity_id| {
+                        let mut activity = activity();
+                        activity.activity_id = (*activity_id).into();
+                        activity.fingerprint = Some(format!("fingerprint-{activity_id}"));
+                        AttentionItem {
+                            activity,
+                            occurrences: 1,
+                            unresolved_occurrences: 1,
+                        }
+                    })
+                    .collect(),
+                recent: recent_ids
+                    .iter()
+                    .map(|activity_id| {
+                        let mut activity = activity();
+                        activity.activity_id = (*activity_id).into();
+                        activity
+                    })
+                    .collect(),
+                unresolved_count: attention_ids.len(),
+                ..ActivitySnapshot::default()
+            },
+            ..BrainRefresh::default()
+        })
     }
 
     fn fixture_app(attention: bool) -> (BrainApp, Arc<MockBrainRuntime>) {
@@ -2286,7 +3355,7 @@ mod tests {
                 diagnostics: Default::default(),
             };
         }
-        let mock = Arc::new(mock);
+        let mock = Arc::new(aligned_mock(mock));
         let runtime = BrainRuntime::new(mock.clone(), mock.clone());
         let app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
         (app, mock)
@@ -2295,7 +3364,7 @@ mod tests {
     fn fixture_app_with_capabilities(
         capabilities: Vec<SessionActionCapability>,
     ) -> (BrainApp, Arc<MockBrainRuntime>) {
-        let mock = Arc::new(MockBrainRuntime {
+        let mock = Arc::new(aligned_mock(MockBrainRuntime {
             activity_snapshot: ActivitySnapshot {
                 attention: vec![AttentionItem {
                     activity: activity(),
@@ -2307,7 +3376,7 @@ mod tests {
             },
             session_action_capabilities: std::sync::Mutex::new(capabilities),
             ..MockBrainRuntime::default()
-        });
+        }));
         let runtime = BrainRuntime::new(mock.clone(), mock.clone());
         (
             BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark)),
@@ -2316,7 +3385,7 @@ mod tests {
     }
 
     fn fixture_app_with_live_activity(activity: ActivityItem) -> (BrainApp, Arc<MockBrainRuntime>) {
-        let mock = Arc::new(MockBrainRuntime {
+        let mock = Arc::new(aligned_mock(MockBrainRuntime {
             activity_snapshot: ActivitySnapshot {
                 attention: vec![AttentionItem {
                     activity,
@@ -2327,7 +3396,7 @@ mod tests {
                 ..ActivitySnapshot::default()
             },
             ..MockBrainRuntime::default()
-        });
+        }));
         let runtime = BrainRuntime::new(mock.clone(), mock.clone());
         (
             BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark)),
@@ -2454,7 +3523,7 @@ mod tests {
 
     impl BrainSource for PromptChangeBoundary {
         fn refresh(&self, _limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
-            Ok(BrainRefresh {
+            Ok(aligned_refresh(BrainRefresh {
                 snapshot: ActivitySnapshot {
                     attention: vec![AttentionItem {
                         activity: activity(),
@@ -2470,7 +3539,7 @@ mod tests {
                     ..ActivitySnapshot::default()
                 },
                 ..BrainRefresh::default()
-            })
+            }))
         }
 
         fn gate_mode(&self) -> BrainGateMode {
@@ -2595,13 +3664,36 @@ mod tests {
         refreshes: std::sync::Mutex<VecDeque<Result<BrainRefresh, BrainSourceError>>>,
     }
 
+    #[test]
+    fn scripted_brain_source_rejects_invalid_refresh_alignment() {
+        let source = ScriptedBrainSource {
+            refreshes: std::sync::Mutex::new(VecDeque::from([Ok(BrainRefresh {
+                snapshot: ActivitySnapshot {
+                    recent: vec![activity()],
+                    ..ActivitySnapshot::default()
+                },
+                ..BrainRefresh::default()
+            })])),
+        };
+
+        assert!(matches!(
+            source.refresh(SnapshotLimits::default()),
+            Err(BrainSourceError::Other(_))
+        ));
+    }
+
     impl BrainSource for ScriptedBrainSource {
         fn refresh(&self, _limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
-            self.refreshes
+            let refresh = self
+                .refreshes
                 .lock()
                 .expect("scripted refreshes poisoned")
                 .pop_front()
-                .expect("unexpected refresh")
+                .expect("unexpected refresh")?;
+            refresh
+                .validate_review_alignment()
+                .map_err(|error| BrainSourceError::Other(error.to_string()))?;
+            Ok(refresh)
         }
 
         fn gate_mode(&self) -> BrainGateMode {
@@ -2694,29 +3786,32 @@ mod tests {
     fn refresh_fixture(marker: &str, review_count: usize, total: usize) -> BrainRefresh {
         let mut live = activity();
         live.activity_id = marker.into();
-        let mut review_decision = decision();
-        review_decision.id = marker.into();
-        BrainRefresh {
+        aligned_refresh(BrainRefresh {
             snapshot: ActivitySnapshot {
                 recent: vec![live],
                 ..ActivitySnapshot::default()
             },
             review_queue: (0..review_count)
-                .map(|_| ReviewItemSummary {
-                    decision: review_decision.clone(),
-                    reason: "fixture".into(),
-                    score: 1.0,
+                .map(|index| {
+                    let mut review_decision = decision();
+                    review_decision.id = format!("{marker}-{index}");
+                    ReviewItemSummary {
+                        decision: review_decision,
+                        reason: "fixture".into(),
+                        score: 1.0,
+                    }
                 })
                 .collect(),
             scorecard: ScorecardSummary {
                 total_decisions: total,
                 ..ScorecardSummary::default()
             },
-        }
+            ..BrainRefresh::default()
+        })
     }
 
     fn refresh_with_recent(activity_ids: &[&str]) -> BrainRefresh {
-        BrainRefresh {
+        aligned_refresh(BrainRefresh {
             snapshot: ActivitySnapshot {
                 recent: activity_ids
                     .iter()
@@ -2729,13 +3824,13 @@ mod tests {
                 ..ActivitySnapshot::default()
             },
             ..BrainRefresh::default()
-        }
+        })
     }
 
     fn refresh_with_attention_session(session_id: &str) -> BrainRefresh {
         let mut item = activity();
         item.session.as_mut().unwrap().session_id = session_id.into();
-        BrainRefresh {
+        aligned_refresh(BrainRefresh {
             snapshot: ActivitySnapshot {
                 attention: vec![AttentionItem {
                     activity: item,
@@ -2746,7 +3841,7 @@ mod tests {
                 ..ActivitySnapshot::default()
             },
             ..BrainRefresh::default()
-        }
+        })
     }
 
     fn assert_refresh_fixture(app: &BrainApp, marker: &str, review_count: usize, total: usize) {
@@ -2755,7 +3850,8 @@ mod tests {
         assert!(
             app.review_queue
                 .iter()
-                .all(|item| item.decision.id == marker)
+                .enumerate()
+                .all(|(index, item)| item.decision.id == format!("{marker}-{index}"))
         );
         assert_eq!(app.scorecard.total_decisions, total);
     }
@@ -2763,7 +3859,7 @@ mod tests {
     impl BrainSource for ErrorAfterFirstSource {
         fn refresh(&self, _limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
             if self.snapshot_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                Ok(BrainRefresh {
+                Ok(aligned_refresh(BrainRefresh {
                     snapshot: ActivitySnapshot {
                         attention: vec![AttentionItem {
                             activity: activity(),
@@ -2774,7 +3870,7 @@ mod tests {
                         ..ActivitySnapshot::default()
                     },
                     ..BrainRefresh::default()
-                })
+                }))
             } else {
                 Err(BrainSourceError::Other(self.error.clone()))
             }
@@ -2793,7 +3889,7 @@ mod tests {
         delay: Duration,
         completed: Arc<std::sync::atomic::AtomicBool>,
     ) -> (BrainApp, Arc<SlowBrainActions>) {
-        let source = Arc::new(MockBrainRuntime {
+        let source = Arc::new(aligned_mock(MockBrainRuntime {
             activity_snapshot: ActivitySnapshot {
                 attention: vec![AttentionItem {
                     activity: activity(),
@@ -2804,7 +3900,7 @@ mod tests {
                 ..ActivitySnapshot::default()
             },
             ..MockBrainRuntime::default()
-        });
+        }));
         let actions = Arc::new(SlowBrainActions {
             error: None,
             calls: AtomicUsize::new(0),
@@ -2833,7 +3929,7 @@ mod tests {
         let mut second = activity();
         second.activity_id = "activity-2".into();
         second.session.as_mut().unwrap().session_id = "session-2".into();
-        let source = Arc::new(MockBrainRuntime {
+        let source = Arc::new(aligned_mock(MockBrainRuntime {
             activity_snapshot: ActivitySnapshot {
                 attention: vec![
                     AttentionItem {
@@ -2851,7 +3947,7 @@ mod tests {
                 ..ActivitySnapshot::default()
             },
             ..MockBrainRuntime::default()
-        });
+        }));
         let actions = Arc::new(SlowBrainActions {
             error: None,
             calls: AtomicUsize::new(0),
