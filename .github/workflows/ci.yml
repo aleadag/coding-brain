@@ -19,6 +19,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
+  musl:
+    name: Musl (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo check --locked --release --target ${{ matrix.target }}
+      - name: Test atomic journal publication
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo test --locked --lib --target x86_64-unknown-linux-musl publication_never_replaces_an_existing_final_name
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

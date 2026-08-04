@@ -1,11 +1,11 @@
-const RELEASE_VERSION: &str = "0.59.0";
+const RELEASE_VERSION: &str = "0.59.1";
 const REPOSITORY: &str = "https://github.com/aleadag/coding-brain";
 const ROOT_CORE_DEPENDENCY: &str =
-    "coding-brain-core = { path = \"crates/coding-brain-core\", version = \"0.59.0\" }";
+    "coding-brain-core = { path = \"crates/coding-brain-core\", version = \"0.59.1\" }";
 const ROOT_TUI_DEPENDENCY: &str =
-    "coding-brain-tui = { path = \"crates/coding-brain-tui\", version = \"0.59.0\" }";
+    "coding-brain-tui = { path = \"crates/coding-brain-tui\", version = \"0.59.1\" }";
 const TUI_CORE_DEPENDENCY: &str =
-    "coding-brain-core = { path = \"../coding-brain-core\", version = \"0.59.0\" }";
+    "coding-brain-core = { path = \"../coding-brain-core\", version = \"0.59.1\" }";
 const ROOT_PACKAGE_INCLUDE: &str = r#"include = [
     "/src/**",
     "/Cargo.toml",
@@ -50,16 +50,19 @@ fn root_package_uses_exact_publication_allowlist() {
 }
 
 #[test]
-fn changelog_is_cut_for_v0_59_0() {
+fn changelog_is_cut_for_v0_59_1() {
     let changelog = include_str!("../CHANGELOG.md");
-    assert!(changelog.contains("## [Unreleased]\n\n## [0.59.0] - 2026-08-03"));
+    assert!(changelog.contains("## [Unreleased]\n\n## [0.59.1] - 2026-08-04"));
+    assert!(changelog.contains("`v0.59.0` tag failed before publication"));
 }
 
 #[test]
 fn release_body_covers_the_real_range_and_known_limitations() {
-    let notes = include_str!("../.github/releases/v0.59.0.md");
+    let notes = include_str!("../.github/releases/v0.59.1.md");
     for required in [
-        "v0.57.2...v0.59.0",
+        "v0.57.2...v0.59.1",
+        "`v0.59.0` tag failed before publication",
+        "musl",
         "PreToolUse anchor",
         "BusyBox `time -o`",
         "cargo install coding-brain",

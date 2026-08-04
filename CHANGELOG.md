@@ -6,6 +6,23 @@ All notable changes to Coding Brain are documented here.
 
 ## [Unreleased]
 
+## [0.59.1] - 2026-08-04
+
+### Fixed
+
+- Linux musl release targets now publish permission journals through the
+  kernel `renameat2` syscall with `RENAME_NOREPLACE`, preserving atomic
+  no-replacement behavior without relying on the GNU-only libc binding.
+- Pull requests now compile both Linux musl release targets and execute the
+  journal no-replacement regression test as an x86_64 musl binary before a
+  release tag can be created.
+
+### Release recovery
+
+- The immutable `v0.59.0` tag failed before publication during its Linux musl
+  artifact builds. No crates.io packages, GitHub Release, or Homebrew formula
+  were published from that tag; `v0.59.1` is the forward recovery release.
+
 ## [0.59.0] - 2026-08-03
 
 ### Added

@@ -2179,7 +2179,7 @@ fn next_creation_identity() -> String {
     format!("{nanos:039}-{:010}-{sequence:020}", std::process::id())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "android"))]
 type RenameAt2 = unsafe extern "C" fn(
     libc::c_int,
     *const libc::c_char,
@@ -2188,7 +2188,7 @@ type RenameAt2 = unsafe extern "C" fn(
     libc::c_uint,
 ) -> libc::c_int;
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "android"))]
 const _: RenameAt2 = libc::renameat2;
 
 #[cfg(target_os = "linux")]
@@ -2200,7 +2200,7 @@ const RENAME_NOREPLACE_FLAG: libc::c_uint = libc::RENAME_NOREPLACE as libc::c_ui
 #[cfg(target_os = "android")]
 const _: () = assert!(libc::RENAME_NOREPLACE >= 0);
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "android"))]
 unsafe fn rename_noreplace_at(
     old_directory: libc::c_int,
     old_name: *const libc::c_char,
@@ -2215,6 +2215,25 @@ unsafe fn rename_noreplace_at(
             new_name,
             RENAME_NOREPLACE_FLAG,
         )
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+unsafe fn rename_noreplace_at(
+    old_directory: libc::c_int,
+    old_name: *const libc::c_char,
+    new_directory: libc::c_int,
+    new_name: *const libc::c_char,
+) -> libc::c_int {
+    unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            old_directory,
+            old_name,
+            new_directory,
+            new_name,
+            RENAME_NOREPLACE_FLAG,
+        ) as libc::c_int
     }
 }
 
