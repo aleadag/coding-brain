@@ -840,13 +840,24 @@ fn validate_session_signature(state: &SessionLifecycleState) -> Result<(), Stora
             ));
         }
     }
-    match (latest, state.session_start_source) {
-        (LifecycleEventName::SessionStart, Some(_)) => Ok(()),
-        (LifecycleEventName::SessionStart, None) => {
-            Err(StorageError::InvalidStorage("missing session start source"))
-        }
-        (_, None) => Ok(()),
-        (_, Some(_)) => Err(StorageError::InvalidStorage(
+    match (
+        latest,
+        state.session_start_source,
+        state.last_signature.as_ref(),
+    ) {
+        (
+            LifecycleEventName::SessionStart,
+            Some(source),
+            Some(LifecycleEventSignature {
+                kind: LifecycleEventKind::SessionStart { source: signature },
+                ..
+            }),
+        ) if source == *signature => Ok(()),
+        (LifecycleEventName::SessionStart, _, _) => Err(StorageError::InvalidStorage(
+            "mismatched session start source",
+        )),
+        (_, None, _) => Ok(()),
+        (_, Some(_), _) => Err(StorageError::InvalidStorage(
             "unexpected session start source",
         )),
     }
@@ -905,7 +916,9 @@ fn validate_invocation(
                 && state
                     .current_turn
                     .as_deref()
-                    .is_some_and(|turn| turn.strip_prefix("invocation-").is_some())
+                    .and_then(|turn| turn.strip_prefix("invocation-"))
+                    .and_then(|suffix| suffix.parse::<u64>().ok())
+                    .is_some()
                 && state.antigravity_child_events.len() <= MAX_ANTIGRAVITY_INVOCATION_STEPS
                 && state.antigravity_child_events.iter().all(|(step, bits)| {
                     *step >= floor && *bits != 0 && *bits & !(PRE_TOOL_BIT | POST_TOOL_BIT) == 0
@@ -1340,4 +1353,59 @@ fn nonnegative_u64(value: i64, error: &'static str) -> Result<u64, StorageError>
 
 fn sqlite_i64(value: u64, error: &'static str) -> Result<i64, StorageError> {
     i64::try_from(value).map_err(|_| StorageError::InvalidStorage(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use coding_brain_core::lifecycle::{LifecycleEvent, LifecycleEventKind, LifecycleIdentity};
+
+    use super::*;
+
+    #[test]
+    fn immediate_transaction_error_rolls_back_the_prior_lifecycle_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = super::super::StoragePaths::at(root.path());
+        let mut db = BrainDb::create_current(&paths).unwrap();
+        let identity = LifecycleIdentity::try_new(
+            AgentProvider::Codex,
+            "session-1".into(),
+            Some("turn-1".into()),
+            None,
+            "/work/project".into(),
+        )
+        .unwrap();
+        db.record_lifecycle(
+            LifecycleEvent::from_parts(identity.clone(), LifecycleEventKind::UserPromptSubmit)
+                .unwrap(),
+            100,
+        )
+        .unwrap();
+        let before = db.read_lifecycle().unwrap();
+        db.connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER abort_lifecycle_session_insert
+                 BEFORE INSERT ON lifecycle_sessions
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected lifecycle persistence failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = db
+            .record_lifecycle(
+                LifecycleEvent::from_parts(identity, LifecycleEventKind::Stop).unwrap(),
+                101,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::Sqlite(_)), "{error:?}");
+        db.connection
+            .execute_batch("DROP TRIGGER abort_lifecycle_session_insert;")
+            .unwrap();
+        assert_eq!(db.read_lifecycle().unwrap(), before);
+    }
 }

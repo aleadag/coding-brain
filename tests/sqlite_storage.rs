@@ -8,7 +8,7 @@ use coding_brain::brain::storage::{
 };
 use coding_brain_core::lifecycle::{
     LifecycleEvent, LifecycleEventKind, LifecycleIdentity, LifecycleSnapshot, PermissionAction,
-    PermissionAuthority,
+    PermissionAuthority, SessionStartSource,
 };
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use rusqlite::limits::Limit;
@@ -299,6 +299,98 @@ fn lifecycle_load_rejects_invocation_sequence_at_next_sequence() {
     let connection = open_for_constraints(&paths.brain_db());
     connection
         .execute("UPDATE lifecycle_invocations SET state_sequence = 2", [])
+        .unwrap();
+    drop(connection);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.read_lifecycle(),
+        Err(StorageError::InvalidStorage(_))
+    ));
+}
+
+#[test]
+fn lifecycle_load_rejects_non_numeric_invocation_identity() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Antigravity,
+        "agy-1".into(),
+        Some("invocation-1".into()),
+        None,
+        "/work/project".into(),
+    )
+    .unwrap();
+    db.record_lifecycle(
+        LifecycleEvent::from_parts_with_turn_initial_step(
+            identity,
+            LifecycleEventKind::UserPromptSubmit,
+            Some(1),
+        )
+        .unwrap(),
+        100,
+    )
+    .unwrap();
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute_batch(
+            "UPDATE lifecycle_invocations SET invocation_id = 'invocation-invalid';
+             UPDATE lifecycle_turns SET turn_id = 'invocation-invalid'
+             WHERE continuity_state = 'current';",
+        )
+        .unwrap();
+    drop(connection);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.read_lifecycle(),
+        Err(StorageError::InvalidStorage(_))
+    ));
+}
+
+#[test]
+fn lifecycle_load_rejects_mismatched_session_start_sources() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Codex,
+        "session-1".into(),
+        None,
+        None,
+        "/work/project".into(),
+    )
+    .unwrap();
+    db.record_lifecycle(
+        LifecycleEvent::from_parts(
+            identity,
+            LifecycleEventKind::SessionStart {
+                source: SessionStartSource::Startup,
+            },
+        )
+        .unwrap(),
+        100,
+    )
+    .unwrap();
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE lifecycle_sessions SET session_start_source = 'resume';",
+        )
         .unwrap();
     drop(connection);
     let db = BrainDb::open_current(
