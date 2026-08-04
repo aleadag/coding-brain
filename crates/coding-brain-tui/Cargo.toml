@@ -1,6 +1,6 @@
 [package]
 name = "coding-brain-tui"
-version = "0.59.0"
+version = "0.59.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Coding Brain terminal UI."
@@ -14,7 +14,7 @@ name = "coding_brain_tui"
 path = "src/lib.rs"
 
 [dependencies]
-coding-brain-core = { path = "../coding-brain-core", version = "0.59.0" }
+coding-brain-core = { path = "../coding-brain-core", version = "0.59.1" }
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 ctrlc = "3"

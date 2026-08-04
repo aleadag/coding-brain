@@ -35,6 +35,24 @@ fn tag_release_runs_the_release_critical_quality_suite_before_building() {
     assert!(!workflow.contains(".tar.gz coding-brain\n"));
 }
 
+#[test]
+fn musl_release_targets_are_checked_before_tagging() {
+    let workflow = include_str!("../.github/workflows/ci.yml");
+    let (_, musl) = workflow.split_once("\n  musl:\n").unwrap();
+    for required in [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "cargo check --locked --release --target ${{ matrix.target }}",
+        "sudo apt-get install -y musl-tools",
+        "cargo test --locked --lib --target x86_64-unknown-linux-musl publication_never_replaces_an_existing_final_name",
+    ] {
+        assert!(
+            musl.contains(required),
+            "missing musl CI contract: {required}"
+        );
+    }
+}
+
 fn job<'a>(workflow: &'a str, name: &str, next: &str) -> &'a str {
     let (_, section) = workflow.split_once(&format!("\n  {name}:\n")).unwrap();
     section.split_once(&format!("\n  {next}:\n")).unwrap().0
