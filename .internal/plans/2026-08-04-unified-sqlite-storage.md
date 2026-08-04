@@ -88,12 +88,12 @@ Record any pre-existing failure on `codexctl-dzlb9`; do not attribute it to the 
 | `permission_attempts` | Primary key `attempt_id`; complete authority identity stored in typed columns; request identity is indexed but not unique; attempt state uses a closed domain. | Exact attempt lookup and active request-identity lookup. |
 | `decision_identities` | Primary key `decision_id`; immutable authority identity/action columns; composite uniqueness supports commit references. | Exact decision and authority-identity lookup. |
 | `decision_payloads` | Primary/foreign key `decision_id` to identity; bounded erasable learning fields only. | Joined committed-learning query by source cursor. |
-| `activity_events` | Primary key `source_cursor` with `1..=i64::MAX` check; unique activity ID; typed terminal action/identity columns support composite commit references. | Cursor pages, activity ID, permission identity, outcome, correction, and distillation indexes. |
+| `activity_events` | Primary key `source_cursor` with `1..=i64::MAX` check; indexed, non-unique logical activity ID permits observed/terminal/delivery/outcome/correction rows for one activity; typed terminal action/identity columns retain the composite uniqueness required by permission-commit references. | Cursor pages, activity ID, permission identity, outcome, correction, and distillation indexes. |
 | `permission_commits` | One row per attempt; unique decision and terminal activity references; composite foreign keys require matching authority identity/action across attempt, decision, and terminal event; closed action/evidence/delivery domains; boolean `response_eligible` check. | Exact attempt/request authority and undelivered-audit lookup. |
 | lifecycle session/turn/invocation tables | Provider-qualified composite keys, bounded sequence values, and foreign keys from turns/invocations to sessions; no duplicate active identity. | Exact provider/session/turn and active-topology indexes. |
 | review `review_meta` / `review_marks` | Per-surface revision; exact surface/group/source-cursor key; closed disposition domain; no Brain tables or attachments. | Exact surface revision and bounded cursor-mark lookup. |
 
-The checked-in schema fixture is authoritative. Any DDL change after Task 1 must update its version, fixture, invariant tests, and supported-upgrade coverage before the same atomic commit.
+The checked-in schema fixture is authoritative. The approved pre-activation Task 3 correction removes only the accidental single-column `activity_id` uniqueness while retaining the terminal-identity composite authority key; it amends schema v1 because no production activation or migration has occurred. Any later DDL change must update its version, fixture, invariant tests, and supported-upgrade coverage before the same atomic commit.
 
 - [ ] **Step 1: Write failing foundation tests**
 

@@ -179,9 +179,12 @@ rows commit in the same SQLite transaction.
 ### `activity_events`
 
 This is the append-ordered audit ledger. A strictly increasing 64-bit integer is
-the stable source cursor. Rows contain typed event kind, activity ID, recorded time,
-provider/session/turn/tool-use identity, project, state, decision ID, outcome,
-correction, supersession, and bounded payload fields.
+the stable source cursor. Rows contain typed event kind, an indexed logical activity
+ID, recorded time, provider/session/turn/tool-use identity, project, state,
+decision ID, outcome, correction, supersession, and bounded payload fields. The
+logical activity ID is intentionally non-unique because one activity can have
+observed, terminal, delivery, outcome, and correction rows. Permission terminal
+rows retain a unique activity-plus-authority identity tuple for commit references.
 
 Cursor allocation and event insertion share one transaction. The high-water
 value never decreases or reuses a cursor after retention, rebuild, or restore;

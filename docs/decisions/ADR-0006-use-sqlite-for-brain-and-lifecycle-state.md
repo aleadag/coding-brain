@@ -96,10 +96,13 @@ serves headless use; warning and hard WAL thresholds surface degradation and
 eventually suspend model inference without affecting deterministic denies.
 
 Activity uses a nonreusing 64-bit source cursor with a persistent high-water
-mark. Distillation advances from the cursor in the last atomically published
-preference generation. Decision identity is separated from erasable learning
-payload so `forget()` can delete learning content, published generations, WAL
-residue, and preserved legacy decision snapshots without breaking immutable
+mark. Its logical activity ID is indexed but non-unique so one activity can
+retain observed, terminal, delivery, outcome, and correction evidence; the
+terminal activity and authority identity tuple remains unique for permission
+commit references. Distillation advances from the cursor in the last atomically
+published preference generation. Decision identity is separated from erasable
+learning payload so `forget()` can delete learning content, published generations,
+WAL residue, and preserved legacy decision snapshots without breaking immutable
 audit relationships.
 
 Disk-full, I/O, checkpoint, corruption, newer-schema, unsafe-path, and migration

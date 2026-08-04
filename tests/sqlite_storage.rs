@@ -1,15 +1,25 @@
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::Duration;
 
 use coding_brain::brain::storage::{
-    BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, OpenRole, REVIEW_APPLICATION_ID,
-    REVIEW_SCHEMA_VERSION, ReviewDb, StorageDeadline, StorageError, StoragePaths,
+    ActivityCursor, BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, OpenRole,
+    REVIEW_APPLICATION_ID, REVIEW_SCHEMA_VERSION, ReviewDb, StorageDeadline, StorageError,
+    StoragePaths,
+};
+use coding_brain_core::brain_activity::{
+    ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivityState,
+    CorrectionDisposition, ProjectEvidence, SessionTarget, SessionTargetProvenance, SnapshotLimits,
 };
 use coding_brain_core::lifecycle::{
     LifecycleEvent, LifecycleEventKind, LifecycleIdentity, LifecycleSnapshot, PermissionAction,
     PermissionAuthority, SessionStartSource,
 };
+use coding_brain_core::project::ProjectId;
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags, params};
@@ -33,6 +43,621 @@ fn private_tempdir() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     root
+}
+
+fn activity_event(activity_id: &str, recorded_at_ms: u64, state: ActivityState) -> ActivityEvent {
+    ActivityEvent {
+        schema_version: ACTIVITY_SCHEMA_VERSION,
+        kind: ActivityKind::Decision,
+        activity_id: activity_id.into(),
+        recorded_at_ms,
+        project: ProjectEvidence {
+            project_id: ProjectId::Temporary("sqlite-project".into()),
+            cwd: "/work/sqlite-project".into(),
+            label: Some("sqlite-project".into()),
+        },
+        session: None,
+        state,
+        tool: Some("Bash".into()),
+        normalized_command: Some("printf safe".into()),
+        fingerprint: Some("fingerprint".into()),
+        rule_id: Some("rule".into()),
+        confidence: Some(0.9),
+        threshold: Some(0.8),
+        reasoning: Some("bounded reason".into()),
+        decision_id: Some(format!("decision-{activity_id}")),
+        outcome: None,
+        correction: None,
+        note: None,
+        supersedes: None,
+    }
+}
+
+fn identified_activity_event(
+    activity_id: &str,
+    recorded_at_ms: u64,
+    state: ActivityState,
+    provider: AgentProvider,
+) -> ActivityEvent {
+    let mut event = activity_event(activity_id, recorded_at_ms, state);
+    event.session = Some(SessionTarget {
+        provider,
+        session_id: format!("session-{activity_id}"),
+        provider_session_id: Some(format!("native-{activity_id}")),
+        turn_id: Some(format!("turn-{activity_id}")),
+        tool_use_id: Some(format!("tool-{activity_id}")),
+        project_id: event.project.project_id.clone(),
+        cwd: event.project.cwd.clone(),
+        provider_hints: vec!["hint".into()],
+        provenance: SessionTargetProvenance::Structured,
+    });
+    event
+}
+
+#[test]
+fn activity_cursor_allows_repeated_logical_ids_and_survives_delete() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let first = db
+        .append_activity(activity_event("activity-1", 1, ActivityState::Observed))
+        .unwrap();
+    let second = db
+        .append_activity(activity_event("activity-1", 2, ActivityState::Denied))
+        .unwrap();
+
+    assert!(second > first);
+    assert_eq!(
+        db.activity_by_id("activity-1", 10, 64 * 1024)
+            .unwrap()
+            .events
+            .len(),
+        2
+    );
+    db.delete_activity_before(second).unwrap();
+    let third = db
+        .append_activity(activity_event("activity-2", 3, ActivityState::Denied))
+        .unwrap();
+    assert!(third > second);
+    assert_eq!(db.activity_high_water().unwrap(), Some(third));
+    assert_eq!(
+        ActivityCursor::try_from(i64::MAX as u64).unwrap().get(),
+        i64::MAX as u64
+    );
+}
+
+#[test]
+fn activity_batch_is_atomic_and_keeps_high_water_on_failure() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let mut invalid = activity_event("invalid", 2, ActivityState::Denied);
+    invalid.schema_version = ACTIVITY_SCHEMA_VERSION + 1;
+
+    assert!(
+        db.append_activity_batch(&[activity_event("valid", 1, ActivityState::Denied), invalid,])
+            .is_err()
+    );
+    assert!(
+        db.activity_after_cursor(None, 10, 64 * 1024)
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    assert_eq!(db.activity_high_water().unwrap(), None);
+
+    let cursors = db
+        .append_activity_batch(&[
+            activity_event("one", 1, ActivityState::Denied),
+            activity_event("two", 2, ActivityState::Denied),
+        ])
+        .unwrap();
+    assert_eq!(
+        cursors
+            .iter()
+            .map(|cursor| cursor.get())
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+
+#[test]
+fn activity_append_rejects_mixed_kinds_for_one_logical_id() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    db.append_activity(activity_event("one-kind", 1, ActivityState::Denied))
+        .unwrap();
+    let mut diagnostic = activity_event("one-kind", 2, ActivityState::Error);
+    diagnostic.kind = ActivityKind::Diagnostic;
+    diagnostic.decision_id = None;
+
+    assert!(matches!(
+        db.append_activity(diagnostic),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert_eq!(db.activity_high_water().unwrap().unwrap().get(), 1);
+}
+
+#[test]
+fn activity_pages_are_bounded_and_ordered_by_cursor() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let cursors = db
+        .append_activity_batch(&[
+            activity_event("one", 30, ActivityState::Denied),
+            activity_event("two", 10, ActivityState::Denied),
+            activity_event("three", 20, ActivityState::Denied),
+        ])
+        .unwrap();
+
+    let recent = db.read_activity_page(None, 2, 128 * 1024).unwrap();
+    assert_eq!(
+        recent
+            .events
+            .iter()
+            .map(|row| row.cursor)
+            .collect::<Vec<_>>(),
+        [cursors[2], cursors[1]]
+    );
+    assert_eq!(recent.next_cursor, Some(cursors[1]));
+    assert!(recent.serialized_bytes > 0);
+    let older = db
+        .read_activity_page(recent.next_cursor, 2, 128 * 1024)
+        .unwrap();
+    assert_eq!(
+        older
+            .events
+            .iter()
+            .map(|row| row.cursor)
+            .collect::<Vec<_>>(),
+        [cursors[0]]
+    );
+
+    let ascending = db.activity_after_cursor(None, 2, 128 * 1024).unwrap();
+    assert_eq!(
+        ascending
+            .events
+            .iter()
+            .map(|row| row.cursor)
+            .collect::<Vec<_>>(),
+        [cursors[0], cursors[1]]
+    );
+    let rest = db
+        .activity_after_cursor(ascending.next_cursor, 2, 128 * 1024)
+        .unwrap();
+    assert_eq!(
+        rest.events.iter().map(|row| row.cursor).collect::<Vec<_>>(),
+        [cursors[2]]
+    );
+    assert!(
+        db.activity_after_cursor(Some(cursors[2]), 2, 128 * 1024)
+            .unwrap()
+            .events
+            .is_empty()
+    );
+
+    let one_payload_bytes = db
+        .activity_after_cursor(None, 1, 128 * 1024)
+        .unwrap()
+        .serialized_bytes;
+    assert!(matches!(
+        db.activity_after_cursor(None, 3, one_payload_bytes - 1),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert_eq!(
+        db.activity_after_cursor(None, 3, one_payload_bytes)
+            .unwrap()
+            .events
+            .len(),
+        1
+    );
+    assert!(db.activity_after_cursor(None, 0, 1).is_err());
+    assert!(db.activity_after_cursor(None, 1, 0).is_err());
+}
+
+#[test]
+fn activity_terminal_identity_keeps_opposite_actions_and_rejects_same_action_duplicates() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let denied =
+        identified_activity_event("permission", 1, ActivityState::Denied, AgentProvider::Codex);
+    let allowed = identified_activity_event(
+        "permission",
+        2,
+        ActivityState::Allowed,
+        AgentProvider::Codex,
+    );
+
+    db.append_activity(denied.clone()).unwrap();
+    db.append_activity(allowed).unwrap();
+    assert_eq!(
+        db.activity_by_id("permission", 10, 128 * 1024)
+            .unwrap()
+            .events
+            .len(),
+        2
+    );
+    assert!(db.append_activity(denied).is_err());
+    assert_eq!(db.activity_high_water().unwrap().unwrap().get(), 2);
+    assert_eq!(
+        db.activity_by_id("permission", 10, 128 * 1024)
+            .unwrap()
+            .project_complete_window(SnapshotLimits::default(), 3)
+            .diagnostics
+            .duplicate_terminal_states,
+        1
+    );
+}
+
+#[test]
+fn activity_cursor_exhaustion_fails_before_insert() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute(
+            "UPDATE schema_meta SET activity_high_water = ?1",
+            [i64::MAX],
+        )
+        .unwrap();
+    drop(connection);
+    let mut db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.append_activity(activity_event("overflow", 1, ActivityState::Denied)),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert!(
+        db.activity_after_cursor(None, 10, 64 * 1024)
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    assert_eq!(
+        db.activity_high_water().unwrap().unwrap().get(),
+        i64::MAX as u64
+    );
+}
+
+#[test]
+fn activity_high_water_rejects_a_value_below_retained_rows() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    db.append_activity(activity_event("retained", 1, ActivityState::Denied))
+        .unwrap();
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute("UPDATE schema_meta SET activity_high_water = 0", [])
+        .unwrap();
+    drop(connection);
+    let mut db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.activity_high_water(),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert!(matches!(
+        db.append_activity(activity_event("next", 2, ActivityState::Denied)),
+        Err(StorageError::InvalidStorage(_))
+    ));
+}
+
+#[test]
+fn activity_reads_reject_typed_payload_disagreement_and_unsupported_payloads() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    db.append_activity(activity_event("corrupt", 1, ActivityState::Denied))
+        .unwrap();
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute("UPDATE activity_events SET event_state = 'allowed'", [])
+        .unwrap();
+    drop(connection);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.activity_after_cursor(None, 10, 64 * 1024),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    drop(db);
+
+    let connection = open_for_constraints(&paths.brain_db());
+    let mut payload: serde_json::Value = serde_json::from_slice(
+        &connection
+            .query_row("SELECT event_payload FROM activity_events", [], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    payload["schema_version"] = serde_json::json!(ACTIVITY_SCHEMA_VERSION + 1);
+    connection
+        .execute(
+            "UPDATE activity_events SET event_state = 'denied', event_payload = ?1",
+            [serde_json::to_vec(&payload).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.activity_after_cursor(None, 10, 64 * 1024),
+        Err(StorageError::InvalidStorage(_))
+    ));
+}
+
+#[test]
+fn activity_queries_use_frozen_indexes() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let events = (0..2_000)
+        .map(|index| activity_event(&format!("activity-{index}"), index, ActivityState::Denied))
+        .collect::<Vec<_>>();
+    db.append_activity_batch(&events).unwrap();
+
+    assert!(
+        db.explain_recent_activity()
+            .unwrap()
+            .contains("activity_events_cursor")
+    );
+    assert!(
+        db.explain_activity_by_id()
+            .unwrap()
+            .contains("activity_events_activity_id")
+    );
+    assert!(
+        db.explain_recent_activity()
+            .unwrap()
+            .contains("USING COVERING INDEX")
+    );
+}
+
+#[test]
+fn activity_round_trip_preserves_supported_kinds_states_and_providers() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let mut events = vec![
+        identified_activity_event("observed", 1, ActivityState::Observed, AgentProvider::Codex),
+        identified_activity_event(
+            "evaluating",
+            2,
+            ActivityState::Evaluating,
+            AgentProvider::Claude,
+        ),
+        identified_activity_event(
+            "allowed",
+            3,
+            ActivityState::Allowed,
+            AgentProvider::Antigravity,
+        ),
+        activity_event("denied", 4, ActivityState::Denied),
+        activity_event("abstained", 5, ActivityState::Abstained),
+        activity_event("error", 6, ActivityState::Error),
+        activity_event("delivered", 7, ActivityState::Delivered),
+        activity_event("delivery-failed", 8, ActivityState::DeliveryFailed),
+        activity_event("interrupted", 9, ActivityState::Interrupted),
+    ];
+    let mut outcome = activity_event("outcome", 10, ActivityState::Outcome);
+    outcome.outcome = Some(ActivityOutcome::Failed);
+    events.push(outcome);
+    let mut correction = activity_event("correction", 11, ActivityState::Correction);
+    correction.correction = Some(CorrectionDisposition::BrainWrong);
+    correction.note = Some("token secret-value".into());
+    events.push(correction);
+    let mut lifecycle = activity_event("lifecycle", 12, ActivityState::Abstained);
+    lifecycle.kind = ActivityKind::Lifecycle;
+    lifecycle.decision_id = None;
+    lifecycle.normalized_command = None;
+    lifecycle.rule_id = None;
+    lifecycle.confidence = None;
+    lifecycle.threshold = None;
+    events.push(lifecycle);
+    let mut diagnostic = activity_event("diagnostic", 13, ActivityState::Error);
+    diagnostic.kind = ActivityKind::Diagnostic;
+    diagnostic.decision_id = None;
+    events.push(diagnostic);
+    let mut expected = events
+        .iter()
+        .cloned()
+        .map(ActivityEvent::normalized)
+        .collect::<Vec<_>>();
+    for event in &mut expected {
+        if let Some(session) = &mut event.session {
+            session.provider_hints.clear();
+        }
+    }
+
+    db.append_activity_batch(&events).unwrap();
+    let actual = db
+        .activity_after_cursor(None, 100, 1024 * 1024)
+        .unwrap()
+        .events
+        .into_iter()
+        .map(|row| row.event)
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    assert_eq!(actual[10].note.as_deref(), Some("token [REDACTED]"));
+}
+
+#[test]
+fn concurrent_activity_writers_allocate_unique_nonreusing_cursors() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let barrier = Arc::new(Barrier::new(4));
+    let writers = (0..4)
+        .map(|writer| {
+            let paths = paths.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut db = BrainDb::open_current(
+                    &paths,
+                    OpenRole::NonHook,
+                    StorageDeadline::after(Duration::from_secs(5)),
+                )
+                .unwrap();
+                barrier.wait();
+                (0..20)
+                    .map(|index| {
+                        db.append_activity(activity_event(
+                            &format!("writer-{writer}-{index}"),
+                            writer * 20 + index,
+                            ActivityState::Denied,
+                        ))
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut cursors = writers
+        .into_iter()
+        .flat_map(|writer| writer.join().unwrap())
+        .collect::<Vec<_>>();
+    cursors.sort_unstable();
+    cursors.dedup();
+
+    assert_eq!(cursors.len(), 80);
+    assert_eq!(cursors.first().unwrap().get(), 1);
+    assert_eq!(cursors.last().unwrap().get(), 80);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap();
+    assert_eq!(db.activity_high_water().unwrap().unwrap().get(), 80);
+}
+
+#[test]
+fn activity_round_trip_preserves_opaque_paths_and_projects_incomplete_state() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let mut event = identified_activity_event(
+        "opaque",
+        1,
+        ActivityState::Evaluating,
+        AgentProvider::Claude,
+    );
+    let opaque = std::path::PathBuf::from(OsString::from_vec(b"/work/opaque-\xff".to_vec()));
+    event.project.cwd = opaque.clone();
+    event.session.as_mut().unwrap().cwd = opaque.clone();
+    db.append_activity(event).unwrap();
+
+    let page = db.activity_after_cursor(None, 10, 64 * 1024).unwrap();
+    assert_eq!(page.events[0].event.project.cwd, opaque);
+    assert_eq!(page.events[0].event.session.as_ref().unwrap().cwd, opaque);
+    assert_eq!(
+        page.project_complete_window(
+            SnapshotLimits {
+                interrupted_after_ms: 1,
+                ..SnapshotLimits::default()
+            },
+            10,
+        )
+        .attention[0]
+            .state,
+        ActivityState::Incomplete
+    );
+}
+
+#[test]
+fn activity_sqlite_page_projects_like_the_legacy_log() {
+    use coding_brain::brain::activity::ActivityStore;
+
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let store = ActivityStore::at(root.path().join("activity.jsonl"));
+    let observed = activity_event("sequence", 10, ActivityState::Observed);
+    let denied = activity_event("sequence", 11, ActivityState::Denied);
+    let delivered = activity_event("sequence", 12, ActivityState::Delivered);
+    let mut outcome = activity_event("sequence", 13, ActivityState::Outcome);
+    outcome.outcome = Some(ActivityOutcome::Succeeded);
+    outcome.supersedes = Some("older-sequence".into());
+    let mut correction = activity_event("sequence", 14, ActivityState::Correction);
+    correction.correction = Some(CorrectionDisposition::BrainRight);
+    let older = activity_event("older-sequence", 1, ActivityState::Denied);
+    let events = [older, observed, denied, delivered, outcome, correction];
+    for event in &events {
+        store.append(event.clone()).unwrap();
+    }
+    db.append_activity_batch(&events).unwrap();
+
+    let limits = SnapshotLimits::default();
+    let legacy = store.snapshot(limits).unwrap();
+    let sqlite = db
+        .activity_after_cursor(None, 100, 1024 * 1024)
+        .unwrap()
+        .project_complete_window(limits, 20);
+    assert_eq!(sqlite, legacy);
+}
+
+#[test]
+fn activity_projection_requires_a_complete_caller_assembled_window() {
+    use coding_brain::brain::activity::ActivityStore;
+
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let store = ActivityStore::at(root.path().join("activity.jsonl"));
+    let events = [
+        activity_event("boundary", 1, ActivityState::Observed),
+        activity_event("boundary", 2, ActivityState::Denied),
+        activity_event("boundary", 3, ActivityState::Delivered),
+    ];
+    for event in &events {
+        store.append(event.clone()).unwrap();
+    }
+    db.append_activity_batch(&events).unwrap();
+
+    let first = db.activity_after_cursor(None, 2, 128 * 1024).unwrap();
+    let second = db
+        .activity_after_cursor(first.next_cursor, 2, 128 * 1024)
+        .unwrap();
+    assert_eq!(first.events.len(), 2);
+    assert_eq!(second.events.len(), 1);
+    let mut records = first.events;
+    records.extend(second.events);
+    let assembled = coding_brain::brain::storage::ActivityPage {
+        next_cursor: records.last().map(|record| record.cursor),
+        serialized_bytes: 0,
+        events: records,
+    };
+
+    assert_eq!(
+        assembled.project_complete_window(SnapshotLimits::default(), 4),
+        store.snapshot(SnapshotLimits::default()).unwrap()
+    );
 }
 
 #[test]
@@ -1060,13 +1685,15 @@ fn activity_terminal_identity_is_all_or_none_and_typed() {
         assert_statement_rejected(&connection, rejected);
     }
     insert_terminal_event(&connection, 1, "activity-1");
-    assert_statement_rejected(
-        &connection,
-        "INSERT INTO activity_events (
+    connection
+        .execute(
+            "INSERT INTO activity_events (
             source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
             event_payload
          ) VALUES (2, 'activity-1', 'diagnostic', 'observed', 1, X'')",
-    );
+            [],
+        )
+        .unwrap();
 }
 
 #[test]

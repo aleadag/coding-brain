@@ -1,5 +1,6 @@
 #![allow(dead_code)] // The SQLite foundation stays inactive until the runtime cutover task.
 
+mod activity;
 mod lifecycle;
 mod schema;
 mod security;
@@ -16,6 +17,9 @@ use rusqlite::limits::Limit;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use security::{SecureDatabaseDirectory, SecurityError};
+
+#[allow(unused_imports)]
+pub use activity::{ActivityCursor, ActivityPage, ActivityRecord};
 
 pub const BRAIN_APPLICATION_ID: i32 = 0x4342_524e;
 pub const BRAIN_SCHEMA_VERSION: i32 = 1;

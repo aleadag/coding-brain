@@ -70,7 +70,7 @@ WHERE source_cursor IS NOT NULL;
 
 CREATE TABLE activity_events (
     source_cursor INTEGER PRIMARY KEY CHECK (source_cursor BETWEEN 1 AND 0x7fffffffffffffff),
-    activity_id TEXT NOT NULL UNIQUE CHECK (length(activity_id) BETWEEN 1 AND 512),
+    activity_id TEXT NOT NULL CHECK (length(activity_id) BETWEEN 1 AND 512),
     event_kind TEXT NOT NULL CHECK (event_kind IN ('decision', 'lifecycle', 'diagnostic')),
     event_state TEXT NOT NULL CHECK (event_state IN ('observed', 'evaluating', 'allowed', 'denied', 'abstained', 'error', 'delivered', 'delivery_failed', 'outcome', 'correction', 'interrupted', 'incomplete')),
     recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms BETWEEN 0 AND 0x7fffffffffffffff),

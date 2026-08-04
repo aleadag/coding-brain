@@ -148,6 +148,17 @@ pub struct ActivityLog {
 }
 
 impl ActivityLog {
+    pub(crate) fn from_events(events: Vec<ActivityEvent>) -> Self {
+        let diagnostics = ActivityDiagnostics {
+            duplicate_terminal_states: duplicate_terminal_count(&events),
+            ..ActivityDiagnostics::default()
+        };
+        Self {
+            events,
+            diagnostics,
+        }
+    }
+
     pub fn events(&self) -> &[ActivityEvent] {
         &self.events
     }
@@ -182,6 +193,14 @@ impl ActivityLog {
             .collect::<HashSet<_>>()
             .len()
     }
+}
+
+pub(crate) fn project_activity_events(
+    events: Vec<ActivityEvent>,
+    limits: SnapshotLimits,
+    now_ms: u64,
+) -> ActivitySnapshot {
+    project_snapshot(&ActivityLog::from_events(events), limits, now_ms)
 }
 
 #[derive(Debug)]
