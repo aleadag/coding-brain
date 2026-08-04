@@ -27,6 +27,8 @@ pub mod risk;
 pub mod safety;
 pub(crate) mod secure_state;
 pub mod sequences;
+#[doc(hidden)]
+pub mod storage;
 
 pub(crate) const UNSUPPORTED_PERMISSION_TOOL_REASON: &str = "unsupported permission tool";
 
