@@ -37,6 +37,93 @@ fn insert_attempt(connection: &Connection, attempt_id: &str, request_key: &str) 
         .unwrap();
 }
 
+fn insert_decision(connection: &Connection, decision_id: &str) {
+    connection
+        .execute(
+            "INSERT INTO decision_identities (
+                decision_id, provider, session_id, turn_id, tool_use_id,
+                authority_action, decision_source, decided_at_ms
+             ) VALUES (?1, 'codex', 'session-1', 'turn-1', 'tool-1',
+                       'allow', 'model', 1)",
+            [decision_id],
+        )
+        .unwrap();
+}
+
+fn insert_terminal_event(connection: &Connection, cursor: i64, activity_id: &str) {
+    connection
+        .execute(
+            "INSERT INTO activity_events (
+                source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+                terminal_provider, terminal_session_id, terminal_turn_id,
+                terminal_tool_use_id, terminal_action, event_payload
+             ) VALUES (?1, ?2, 'decision', 'allowed', 1,
+                       'codex', 'session-1', 'turn-1', 'tool-1', 'allow', X'')",
+            params![cursor, activity_id],
+        )
+        .unwrap();
+}
+
+fn insert_commit(
+    connection: &Connection,
+    attempt_id: &str,
+    decision_id: &str,
+    activity_id: &str,
+    evidence_kind: &str,
+    delivery_state: &str,
+    response_eligible: i64,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT INTO permission_commits (
+            attempt_id, decision_id, terminal_activity_id, provider, session_id,
+            turn_id, tool_use_id, authority_action, evidence_kind, delivery_state,
+            response_eligible, committed_at_ms
+         ) VALUES (?1, ?2, ?3, 'codex', 'session-1',
+                   'turn-1', 'tool-1', 'allow', ?4, ?5, ?6, 1)",
+        params![
+            attempt_id,
+            decision_id,
+            activity_id,
+            evidence_kind,
+            delivery_state,
+            response_eligible
+        ],
+    )
+}
+
+fn assert_statement_rejected(connection: &Connection, sql: &str) {
+    assert!(
+        connection.execute_batch(sql).is_err(),
+        "statement unexpectedly accepted: {sql}"
+    );
+}
+
+fn assert_current_brain_open_is_invalid(paths: &StoragePaths) {
+    let error = BrainDb::open_current(
+        paths,
+        OpenRole::Hook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, StorageError::InvalidStorage(_)),
+        "{error:?}"
+    );
+}
+
+fn assert_current_review_open_is_invalid(paths: &StoragePaths) {
+    let error = ReviewDb::open_current(
+        paths,
+        OpenRole::Hook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, StorageError::InvalidStorage(_)),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn hook_open_never_creates_or_migrates() {
     let root = tempfile::tempdir().unwrap();
@@ -203,6 +290,83 @@ fn hook_open_rejects_incomplete_and_unsupported_schema_without_repair() {
 }
 
 #[test]
+fn current_brain_open_rejects_missing_or_forged_frozen_schema_objects() {
+    for mutation in [
+        "DROP TABLE decision_payloads;",
+        "DROP INDEX permission_commits_undelivered_audit;
+         CREATE INDEX permission_commits_undelivered_audit
+         ON permission_commits (attempt_id);",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let connection = open_for_constraints(&paths.brain_db());
+        connection.execute_batch(mutation).unwrap();
+        drop(connection);
+
+        assert_current_brain_open_is_invalid(&paths);
+    }
+}
+
+#[test]
+fn current_review_open_rejects_missing_or_forged_frozen_schema_objects() {
+    for mutation in [
+        "DROP TABLE review_marks;",
+        "DROP INDEX review_marks_surface_cursor;
+         CREATE INDEX review_marks_surface_cursor ON review_marks (group_id);",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::at(root.path());
+        drop(ReviewDb::create_current(&paths).unwrap());
+        let connection = open_for_constraints(&paths.review_db());
+        connection.execute_batch(mutation).unwrap();
+        drop(connection);
+
+        assert_current_review_open_is_invalid(&paths);
+    }
+}
+
+#[test]
+fn current_open_fails_closed_when_sqlite_schema_is_corrupt() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+    let schema_version = connection
+        .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema = ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_schema
+             SET sql = 'CREATE TABLE permission_attempts('
+             WHERE name = 'permission_attempts'",
+            [],
+        )
+        .unwrap();
+    connection
+        .pragma_update(None, "schema_version", schema_version + 1)
+        .unwrap();
+    drop(connection);
+
+    let error = BrainDb::open_current(
+        &paths,
+        OpenRole::Hook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            StorageError::InvalidStorage(_) | StorageError::Sqlite(_)
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn expired_deadline_fails_before_opening_storage() {
     let root = tempfile::tempdir().unwrap();
     let paths = StoragePaths::at(root.path());
@@ -255,6 +419,86 @@ fn brain_schema_enforces_closed_domains_and_nonunique_request_identity() {
         [],
     );
     assert!(invalid_meta.is_err());
+    for rejected in [
+        "UPDATE schema_meta SET migration_state = 'unknown' WHERE singleton = 1",
+        "UPDATE schema_meta SET activity_high_water = -1 WHERE singleton = 1",
+        "UPDATE schema_meta SET application_id = 0 WHERE singleton = 1",
+        "UPDATE permission_attempts SET provider = 'unknown' WHERE attempt_id = 'attempt-1'",
+        "UPDATE permission_attempts SET authority_action = 'maybe' WHERE attempt_id = 'attempt-1'",
+        "INSERT INTO permission_attempts (
+            attempt_id, provider, session_id, turn_id, tool_use_id, request_key,
+            authority_action, attempt_state, created_at_ms, updated_at_ms
+         ) VALUES ('attempt-1', 'codex', 'session-1', 'turn-1', 'tool-1',
+                   'other-request', 'allow', 'decided', 1, 1)",
+    ] {
+        assert_statement_rejected(&connection, rejected);
+    }
+}
+
+#[test]
+fn decision_and_learning_payload_constraints_are_executable() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+    insert_decision(&connection, "decision-1");
+
+    for rejected in [
+        "UPDATE decision_identities SET decision_source = 'unknown'
+         WHERE decision_id = 'decision-1'",
+        "UPDATE decision_identities SET authority_action = 'maybe'
+         WHERE decision_id = 'decision-1'",
+        "INSERT INTO decision_identities (
+            decision_id, provider, session_id, turn_id, tool_use_id,
+            authority_action, decision_source, decided_at_ms
+         ) VALUES ('decision-1', 'codex', 'session-1', 'turn-1', 'tool-1',
+                   'allow', 'model', 2)",
+        "INSERT INTO decision_payloads (decision_id) VALUES ('missing')",
+        "INSERT INTO decision_payloads (decision_id, source_cursor)
+         VALUES ('decision-1', 0)",
+    ] {
+        assert_statement_rejected(&connection, rejected);
+    }
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO decision_payloads (decision_id, normalized_command)
+                 VALUES ('decision-1', ?1)",
+                ["x".repeat(4097)],
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn activity_terminal_identity_is_all_or_none_and_typed() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+
+    for rejected in [
+        "INSERT INTO activity_events (
+            source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+            terminal_provider, event_payload
+         ) VALUES (1, 'partial', 'decision', 'allowed', 1, 'codex', X'')",
+        "INSERT INTO activity_events (
+            source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+            terminal_provider, terminal_session_id, terminal_turn_id,
+            terminal_tool_use_id, terminal_action, event_payload
+         ) VALUES (1, 'bad-action', 'decision', 'allowed', 1,
+                   'codex', 'session-1', 'turn-1', 'tool-1', 'maybe', X'')",
+    ] {
+        assert_statement_rejected(&connection, rejected);
+    }
+    insert_terminal_event(&connection, 1, "activity-1");
+    assert_statement_rejected(
+        &connection,
+        "INSERT INTO activity_events (
+            source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+            event_payload
+         ) VALUES (2, 'activity-1', 'diagnostic', 'observed', 1, X'')",
+    );
 }
 
 #[test]
@@ -311,6 +555,97 @@ fn permission_commit_requires_matching_authority_identity_and_action() {
 }
 
 #[test]
+fn permission_commit_enforces_unique_references_and_closed_domains() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+    for (attempt, decision, cursor, activity) in [
+        ("attempt-1", "decision-1", 1, "activity-1"),
+        ("attempt-2", "decision-2", 2, "activity-2"),
+    ] {
+        insert_attempt(&connection, attempt, attempt);
+        insert_decision(&connection, decision);
+        insert_terminal_event(&connection, cursor, activity);
+    }
+    insert_commit(
+        &connection,
+        "attempt-1",
+        "decision-1",
+        "activity-1",
+        "provider_authority",
+        "pending",
+        1,
+    )
+    .unwrap();
+
+    assert!(
+        insert_commit(
+            &connection,
+            "attempt-2",
+            "decision-1",
+            "activity-2",
+            "provider_authority",
+            "pending",
+            1,
+        )
+        .is_err()
+    );
+    assert!(
+        insert_commit(
+            &connection,
+            "attempt-2",
+            "decision-2",
+            "activity-1",
+            "provider_authority",
+            "pending",
+            1,
+        )
+        .is_err()
+    );
+    assert!(
+        insert_commit(
+            &connection,
+            "attempt-1",
+            "decision-2",
+            "activity-2",
+            "provider_authority",
+            "pending",
+            1,
+        )
+        .is_err()
+    );
+    for (evidence, delivery, eligible) in [
+        ("unknown", "pending", 1),
+        ("provider_authority", "maybe", 1),
+        ("provider_authority", "pending", 2),
+    ] {
+        assert!(
+            insert_commit(
+                &connection,
+                "attempt-2",
+                "decision-2",
+                "activity-2",
+                evidence,
+                delivery,
+                eligible,
+            )
+            .is_err()
+        );
+    }
+    insert_commit(
+        &connection,
+        "attempt-2",
+        "decision-2",
+        "activity-2",
+        "deterministic_safety",
+        "delivered",
+        0,
+    )
+    .unwrap();
+}
+
+#[test]
 fn lifecycle_schema_enforces_provider_qualified_topology() {
     let root = tempfile::tempdir().unwrap();
     let paths = StoragePaths::at(root.path());
@@ -348,6 +683,49 @@ fn lifecycle_schema_enforces_provider_qualified_topology() {
         [],
     );
     assert!(duplicate_active_turn.is_err());
+
+    for rejected in [
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, provider_session_id, lifecycle_state, sequence, updated_at_ms
+         ) VALUES ('codex', 'session-2', 'root-1', 'active', 2, 2)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, lifecycle_state, sequence, updated_at_ms
+         ) VALUES ('codex', 'negative-session', 'idle', -1, 1)",
+        "INSERT INTO lifecycle_turns (
+            provider, session_id, turn_id, turn_state, sequence, updated_at_ms
+         ) VALUES ('codex', 'session-1', 'negative-turn', 'stopped', -1, 1)",
+        "INSERT INTO lifecycle_invocations (
+            provider, session_id, turn_id, invocation_id,
+            invocation_state, sequence, updated_at_ms
+         ) VALUES ('codex', 'session-1', 'missing-turn', 'orphan',
+                   'active', 1, 1)",
+    ] {
+        assert_statement_rejected(&connection, rejected);
+    }
+    connection
+        .execute(
+            "INSERT INTO lifecycle_invocations (
+                provider, session_id, turn_id, invocation_id,
+                invocation_state, sequence, updated_at_ms
+             ) VALUES ('codex', 'session-1', 'turn-1', 'invocation-1',
+                       'active', 1, 1)",
+            [],
+        )
+        .unwrap();
+    for rejected in [
+        "INSERT INTO lifecycle_invocations (
+            provider, session_id, turn_id, invocation_id,
+            invocation_state, sequence, updated_at_ms
+         ) VALUES ('codex', 'session-1', 'turn-1', 'invocation-2',
+                   'active', 2, 2)",
+        "INSERT INTO lifecycle_invocations (
+            provider, session_id, turn_id, invocation_id,
+            invocation_state, sequence, updated_at_ms
+         ) VALUES ('codex', 'session-1', 'turn-1', 'negative-invocation',
+                   'completed', -1, 1)",
+    ] {
+        assert_statement_rejected(&connection, rejected);
+    }
 }
 
 #[test]
@@ -417,12 +795,14 @@ fn fresh_review_database_is_isolated_and_constrained() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(tables, ["review_marks", "review_meta"]);
-    assert_eq!(
-        connection
-            .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(1))
-            .unwrap(),
-        "main"
-    );
+    let attached = connection
+        .prepare("PRAGMA database_list")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(attached, ["main"]);
 
     let invalid_disposition = connection.execute(
         "INSERT INTO review_marks (surface, group_id, source_cursor, disposition, revision)
@@ -430,4 +810,52 @@ fn fresh_review_database_is_isolated_and_constrained() {
         [],
     );
     assert!(invalid_disposition.is_err());
+
+    for rejected in [
+        "INSERT INTO review_meta (surface, revision, source_high_water)
+         VALUES ('unknown', 0, 0)",
+        "UPDATE review_meta SET revision = -1 WHERE surface = 'review'",
+        "UPDATE review_meta SET source_high_water = -1 WHERE surface = 'review'",
+    ] {
+        assert_statement_rejected(&connection, rejected);
+    }
+    for (surface, group_id, cursor, revision) in [
+        ("unknown", "group-1", 1, 1),
+        ("review", "", 1, 1),
+        ("review", "group-1", 0, 1),
+        ("review", "group-1", 1, 0),
+    ] {
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO review_marks (
+                        surface, group_id, source_cursor, disposition, revision
+                     ) VALUES (?1, ?2, ?3, 'reviewed', ?4)",
+                    params![surface, group_id, cursor, revision],
+                )
+                .is_err()
+        );
+    }
+    connection
+        .execute(
+            "INSERT INTO review_marks (
+                surface, group_id, source_cursor, disposition, revision
+             ) VALUES ('review', 'group-1', 1, 'reviewed', 1)",
+            [],
+        )
+        .unwrap();
+    assert_statement_rejected(
+        &connection,
+        "INSERT INTO review_marks (
+            surface, group_id, source_cursor, disposition, revision
+         ) VALUES ('review', 'group-1', 1, 'archived', 2)",
+    );
+    connection
+        .execute(
+            "INSERT INTO review_marks (
+                surface, group_id, source_cursor, disposition, revision
+             ) VALUES ('attention', 'group-1', 1, 'archived', 1)",
+            [],
+        )
+        .unwrap();
 }

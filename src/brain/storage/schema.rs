@@ -20,6 +20,15 @@ const MAX_FUNCTION_ARGS: i32 = 32;
 const MAX_LIKE_PATTERN_BYTES: i32 = 4_096;
 const MAX_VARIABLES: i32 = 1_024;
 const MAX_TRIGGER_DEPTH: i32 = 16;
+const MAX_FROZEN_SCHEMA_OBJECTS: usize = 64;
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SchemaObject {
+    object_type: String,
+    name: String,
+    table_name: String,
+    sql: Option<String>,
+}
 
 pub(super) fn configure_connection(
     connection: &Connection,
@@ -101,10 +110,68 @@ pub(super) fn verify_current(
             schema_version: user_version,
         });
     }
+    verify_frozen_schema(connection, kind, deadline)?;
     match kind {
         DatabaseKind::Brain => verify_brain_meta(connection, deadline),
         DatabaseKind::Review => verify_review_meta(connection, deadline),
     }
+}
+
+fn verify_frozen_schema(
+    connection: &Connection,
+    kind: DatabaseKind,
+    deadline: StorageDeadline,
+) -> Result<(), StorageError> {
+    deadline.ensure_remaining()?;
+    let reference = Connection::open_in_memory()?;
+    deadline.ensure_remaining()?;
+    deadline.apply(&reference)?;
+    reference.execute_batch(match kind {
+        DatabaseKind::Brain => BRAIN_SCHEMA_SQL,
+        DatabaseKind::Review => REVIEW_SCHEMA_SQL,
+    })?;
+    deadline.ensure_remaining()?;
+
+    let expected = schema_objects(&reference, MAX_FROZEN_SCHEMA_OBJECTS + 1, deadline)?;
+    if expected.len() > MAX_FROZEN_SCHEMA_OBJECTS {
+        return Err(StorageError::InvalidStorage(
+            "frozen schema exceeds its object bound",
+        ));
+    }
+    let actual = schema_objects(connection, expected.len() + 1, deadline)?;
+    if actual != expected {
+        return Err(StorageError::InvalidStorage(
+            "database schema does not match the frozen version",
+        ));
+    }
+    Ok(())
+}
+
+fn schema_objects(
+    connection: &Connection,
+    limit: usize,
+    deadline: StorageDeadline,
+) -> Result<Vec<SchemaObject>, StorageError> {
+    deadline.apply(connection)?;
+    let mut statement = connection.prepare(
+        "SELECT type, name, tbl_name, sql
+         FROM main.sqlite_schema
+         LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit as i64])?;
+    let mut objects = Vec::with_capacity(limit);
+    while let Some(row) = rows.next()? {
+        objects.push(SchemaObject {
+            object_type: row.get(0)?,
+            name: row.get(1)?,
+            table_name: row.get(2)?,
+            sql: row.get(3)?,
+        });
+        deadline.ensure_remaining()?;
+    }
+    deadline.ensure_remaining()?;
+    objects.sort_unstable();
+    Ok(objects)
 }
 
 fn verify_brain_meta(
