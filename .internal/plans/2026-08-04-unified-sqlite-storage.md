@@ -338,7 +338,7 @@ git commit -m "🗃️ feat: add indexed SQLite activity ledger (codexctl-2o9fo)
 - Modify: `tests/sqlite_storage.rs`
 
 **Interfaces:**
-- Produces: `DecisionIdentity`, `DecisionPayload`, `BrainDb::{insert_decision,learning_decisions,forget_learning}`.
+- Produces: `DecisionIdentity`, `DecisionPayload`, `LearningReadSession`, `BrainDb::{insert_decision,decision_payload,learning_decisions,learning_read_session,forget_learning}`.
 - Consumes: immutable activity cursors and the existing immutable preference-generation publisher.
 - Preserves: `read_learning_decisions()` as a compatibility facade backed by `BrainDb` until direct callers are migrated.
 
@@ -346,7 +346,9 @@ git commit -m "🗃️ feat: add indexed SQLite activity ledger (codexctl-2o9fo)
 - Permission commits can retain minimal immutable decision identity after learning payload deletion.
 - Metrics, retrieval, briefing, insights, and distillation read only joined committed payloads.
 - `forget()` uses a durable erasure generation that remains incomplete until payloads/canonical marks, published generations, and frozen legacy learning sources are gone.
+- Payload reads and writes hold the shared gate derived from the database state root; erasure/resume holds it exclusively. A `LearningReadSession` retains the shared gate across every page and downstream publication. This stabilizes the erasure boundary, not a SQLite snapshot; concurrent commits can appear in later cursor pages.
 - Learning reads and downgrade export fail closed while erasure is incomplete; startup resumes it before exposing learning data.
+- Legacy decision locks are acquired in sorted order before the derived erasure and distill locks. Locks, managed roots, and erased entries use descriptor-relative no-follow validation; unsafe ownership, type, mode, or link count fails closed without repair.
 - Secure deletion and WAL truncation failures leave erasure incomplete; no supported reader or export can restore forgotten payloads after completion.
 
 - [ ] **Step 1: Write failing forget and cursor-publication tests**
@@ -370,7 +372,7 @@ Expected: compilation fails on the new decision APIs.
 
 - [ ] **Step 3: Implement split storage and erasure ordering**
 
-Implement `decision_identities` and `decision_payloads` with `ON DELETE CASCADE` only from identity to payload, never from commit to identity. Under the global erasure gate, first persist an incomplete erasure generation. Delete database payloads, preference generations, and frozen legacy learning files; checkpoint/truncate and sync; then mark the generation complete. Startup resumes any incomplete generation before learning reads or downgrade export. The guarantee covers Coding Brain-managed logical copies, not filesystem snapshots, backups, or physical media.
+Implement `decision_identities` and `decision_payloads` with `ON DELETE CASCADE` only from identity to payload, never from commit to identity. Derive the global erasure gate from the database state root rather than trusting caller paths. Shared payload readers/writers must hold it through materialization/commit, and a paged learning session must retain it through publication. Acquire sorted legacy decision locks before the derived erasure and distill locks. Under the exclusive gate, first persist an incomplete erasure generation. Delete database payloads, preference generations, and frozen legacy learning files through descriptor-relative no-follow operations; checkpoint/truncate and sync; then mark the generation complete. Startup resumes any incomplete generation before learning reads or downgrade export. The guarantee covers Coding Brain-managed logical copies, not filesystem snapshots, backups, or physical media.
 
 - [ ] **Step 4: Run learning and process tests**
 

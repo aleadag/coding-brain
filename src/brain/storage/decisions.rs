@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +10,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::brain::decisions::{DecisionContext, DecisionOutcome, DecisionRecord, DecisionType};
+use crate::brain::secure_state::{SecureStateDirectory, SecureStateError};
 
 use super::{ActivityCursor, BrainDb, StorageError};
 
@@ -130,6 +131,28 @@ pub struct LearningDecisionPage {
     pub serialized_bytes: usize,
 }
 
+/// Holds a stable erasure boundary across a complete learning-data consumption.
+///
+/// The caller must retain this session through every page and downstream
+/// publication. It intentionally does not provide a frozen SQLite snapshot:
+/// concurrently committed decisions can appear in later cursor pages.
+pub struct LearningReadSession<'database> {
+    database: &'database BrainDb,
+    _erasure_gate: File,
+}
+
+impl LearningReadSession<'_> {
+    pub fn page_after(
+        &self,
+        after: Option<ActivityCursor>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<LearningDecisionPage, StorageError> {
+        self.database
+            .learning_decisions_after_locked(after, max_rows, max_bytes)
+    }
+}
+
 impl LearningDecisionPage {
     pub fn into_records(self) -> Vec<DecisionRecord> {
         self.decisions
@@ -182,6 +205,8 @@ impl BrainDb {
         identity: &DecisionIdentity,
         payload: &DecisionPayload,
     ) -> Result<(), StorageError> {
+        let _erasure_gate = acquire_shared_erasure_gate(&self.learning_root)?;
+        self.ensure_learning_available()?;
         validate_identity_payload(identity, payload)?;
         validate_source_activity(&self.connection, identity, payload)?;
         let serialized = serialize_record(&payload.record)?;
@@ -252,6 +277,7 @@ impl BrainDb {
                 serialized,
             ],
         )?;
+        decision_write_stage("before-commit")?;
         super::activity::commit_before_deadline(self.deadline, || transaction.commit())
     }
 
@@ -290,6 +316,7 @@ impl BrainDb {
         &self,
         decision_id: &str,
     ) -> Result<Option<DecisionPayload>, StorageError> {
+        let _erasure_gate = acquire_shared_erasure_gate(&self.learning_root)?;
         self.ensure_learning_available()?;
         validate_id(decision_id)?;
         super::activity::apply_deadline(&self.connection, self.deadline)?;
@@ -337,11 +364,31 @@ impl BrainDb {
         max_bytes: usize,
     ) -> Result<Vec<DecisionPayload>, StorageError> {
         Ok(self
-            .learning_decisions_after(None, max_rows, max_bytes)?
+            .learning_read_session()?
+            .page_after(None, max_rows, max_bytes)?
             .decisions)
     }
 
+    pub fn learning_read_session(&self) -> Result<LearningReadSession<'_>, StorageError> {
+        let gate = acquire_shared_erasure_gate(&self.learning_root)?;
+        self.ensure_learning_available()?;
+        Ok(LearningReadSession {
+            database: self,
+            _erasure_gate: gate,
+        })
+    }
+
     pub fn learning_decisions_after(
+        &self,
+        after: Option<ActivityCursor>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<LearningDecisionPage, StorageError> {
+        self.learning_read_session()?
+            .page_after(after, max_rows, max_bytes)
+    }
+
+    fn learning_decisions_after_locked(
         &self,
         after: Option<ActivityCursor>,
         max_rows: usize,
@@ -362,7 +409,7 @@ impl BrainDb {
             "SELECT p.decision_id, i.identity_kind, i.provider, i.session_id, i.turn_id,
                     i.tool_use_id, i.authority_action, i.decision_source, i.decided_at_ms,
                     p.payload_kind, p.source_cursor, p.normalized_command, p.reasoning, p.note,
-                    p.decision_record, a.event_payload
+                    p.decision_record
              FROM decision_payloads AS p
              JOIN decision_identities AS i ON i.decision_id = p.decision_id
                                            AND i.identity_kind = p.payload_kind
@@ -432,8 +479,9 @@ impl BrainDb {
                     "decision payload disagrees with identity",
                 ));
             }
-            let activity_payload = row.get::<_, Vec<u8>>(15)?;
-            validate_source_activity_payload(&identity, &activity_payload)?;
+            let activity =
+                super::activity::validated_activity_at(&self.connection, payload.source_cursor)?;
+            validate_source_activity_event(&identity, &activity.event)?;
             result.push(payload);
             super::activity::ensure_deadline(self.deadline)?;
         }
@@ -480,7 +528,12 @@ impl BrainDb {
         paths: &LearningErasePaths,
         resume: bool,
     ) -> Result<u64, StorageError> {
-        let _locks = ErasureLocks::acquire(paths)?;
+        if paths.brain_root != self.learning_root {
+            return Err(StorageError::InvalidStorage(
+                "erasure brain root does not match storage state",
+            ));
+        }
+        let _locks = ErasureLocks::acquire(paths, &self.learning_root)?;
         let current = self.erasure_state()?;
         if resume && current.complete {
             return Ok(current.generation);
@@ -511,13 +564,17 @@ impl BrainDb {
         erasure_stage(&paths.brain_root, "after-database-delete")?;
         erase_legacy_sources(paths)?;
         erasure_stage(&paths.brain_root, "after-external-delete")?;
-        crate::brain::distill::erase_published_preferences_at_root(&paths.brain_root)?;
+        erase_published_preferences(&self.learning_root)?;
         erasure_stage(&paths.brain_root, "after-generation-delete")?;
         erasure_stage(&paths.brain_root, "before-wal-truncate")?;
         checkpoint_truncate(&self.connection)?;
         erasure_stage(&paths.brain_root, "after-wal-truncate")?;
-        sync_dir(self.database_directory()?)?;
-        sync_dir(&paths.brain_root)?;
+        SecureStateDirectory::open_existing_strict(self.database_directory()?)
+            .map_err(secure_storage_error)?
+            .sync()?;
+        SecureStateDirectory::open_existing_strict(&self.learning_root)
+            .map_err(secure_storage_error)?
+            .sync()?;
         erasure_stage(&paths.brain_root, "before-complete")?;
         let updated = self.connection.execute(
             "UPDATE schema_meta SET erasure_state = 'complete'
@@ -669,30 +726,19 @@ fn validate_source_activity(
     identity: &DecisionIdentity,
     payload: &DecisionPayload,
 ) -> Result<(), StorageError> {
-    let cursor = i64::try_from(payload.source_cursor.get())
-        .map_err(|_| StorageError::InvalidStorage("decision cursor is out of range"))?;
-    let bytes = connection
-        .query_row(
-            "SELECT event_payload FROM activity_events WHERE source_cursor = ?1",
-            [cursor],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()?
-        .ok_or(StorageError::InvalidStorage(
-            "decision source activity is absent",
-        ))?;
-    validate_source_activity_payload(identity, &bytes)
+    let activity = super::activity::validated_activity_at(connection, payload.source_cursor)?;
+    validate_source_activity_event(identity, &activity.event)
 }
 
-fn validate_source_activity_payload(
+fn validate_source_activity_event(
     identity: &DecisionIdentity,
-    bytes: &[u8],
+    event: &ActivityEvent,
 ) -> Result<(), StorageError> {
-    let event: ActivityEvent = serde_json::from_slice(bytes)
-        .map_err(|_| StorageError::InvalidStorage("decision source activity is invalid"))?;
-    if event.decision_id.as_deref() != Some(identity.decision_id()) {
+    if event.kind != coding_brain_core::brain_activity::ActivityKind::Decision
+        || event.decision_id.as_deref() != Some(identity.decision_id())
+    {
         return Err(StorageError::InvalidStorage(
-            "decision source activity has a different decision ID",
+            "decision source activity has a different kind or decision ID",
         ));
     }
     if let DecisionIdentity::Permission {
@@ -945,62 +991,70 @@ struct ErasureLocks {
 }
 
 impl ErasureLocks {
-    fn acquire(paths: &LearningErasePaths) -> Result<Self, StorageError> {
-        create_private_directory(&paths.brain_root)?;
-        let mut lock_paths = paths
-            .legacy_sources
-            .iter()
-            .filter(|root| root.is_dir())
-            .map(|root| root.join("decisions.lock"))
-            .collect::<Vec<_>>();
-        lock_paths.sort();
-        lock_paths.push(paths.brain_root.join("erasure.lock"));
-        lock_paths.push(paths.brain_root.join("distill.lock"));
-        let mut files = Vec::with_capacity(lock_paths.len());
-        for path in lock_paths {
-            let file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(path)?;
-            set_private_file_mode(&file)?;
-            file.try_lock_exclusive().map_err(|error| {
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    StorageError::Busy
-                } else {
-                    StorageError::Io(error)
+    fn acquire(paths: &LearningErasePaths, brain_root: &Path) -> Result<Self, StorageError> {
+        let mut files = Vec::new();
+        for path in &paths.legacy_sources {
+            let directory = match SecureStateDirectory::open_existing_strict(path) {
+                Ok(directory) => directory,
+                Err(SecureStateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    continue;
                 }
-            })?;
-            files.push(file);
+                Err(error) => return Err(secure_storage_error(error)),
+            };
+            files.push(lock_exclusive(
+                directory
+                    .open_regular_strict(c"decisions.lock", true)
+                    .map_err(secure_storage_error)?,
+            )?);
         }
+        let brain =
+            SecureStateDirectory::open_or_create(brain_root).map_err(secure_storage_error)?;
+        files.push(lock_exclusive(
+            brain
+                .open_regular_strict(c"erasure.lock", true)
+                .map_err(secure_storage_error)?,
+        )?);
+        files.push(lock_exclusive(
+            brain
+                .open_regular_strict(c"distill.lock", true)
+                .map_err(secure_storage_error)?,
+        )?);
         Ok(Self { files })
     }
 }
 
-#[cfg(unix)]
-fn create_private_directory(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::create_dir_all(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+fn acquire_shared_erasure_gate(brain_root: &Path) -> Result<File, StorageError> {
+    let directory =
+        SecureStateDirectory::open_or_create(brain_root).map_err(secure_storage_error)?;
+    let file = directory
+        .open_regular_strict(c"erasure.lock", true)
+        .map_err(secure_storage_error)?;
+    FileExt::try_lock_shared(&file).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            StorageError::Busy
+        } else {
+            StorageError::Io(error)
+        }
+    })?;
+    Ok(file)
 }
 
-#[cfg(not(unix))]
-fn create_private_directory(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)
+fn lock_exclusive(file: File) -> Result<File, StorageError> {
+    file.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            StorageError::Busy
+        } else {
+            StorageError::Io(error)
+        }
+    })?;
+    Ok(file)
 }
 
-#[cfg(unix)]
-fn set_private_file_mode(file: &File) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_file_mode(_file: &File) -> io::Result<()> {
-    Ok(())
+fn secure_storage_error(error: SecureStateError) -> StorageError {
+    match error {
+        SecureStateError::Io(error) => StorageError::Io(error),
+        SecureStateError::InvalidStorage(reason) => StorageError::InvalidStorage(reason),
+    }
 }
 
 impl Drop for ErasureLocks {
@@ -1013,15 +1067,37 @@ impl Drop for ErasureLocks {
 
 fn erase_legacy_sources(paths: &LearningErasePaths) -> Result<(), StorageError> {
     for root in &paths.legacy_sources {
-        if !root.exists() {
-            continue;
+        let directory = match SecureStateDirectory::open_existing_strict(root) {
+            Ok(directory) => directory,
+            Err(SecureStateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(secure_storage_error(error)),
+        };
+        for name in [c"decisions.jsonl", c"canonical.jsonl", c"preferences.json"] {
+            directory
+                .remove_regular_if_present(name)
+                .map_err(secure_storage_error)?;
         }
-        for name in ["decisions.jsonl", "canonical.jsonl", "preferences.json"] {
-            remove_file(root.join(name))?;
-        }
-        remove_dir(root.join("preferences"))?;
-        sync_dir(root)?;
+        directory
+            .remove_tree_if_present(c"preferences")
+            .map_err(secure_storage_error)?;
+        directory.sync()?;
     }
+    Ok(())
+}
+
+fn erase_published_preferences(brain_root: &Path) -> Result<(), StorageError> {
+    let directory =
+        SecureStateDirectory::open_existing_strict(brain_root).map_err(secure_storage_error)?;
+    directory
+        .remove_regular_if_present(c"distill-watermark.json")
+        .map_err(secure_storage_error)?;
+    directory
+        .remove_regular_if_present(c"distill-trigger")
+        .map_err(secure_storage_error)?;
+    directory
+        .remove_tree_if_present(c"preferences-generations")
+        .map_err(secure_storage_error)?;
+    directory.sync()?;
     Ok(())
 }
 
@@ -1058,29 +1134,23 @@ fn erasure_stage(brain_root: &Path, stage: &'static str) -> Result<(), StorageEr
     Ok(())
 }
 
-fn remove_file(path: PathBuf) -> Result<(), StorageError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(StorageError::Io(error)),
+fn decision_write_stage(stage: &'static str) -> Result<(), StorageError> {
+    #[cfg(debug_assertions)]
+    if std::env::var("CODING_BRAIN_DECISION_WRITE_PAUSE").as_deref() == Ok(stage) {
+        let marker = std::env::var_os("CODING_BRAIN_DECISION_WRITE_MARKER")
+            .map(PathBuf::from)
+            .ok_or(StorageError::InvalidStorage(
+                "decision write test marker is absent",
+            ))?;
+        let release = std::env::var_os("CODING_BRAIN_DECISION_WRITE_RELEASE")
+            .map(PathBuf::from)
+            .ok_or(StorageError::InvalidStorage(
+                "decision write test release is absent",
+            ))?;
+        fs::write(marker, stage)?;
+        while !release.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
-}
-
-fn remove_dir(path: PathBuf) -> Result<(), StorageError> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(StorageError::Io(error)),
-    }
-}
-
-#[cfg(unix)]
-fn sync_dir(path: &Path) -> Result<(), StorageError> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> Result<(), StorageError> {
     Ok(())
 }

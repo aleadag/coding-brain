@@ -22,9 +22,12 @@ It failed to compile because `DecisionKind`, `DecisionIdentity`, `DecisionPayloa
 - The exact 1,048,576-byte serialized record boundary round-trips. A 1,048,577-byte record is rejected, while typed projections remain capped at 4,096 bytes.
 - Learning pages are ordered and continued by immutable activity cursor. The unique payload-to-cursor index prevents a cursor-only continuation from skipping another row.
 - Observation payloads become eligible after their atomic identity/payload insert. Permission payloads require an exact authoritative `permission_commits` join; an uncommitted proposal is excluded.
-- Reads reject malformed serialized records, typed projection disagreement, payload/identity kind disagreement, provider disagreement, and activity/decision identity disagreement.
+- Exact and paged reads route their source cursor through the complete Task 3 activity decoder. They reject unsupported schemas, non-normalized or inconsistent payloads, every typed-column disagreement, non-decision activity, decision-ID mismatch, and permission authority mismatch.
 - Consumer tests feed SQLite page records through the pure baseline, briefing, retrieval, metrics, insights, and distillation seams without switching production storage selection.
 - Erasure deletes payloads, legacy decision/canonical/preference files, every published preference generation, the watermark, and the trigger while preserving activity, decision identity, and permission commit audit rows.
+- Payload reads and writes hold a shared gate derived from the database state root through materialization or commit. `LearningReadSession` retains it across pages and publication; erasure/resume uses the same gate exclusively, so it cannot begin while a supported reader or writer is in flight. This is erasure-boundary stability, not a frozen SQLite snapshot: concurrently committed decisions may appear in later cursor pages.
+- Erasure acquires sorted legacy decision locks before the derived erasure and distill locks. Roots, locks, and deletions use descriptor-relative no-follow validation of owner, type, mode, link count, and opened/path identity. Missing legacy roots remain absent; unsafe nested entries leave the durable generation incomplete.
+- Descriptor-relative directory enumeration uses the portable `errno` crate around `readdir`, avoiding target-specific errno symbols and deprecated fixed-buffer enumeration APIs.
 - Each fresh erasure increments the durable generation. An interrupted generation remains unavailable to learning reads, resumes with the same generation, and becomes complete only after verified WAL truncation and directory sync.
 - Process tests kill erasure after the in-progress marker, database deletion, external deletion, generation deletion, before and after WAL truncation, and before and after final completion.
 - Crash reopen accepts only validated SQLite `-wal`, `-shm`, and `-journal` sidecars. Creation still rejects all pre-existing sidecars, and reopen rejects unknown, linked, wrongly owned, or broadly accessible files.
@@ -35,7 +38,7 @@ All commands ran from the Task 4 worktree.
 
 ```text
 nix develop path:. --command cargo test --test sqlite_storage -- --test-threads=1
-63 passed; 0 failed
+73 passed; 0 failed
 
 nix develop path:. --command cargo test --test distill_process -- --test-threads=1
 4 passed; 0 failed; 1 release-only test ignored

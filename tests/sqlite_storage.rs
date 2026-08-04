@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::process::{Command, Stdio};
@@ -25,6 +25,7 @@ use coding_brain_core::lifecycle::{
 };
 use coding_brain_core::project::ProjectId;
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
+use fs2::FileExt;
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags, params};
 
@@ -47,6 +48,16 @@ fn private_tempdir() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     root
+}
+
+fn create_managed_dir(path: &std::path::Path) {
+    fs::create_dir_all(path).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn write_managed_file(path: &std::path::Path, bytes: &[u8]) {
+    fs::write(path, bytes).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 fn complete_decision(decision_id: &str, provider: AgentProvider) -> DecisionRecord {
@@ -2417,6 +2428,86 @@ fn decision_reads_reject_malformed_records_and_typed_projection_disagreement() {
 }
 
 #[test]
+fn decision_reads_reuse_complete_activity_row_validation() {
+    for corruption in ["unsupported-schema", "inconsistent-kind", "typed-column"] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        let mut db = BrainDb::create_current(&paths).unwrap();
+        let cursor = db
+            .append_activity(decision_activity_event(
+                "observation",
+                "observation-decision",
+                1,
+                ActivityState::Observed,
+                None,
+            ))
+            .unwrap();
+        db.insert_decision(
+            &DecisionIdentity::observation("observation-decision", AgentProvider::Codex, 1),
+            &DecisionPayload::new(
+                DecisionKind::Observation,
+                cursor,
+                complete_decision("observation-decision", AgentProvider::Codex),
+            ),
+        )
+        .unwrap();
+        drop(db);
+
+        let connection = open_for_constraints(&paths.brain_db());
+        match corruption {
+            "typed-column" => {
+                connection
+                    .execute("UPDATE activity_events SET event_state = 'evaluating'", [])
+                    .unwrap();
+            }
+            variant => {
+                let bytes: Vec<u8> = connection
+                    .query_row("SELECT event_payload FROM activity_events", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                let mut payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                if variant == "unsupported-schema" {
+                    payload["schema_version"] = serde_json::json!(ACTIVITY_SCHEMA_VERSION + 1);
+                } else {
+                    payload["kind"] = serde_json::json!("lifecycle");
+                    connection
+                        .execute("UPDATE activity_events SET event_kind = 'lifecycle'", [])
+                        .unwrap();
+                }
+                connection
+                    .execute(
+                        "UPDATE activity_events SET event_payload = ?1",
+                        [serde_json::to_vec(&payload).unwrap()],
+                    )
+                    .unwrap();
+            }
+        }
+        drop(connection);
+        let db = BrainDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                db.decision_payload("observation-decision"),
+                Err(StorageError::InvalidStorage(_))
+            ),
+            "{corruption}"
+        );
+        assert!(
+            matches!(
+                db.learning_decisions(10, 1024 * 1024),
+                Err(StorageError::InvalidStorage(_))
+            ),
+            "{corruption}"
+        );
+    }
+}
+
+#[test]
 fn learning_row_lookahead_is_safe_at_the_sqlite_integer_boundary() {
     let Ok(max_rows) = usize::try_from(i64::MAX) else {
         return;
@@ -2429,6 +2520,389 @@ fn learning_row_lookahead_is_safe_at_the_sqlite_integer_boundary() {
 
     assert!(page.decisions.is_empty());
     assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn learning_read_session_stabilizes_erasure_not_the_sqlite_snapshot() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut writer = BrainDb::create_current(&paths).unwrap();
+    for index in 1..=2 {
+        let decision_id = format!("observation-{index}");
+        let cursor = writer
+            .append_activity(decision_activity_event(
+                &format!("activity-{index}"),
+                &decision_id,
+                index,
+                ActivityState::Observed,
+                None,
+            ))
+            .unwrap();
+        writer
+            .insert_decision(
+                &DecisionIdentity::observation(decision_id.clone(), AgentProvider::Codex, index),
+                &DecisionPayload::new(
+                    DecisionKind::Observation,
+                    cursor,
+                    complete_decision(&decision_id, AgentProvider::Codex),
+                ),
+            )
+            .unwrap();
+    }
+    drop(writer);
+
+    let reader = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(2)),
+    )
+    .unwrap();
+    let session = reader.learning_read_session().unwrap();
+    let first = session.page_after(None, 1, 2 * 1024 * 1024).unwrap();
+    assert!(first.next_cursor.is_some());
+
+    let mut concurrent_writer = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(2)),
+    )
+    .unwrap();
+    let cursor = concurrent_writer
+        .append_activity(decision_activity_event(
+            "activity-3",
+            "observation-3",
+            3,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    concurrent_writer
+        .insert_decision(
+            &DecisionIdentity::observation("observation-3", AgentProvider::Codex, 3),
+            &DecisionPayload::new(
+                DecisionKind::Observation,
+                cursor,
+                complete_decision("observation-3", AgentProvider::Codex),
+            ),
+        )
+        .unwrap();
+    drop(concurrent_writer);
+
+    let mut eraser = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(2)),
+    )
+    .unwrap();
+    let erase = LearningErasePaths::new(root.path().join("brain"), Vec::new());
+    assert!(matches!(
+        eraser.forget_learning(&erase),
+        Err(StorageError::Busy)
+    ));
+    assert!(eraser.erasure_state().unwrap().complete);
+
+    let second = session
+        .page_after(first.next_cursor, 1, 2 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(second.decisions.len(), 1);
+    let third = session
+        .page_after(second.next_cursor, 1, 2 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(third.decisions.len(), 1);
+    assert_eq!(
+        third.decisions[0].record.decision_id.as_deref(),
+        Some("observation-3")
+    );
+    drop(session);
+    eraser.forget_learning(&erase).unwrap();
+}
+
+#[test]
+fn erasure_rejects_a_caller_supplied_non_derived_brain_root() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let wrong = root.path().join("other-brain");
+
+    assert!(matches!(
+        db.forget_learning(&LearningErasePaths::new(wrong.clone(), Vec::new())),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert!(!wrong.exists());
+    assert!(db.erasure_state().unwrap().complete);
+}
+
+#[test]
+fn writer_obeys_the_shared_erasure_gate_and_post_erasure_state() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let cursor = db
+        .append_activity(decision_activity_event(
+            "observation",
+            "observation-decision",
+            1,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    let identity = DecisionIdentity::observation("observation-decision", AgentProvider::Codex, 1);
+    let payload = DecisionPayload::new(
+        DecisionKind::Observation,
+        cursor,
+        complete_decision("observation-decision", AgentProvider::Codex),
+    );
+    fs::create_dir(root.path().join("brain")).unwrap();
+    fs::set_permissions(root.path().join("brain"), fs::Permissions::from_mode(0o700)).unwrap();
+    let gate = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(root.path().join("brain/erasure.lock"))
+        .unwrap();
+    gate.set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap();
+    gate.try_lock_exclusive().unwrap();
+
+    assert!(matches!(
+        db.insert_decision(&identity, &payload),
+        Err(StorageError::Busy)
+    ));
+    FileExt::unlock(&gate).unwrap();
+    db.forget_learning(&LearningErasePaths::new(
+        root.path().join("brain"),
+        Vec::new(),
+    ))
+    .unwrap();
+    db.insert_decision(&identity, &payload).unwrap();
+    assert_eq!(db.learning_decisions(10, 1024 * 1024).unwrap().len(), 1);
+}
+
+#[test]
+fn paused_decision_writer_process_helper() {
+    let Some(root) = std::env::var_os("CODING_BRAIN_DECISION_WRITE_ROOT") else {
+        return;
+    };
+    let paths = StoragePaths::at(std::path::Path::new(&root));
+    let mut db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(30)),
+    )
+    .unwrap();
+    let cursor = db
+        .append_activity(decision_activity_event(
+            "paused-writer",
+            "paused-decision",
+            1,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    db.insert_decision(
+        &DecisionIdentity::observation("paused-decision", AgentProvider::Codex, 1),
+        &DecisionPayload::new(
+            DecisionKind::Observation,
+            cursor,
+            complete_decision("paused-decision", AgentProvider::Codex),
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn in_flight_writer_finishes_before_erasure_can_delete_and_complete() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let marker = root.path().join("writer-marker");
+    let release = root.path().join("writer-release");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("paused_decision_writer_process_helper")
+        .arg("--nocapture")
+        .env("CODING_BRAIN_DECISION_WRITE_ROOT", root.path())
+        .env("CODING_BRAIN_DECISION_WRITE_PAUSE", "before-commit")
+        .env("CODING_BRAIN_DECISION_WRITE_MARKER", &marker)
+        .env("CODING_BRAIN_DECISION_WRITE_RELEASE", &release)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !marker.exists() {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut eraser = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(2)),
+    )
+    .unwrap();
+    let erase = LearningErasePaths::new(root.path().join("brain"), Vec::new());
+    assert!(matches!(
+        eraser.forget_learning(&erase),
+        Err(StorageError::Busy)
+    ));
+    assert!(eraser.erasure_state().unwrap().complete);
+    fs::write(&release, b"continue").unwrap();
+    assert!(child.wait().unwrap().success());
+
+    assert_eq!(eraser.learning_decisions(10, 1024 * 1024).unwrap().len(), 1);
+    eraser.forget_learning(&erase).unwrap();
+    assert!(
+        eraser
+            .learning_decisions(10, 1024 * 1024)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn failed_later_erasure_gate_releases_earlier_legacy_decision_locks() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let brain_root = root.path().join("brain");
+    let legacy = root.path().join("legacy");
+    fs::create_dir(&brain_root).unwrap();
+    fs::create_dir(&legacy).unwrap();
+    for directory in [&brain_root, &legacy] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let erasure = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(brain_root.join("erasure.lock"))
+        .unwrap();
+    erasure
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap();
+    erasure.try_lock_exclusive().unwrap();
+
+    assert!(matches!(
+        db.forget_learning(&LearningErasePaths::new(
+            brain_root.clone(),
+            vec![legacy.clone()],
+        )),
+        Err(StorageError::Busy)
+    ));
+    let decisions = File::open(legacy.join("decisions.lock")).unwrap();
+    decisions.try_lock_exclusive().unwrap();
+}
+
+#[test]
+fn unsafe_managed_generation_entries_leave_erasure_incomplete_without_repair() {
+    for attack in ["symlink", "hardlink", "broad-mode"] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        let mut db = BrainDb::create_current(&paths).unwrap();
+        let brain_root = root.path().join("brain");
+        create_managed_dir(&brain_root);
+        let generations = brain_root.join("preferences-generations");
+        create_managed_dir(&generations);
+        let outside = root.path().join("outside");
+        create_managed_dir(&outside);
+        let target = outside.join("retained");
+        write_managed_file(&target, b"private");
+        match attack {
+            "symlink" => symlink(&target, generations.join("unsafe-entry")).unwrap(),
+            "hardlink" => fs::hard_link(&target, generations.join("unsafe-entry")).unwrap(),
+            "broad-mode" => {
+                let entry = generations.join("unsafe-entry");
+                write_managed_file(&entry, b"private");
+                fs::set_permissions(entry, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        assert!(
+            matches!(
+                db.forget_learning(&LearningErasePaths::new(brain_root, Vec::new())),
+                Err(StorageError::InvalidStorage(_))
+            ),
+            "{attack}"
+        );
+        assert!(!db.erasure_state().unwrap().complete, "{attack}");
+        assert_eq!(fs::read(&target).unwrap(), b"private", "{attack}");
+    }
+}
+
+#[test]
+fn erasure_rejects_symlink_hardlink_and_broad_lock_entries_without_repair() {
+    for attack in ["symlink", "hardlink", "broad-mode"] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        let mut db = BrainDb::create_current(&paths).unwrap();
+        let brain_root = root.path().join("brain");
+        create_managed_dir(&brain_root);
+        let target = root.path().join("lock-target");
+        write_managed_file(&target, b"retained");
+        match attack {
+            "symlink" => symlink(&target, brain_root.join("erasure.lock")).unwrap(),
+            "hardlink" => fs::hard_link(&target, brain_root.join("erasure.lock")).unwrap(),
+            "broad-mode" => {
+                write_managed_file(&brain_root.join("erasure.lock"), b"");
+                fs::set_permissions(
+                    brain_root.join("erasure.lock"),
+                    fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        assert!(
+            matches!(
+                db.forget_learning(&LearningErasePaths::new(brain_root, Vec::new())),
+                Err(StorageError::InvalidStorage(_))
+            ),
+            "{attack}"
+        );
+        assert!(db.erasure_state().unwrap().complete, "{attack}");
+        if attack != "broad-mode" {
+            assert_eq!(fs::read(&target).unwrap(), b"retained", "{attack}");
+        }
+    }
+}
+
+#[test]
+fn erasure_rejects_symlink_or_broad_managed_roots_without_following_them() {
+    for attack in ["brain-symlink", "legacy-broad"] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        let mut db = BrainDb::create_current(&paths).unwrap();
+        let brain_root = root.path().join("brain");
+        let legacy = root.path().join("legacy");
+        let outside = root.path().join("outside");
+        create_managed_dir(&outside);
+        write_managed_file(&outside.join("retained"), b"private");
+        let legacy_sources = if attack == "brain-symlink" {
+            symlink(&outside, &brain_root).unwrap();
+            Vec::new()
+        } else {
+            create_managed_dir(&brain_root);
+            create_managed_dir(&legacy);
+            fs::set_permissions(&legacy, fs::Permissions::from_mode(0o755)).unwrap();
+            vec![legacy]
+        };
+
+        assert!(
+            matches!(
+                db.forget_learning(&LearningErasePaths::new(brain_root, legacy_sources)),
+                Err(StorageError::InvalidStorage(_))
+            ),
+            "{attack}"
+        );
+        assert!(db.erasure_state().unwrap().complete, "{attack}");
+        assert_eq!(fs::read(outside.join("retained")).unwrap(), b"private");
+    }
 }
 
 #[test]
@@ -2456,17 +2930,18 @@ fn forget_removes_payload_and_managed_learning_files_but_preserves_audit() {
     .unwrap();
     let brain_root = root.path().join("brain");
     let generation = brain_root.join("preferences-generations/gen-1");
-    fs::create_dir_all(&generation).unwrap();
-    fs::write(generation.join("global.json"), b"preferences").unwrap();
-    fs::write(brain_root.join("distill-watermark.json"), b"watermark").unwrap();
-    fs::write(brain_root.join("distill-trigger"), b"trigger").unwrap();
+    create_managed_dir(&generation);
+    create_managed_dir(generation.parent().unwrap());
+    write_managed_file(&generation.join("global.json"), b"preferences");
+    write_managed_file(&brain_root.join("distill-watermark.json"), b"watermark");
+    write_managed_file(&brain_root.join("distill-trigger"), b"trigger");
     let legacy = root.path().join("frozen-legacy");
-    fs::create_dir_all(&legacy).unwrap();
+    create_managed_dir(&legacy);
     for name in ["decisions.jsonl", "canonical.jsonl", "preferences.json"] {
-        fs::write(legacy.join(name), b"learning").unwrap();
+        write_managed_file(&legacy.join(name), b"learning");
     }
-    fs::create_dir_all(legacy.join("preferences")).unwrap();
-    fs::write(legacy.join("preferences/project.json"), b"learning").unwrap();
+    create_managed_dir(&legacy.join("preferences"));
+    write_managed_file(&legacy.join("preferences/project.json"), b"learning");
     let erase = LearningErasePaths::new(brain_root.clone(), vec![legacy.clone()]);
 
     let generation = db.forget_learning(&erase).unwrap();
@@ -2587,16 +3062,16 @@ fn interrupted_erasure_fails_closed_and_resumes_at_the_same_generation() {
         drop(db);
         let brain_root = root.path().join("brain");
         let legacy = root.path().join("legacy");
-        fs::create_dir_all(brain_root.join("preferences-generations/gen-1")).unwrap();
-        fs::write(
-            brain_root.join("preferences-generations/gen-1/global.json"),
+        create_managed_dir(&brain_root.join("preferences-generations"));
+        create_managed_dir(&brain_root.join("preferences-generations/gen-1"));
+        write_managed_file(
+            &brain_root.join("preferences-generations/gen-1/global.json"),
             b"preferences",
-        )
-        .unwrap();
-        fs::write(brain_root.join("distill-watermark.json"), b"watermark").unwrap();
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("decisions.jsonl"), b"learning").unwrap();
-        fs::write(legacy.join("canonical.jsonl"), b"learning").unwrap();
+        );
+        write_managed_file(&brain_root.join("distill-watermark.json"), b"watermark");
+        create_managed_dir(&legacy);
+        write_managed_file(&legacy.join("decisions.jsonl"), b"learning");
+        write_managed_file(&legacy.join("canonical.jsonl"), b"learning");
         let marker = root.path().join("erasure-marker");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")

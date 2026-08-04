@@ -63,6 +63,24 @@ impl SecureStateDirectory {
         })
     }
 
+    pub(crate) fn open_existing_strict(state_root: &Path) -> Result<Self, SecureStateError> {
+        let state_root = state_root_for_traversal(state_root);
+        let components = normal_components(&state_root)?;
+        let mut directory = open_directory(if state_root.is_absolute() {
+            Path::new("/")
+        } else {
+            Path::new(".")
+        })?;
+        for (index, name) in components.iter().enumerate() {
+            directory =
+                open_existing_directory_at(&directory, name, index + 1 == components.len())?;
+        }
+        Ok(Self {
+            descriptor: directory,
+            display_path: state_root.into_owned(),
+        })
+    }
+
     pub(crate) fn open_regular_strict(
         &self,
         name: &CStr,
@@ -77,6 +95,104 @@ impl SecureStateDirectory {
 
     pub(crate) fn sync(&self) -> io::Result<()> {
         self.descriptor.sync_all()
+    }
+
+    pub(crate) fn remove_regular_if_present(&self, name: &CStr) -> Result<(), SecureStateError> {
+        let metadata = match metadata_at(&self.descriptor, name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        validate_regular_metadata(&metadata)?;
+        if metadata.mode & 0o777 != 0o600 {
+            return Err(SecureStateError::InvalidStorage(
+                "regular entry mode is not 0600",
+            ));
+        }
+        let file = self.open_regular_strict(name, false)?;
+        self.validate_regular(name, &file, 0o600)?;
+        self.unlink(name)?;
+        self.sync()?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_tree_if_present(&self, name: &CStr) -> Result<(), SecureStateError> {
+        let metadata = match metadata_at(&self.descriptor, name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        validate_private_directory_metadata(&metadata)?;
+        let child = self.open_child_strict(name)?;
+        child.remove_all_entries()?;
+        let after = metadata_at(&self.descriptor, name)?;
+        let opened = SecureEntryMetadata::from(&child.descriptor.metadata()?);
+        validate_private_directory_metadata(&after)?;
+        validate_private_directory_metadata(&opened)?;
+        if after.dev != opened.dev || after.ino != opened.ino {
+            return Err(SecureStateError::InvalidStorage(
+                "directory entry descriptor no longer matches its path",
+            ));
+        }
+        let result = unsafe {
+            libc::unlinkat(
+                self.descriptor.as_raw_fd(),
+                name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        self.sync()?;
+        Ok(())
+    }
+
+    fn open_child_strict(&self, name: &CStr) -> Result<Self, SecureStateError> {
+        let before = metadata_at(&self.descriptor, name)?;
+        validate_private_directory_metadata(&before)?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.descriptor.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(SecureStateError::InvalidStorage(
+                "open private directory entry",
+            ));
+        }
+        let descriptor = unsafe { File::from_raw_fd(descriptor) };
+        let opened = SecureEntryMetadata::from(&descriptor.metadata()?);
+        validate_private_directory_metadata(&opened)?;
+        if before.dev != opened.dev || before.ino != opened.ino {
+            return Err(SecureStateError::InvalidStorage(
+                "private directory changed during open",
+            ));
+        }
+        Ok(Self {
+            descriptor,
+            display_path: self.display_path.join(OsStr::from_bytes(name.to_bytes())),
+        })
+    }
+
+    #[allow(clippy::unnecessary_cast)] // libc mode constants vary across Unix targets.
+    fn remove_all_entries(&self) -> Result<(), SecureStateError> {
+        for name in directory_entry_names(&self.descriptor)? {
+            let metadata = metadata_at(&self.descriptor, &name)?;
+            let kind = metadata.mode & libc::S_IFMT as u32;
+            if kind == libc::S_IFREG as u32 {
+                self.remove_regular_if_present(&name)?;
+            } else if kind == libc::S_IFDIR as u32 {
+                self.remove_tree_if_present(&name)?;
+            } else {
+                return Err(SecureStateError::InvalidStorage(
+                    "managed directory contains an unsafe entry",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn open_regular_with_hook(
@@ -286,6 +402,69 @@ impl SecureStateDirectory {
         (result == 0)
             .then_some(())
             .ok_or_else(io::Error::last_os_error)
+    }
+}
+
+fn open_existing_directory_at(
+    parent: &File,
+    name: &OsStr,
+    private: bool,
+) -> Result<File, SecureStateError> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| SecureStateError::InvalidStorage("invalid directory name"))?;
+    let before = metadata_at(parent, &name)?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(SecureStateError::InvalidStorage("open directory component"));
+    }
+    let directory = unsafe { File::from_raw_fd(descriptor) };
+    let opened = SecureEntryMetadata::from(&directory.metadata()?);
+    if before.dev != opened.dev || before.ino != opened.ino {
+        return Err(SecureStateError::InvalidStorage(
+            "directory changed during open",
+        ));
+    }
+    if private {
+        validate_private_directory_metadata(&before)?;
+        validate_private_directory_metadata(&opened)?;
+    }
+    Ok(directory)
+}
+
+fn directory_entry_names(directory: &File) -> Result<Vec<CString>, SecureStateError> {
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(duplicate) };
+        return Err(error.into());
+    }
+    let mut names = Vec::new();
+    loop {
+        errno::set_errno(errno::Errno(0));
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = errno::errno().0;
+            unsafe { libc::closedir(stream) };
+            return if error == 0 {
+                Ok(names)
+            } else {
+                Err(io::Error::from_raw_os_error(error).into())
+            };
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
     }
 }
 
@@ -644,6 +823,21 @@ fn validate_regular_metadata(metadata: &SecureEntryMetadata) -> Result<(), Secur
     Ok(())
 }
 
+#[allow(clippy::unnecessary_cast)]
+fn validate_private_directory_metadata(
+    metadata: &SecureEntryMetadata,
+) -> Result<(), SecureStateError> {
+    if metadata.mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || metadata.uid != unsafe { libc::geteuid() }
+        || metadata.mode & 0o777 != 0o700
+    {
+        return Err(SecureStateError::InvalidStorage(
+            "private directory owner, type, or mode",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -661,6 +855,29 @@ mod tests {
     fn platform_helper_signatures_remain_stable() {
         let _: libc::c_int = created_directory_platform::OPEN_FLAGS;
         let _: fn(&File) -> io::Result<()> = created_directory_platform::chmod;
+    }
+
+    #[test]
+    fn directory_enumeration_uses_portable_error_reporting() {
+        let source = include_str!("secure_state.rs");
+        let start = source.find("fn directory_entry_names").unwrap();
+        let end = source[start..]
+            .find("pub(super) fn open_or_create_nested")
+            .map(|offset| start + offset)
+            .unwrap();
+        let enumeration = &source[start..end];
+        assert!(enumeration.contains(concat!("libc::", "readdir")));
+        assert!(enumeration.contains(concat!("errno::", "set_errno")));
+        assert!(enumeration.contains(concat!("errno::", "errno")));
+        assert!(!enumeration.contains(concat!("libc::", "readdir_r")));
+        for target_specific_errno in [
+            concat!("__errno", "_location"),
+            concat!("libc::", "__errno"),
+            concat!("libc::", "___errno"),
+            concat!("libc::", "__error"),
+        ] {
+            assert!(!enumeration.contains(target_specific_errno));
+        }
     }
 
     #[test]

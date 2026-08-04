@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 #[cfg(debug_assertions)]
@@ -11,7 +12,10 @@ use std::time::Instant;
 fn write_decisions(home: &Path, count: usize) {
     let root = home.join("state/coding-brain/brain");
     fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     let mut file = fs::File::create(root.join("decisions.jsonl")).unwrap();
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap();
     for index in 1..=count {
         writeln!(
             file,

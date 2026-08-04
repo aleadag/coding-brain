@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::decisions::{DecisionRecord, project_slug, read_distillation_decisions};
 use super::pref_store::{parse_preferences_json, preferences_to_json};
 use super::preferences::{DistilledPreferences, distill_preferences};
+use super::secure_state::{SecureStateDirectory, SecureStateError};
 
 const SCHEMA_VERSION: u32 = 1;
 const DISTILL_INTERVAL: usize = 10;
@@ -159,14 +160,10 @@ fn finish_locked(
 
 fn try_acquire_lock(paths: &CodingBrainPaths) -> Result<Option<File>, DistillError> {
     let root = brain_root(paths);
-    create_private_dir(&root)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(root.join("distill.lock"))?;
-    set_file_mode(&lock)?;
+    let directory = SecureStateDirectory::open_or_create(&root).map_err(secure_distill_error)?;
+    let lock = directory
+        .open_regular_strict(c"distill.lock", true)
+        .map_err(secure_distill_error)?;
     match lock.try_lock_exclusive() {
         Ok(()) => Ok(Some(lock)),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -289,7 +286,7 @@ pub(crate) fn forget_preferences_with(
     erase_source: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), DistillError> {
     let root = brain_root(paths);
-    create_private_dir(&root)?;
+    SecureStateDirectory::open_or_create(&root).map_err(secure_distill_error)?;
     let Some(erasure_lock) = try_acquire_named_lock(&root, "erasure.lock")? else {
         return Err(DistillError::AlreadyRunning);
     };
@@ -307,13 +304,12 @@ pub(crate) fn forget_preferences_with(
 }
 
 fn try_acquire_named_lock(root: &Path, name: &str) -> Result<Option<File>, DistillError> {
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(root.join(name))?;
-    set_file_mode(&lock)?;
+    let directory = SecureStateDirectory::open_or_create(root).map_err(secure_distill_error)?;
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| DistillError::Io(io::Error::new(io::ErrorKind::InvalidInput, "lock name")))?;
+    let lock = directory
+        .open_regular_strict(&name, true)
+        .map_err(secure_distill_error)?;
     match lock.try_lock_exclusive() {
         Ok(()) => Ok(Some(lock)),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -322,22 +318,30 @@ fn try_acquire_named_lock(root: &Path, name: &str) -> Result<Option<File>, Disti
 }
 
 pub(crate) fn erase_published_preferences_at_root(root: &Path) -> io::Result<()> {
-    remove_file_if_present(&root.join("distill-watermark.json"))?;
-    remove_file_if_present(&root.join("distill-trigger"))?;
-    match fs::remove_dir_all(root.join("preferences-generations")) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    sync_directory(root)
+    let directory = SecureStateDirectory::open_existing_strict(root).map_err(secure_io_error)?;
+    directory
+        .remove_regular_if_present(c"distill-watermark.json")
+        .map_err(secure_io_error)?;
+    directory
+        .remove_regular_if_present(c"distill-trigger")
+        .map_err(secure_io_error)?;
+    directory
+        .remove_tree_if_present(c"preferences-generations")
+        .map_err(secure_io_error)?;
+    directory.sync()
 }
 
-fn remove_file_if_present(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+fn secure_io_error(error: SecureStateError) -> io::Error {
+    match error {
+        SecureStateError::Io(error) => error,
+        SecureStateError::InvalidStorage(reason) => {
+            io::Error::new(io::ErrorKind::InvalidData, reason)
+        }
     }
+}
+
+fn secure_distill_error(error: SecureStateError) -> DistillError {
+    DistillError::Io(secure_io_error(error))
 }
 
 pub(crate) fn read_watermark(paths: &CodingBrainPaths) -> Result<DistillWatermark, DistillError> {
@@ -629,7 +633,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(&temp);
         let lock_path = brain_root(&paths).join("distill.lock");
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        create_private_dir(lock_path.parent().unwrap()).unwrap();
         let held = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -637,6 +641,7 @@ mod tests {
             .truncate(false)
             .open(lock_path)
             .unwrap();
+        set_file_mode(&held).unwrap();
         FileExt::lock_exclusive(&held).unwrap();
 
         assert_eq!(

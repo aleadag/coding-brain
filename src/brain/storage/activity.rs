@@ -520,6 +520,24 @@ fn decode_activity_row(row: &Row<'_>, payload: &[u8]) -> Result<ActivityRecord, 
     Ok(ActivityRecord { cursor, event })
 }
 
+pub(super) fn validated_activity_at(
+    connection: &Connection,
+    cursor: ActivityCursor,
+) -> Result<ActivityRecord, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+                    terminal_provider, terminal_session_id, terminal_turn_id,
+                    terminal_tool_use_id, terminal_action, outcome, correction, event_payload
+             FROM activity_events WHERE source_cursor = ?1",
+    )?;
+    let mut rows = statement.query([cursor_i64(cursor)])?;
+    let row = rows.next()?.ok_or(StorageError::InvalidStorage(
+        "decision source activity is absent",
+    ))?;
+    let payload = row.get::<_, Vec<u8>>(12)?;
+    decode_activity_row(row, &payload)
+}
+
 fn validate_page_limits(max_rows: usize, max_bytes: usize) -> Result<(), StorageError> {
     if max_rows == 0 || max_bytes == 0 {
         Err(StorageError::InvalidStorage(

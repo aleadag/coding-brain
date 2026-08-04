@@ -297,6 +297,7 @@ dependencies = [
  "coding-brain-tui",
  "crossterm",
  "ctrlc",
+ "errno",
  "fs2",
  "libc",
  "ratatui",

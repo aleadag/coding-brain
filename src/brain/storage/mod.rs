@@ -24,7 +24,7 @@ pub use activity::{ActivityCursor, ActivityPage, ActivityRecord};
 #[allow(unused_imports)]
 pub use decisions::{
     DecisionIdentity, DecisionKind, DecisionPayload, ErasureState, LearningDecisionPage,
-    LearningErasePaths,
+    LearningErasePaths, LearningReadSession,
 };
 
 pub const BRAIN_APPLICATION_ID: i32 = 0x4342_524e;
@@ -61,6 +61,10 @@ impl StoragePaths {
     pub fn review_db(&self) -> PathBuf {
         self.db_dir
             .join(OsStr::from_bytes(REVIEW_DATABASE_NAME.to_bytes()))
+    }
+
+    fn brain_learning_root(&self) -> PathBuf {
+        self.state_root.join("brain")
     }
 }
 
@@ -200,6 +204,7 @@ pub struct BrainDb {
     connection: Connection,
     deadline: Option<StorageDeadline>,
     database_path: PathBuf,
+    learning_root: PathBuf,
 }
 
 impl fmt::Debug for BrainDb {
@@ -215,6 +220,7 @@ impl BrainDb {
             connection,
             deadline: None,
             database_path: paths.brain_db(),
+            learning_root: paths.brain_learning_root(),
         })
     }
 
@@ -228,6 +234,7 @@ impl BrainDb {
             connection,
             deadline: Some(deadline),
             database_path: paths.brain_db(),
+            learning_root: paths.brain_learning_root(),
         };
         if role == OpenRole::Hook && !database.erasure_state()?.complete {
             return Err(StorageError::MigrationRequired);
