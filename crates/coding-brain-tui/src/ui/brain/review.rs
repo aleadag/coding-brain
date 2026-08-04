@@ -1,38 +1,55 @@
+use coding_brain_core::review_state::ReviewSurface;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
 
 use crate::brain_app::BrainApp;
 
+use super::{review_prefix, review_style, review_title};
+
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(45), Constraint::Min(8)])
         .split(area);
+    let projection = app.review_projection(ReviewSurface::Review);
     let items = if app.review_queue().is_empty() {
         vec![ListItem::new("No review-worthy decisions")]
     } else {
         app.review_queue()
             .iter()
-            .map(|item| {
-                ListItem::new(format!(
+            .zip(&projection.items)
+            .map(|(item, target)| {
+                let content = format!(
                     "{:.0}  {}  {}  {}",
                     item.score,
                     item.decision.provider.label(),
                     item.reason,
                     item.decision.id
-                ))
+                );
+                let content_style = if target.new_member_keys.is_empty() {
+                    review_style(target, app.theme())
+                } else {
+                    Style::default().fg(app.theme().text_primary)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        review_prefix(target, "NEW"),
+                        review_style(target, app.theme()),
+                    ),
+                    Span::styled(content, content_style),
+                ]))
             })
             .collect()
     };
     let list = List::new(items)
         .block(
             Block::default()
-                .title(format!(" Review Queue ({}) ", app.review_queue().len()))
+                .title(review_title("Review Queue", projection))
                 .borders(Borders::ALL),
         )
         .highlight_style(

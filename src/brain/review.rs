@@ -25,19 +25,33 @@ pub struct ReviewItem {
     pub score: i32,
 }
 
+pub(crate) fn review_source_identity(record: &DecisionRecord) -> Vec<u8> {
+    coding_brain_core::runtime::DecisionSummary::from(record).review_source_identity()
+}
+
+pub(crate) fn review_display_id(record: &DecisionRecord, _source_identity: &[u8]) -> String {
+    coding_brain_core::runtime::DecisionSummary::from(record).review_display_id()
+}
+
 /// Build the prioritized review queue.
 pub fn build_queue(decisions: &[DecisionRecord]) -> Vec<ReviewItem> {
     let mut items: Vec<ReviewItem> = Vec::new();
+    let reviewable = decisions
+        .iter()
+        .filter(|decision| decision.canonical != Some(true))
+        .collect::<Vec<_>>();
     // compute_counterfactuals (and the other compute_* helpers) operate on
     // the core `DecisionSummary` DTO since the metrics surface is shared
     // with the TUI. Project once at the call site.
-    let summaries: Vec<coding_brain_core::runtime::DecisionSummary> =
-        decisions.iter().map(Into::into).collect();
+    let summaries: Vec<coding_brain_core::runtime::DecisionSummary> = reviewable
+        .iter()
+        .map(|decision| (*decision).into())
+        .collect();
     let cfs = compute_counterfactuals(&summaries);
 
     for cf in &cfs {
         if cf.brain_was_right {
-            if let Some(record) = find_by_id(decisions, cf.decision_id.as_deref()) {
+            if let Some(record) = find_by_id(&reviewable, cf.decision_id.as_deref()) {
                 items.push(ReviewItem {
                     record: record.clone(),
                     reason: format!("Brain was right (counterfactual): {}", cf.outcome_summary),
@@ -47,11 +61,8 @@ pub fn build_queue(decisions: &[DecisionRecord]) -> Vec<ReviewItem> {
         }
     }
 
-    for d in decisions {
+    for d in reviewable {
         if d.brain_action.is_empty() {
-            continue;
-        }
-        if d.canonical == Some(true) {
             continue;
         }
         let tier = classify_risk(d.tool.as_deref(), d.command.as_deref());
@@ -76,24 +87,26 @@ pub fn build_queue(decisions: &[DecisionRecord]) -> Vec<ReviewItem> {
         }
     }
 
-    // De-duplicate by decision_id (counterfactual + high-confidence miss can overlap).
+    // De-duplicate counterfactual and risk reasons for the same source decision.
     items.sort_by(|a, b| {
-        let a_id = a.record.decision_id.as_deref().unwrap_or("");
-        let b_id = b.record.decision_id.as_deref().unwrap_or("");
-        a_id.cmp(b_id).then_with(|| b.score.cmp(&a.score))
+        review_source_identity(&a.record)
+            .cmp(&review_source_identity(&b.record))
+            .then_with(|| b.score.cmp(&a.score))
     });
-    items.dedup_by(|a, b| {
-        a.record.decision_id.is_some() && a.record.decision_id == b.record.decision_id
-    });
+    items.dedup_by(|a, b| review_source_identity(&a.record) == review_source_identity(&b.record));
     items.sort_by_key(|x| std::cmp::Reverse(x.score));
     items
 }
 
-fn find_by_id<'a>(decisions: &'a [DecisionRecord], id: Option<&str>) -> Option<&'a DecisionRecord> {
+fn find_by_id<'a>(
+    decisions: &[&'a DecisionRecord],
+    id: Option<&str>,
+) -> Option<&'a DecisionRecord> {
     let id = id?;
     decisions
         .iter()
-        .find(|d| d.decision_id.as_deref() == Some(id))
+        .copied()
+        .find(|decision| decision.decision_id.as_deref() == Some(id))
 }
 
 /// Run an interactive review pass. Returns the number of items marked canonical.
@@ -143,7 +156,12 @@ pub fn run_interactive() -> usize {
             let cmd = buf.trim();
             match cmd {
                 "m" | "mark" => {
-                    if let Some(id) = item.record.decision_id.as_deref() {
+                    if let Some(id) = item
+                        .record
+                        .decision_id
+                        .as_deref()
+                        .filter(|id| !id.trim().is_empty())
+                    {
                         match mark_canonical(id, None) {
                             Ok(()) => {
                                 println!("  ✓ marked canonical");
@@ -163,7 +181,12 @@ pub fn run_interactive() -> usize {
                     let _ = io::stdout().flush();
                     let mut note = String::new();
                     let _ = reader.read_line(&mut note);
-                    if let Some(id) = item.record.decision_id.as_deref() {
+                    if let Some(id) = item
+                        .record
+                        .decision_id
+                        .as_deref()
+                        .filter(|id| !id.trim().is_empty())
+                    {
                         match mark_canonical(id, Some(note.trim())) {
                             Ok(()) => {
                                 println!("  ✓ marked canonical with note");
@@ -261,6 +284,9 @@ fn print_full_details(d: &DecisionRecord) {
 /// One-shot non-interactive helper for `--mark <id>` (called from the
 /// counterfactual report).
 pub fn mark_by_id(decision_id: &str, note: Option<&str>) -> Result<(), String> {
+    if decision_id.trim().is_empty() {
+        return Err("decision id must not be empty".into());
+    }
     mark_canonical(decision_id, note)
 }
 
@@ -290,5 +316,54 @@ pub fn print_queue() {
     }
     if queue.is_empty() {
         println!("(empty)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coding_brain_core::provider::AgentProvider;
+
+    fn decision(id: &str, brain_action: &str, user_action: &str) -> DecisionRecord {
+        DecisionRecord {
+            provider: AgentProvider::Codex,
+            timestamp: "1".into(),
+            pid: 7,
+            project: "project".into(),
+            tool: Some("Bash".into()),
+            command: Some("cargo test".into()),
+            brain_action: brain_action.into(),
+            brain_confidence: 0.9,
+            brain_reasoning: "reason".into(),
+            user_action: user_action.into(),
+            context: None,
+            outcome: None,
+            decision_type: super::super::decisions::DecisionType::Session,
+            suggested_at: Some(1),
+            resolved_at: Some(2),
+            override_reason: None,
+            decision_id: Some(id.into()),
+            brain_decision_ms: None,
+            cache_hit: None,
+            canonical: None,
+        }
+    }
+
+    #[test]
+    fn canonical_counterfactual_cannot_reenter_review_queue() {
+        let mut canonical = decision("canonical", "deny", "reject");
+        canonical.canonical = Some(true);
+        let mut outcome = decision("outcome", "", "auto");
+        outcome.outcome = Some(super::super::decisions::DecisionOutcome::Error(
+            "failed".into(),
+        ));
+
+        assert!(build_queue(&[canonical, outcome]).is_empty());
+    }
+
+    #[test]
+    fn mark_by_id_rejects_empty_and_whitespace_ids() {
+        assert!(mark_by_id("", None).is_err());
+        assert!(mark_by_id("   ", None).is_err());
     }
 }

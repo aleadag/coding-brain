@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use coding_brain_core::brain_activity::{
     ActivityItem, ActivityOutcome, ActivityState, DeliveryState,
 };
+use coding_brain_core::review_state::{ReviewSurface, ReviewTarget};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -14,6 +15,8 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::brain_app::BrainApp;
+
+use super::{review_prefix, review_style};
 
 const WIDE_BREAKPOINT: u16 = 120;
 const MAX_NARROW_EVIDENCE_HEIGHT: u16 = 12;
@@ -94,12 +97,25 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
     let mut items = snapshot
         .attention
         .iter()
-        .map(|item| {
-            ListItem::new(activity_row(
+        .zip(&app.review_projection(ReviewSurface::Attention).items)
+        .map(|(item, target)| {
+            let count = if item.occurrences > 1 {
+                let new_count = target.new_member_keys.len();
+                Some(if new_count < item.occurrences {
+                    format!("x{} · {new_count} new", item.occurrences)
+                } else {
+                    format!("x{}", item.occurrences)
+                })
+            } else {
+                None
+            };
+            ListItem::new(lifecycle_activity_row(
                 &item.activity,
-                (item.occurrences > 1).then_some(item.occurrences),
+                count,
                 row_width,
                 app.theme(),
+                target,
+                "NEW",
             ))
         })
         .collect::<Vec<_>>();
@@ -139,6 +155,7 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
 
 fn render_recent(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
     let snapshot = app.snapshot();
+    let projection = app.review_projection(ReviewSurface::Recent);
     let row_width = usize::from(area.width.saturating_sub(4));
     let items = if snapshot.recent.is_empty() {
         vec![ListItem::new("No recent resolved activity")]
@@ -146,11 +163,25 @@ fn render_recent(frame: &mut Frame<'_>, area: Rect, app: &BrainApp) {
         snapshot
             .recent
             .iter()
-            .map(|item| ListItem::new(activity_row(item, None, row_width, app.theme())))
+            .zip(&projection.items)
+            .map(|(item, target)| {
+                ListItem::new(lifecycle_activity_row(
+                    item,
+                    None,
+                    row_width,
+                    app.theme(),
+                    target,
+                    "unseen",
+                ))
+            })
             .collect()
     };
     let list = List::new(items)
-        .block(Block::default().title(" Recent ").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(format!(" Recent ({} unseen) ", projection.new_count))
+                .borders(Borders::ALL),
+        )
         .highlight_style(
             Style::default()
                 .fg(app.theme().header)
@@ -557,9 +588,46 @@ pub(super) fn truncate_display(value: &str, max_width: usize) -> String {
     output
 }
 
+#[cfg(test)]
 fn activity_row(
     item: &ActivityItem,
     occurrences: Option<usize>,
+    width: usize,
+    theme: &coding_brain_core::theme::Theme,
+) -> Line<'static> {
+    activity_row_with_count(
+        item,
+        occurrences.map(|count| format!("x{count}")),
+        width,
+        theme,
+    )
+}
+
+fn lifecycle_activity_row(
+    item: &ActivityItem,
+    count: Option<String>,
+    width: usize,
+    theme: &coding_brain_core::theme::Theme,
+    target: &ReviewTarget,
+    unseen_label: &str,
+) -> Line<'static> {
+    let prefix = review_prefix(target, unseen_label);
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let mut body = activity_row_with_count(item, count, width.saturating_sub(prefix_width), theme);
+    if target.new_member_keys.is_empty() {
+        for span in &mut body.spans {
+            span.style = review_style(target, theme);
+        }
+    }
+    let mut spans = Vec::with_capacity(body.spans.len() + 1);
+    spans.push(Span::styled(prefix, review_style(target, theme)));
+    spans.extend(body.spans);
+    Line::from(spans)
+}
+
+fn activity_row_with_count(
+    item: &ActivityItem,
+    count: Option<String>,
     width: usize,
     theme: &coding_brain_core::theme::Theme,
 ) -> Line<'static> {
@@ -567,7 +635,6 @@ fn activity_row(
     let project = safe_row_text(project_label(item).as_ref());
     let provider = safe_row_text(provider_label(item));
     let action = safe_row_text(command_label(item));
-    let count = occurrences.map(|count| format!("x{count}"));
     let count_width = count.as_deref().map(UnicodeWidthStr::width).unwrap_or(0);
     let count_reserve = count.as_ref().map(|_| FIELD_GAP + count_width).unwrap_or(0);
     let body_width = width.saturating_sub(count_reserve);
