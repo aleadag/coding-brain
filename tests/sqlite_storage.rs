@@ -4276,6 +4276,56 @@ fn review_recent_rejects_archive_metadata_even_without_marks() {
 }
 
 #[test]
+fn review_rejects_exact_mark_beyond_persisted_source_high_water() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(ReviewDb::create_current(&paths).unwrap());
+    let key = ReviewKey::derive(ReviewSurface::Attention, b"future-mark");
+    let connection = open_for_constraints(&paths.review_db());
+    connection
+        .execute(
+            "UPDATE review_meta
+             SET revision = 1, source_high_water = 1
+             WHERE surface = 'attention'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO review_marks (
+                surface, group_id, source_cursor, disposition, revision
+             ) VALUES ('attention', ?1, 2, 'reviewed', 1)",
+            [key.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+    let review = ReviewDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    let future_cursor = ActivityCursor::try_from(2_u64).unwrap();
+    let evidence = ReviewEligibility::try_new(
+        ReviewSurface::Attention,
+        Some(future_cursor),
+        vec![ReviewEligibleOccurrence::new(
+            ReviewSurface::Attention,
+            key,
+            future_cursor,
+        )],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        review.read_surface(&evidence),
+        Err(StorageError::InvalidStorage(
+            "stored review cursor exceeds its source high-water"
+        ))
+    ));
+}
+
+#[test]
 fn review_newer_cursor_resurfaces_the_same_key() {
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
@@ -5049,4 +5099,26 @@ fn review_reset_is_busy_while_a_local_connection_is_alive() {
     assert_eq!(review.user_version().unwrap(), REVIEW_SCHEMA_VERSION);
     drop(review);
     ReviewDb::reset(&paths).unwrap();
+}
+
+#[test]
+fn review_reset_rejects_replaced_gate_while_a_live_connection_uses_the_old_inode() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let review = ReviewDb::create_current(&paths).unwrap();
+    let database_before = fs::read(paths.review_db()).unwrap();
+    let inode_before = fs::metadata(paths.review_db()).unwrap().ino();
+    let gate = paths.db_dir().join("review-reset.lock");
+    fs::remove_file(&gate).unwrap();
+    write_managed_file(&gate, b"replacement generation");
+
+    let reset = ReviewDb::reset(&paths);
+
+    assert!(matches!(
+        reset,
+        Err(StorageError::Busy | StorageError::InvalidStorage(_))
+    ));
+    assert_eq!(fs::metadata(paths.review_db()).unwrap().ino(), inode_before);
+    assert_eq!(fs::read(paths.review_db()).unwrap(), database_before);
+    assert_eq!(review.user_version().unwrap(), REVIEW_SCHEMA_VERSION);
 }

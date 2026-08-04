@@ -315,8 +315,13 @@ impl BrainDb {
 
 pub struct ReviewDb {
     connection: Connection,
-    _reset_gate: File,
+    _reset_guard: ReviewResetGuard,
     deadline: Option<StorageDeadline>,
+}
+
+struct ReviewResetGuard {
+    _gate: File,
+    directory: SecureDatabaseDirectory,
 }
 
 impl fmt::Debug for ReviewDb {
@@ -327,11 +332,11 @@ impl fmt::Debug for ReviewDb {
 
 impl ReviewDb {
     pub fn create_current(paths: &StoragePaths) -> Result<Self, StorageError> {
-        let reset_gate = acquire_review_reset_gate(paths, true, false)?;
+        let reset_guard = acquire_review_reset_guard(paths, true, false)?;
         let connection = create_current(paths, REVIEW_DATABASE_NAME, DatabaseKind::Review)?;
         Ok(Self {
             connection,
-            _reset_gate: reset_gate,
+            _reset_guard: reset_guard,
             deadline: None,
         })
     }
@@ -342,26 +347,27 @@ impl ReviewDb {
         deadline: StorageDeadline,
     ) -> Result<Self, StorageError> {
         deadline.ensure_remaining()?;
-        let reset_gate = acquire_review_reset_gate(paths, false, false)?;
+        let reset_guard = acquire_review_reset_guard(paths, false, false)?;
         deadline.ensure_remaining()?;
         let connection = open_current(paths, REVIEW_DATABASE_NAME, DatabaseKind::Review, deadline)?;
         Ok(Self {
             connection,
-            _reset_gate: reset_gate,
+            _reset_guard: reset_guard,
             deadline: Some(deadline),
         })
     }
 
     pub fn reset(paths: &StoragePaths) -> Result<(), StorageError> {
-        let directory = SecureDatabaseDirectory::prepare(&paths.state_root, true)?;
-        let reset_gate = directory.open_lock_file(REVIEW_RESET_GATE_NAME, true)?;
-        lock_review_reset_gate(&reset_gate, true)?;
-        directory.remove_database(REVIEW_DATABASE_NAME)?;
-        drop(create_current(
-            paths,
+        let reset_guard = acquire_review_reset_guard(paths, true, true)?;
+        reset_guard
+            .directory
+            .remove_database(REVIEW_DATABASE_NAME)?;
+        drop(create_current_in_directory(
+            &reset_guard.directory,
             REVIEW_DATABASE_NAME,
             DatabaseKind::Review,
         )?);
+        reset_guard.directory.validate_path_correspondence()?;
         Ok(())
     }
 
@@ -382,22 +388,29 @@ impl ReviewDb {
     }
 }
 
-fn acquire_review_reset_gate(
+fn acquire_review_reset_guard(
     paths: &StoragePaths,
     create: bool,
     exclusive: bool,
-) -> Result<File, StorageError> {
+) -> Result<ReviewResetGuard, StorageError> {
     let directory = SecureDatabaseDirectory::prepare(&paths.state_root, create)?;
+    lock_review_reset_file(directory.state_root_descriptor(), exclusive)?;
+    directory.validate_path_correspondence()?;
     let gate = directory.open_lock_file(REVIEW_RESET_GATE_NAME, create)?;
-    lock_review_reset_gate(&gate, exclusive)?;
-    Ok(gate)
+    lock_review_reset_file(&gate, exclusive)?;
+    directory.validate_lock_file(REVIEW_RESET_GATE_NAME, &gate)?;
+    directory.validate_path_correspondence()?;
+    Ok(ReviewResetGuard {
+        _gate: gate,
+        directory,
+    })
 }
 
-fn lock_review_reset_gate(gate: &File, exclusive: bool) -> Result<(), StorageError> {
+fn lock_review_reset_file(file: &File, exclusive: bool) -> Result<(), StorageError> {
     let result = if exclusive {
-        gate.try_lock_exclusive()
+        file.try_lock_exclusive()
     } else {
-        FileExt::try_lock_shared(gate)
+        FileExt::try_lock_shared(file)
     };
     result.map_err(|error| {
         if error.kind() == io::ErrorKind::WouldBlock {
@@ -414,6 +427,15 @@ fn create_current(
     kind: DatabaseKind,
 ) -> Result<Connection, StorageError> {
     let directory = SecureDatabaseDirectory::prepare(&paths.state_root, true)?;
+    create_current_in_directory(&directory, database_name, kind)
+}
+
+fn create_current_in_directory(
+    directory: &SecureDatabaseDirectory,
+    database_name: &CStr,
+    kind: DatabaseKind,
+) -> Result<Connection, StorageError> {
+    directory.validate_path_correspondence()?;
     directory.reject_untrusted_entries(database_name, false)?;
     let file = directory.create_database_file(database_name)?;
     drop(file);
@@ -425,6 +447,7 @@ fn create_current(
     schema::configure_connection(&connection, None)?;
     schema::initialize_current(&connection, kind)?;
     directory.validate_after_open(database_name)?;
+    directory.validate_path_correspondence()?;
     Ok(connection)
 }
 

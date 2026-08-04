@@ -26,6 +26,8 @@ impl From<io::Error> for SecurityError {
 }
 
 pub(super) struct SecureDatabaseDirectory {
+    state_root_descriptor: File,
+    state_root_path: PathBuf,
     descriptor: File,
     path: PathBuf,
 }
@@ -33,19 +35,55 @@ pub(super) struct SecureDatabaseDirectory {
 impl SecureDatabaseDirectory {
     pub(super) fn prepare(state_root: &Path, create: bool) -> Result<Self, SecurityError> {
         validate_or_create_state_root(state_root, create)?;
+        let state_root_path = state_root_for_traversal(state_root).into_owned();
+        let state_root_descriptor = open_existing_directory(&state_root_path)?;
         if create {
-            let state_root = open_existing_directory(state_root)?;
-            open_or_create_directory_at(&state_root, OsStr::new("db"), true)?;
+            open_or_create_directory_at(&state_root_descriptor, OsStr::new("db"), true)?;
         }
-        let path = state_root.join("db");
-        let descriptor = open_existing_directory(&path)?;
+        let descriptor = open_directory_at(&state_root_descriptor, OsStr::new("db"))?;
         validate_private_directory(&descriptor)?;
         validate_local_filesystem(&descriptor)?;
-        Ok(Self { descriptor, path })
+        let path = state_root_path.join("db");
+        Ok(Self {
+            state_root_descriptor,
+            state_root_path,
+            descriptor,
+            path,
+        })
     }
 
     pub(super) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(super) fn state_root_descriptor(&self) -> &File {
+        &self.state_root_descriptor
+    }
+
+    pub(super) fn validate_path_correspondence(&self) -> Result<(), SecurityError> {
+        let current_state_root = open_existing_directory(&self.state_root_path)?;
+        let retained_state_root = EntryMetadata::from(&self.state_root_descriptor.metadata()?);
+        let reopened_state_root = EntryMetadata::from(&current_state_root.metadata()?);
+        if retained_state_root.dev != reopened_state_root.dev
+            || retained_state_root.ino != reopened_state_root.ino
+        {
+            return Err(SecurityError::Invalid(
+                "database state root changed after anchor acquisition",
+            ));
+        }
+        let current_database_directory =
+            open_directory_at(&self.state_root_descriptor, OsStr::new("db"))?;
+        let retained_database_directory = EntryMetadata::from(&self.descriptor.metadata()?);
+        let reopened_database_directory =
+            EntryMetadata::from(&current_database_directory.metadata()?);
+        if retained_database_directory.dev != reopened_database_directory.dev
+            || retained_database_directory.ino != reopened_database_directory.ino
+        {
+            return Err(SecurityError::Invalid(
+                "database directory changed after anchor acquisition",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn reject_untrusted_entries(
@@ -131,6 +169,19 @@ impl SecureDatabaseDirectory {
             return Err(SecurityError::Invalid("database lock changed during open"));
         }
         Ok(file)
+    }
+
+    pub(super) fn validate_lock_file(&self, name: &CStr, file: &File) -> Result<(), SecurityError> {
+        let opened = EntryMetadata::from(&file.metadata()?);
+        let at_path = metadata_at(&self.descriptor, name)?;
+        validate_private_file(&opened)?;
+        validate_private_file(&at_path)?;
+        if at_path.dev != opened.dev || at_path.ino != opened.ino {
+            return Err(SecurityError::Invalid(
+                "database lock changed after locking",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn validate_after_open(&self, database_name: &CStr) -> Result<(), SecurityError> {

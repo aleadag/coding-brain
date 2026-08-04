@@ -59,7 +59,7 @@ test result: FAILED. 0 passed; 1 failed
 - `ReviewEligibility` binds one closed surface to at most `MAX_REVIEW_KEYS` exact key/cursor occurrences and a nondecreasing Brain high-water. Each occurrence retains its source surface and exact existing `ReviewKey`; its bounded SQLite group ID is the key's stable hexadecimal form, including opaque legacy Review identities.
 - `ReviewDb::read_surface` loads one bounded indexed surface. A mark applies only when group ID and nonzero source cursor both match current captured evidence.
 - `ReviewDb::mutate` validates before SQL, starts one immediate transaction, loads and prunes only the affected surface, applies the shared pure mutation rules, replaces exact rows, updates metadata, verifies counts, and commits within the caller's deadline.
-- Every `ReviewDb` holds a shared, descriptor-relative `review-reset.lock` for its connection lifetime. Reset acquires that validated owner-only gate exclusively before touching SQLite, returns `Busy` while any local or other-process Review connection remains alive, and holds the gate through direct database recreation.
+- Every `ReviewDb` retains the validated state-root and database-directory descriptors, takes a shared lock on the state-root descriptor before the descriptor-relative `review-reset.lock`, and holds both for its connection lifetime. Reset takes the same anchor and gate exclusively in that order before touching SQLite. The independently anchored state-root lock still conflicts if the named gate or database-directory pathname is replaced, while post-lock descriptor/path checks fail closed on races.
 - `ReviewDb::reset` validates the database, reset gate, and known sidecars descriptor-relatively; it rejects symlinks, hard links, broad modes, unknown sidecars, and path substitution, then recreates only `review.sqlite3`.
 - SQLite revision `i64::MAX` maps to `ReviewRevisionOverflow` before any signed cast. Recent archive rows or metadata fail closed, and mutation loops recheck the absolute deadline.
 
@@ -97,7 +97,7 @@ Final workspace gates after the completed self-review:
 
 ```text
 $ nix develop path:. --command cargo test --workspace --all-targets -- --test-threads=1
-25 successful test binaries; 3144 passed; 0 failed
+25 successful test binaries; 3145 passed; 0 failed
 
 $ nix develop path:. --command cargo clippy --workspace --all-targets -- -D warnings
 Finished `dev` profile; no warnings
@@ -113,4 +113,40 @@ exit 0; no `rusqlite` dependency
 
 $ cmp -s src/brain/storage/schema-v1/review.sql tests/fixtures/storage/schema-v1/review.sql
 exit 0
+```
+
+## Review follow-up
+
+An independent review found that the named reset gate was itself a replaceable inode. The real regression unlinked and recreated a valid owner-only gate while a live `ReviewDb` held the old inode; reset incorrectly returned success and replaced `review.sqlite3`. A second corruption regression inserted an exact mark whose cursor exceeded the persisted surface high-water; `read_surface` incorrectly accepted the mark.
+
+```text
+$ nix develop path:. --command cargo test --test sqlite_storage review_reset_rejects_replaced_gate_while_a_live_connection_uses_the_old_inode -- --exact --nocapture
+RED: reset returned success, so the expected Busy or InvalidStorage assertion failed
+GREEN: test result: ok. 1 passed; 0 failed
+
+$ nix develop path:. --command cargo test --test sqlite_storage review_rejects_exact_mark_beyond_persisted_source_high_water -- --exact --nocapture
+RED: read_surface accepted the corrupt exact future mark, so the expected InvalidStorage assertion failed
+GREEN: test result: ok. 1 passed; 0 failed
+```
+
+The fix retains the validated state-root descriptor as the lock anchor for every live Review connection and reset, with lock order `state-root anchor -> named gate -> SQLite`. Connection field order releases SQLite before the guard, and guard field order releases the named gate before the anchor. `load_surface` now rejects every stored cursor above `review_meta.source_high_water` before exact-evidence matching.
+
+Fresh follow-up verification:
+
+```text
+$ nix develop path:. --command cargo test --test brain_review_state --test sqlite_storage review -- --test-threads=1
+brain_review_state: 1 passed; 0 failed; 1 ignored
+sqlite_storage: 25 passed; 0 failed; 1 ignored
+
+$ nix develop path:. --command cargo test --workspace --all-targets --quiet -- --test-threads=1
+25 successful test binaries; 3145 passed; 0 failed
+
+$ nix develop path:. --command cargo clippy --workspace --all-targets -- -D warnings
+Finished `dev` profile; no warnings
+
+$ nix develop path:. --command cargo fmt --all -- --check
+exit 0
+
+$ nix develop path:. --command cargo build --workspace --all-targets
+Finished `dev` profile
 ```

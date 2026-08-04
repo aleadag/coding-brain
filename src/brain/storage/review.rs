@@ -392,6 +392,11 @@ fn load_surface(
             row.get::<_, i64>(1)?,
             "stored review cursor is out of range",
         )?;
+        if source_cursor > stored_high_water {
+            return Err(StorageError::InvalidStorage(
+                "stored review cursor exceeds its source high-water",
+            ));
+        }
         let disposition = parse_disposition(&row.get::<_, String>(2)?)?;
         if evidence.surface == ReviewSurface::Recent && disposition == ReviewDisposition::Archived {
             return Err(StorageError::InvalidStorage(
