@@ -333,7 +333,16 @@ impl fmt::Debug for ReviewDb {
 impl ReviewDb {
     pub fn create_current(paths: &StoragePaths) -> Result<Self, StorageError> {
         let reset_guard = acquire_review_reset_guard(paths, true, false)?;
-        let connection = create_current(paths, REVIEW_DATABASE_NAME, DatabaseKind::Review)?;
+        Self::create_current_after_guard(reset_guard)
+    }
+
+    fn create_current_after_guard(reset_guard: ReviewResetGuard) -> Result<Self, StorageError> {
+        let connection = create_current_in_directory(
+            &reset_guard.directory,
+            REVIEW_DATABASE_NAME,
+            DatabaseKind::Review,
+        )?;
+        reset_guard.directory.validate_path_correspondence()?;
         Ok(Self {
             connection,
             _reset_guard: reset_guard,
@@ -349,7 +358,21 @@ impl ReviewDb {
         deadline.ensure_remaining()?;
         let reset_guard = acquire_review_reset_guard(paths, false, false)?;
         deadline.ensure_remaining()?;
-        let connection = open_current(paths, REVIEW_DATABASE_NAME, DatabaseKind::Review, deadline)?;
+        Self::open_current_after_guard(reset_guard, deadline)
+    }
+
+    fn open_current_after_guard(
+        reset_guard: ReviewResetGuard,
+        deadline: StorageDeadline,
+    ) -> Result<Self, StorageError> {
+        reset_guard.directory.validate_path_correspondence()?;
+        let connection = open_current_in_directory(
+            &reset_guard.directory,
+            REVIEW_DATABASE_NAME,
+            DatabaseKind::Review,
+            deadline,
+        )?;
+        reset_guard.directory.validate_path_correspondence()?;
         Ok(Self {
             connection,
             _reset_guard: reset_guard,
@@ -459,6 +482,15 @@ fn open_current(
 ) -> Result<Connection, StorageError> {
     deadline.ensure_remaining()?;
     let directory = SecureDatabaseDirectory::prepare(&paths.state_root, false)?;
+    open_current_in_directory(&directory, database_name, kind, deadline)
+}
+
+fn open_current_in_directory(
+    directory: &SecureDatabaseDirectory,
+    database_name: &CStr,
+    kind: DatabaseKind,
+    deadline: StorageDeadline,
+) -> Result<Connection, StorageError> {
     deadline.ensure_remaining()?;
     directory.reject_untrusted_entries(database_name, true)?;
     deadline.ensure_remaining()?;
@@ -483,4 +515,57 @@ fn open_connection(path: &Path) -> Result<Connection, StorageError> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW
             | OpenFlags::SQLITE_OPEN_EXRESCODE,
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn replace_database_directory(root: &Path, copy_review_database: bool) {
+        let paths = StoragePaths::at(root);
+        let retained = root.join("db-retained");
+        fs::rename(paths.db_dir(), &retained).unwrap();
+        fs::create_dir(paths.db_dir()).unwrap();
+        fs::set_permissions(paths.db_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+        if copy_review_database {
+            fs::copy(retained.join("review.sqlite3"), paths.review_db()).unwrap();
+            fs::set_permissions(paths.review_db(), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn review_create_rejects_database_directory_replacement_after_guard_acquisition() {
+        let create_root = tempfile::tempdir().unwrap();
+        fs::set_permissions(create_root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let create_paths = StoragePaths::at(create_root.path());
+        let create_guard = acquire_review_reset_guard(&create_paths, true, false).unwrap();
+        replace_database_directory(create_root.path(), false);
+
+        assert!(matches!(
+            ReviewDb::create_current_after_guard(create_guard),
+            Err(StorageError::InvalidStorage(_))
+        ));
+        assert!(!create_paths.review_db().exists());
+    }
+
+    #[test]
+    fn review_open_rejects_database_directory_replacement_after_guard_acquisition() {
+        let open_root = tempfile::tempdir().unwrap();
+        fs::set_permissions(open_root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let open_paths = StoragePaths::at(open_root.path());
+        drop(ReviewDb::create_current(&open_paths).unwrap());
+        let open_guard = acquire_review_reset_guard(&open_paths, false, false).unwrap();
+        replace_database_directory(open_root.path(), true);
+
+        assert!(matches!(
+            ReviewDb::open_current_after_guard(
+                open_guard,
+                StorageDeadline::after(Duration::from_millis(250)),
+            ),
+            Err(StorageError::InvalidStorage(_))
+        ));
+    }
 }

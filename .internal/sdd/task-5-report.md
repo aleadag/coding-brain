@@ -150,3 +150,40 @@ exit 0
 $ nix develop path:. --command cargo build --workspace --all-targets
 Finished `dev` profile
 ```
+
+## Retained-directory constructor follow-up
+
+A final full-range review found that both public Review constructors acquired guard generation A and then called generic path-based helpers that independently prepared storage. Replacing `db/` in that gap let creation write a new `review.sqlite3` in generation B and let opening connect to a valid copied database in B before the retained guard detected the mismatch.
+
+The deterministic unit regressions acquire the real guard, replace `db/`, and invoke the same private after-guard constructor seams. Reverting those seams to the original generic re-prepare behavior reproduced both failures:
+
+```text
+$ nix develop path:. --command cargo test database_directory_replacement_after_guard_acquisition -- --nocapture
+test review_create_rejects_database_directory_replacement_after_guard_acquisition ... FAILED
+test review_open_rejects_database_directory_replacement_after_guard_acquisition ... FAILED
+test result: FAILED. 0 passed; 2 failed
+```
+
+`ReviewDb::create_current` now creates through `reset_guard.directory`. `ReviewDb::open_current` uses a factored `open_current_in_directory` with the same retained descriptor. Both after-guard seams perform a final retained path-correspondence check. The generic `BrainDb` path behavior is unchanged apart from calling the factored open helper.
+
+```text
+$ nix develop path:. --command cargo test database_directory_replacement_after_guard_acquisition -- --nocapture
+lib: test result: ok. 2 passed; 0 failed
+bin: test result: ok. 2 passed; 0 failed
+
+$ nix develop path:. --command cargo test --test brain_review_state --test sqlite_storage review -- --test-threads=1
+brain_review_state: 1 passed; 0 failed; 1 ignored
+sqlite_storage: 25 passed; 0 failed; 1 ignored
+
+$ nix develop path:. --command cargo test --workspace --all-targets --quiet -- --test-threads=1
+25 successful test binaries; 3149 passed; 0 failed
+
+$ nix develop path:. --command cargo clippy --workspace --all-targets -- -D warnings
+Finished `dev` profile; no warnings
+
+$ nix develop path:. --command cargo fmt --all -- --check
+exit 0
+
+$ nix develop path:. --command cargo build --workspace --all-targets
+Finished `dev` profile
+```
