@@ -203,6 +203,11 @@ CREATE TABLE lifecycle_sessions (
     FOREIGN KEY (provider, provider_session_id)
         REFERENCES lifecycle_sessions (provider, session_id) ON DELETE CASCADE,
     CHECK (
+        (latest_event = 'session_start' AND session_start_source IS NOT NULL)
+        OR
+        (latest_event != 'session_start' AND session_start_source IS NULL)
+    ),
+    CHECK (
         (
             signature_event IS NULL
             AND signature_turn_id IS NULL
@@ -230,6 +235,25 @@ CREATE TABLE lifecycle_sessions (
             AND signature_detail_id IS NULL
             AND signature_session_start_source IS NULL
         )
+    ),
+    CHECK (
+        (
+            latest_event = 'permission_request'
+            AND signature_event IS NULL
+            AND signature_turn_id IS NULL
+            AND signature_detail_id IS NULL
+            AND signature_session_start_source IS NULL
+        )
+        OR
+        (
+            latest_event != 'permission_request'
+            AND signature_event IS NOT NULL
+            AND signature_event = latest_event
+            AND (
+                latest_event != 'session_start'
+                OR signature_session_start_source = session_start_source
+            )
+        )
     )
 ) STRICT;
 
@@ -254,7 +278,22 @@ CREATE TABLE lifecycle_leases (
     projected_status TEXT NOT NULL CHECK (projected_status IN ('processing', 'needs_input', 'idle')),
     PRIMARY KEY (provider, session_id),
     FOREIGN KEY (provider, session_id)
-        REFERENCES lifecycle_sessions (provider, session_id) ON DELETE CASCADE
+        REFERENCES lifecycle_sessions (provider, session_id) ON DELETE CASCADE,
+    CHECK (
+        (status_event = 'stop' AND projected_status = 'idle')
+        OR
+        (
+            status_event = 'permission_request'
+            AND projected_status IN ('processing', 'needs_input')
+        )
+        OR
+        (
+            status_event IN (
+                'user_prompt_submit', 'pre_tool_use', 'post_tool_use', 'subagent_start'
+            )
+            AND projected_status = 'processing'
+        )
+    )
 ) STRICT;
 
 CREATE INDEX lifecycle_leases_status

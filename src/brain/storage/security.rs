@@ -278,14 +278,16 @@ fn validate_safe_ancestor_metadata(metadata: &EntryMetadata) -> Result<(), Secur
             "state directory ancestor is not a directory",
         ));
     }
-    if metadata.mode & 0o022 != 0 {
-        let sticky = metadata.mode & libc::S_ISVTX as u32 != 0;
-        let trusted_owner = metadata.uid == 0 || metadata.uid == unsafe { libc::geteuid() };
-        if !sticky || !trusted_owner {
-            return Err(SecurityError::Invalid(
-                "state directory ancestor is replaceable by another user",
-            ));
-        }
+    let trusted_owner = metadata.uid == 0 || metadata.uid == unsafe { libc::geteuid() };
+    if !trusted_owner {
+        return Err(SecurityError::Invalid(
+            "state directory ancestor is foreign-owned",
+        ));
+    }
+    if metadata.mode & 0o022 != 0 && metadata.mode & libc::S_ISVTX as u32 == 0 {
+        return Err(SecurityError::Invalid(
+            "state directory ancestor is replaceable by another user",
+        ));
     }
     Ok(())
 }
@@ -433,5 +435,37 @@ mod tests {
         };
 
         assert!(validate_private_state_root_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)] // libc mode constants vary in width across Unix targets.
+    fn safe_ancestor_metadata_rejects_foreign_owner_even_without_write_bits() {
+        let metadata = EntryMetadata {
+            mode: libc::S_IFDIR as u32 | 0o755,
+            uid: unsafe { libc::geteuid() }.wrapping_add(1),
+            nlink: 1,
+            dev: 1,
+            ino: 1,
+        };
+
+        assert!(validate_safe_ancestor_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)] // libc mode constants vary in width across Unix targets.
+    fn safe_ancestor_metadata_requires_sticky_for_trusted_writable_owner() {
+        let mut metadata = EntryMetadata {
+            mode: libc::S_IFDIR as u32 | 0o777,
+            uid: unsafe { libc::geteuid() },
+            nlink: 1,
+            dev: 1,
+            ino: 1,
+        };
+
+        assert!(validate_safe_ancestor_metadata(&metadata).is_err());
+        metadata.mode |= libc::S_ISVTX as u32;
+        assert!(validate_safe_ancestor_metadata(&metadata).is_ok());
+        metadata.uid = 0;
+        assert!(validate_safe_ancestor_metadata(&metadata).is_ok());
     }
 }

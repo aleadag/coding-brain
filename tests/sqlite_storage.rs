@@ -740,7 +740,7 @@ fn lifecycle_schema_enforces_provider_qualified_topology() {
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, provider_session_id,
             latest_event, latest_sequence, latest_received_at_ms
-         ) VALUES ('codex', 'orphan', X'2F', 'missing', 'stop', 1, 1)",
+         ) VALUES ('codex', 'orphan', X'2F', 'missing', 'permission_request', 1, 1)",
         "INSERT INTO lifecycle_turns (
             provider, session_id, continuity_state, turn_id, turn_open
          ) VALUES ('codex', 'missing', 'current', 'turn-1', 1)",
@@ -760,7 +760,7 @@ fn lifecycle_schema_enforces_provider_qualified_topology() {
                 provider, session_id, cwd, latest_event, latest_sequence,
                 latest_received_at_ms, session_start_source
              ) VALUES (
-                'codex', 'permission-fact', X'2F', 'permission_request', 2, 2, 'startup'
+                'codex', 'permission-fact', X'2F', 'permission_request', 2, 2, NULL
              );
              INSERT INTO lifecycle_leases (
                 provider, session_id, status_event, status_sequence,
@@ -779,33 +779,34 @@ fn lifecycle_schema_enforces_provider_qualified_topology() {
     for rejected in [
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
-         ) VALUES ('unknown', 'bad-provider', X'2F', 'stop', 1, 1)",
+         ) VALUES ('unknown', 'bad-provider', X'2F', 'permission_request', 1, 1)",
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
-         ) VALUES ('codex', '', X'2F', 'stop', 1, 1)",
+         ) VALUES ('codex', '', X'2F', 'permission_request', 1, 1)",
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
-         ) VALUES ('codex', printf('%0513d', 0), X'2F', 'stop', 1, 1)",
+         ) VALUES ('codex', printf('%0513d', 0), X'2F', 'permission_request', 1, 1)",
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
-         ) VALUES ('codex', 'empty-cwd', X'', 'stop', 1, 1)",
+         ) VALUES ('codex', 'empty-cwd', X'', 'permission_request', 1, 1)",
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
-         ) VALUES ('codex', 'long-cwd', zeroblob(4097), 'stop', 1, 1)",
+         ) VALUES ('codex', 'long-cwd', zeroblob(4097), 'permission_request', 1, 1)",
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, transcript_path,
             latest_event, latest_sequence, latest_received_at_ms
-         ) VALUES ('codex', 'long-transcript', X'2F', zeroblob(4097), 'stop', 1, 1)",
+         ) VALUES ('codex', 'long-transcript', X'2F', zeroblob(4097),
+                   'permission_request', 1, 1)",
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
-         ) VALUES ('codex', 'zero-sequence', X'2F', 'stop', 0, 1)",
+         ) VALUES ('codex', 'zero-sequence', X'2F', 'permission_request', 0, 1)",
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
-         ) VALUES ('codex', 'negative-time', X'2F', 'stop', 1, -1)",
+         ) VALUES ('codex', 'negative-time', X'2F', 'permission_request', 1, -1)",
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, latest_event, latest_sequence,
             latest_received_at_ms, ignored_reason
-         ) VALUES ('codex', 'bad-ignore', X'2F', 'stop', 1, 1, 'unknown')",
+         ) VALUES ('codex', 'bad-ignore', X'2F', 'permission_request', 1, 1, 'unknown')",
         "INSERT INTO lifecycle_sessions (
             provider, session_id, cwd, latest_event, latest_sequence,
             latest_received_at_ms, signature_event, signature_turn_id
@@ -815,6 +816,27 @@ fn lifecycle_schema_enforces_provider_qualified_topology() {
             provider, session_id, cwd, latest_event, latest_sequence,
             latest_received_at_ms, signature_detail_id
          ) VALUES ('codex', 'detached-detail', X'2F', 'stop', 1, 1, 'request-key')",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence,
+            latest_received_at_ms, session_start_source
+         ) VALUES ('codex', 'permission-source', X'2F',
+                   'permission_request', 1, 1, 'startup')",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence,
+            latest_received_at_ms, signature_event, signature_session_start_source
+         ) VALUES ('codex', 'missing-start-source', X'2F',
+                   'session_start', 1, 1, 'session_start', 'startup')",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence,
+            latest_received_at_ms, signature_event, signature_turn_id
+         ) VALUES ('codex', 'mismatched-signature', X'2F',
+                   'pre_tool_use', 1, 1, 'post_tool_use', 'turn-1')",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence,
+            latest_received_at_ms, session_start_source,
+            signature_event, signature_session_start_source
+         ) VALUES ('codex', 'mismatched-source', X'2F', 'session_start', 1, 1,
+                   'startup', 'session_start', 'resume')",
         "INSERT INTO lifecycle_leases (
             provider, session_id, status_event, status_sequence,
             status_received_at_ms, projected_status
@@ -827,6 +849,14 @@ fn lifecycle_schema_enforces_provider_qualified_topology() {
             provider, session_id, status_event, status_sequence,
             status_received_at_ms, projected_status
          ) VALUES ('codex', 'root-1', 'stop', 0, 1, 'idle')",
+        "INSERT INTO lifecycle_leases (
+            provider, session_id, status_event, status_sequence,
+            status_received_at_ms, projected_status
+         ) VALUES ('codex', 'root-1', 'stop', 1, 1, 'processing')",
+        "INSERT INTO lifecycle_leases (
+            provider, session_id, status_event, status_sequence,
+            status_received_at_ms, projected_status
+         ) VALUES ('codex', 'root-1', 'pre_tool_use', 1, 1, 'idle')",
         "INSERT INTO lifecycle_turns (
             provider, session_id, continuity_state, turn_id, turn_open
          ) VALUES ('codex', 'root-1', 'current', 'turn-2', 1)",
