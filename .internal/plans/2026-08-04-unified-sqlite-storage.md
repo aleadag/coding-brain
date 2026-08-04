@@ -14,14 +14,27 @@
 - Keep `rusqlite` in the root package only; `coding-brain-core` must not depend on SQLite or binary modules.
 - Use `$XDG_STATE_HOME/coding-brain/db/brain.sqlite3` and `review.sqlite3` under a validated owner-only local-filesystem directory.
 - Use WAL, `synchronous=FULL`, foreign keys, defensive mode, `trusted_schema=OFF`, disabled extension loading, secure deletion, and explicit SQLite limits.
-- One monotonic hook storage deadline covers open, busy retries, admission, permission commit, and delivery evidence.
+- One absolute hook deadline starts before admission. Inference consumes it, and open, busy retries, commit, and delivery evidence receive only its remaining time; no phase resets it.
 - Hooks never initialize or migrate schema. Missing, busy, incomplete, unsafe, corrupt, older, or newer Brain storage leaves native provider handling authoritative.
 - Deterministic code-owned safety denies remain fail-closed if audit storage is unavailable.
 - Never ship a partial live SQLite/JSONL permission split. Legacy readers exist only for migration/export fixtures until final cutover.
 - Keep `session-links.jsonl` unchanged; missing or inconsistent links disable exact navigation/recovery action, not permission authority.
 - Preserve a nonreusing 64-bit activity source cursor and the cursor in the last published immutable preference generation.
+- Restrict activity cursors to exact positive SQLite integers (`1..=i64::MAX`) and fail closed before allocation at the upper bound.
+- Treat `forget()` as verified logical erasure from Coding Brain-managed stores; do not promise physical-media, snapshot, or backup erasure.
+- Task 8 is the only production activation point. Earlier tasks may add adapters and tests but must leave every live legacy writer intact.
 - Do not commit raw runtime state, sensitive commands, fixture secrets, or user paths.
 - Every behavior change is test-first and every task ends with a fresh focused gate before its atomic commit.
+
+---
+
+## Preflight Baseline
+
+Before Task 1 changes any dependency or source file, run:
+
+`nix develop path:. --command cargo test --workspace --all-targets -- --test-threads=1`
+
+Record any pre-existing failure on `codexctl-dzlb9`; do not attribute it to the migration or weaken a production threshold to make it pass.
 
 ---
 
@@ -53,6 +66,7 @@
 - Create: `src/brain/storage/schema.rs`
 - Create: `src/brain/storage/security.rs`
 - Create: `tests/sqlite_storage.rs`
+- Add fixture: `tests/fixtures/storage/schema-v1/**`
 
 **Interfaces:**
 - Produces: `StoragePaths::at(&Path)`, `StorageDeadline`, `OpenRole`, `BrainDb::create_current`, `BrainDb::open_current`, `ReviewDb::create_current`, `ReviewDb::open_current`, and `StorageError`.
@@ -64,6 +78,22 @@
 - Fresh databases have exact application/schema versions, required pragmas, owner-only files, and no dependency on a system SQLite library.
 - Unsafe ancestors, database files, or pre-existing sidecars are rejected before authoritative use.
 - Hook-role opening never creates or upgrades a database and respects one absolute deadline.
+- A frozen schema fixture and constraint tests enforce the authority invariant matrix below.
+
+**Schema Invariant Matrix:**
+
+| Table | Required identity and constraints | Required query path |
+|---|---|---|
+| `schema_meta` | Singleton row; exact application/schema generation; migration and erasure states use closed `CHECK` domains; `activity_high_water` is `0..=i64::MAX`. | Exact singleton lookup on every open. |
+| `permission_attempts` | Primary key `attempt_id`; complete authority identity stored in typed columns; request identity is indexed but not unique; attempt state uses a closed domain. | Exact attempt lookup and active request-identity lookup. |
+| `decision_identities` | Primary key `decision_id`; immutable authority identity/action columns; composite uniqueness supports commit references. | Exact decision and authority-identity lookup. |
+| `decision_payloads` | Primary/foreign key `decision_id` to identity; bounded erasable learning fields only. | Joined committed-learning query by source cursor. |
+| `activity_events` | Primary key `source_cursor` with `1..=i64::MAX` check; unique activity ID; typed terminal action/identity columns support composite commit references. | Cursor pages, activity ID, permission identity, outcome, correction, and distillation indexes. |
+| `permission_commits` | One row per attempt; unique decision and terminal activity references; composite foreign keys require matching authority identity/action across attempt, decision, and terminal event; closed action/evidence/delivery domains; boolean `response_eligible` check. | Exact attempt/request authority and undelivered-audit lookup. |
+| lifecycle session/turn/invocation tables | Provider-qualified composite keys, bounded sequence values, and foreign keys from turns/invocations to sessions; no duplicate active identity. | Exact provider/session/turn and active-topology indexes. |
+| review `review_meta` / `review_marks` | Per-surface revision; exact surface/group/source-cursor key; closed disposition domain; no Brain tables or attachments. | Exact surface revision and bounded cursor-mark lookup. |
+
+The checked-in schema fixture is authoritative. Any DDL change after Task 1 must update its version, fixture, invariant tests, and supported-upgrade coverage before the same atomic commit.
 
 - [ ] **Step 1: Write failing foundation tests**
 
@@ -132,7 +162,7 @@ impl StorageDeadline {
 }
 ```
 
-Configure each connection with static pragmas, `OpenFlags::SQLITE_OPEN_NO_FOLLOW`, disabled extension loading, defensive database config, and explicit length/column/SQL limits. Validate the dedicated directory and every pre-existing entry before open.
+Implement the complete invariant-matrix DDL and check in its exact schema fixture. Configure each connection with static pragmas, `OpenFlags::SQLITE_OPEN_NO_FOLLOW`, disabled extension loading, defensive database config, and explicit length/column/SQL limits. Validate the dedicated directory and every pre-existing entry before open.
 
 - [ ] **Step 4: Run foundation and packaging checks**
 
@@ -147,7 +177,7 @@ Expected: `libsqlite3-sys` appears only below the root `coding-brain` package.
 - [ ] **Step 5: Commit the atomic foundation**
 
 ```bash
-git add Cargo.toml Cargo.lock src/brain/mod.rs src/brain/storage tests/sqlite_storage.rs
+git add Cargo.toml Cargo.lock src/brain/mod.rs src/brain/storage tests/sqlite_storage.rs tests/fixtures/storage/schema-v1
 git commit -m "🗃️ feat: add secure SQLite storage foundation (codexctl-2o9fo)"
 ```
 
@@ -167,7 +197,7 @@ git commit -m "🗃️ feat: add secure SQLite storage foundation (codexctl-2o9f
 
 **Acceptance Criteria:**
 - Core lifecycle transition behavior is unchanged and fully testable without filesystem or SQLite access.
-- The complete non-permission lifecycle snapshot persists in the Brain database with the existing 1 MiB bound.
+- Complete non-permission lifecycle topology persists in typed session, turn, lease, invocation, and subagent tables; only provider-specific extras retain the existing 1 MiB aggregate bound.
 - Permission disposition/authority is absent from live core snapshot persistence and remains available only through Brain permission tables.
 - No SQLite dependency enters `coding-brain-core`.
 
@@ -193,7 +223,7 @@ Expected: compilation fails because `BrainDb::record_lifecycle` does not exist.
 
 - [ ] **Step 3: Extract pure transitions and implement lifecycle adapter**
 
-Expose one pure transition entry point in core and store the bounded serialized non-permission snapshot in `lifecycle_state`, with typed provider/session/high-sequence columns for exact lookup. Remove permission map mutation from the pure topology snapshot; permission events call the permission storage interface in Task 6.
+Expose one pure transition entry point in core. Load a bounded snapshot from relational session, turn, lease, invocation, and subagent rows, apply the transition, then persist the affected typed rows in one transaction. Bounded JSON is allowed only for validated provider-specific extras. Remove permission map mutation from the pure topology snapshot; permission events call the permission storage interface in Task 6.
 
 ```rust
 pub(crate) fn record_lifecycle(
@@ -243,6 +273,7 @@ git commit -m "♻️ refactor: separate lifecycle state from persistence (codex
 
 **Acceptance Criteria:**
 - Activity insert and high-water allocation are atomic and cursors never reuse after retention or rebuild.
+- Cursor allocation is restricted to `1..=i64::MAX`; reaching the maximum returns a fail-closed storage error without inserting or coercing a numeric value.
 - Live/Review/Scorecard inputs use indexed cursor/key queries with row and byte limits.
 - Existing projection semantics, duplicate-terminal diagnostics, corrections, outcome correlation, and delivery states remain unchanged.
 - Legacy JSONL parsing remains available only behind the migration adapter.
@@ -278,12 +309,7 @@ Expected: compilation fails on missing activity APIs.
 Use a transactionally updated `activity_high_water`; never derive it from retained rows. Insert typed columns and bounded payloads, then materialize bounded pages before calling existing pure projection code.
 
 ```rust
-let cursor: u64 = tx.query_row(
-    "UPDATE schema_meta SET activity_high_water = activity_high_water + 1
-     RETURNING activity_high_water",
-    [],
-    |row| row.get(0),
-)?;
+let cursor = checked_next_cursor(tx)?;
 insert_activity(&tx, cursor, &event)?;
 ```
 
@@ -318,8 +344,9 @@ git commit -m "🗃️ feat: add indexed SQLite activity ledger (codexctl-2o9fo)
 **Acceptance Criteria:**
 - Permission commits can retain minimal immutable decision identity after learning payload deletion.
 - Metrics, retrieval, briefing, insights, and distillation read only joined committed payloads.
-- `forget()` atomically removes payloads/canonical marks, then removes published generations and frozen legacy learning sources under one lock order.
-- Secure deletion and WAL truncation failures make erasure uncertain/failing; downgrade export cannot restore forgotten payloads.
+- `forget()` uses a durable erasure generation that remains incomplete until payloads/canonical marks, published generations, and frozen legacy learning sources are gone.
+- Learning reads and downgrade export fail closed while erasure is incomplete; startup resumes it before exposing learning data.
+- Secure deletion and WAL truncation failures leave erasure incomplete; no supported reader or export can restore forgotten payloads after completion.
 
 - [ ] **Step 1: Write failing forget and cursor-publication tests**
 
@@ -342,7 +369,7 @@ Expected: compilation fails on the new decision APIs.
 
 - [ ] **Step 3: Implement split storage and erasure ordering**
 
-Implement `decision_identities` and `decision_payloads` with `ON DELETE CASCADE` only from identity to payload, never from commit to identity. Keep the global erasure gate held across the database transaction, preference generation deletion, frozen legacy deletion, secure-delete checkpoint, and final directory sync.
+Implement `decision_identities` and `decision_payloads` with `ON DELETE CASCADE` only from identity to payload, never from commit to identity. Under the global erasure gate, first persist an incomplete erasure generation. Delete database payloads, preference generations, and frozen legacy learning files; checkpoint/truncate and sync; then mark the generation complete. Startup resumes any incomplete generation before learning reads or downgrade export. The guarantee covers Coding Brain-managed logical copies, not filesystem snapshots, backups, or physical media.
 
 - [ ] **Step 4: Run learning and process tests**
 
@@ -374,6 +401,7 @@ git commit -m "🔒 feat: make SQLite learning payload erasable (codexctl-2o9fo)
 - Review state uses only `review.sqlite3` and cannot mutate Brain authority/audit tables.
 - Revision conflicts, independent surfaces, archive/undo/reset, count validation, and new-occurrence resurfacing match current behavior.
 - Review corruption/busy state degrades review operations without disabling coherent Brain reads or permissions.
+- A review mark hides only its exact validated source cursor; later cursors always resurface and missing-cursor marks are harmless, pruneable orphans.
 
 - [ ] **Step 1: Add failing isolation tests**
 
@@ -395,7 +423,7 @@ Expected: test fails because review state still uses JSON.
 
 - [ ] **Step 3: Implement review schema and adapter**
 
-Keep the current mutation validator pure. Load the relevant surface revision/marks, apply validation, and replace only affected rows inside one immediate review transaction. Never attach `brain.sqlite3`.
+Keep the current mutation validator pure. Load the relevant surface revision/marks, apply validation, and replace only affected exact-cursor rows inside one immediate review transaction. Never attach `brain.sqlite3`. Race tests append and retain Brain activity between validation and review commit; newer cursors must remain visible and orphaned marks must not affect Brain reads.
 
 - [ ] **Step 4: Run review suites**
 
@@ -414,23 +442,22 @@ git commit -m "🗃️ feat: isolate review state in SQLite (codexctl-2o9fo)"
 
 **Files:**
 - Create: `src/brain/storage/permissions.rs`
-- Modify: `src/brain/permission_hook.rs`
 - Modify: `src/brain/permission_request_lock.rs`
-- Modify: `src/brain/permission_transaction.rs`
 - Modify: `tests/hook_activity.rs`
 - Modify: `tests/sqlite_storage.rs`
 
 **Interfaces:**
 - Produces: `PermissionAttemptGuard`, `AttemptId`, `PreparedPermissionCommit`, and `BrainDb::{admit_permission,commit_permission,record_delivery,permission_decision}`.
 - Consumes: existing request lock, `HookDecisionRecord`, `ActivityEvent`, `PermissionAuthority`, and absolute `StorageDeadline`.
-- Legacy `PermissionTransactionJournal` remains parse-only for Task 7 migration and has no live commit/recovery caller.
+- Legacy `PermissionTransactionJournal` remains the production path until Task 8 and later becomes parse-only for Task 7 migration.
 
 **Acceptance Criteria:**
 - Concurrent identical requests have one active inference winner; sequential identical requests receive distinct attempts.
 - Proposal, terminal activity, and exact authority commit atomically before stdout.
 - Failed/uncertain commit emits no model response; fresh-open state determines committed versus absent without replay.
 - DeliveryFailed and DeliveryUnknown remain distinct; deterministic safety denies survive unavailable audit.
-- No live permission journal is created or recovered.
+- SQLite permission APIs and process fixtures create no permission journal, but the production hook remains on the legacy path until Task 8.
+- One absolute deadline begins before admission, includes inference time, and cannot be reset by later storage calls or busy retries.
 
 - [ ] **Step 1: Add failing process-boundary tests**
 
@@ -450,7 +477,7 @@ fn uncertain_commit_never_emits_and_fresh_open_decides_state() {
 
 - [ ] **Step 2: Verify failure**
 
-Run: `nix develop path:. --command cargo test --test hook_activity uncertain_commit_never_emits -- --exact`
+Run: `nix develop path:. --command cargo test --test sqlite_storage uncertain_commit_never_emits -- --exact`
 
 Expected: test fails against cross-store journal behavior.
 
@@ -472,18 +499,18 @@ pub(crate) fn commit_permission(
 }
 ```
 
-Write stdout only after this returns `Ok`. A delivery append error after stdout leaves unknown evidence unless stdout itself returned an error.
+The SQLite adapter writes stdout only after this returns `Ok`. A delivery append error after stdout leaves unknown evidence unless stdout itself returned an error. Keep the production hook wired to the legacy adapter until Task 8; test this path through an explicit SQLite process fixture.
 
 - [ ] **Step 4: Run provider and permission suites**
 
-Run: `nix develop path:. --command cargo test --test hook_activity permission -- --test-threads=1`
+Run: `nix develop path:. --command cargo test --test sqlite_storage permission -- --test-threads=1`
 
-Expected: Codex, Claude, and Antigravity atomicity/delivery tests pass serially.
+Expected: SQLite atomicity, deadline exhaustion, busy-retry, and delivery tests pass serially while existing provider-hook tests remain unchanged.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/brain/storage/permissions.rs src/brain/permission_hook.rs src/brain/permission_request_lock.rs src/brain/permission_transaction.rs tests/hook_activity.rs tests/sqlite_storage.rs
+git add src/brain/storage/permissions.rs src/brain/permission_request_lock.rs tests/hook_activity.rs tests/sqlite_storage.rs
 git commit -m "🔒 feat: commit permission authority atomically (codexctl-2o9fo)"
 ```
 
@@ -498,13 +525,14 @@ git commit -m "🔒 feat: commit permission authority atomically (codexctl-2o9fo
 - Modify: `crates/coding-brain-core/src/lifecycle/store.rs`
 
 **Interfaces:**
-- Produces: `MigrationCoordinator::{inspect,run_non_hook,resume}`, `MigrationStatus`, `LegacySourceSet`, and `LEGACY_EXPORT_PROFILE`.
+- Produces: `MigrationCoordinator::{inspect,run_non_hook,resume}`, `MigrationStatus`, `LegacySourceSet`, `FrozenSourceManifest`, and `LEGACY_EXPORT_PROFILE`.
 - Consumes: bounded legacy readers, both staging database constructors, fixed-order legacy locks, source fingerprints, and directory sync.
 
 **Acceptance Criteria:**
 - Non-hook migration streams every supported legacy store; hooks only report `MigrationRequired` or `MigrationActive`.
 - Publication is restartable at every crash point and never exposes a response-eligible partial authority database.
 - Final cutover locks/fingerprints all sources, publishes an incomplete generation, freezes legacy writers, then marks Brain complete.
+- The completed generation includes a frozen-source manifest; every model attempt cheaply rejects changed inode/size/time metadata or recreated legacy paths as split-brain.
 - Exact historical proposal plus terminal Allowed/Denied becomes response-ineligible commitment; mismatches remain incomplete/diagnostic.
 - The exact `4vh58` shape migrates without blocking unrelated projection and preserves DeliveryUnknown plus later outcome.
 - Review migration failure remains isolated and preserves `review-state.json`.
@@ -532,13 +560,13 @@ Expected: compilation fails on the migration coordinator.
 
 - [ ] **Step 3: Implement staged import and cutover state machine**
 
-Use explicit states `Building`, `Verified`, `BrainPublishedIncomplete`, `LegacyFrozen`, and `Complete`. Every resume validates exact files, ownership, modes, link counts, fingerprints, and database generation before advancing. Do not delete uncertain staging or legacy evidence.
+Use explicit states `Building`, `Verified`, `BrainPublishedIncomplete`, `LegacyFrozen`, and `Complete`. Every resume validates exact files, ownership, modes, link counts, fingerprints, and database generation before advancing. At freeze, publish a manifest of exact path, inode, size, and modification metadata. Expose a bounded manifest check for Task 8 to activate before model inference; a mismatch or recreated path is split-brain. Do not delete uncertain staging or legacy evidence.
 
 - [ ] **Step 4: Run crash/source-race migration matrix**
 
 Run: `nix develop path:. --command cargo test --test storage_migration -- --test-threads=1`
 
-Expected: all schema, tail, corruption, process-kill, source-race, and review-isolation cases pass.
+Expected: all schema, tail, corruption, process-kill, source-race, pre-opened-writable-descriptor, frozen-manifest, and review-isolation cases pass.
 
 - [ ] **Step 5: Commit**
 
@@ -551,11 +579,13 @@ git commit -m "🗃️ feat: migrate legacy Brain state atomically (codexctl-2o9
 
 **Files:**
 - Modify: `src/lifecycle_hook.rs`
+- Modify: `src/brain/permission_hook.rs`
+- Modify: `src/brain/permission_transaction.rs`
 - Modify: `src/runtime/brain.rs`
 - Modify: `src/brain/recovery.rs`
 - Modify: `src/doctor.rs`
 - Modify: `src/main.rs`
-- Modify: `tests/{lifecycle_hook_cli,headless_activity,brain_tui_smoke,integration_tests}.rs`
+- Modify: `tests/{hook_activity,lifecycle_hook_cli,headless_activity,brain_tui_smoke,integration_tests}.rs`
 
 **Interfaces:**
 - Consumes: current Brain/review database facades and `MigrationCoordinator` on non-hook startup.
@@ -563,6 +593,7 @@ git commit -m "🗃️ feat: migrate legacy Brain state atomically (codexctl-2o9
 - Preserves: `SessionLinkStore` append/projection order and fail-closed guarded action semantics.
 
 **Acceptance Criteria:**
+- Tasks 1-7, 9, and 10 are complete; verified migration, downgrade export, erasure recovery, and WAL admission safeguards exist before activation.
 - Every live decision, lifecycle, activity, review, recovery, correction, Scorecard, and TUI path reads/writes SQLite.
 - Hooks never migrate and return provider-neutral/native behavior for unavailable current storage.
 - TUI Busy/error refresh retains the last coherent view and never blanks because storage recovery is blocked.
@@ -591,7 +622,7 @@ Expected: legacy files are still created.
 
 - [ ] **Step 3: Switch runtime constructors and remove recovery coupling**
 
-Route non-hook startup through migration before building TUI sources. Route permission/lifecycle hooks through `OpenRole::Hook`. Replace journal recovery status with storage migration/maintenance status. Keep old readers reachable only through `storage::legacy`.
+Route non-hook startup through migration before building TUI sources. In this one task, switch permission and lifecycle hooks through `OpenRole::Hook`, disable every live permission-journal writer/recovery caller, and activate frozen-manifest plus WAL-hard-limit admission. Replace journal recovery status with storage migration/maintenance status. Keep old readers reachable only through `storage::legacy`.
 
 - [ ] **Step 4: Run runtime and TUI suites**
 
@@ -602,7 +633,7 @@ Expected: all runtime paths pass with SQLite-only live storage and coherent degr
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/lifecycle_hook.rs src/runtime/brain.rs src/brain/recovery.rs src/doctor.rs src/main.rs tests/lifecycle_hook_cli.rs tests/headless_activity.rs tests/brain_tui_smoke.rs tests/integration_tests.rs
+git add src/lifecycle_hook.rs src/brain/permission_hook.rs src/brain/permission_transaction.rs src/runtime/brain.rs src/brain/recovery.rs src/doctor.rs src/main.rs tests/hook_activity.rs tests/lifecycle_hook_cli.rs tests/headless_activity.rs tests/brain_tui_smoke.rs tests/integration_tests.rs
 git commit -m "♻️ refactor: cut runtime over to SQLite storage (codexctl-2o9fo)"
 ```
 
@@ -623,6 +654,7 @@ git commit -m "♻️ refactor: cut runtime over to SQLite storage (codexctl-2o9
 **Acceptance Criteria:**
 - Audit export is stable, bounded, redacted, and clearly non-executable.
 - Legacy export writes only a new owner-only directory, refuses overwrite, round-trips through frozen readers, and rejects lossy evidence.
+- Legacy export refuses to run while a privacy-erasure generation is incomplete and cannot emit logically erased payloads.
 - Review reset affects only `review.sqlite3` and requires no deletion of Brain authority.
 - No command swaps exported state into the live state root.
 
@@ -681,6 +713,7 @@ git commit -m "✨ feat: export and reset SQLite storage safely (codexctl-2o9fo)
 - Disk-full/I/O errors preserve operation-specific admission/commit/delivery/checkpoint semantics.
 - Doctor reports database path, schema, bundled SQLite version, migration status, WAL size, integrity state, and fixed redacted error categories.
 - Hook paths never run vacuum, bulk retention, or full integrity checks.
+- All maintenance and fault behavior is complete and directly tested before Task 8 activates SQLite production writers.
 
 - [ ] **Step 1: Write failing WAL and disk-full tests**
 
@@ -837,6 +870,14 @@ Run: `nix develop path:. --command cargo build --workspace --all-targets`
 
 Expected: build succeeds.
 
+Run: `nix develop path:. --command cargo package --workspace --allow-dirty`
+
+Expected: every publishable crate packages from the final cleaned source tree.
+
+Run: `nix build path:.`
+
+Expected: the final Nix package builds and checks with bundled SQLite.
+
 Run: `git diff --check`
 
 Expected: no whitespace errors.
@@ -850,12 +891,48 @@ git commit -m "📝 docs: document SQLite storage cutover (codexctl-2o9fo)"
 
 ## Dependency Order
 
-1. Task 1 blocks every storage task.
-2. Task 2 blocks Tasks 6-8.
-3. Tasks 3 and 4 block Tasks 6-10.
-4. Task 5 blocks Tasks 7-9.
-5. Task 6 blocks Tasks 7, 8, 10, and 11.
-6. Task 7 blocks runtime cutover and export.
-7. Task 8 blocks final adversarial verification and cleanup.
-8. Tasks 9 and 10 block Task 11.
-9. Task 11 blocks Task 12.
+Implementation is serial because the schema and fixtures are shared mutable state, even when different workers own successive tasks:
+
+1. Run the preflight baseline.
+2. Tasks 1 through 7 run in numeric order and add only inactive SQLite adapters plus migration.
+3. Task 9 adds verified rollback/export before activation.
+4. Task 10 adds WAL, disk-failure, and maintenance safeguards before activation.
+5. Task 8 is the sole production runtime cutover.
+6. Task 11 runs the full adversarial/provider/package matrix against the active runtime.
+7. Task 12 removes obsolete live surfaces, updates documentation, and repeats every final gate.
+
+Subagent-driven execution may use a fresh worker and reviewers for each task, but only one implementation task may edit the worktree at a time.
+
+## Stress Test Results: Unified SQLite Implementation Plan
+
+### Resolved Decisions
+
+- Task 8 alone activates SQLite in production; Task 6 builds and tests inactive permission APIs without creating a partial live split.
+- Verified downgrade export and WAL/disk safeguards must exist before runtime activation.
+- Task 1 freezes an explicit schema invariant matrix and fixture rather than leaving authority constraints to implementation judgment.
+- Lifecycle topology uses typed relational tables, with bounded JSON limited to provider-specific extras.
+- Privacy erasure is a durable, resumable generation; learning reads and downgrade export fail closed while it is incomplete.
+- A frozen-source manifest detects post-cutover mutation, including legacy paths held open by older processes.
+- Review marks are exact-cursor visibility hints; newer events resurface and missing-cursor marks are harmless orphans.
+- One absolute hook deadline starts before admission and includes inference plus every later storage retry.
+- Activity cursors use the exact positive SQLite integer domain and fail closed at `i64::MAX`.
+- Implementation tasks run serially because they share the schema and integration fixtures.
+- `forget()` guarantees logical erasure from Coding Brain-managed stores, not physical media, snapshots, or backups.
+- Verification brackets the work with a full baseline and final workspace, package, Nix, and exact-head CI gates.
+
+### Changes Made
+
+- Added a preflight baseline and final package/Nix repetition.
+- Added the schema invariant matrix, signed cursor boundary, resumable erasure protocol, frozen-source manifest, cross-database review race semantics, and absolute deadline contract.
+- Moved production permission-hook activation out of Task 6 and made Task 8 depend operationally on migration, export, and maintenance completion.
+- Replaced the parallel-looking dependency order with a single serial implementation sequence.
+
+### Deferred / Parking Lot
+
+- Physical-media and external-backup erasure remain outside Coding Brain's supported guarantee.
+- Cross-platform and musl verification runs on the final exact commit when PR publication is separately authorized.
+
+### Confidence Assessment
+
+- Overall: High
+- Areas of concern: migration freeze behavior with older live processes and privacy-erasure crash recovery remain the highest-risk implementation areas and require process-boundary fault injection before cutover.
