@@ -149,13 +149,16 @@ outside all database transactions. A stale evaluation remains a projection as
 
 ### `decision_identities` and `decision_payloads`
 
-Each identity row has a unique decision ID and only the immutable correlation
-and authority facts required by the audit. Each optional payload row contains
-the typed record kind, provider, session, turn, project, tool, normalized
-command, action, confidence, threshold, source, reasoning, user action,
-decision type, timestamps, and bounded provider metadata used for learning.
-This includes hook proposals and the existing non-hook learning records carried
-by `decisions.jsonl`.
+Each identity row has a unique decision ID and a closed identity kind.
+Permission identities require the complete immutable correlation and authority
+facts used by commit foreign keys. Non-authoritative observation identities
+retain their real provider and timestamp but require permission authority
+fields to be null, so compatibility never depends on invented session, turn,
+tool-use, or action evidence. Each optional payload row has the same closed
+kind through a composite foreign key and contains the typed indexed learning
+fields plus one complete validated payload bounded to the final legacy decision
+record limit. This includes hook proposals and the existing non-hook learning
+records carried by `decisions.jsonl`.
 
 Proposal existence does not grant permission authority and does not prove that
 the provider received a response or executed a tool. `forget()` deletes

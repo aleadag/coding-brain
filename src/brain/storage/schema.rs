@@ -10,7 +10,8 @@ use super::{
 pub(super) const BRAIN_SCHEMA_SQL: &str = include_str!("schema-v1/brain.sql");
 pub(super) const REVIEW_SCHEMA_SQL: &str = include_str!("schema-v1/review.sql");
 
-const MAX_VALUE_BYTES: i32 = 1024 * 1024;
+// A maximum supported decision blob shares a row with bounded typed projections.
+const MAX_VALUE_BYTES: i32 = 1024 * 1024 + 64 * 1024;
 const MAX_SQL_BYTES: i32 = 1024 * 1024;
 const MAX_COLUMNS: i32 = 128;
 const MAX_EXPRESSION_DEPTH: i32 = 100;
@@ -209,7 +210,7 @@ fn verify_brain_meta(
             schema_version: version,
         });
     }
-    if migration != "complete" || erasure != "complete" {
+    if migration != "complete" || !matches!(erasure.as_str(), "complete" | "in_progress") {
         return Err(StorageError::MigrationRequired);
     }
     deadline.apply(connection)?;

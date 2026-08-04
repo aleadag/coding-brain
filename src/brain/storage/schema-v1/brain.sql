@@ -42,14 +42,25 @@ WHERE attempt_state IN ('evaluating', 'needs_input', 'decided');
 
 CREATE TABLE decision_identities (
     decision_id TEXT PRIMARY KEY CHECK (length(decision_id) BETWEEN 1 AND 512),
+    identity_kind TEXT NOT NULL CHECK (identity_kind IN ('permission', 'observation')),
     provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude', 'antigravity')),
-    session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 512),
-    turn_id TEXT NOT NULL CHECK (length(turn_id) BETWEEN 1 AND 512),
-    tool_use_id TEXT NOT NULL CHECK (length(tool_use_id) BETWEEN 1 AND 512),
-    authority_action TEXT NOT NULL CHECK (authority_action IN ('allow', 'deny')),
-    decision_source TEXT NOT NULL CHECK (decision_source IN ('model', 'deterministic_safety', 'native_provider')),
+    session_id TEXT CHECK (session_id IS NULL OR length(session_id) BETWEEN 1 AND 512),
+    turn_id TEXT CHECK (turn_id IS NULL OR length(turn_id) BETWEEN 1 AND 512),
+    tool_use_id TEXT CHECK (tool_use_id IS NULL OR length(tool_use_id) BETWEEN 1 AND 512),
+    authority_action TEXT CHECK (authority_action IS NULL OR authority_action IN ('allow', 'deny')),
+    decision_source TEXT CHECK (decision_source IS NULL OR decision_source IN ('model', 'deterministic_safety', 'native_provider')),
     decided_at_ms INTEGER NOT NULL CHECK (decided_at_ms BETWEEN 0 AND 0x7fffffffffffffff),
-    UNIQUE (decision_id, provider, session_id, turn_id, tool_use_id, authority_action)
+    UNIQUE (decision_id, identity_kind),
+    UNIQUE (decision_id, provider, session_id, turn_id, tool_use_id, authority_action),
+    CHECK (
+        (identity_kind = 'permission'
+         AND session_id IS NOT NULL AND turn_id IS NOT NULL AND tool_use_id IS NOT NULL
+         AND authority_action IS NOT NULL AND decision_source IS NOT NULL)
+        OR
+        (identity_kind = 'observation'
+         AND session_id IS NULL AND turn_id IS NULL AND tool_use_id IS NULL
+         AND authority_action IS NULL AND decision_source IS NULL)
+    )
 ) STRICT;
 
 CREATE INDEX decision_identities_authority
@@ -57,15 +68,19 @@ ON decision_identities (provider, session_id, turn_id, tool_use_id, authority_ac
 
 CREATE TABLE decision_payloads (
     decision_id TEXT PRIMARY KEY,
-    source_cursor INTEGER CHECK (source_cursor BETWEEN 1 AND 0x7fffffffffffffff),
+    payload_kind TEXT NOT NULL CHECK (payload_kind IN ('permission', 'observation')),
+    source_cursor INTEGER NOT NULL CHECK (source_cursor BETWEEN 1 AND 0x7fffffffffffffff),
     normalized_command TEXT CHECK (normalized_command IS NULL OR length(normalized_command) <= 4096),
     reasoning TEXT CHECK (reasoning IS NULL OR length(reasoning) <= 4096),
     note TEXT CHECK (note IS NULL OR length(note) <= 4096),
-    FOREIGN KEY (decision_id) REFERENCES decision_identities (decision_id) ON DELETE CASCADE
+    decision_record BLOB NOT NULL CHECK (length(decision_record) <= 1048576),
+    FOREIGN KEY (decision_id, payload_kind)
+        REFERENCES decision_identities (decision_id, identity_kind) ON DELETE CASCADE,
+    FOREIGN KEY (source_cursor) REFERENCES activity_events (source_cursor) ON DELETE RESTRICT
 ) STRICT;
 
-CREATE INDEX decision_payloads_source_cursor
-ON decision_payloads (source_cursor, decision_id)
+CREATE UNIQUE INDEX decision_payloads_source_cursor
+ON decision_payloads (source_cursor)
 WHERE source_cursor IS NOT NULL;
 
 CREATE TABLE activity_events (

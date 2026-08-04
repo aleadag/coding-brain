@@ -541,11 +541,11 @@ fn cursor_i64(cursor: ActivityCursor) -> i64 {
     i64::try_from(cursor.get()).expect("ActivityCursor is restricted to the SQLite integer range")
 }
 
-fn ensure_deadline(deadline: Option<StorageDeadline>) -> Result<(), StorageError> {
+pub(super) fn ensure_deadline(deadline: Option<StorageDeadline>) -> Result<(), StorageError> {
     deadline.map_or(Ok(()), StorageDeadline::ensure_remaining)
 }
 
-fn commit_before_deadline<T>(
+pub(super) fn commit_before_deadline<T>(
     deadline: Option<StorageDeadline>,
     commit: impl FnOnce() -> rusqlite::Result<T>,
 ) -> Result<T, StorageError> {
@@ -579,7 +579,7 @@ fn ensure_single_activity_kind(
     }
 }
 
-fn apply_deadline(
+pub(super) fn apply_deadline(
     connection: &Connection,
     deadline: Option<StorageDeadline>,
 ) -> Result<(), StorageError> {

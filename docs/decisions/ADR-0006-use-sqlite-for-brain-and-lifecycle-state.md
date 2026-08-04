@@ -103,7 +103,11 @@ commit references. Distillation advances from the cursor in the last atomically
 published preference generation. Decision identity is separated from erasable
 learning payload so `forget()` can delete learning content, published generations,
 WAL residue, and preserved legacy decision snapshots without breaking immutable
-audit relationships.
+audit relationships. Permission identities retain complete authority fields;
+non-authoritative observation identities use a distinct closed kind and cannot
+carry fabricated permission identity or action fields. The matching erasable
+payload remains bounded while preserving the complete supported legacy learning
+record.
 
 Disk-full, I/O, checkpoint, corruption, newer-schema, unsafe-path, and migration
 failures preserve the last coherent TUI view and never become permission or

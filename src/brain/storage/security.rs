@@ -53,7 +53,11 @@ impl SecureDatabaseDirectory {
         database_name: &CStr,
         database_must_exist: bool,
     ) -> Result<(), SecurityError> {
-        self.reject_sidecars(database_name)?;
+        if database_must_exist {
+            self.validate_existing_sidecars(database_name)?;
+        } else {
+            self.reject_sidecars(database_name)?;
+        }
         match metadata_at(&self.descriptor, database_name) {
             Ok(metadata) => validate_private_file(&metadata),
             Err(error) if error.kind() == io::ErrorKind::NotFound && !database_must_exist => Ok(()),
@@ -111,6 +115,31 @@ impl SecureDatabaseDirectory {
             let entry = entry?;
             if entry.file_name().as_bytes().starts_with(&sidecar_prefix) {
                 return Err(SecurityError::Invalid("pre-existing SQLite sidecar"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_existing_sidecars(&self, database_name: &CStr) -> Result<(), SecurityError> {
+        let mut sidecar_prefix = database_name.to_bytes().to_vec();
+        sidecar_prefix.push(b'-');
+        for entry in fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let file_name_bytes = file_name.as_bytes();
+            if !file_name_bytes.starts_with(&sidecar_prefix) {
+                continue;
+            }
+            let suffix = &file_name_bytes[sidecar_prefix.len() - 1..];
+            if !matches!(suffix, b"-wal" | b"-shm" | b"-journal") {
+                return Err(SecurityError::Invalid("unknown SQLite sidecar"));
+            }
+            let name = CString::new(file_name_bytes)
+                .map_err(|_| SecurityError::Invalid("invalid SQLite sidecar name"))?;
+            match metadata_at(&self.descriptor, &name) {
+                Ok(metadata) => validate_private_file(&metadata)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
         Ok(())

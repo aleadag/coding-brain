@@ -1,6 +1,7 @@
 #![allow(dead_code)] // The SQLite foundation stays inactive until the runtime cutover task.
 
 mod activity;
+mod decisions;
 mod lifecycle;
 mod schema;
 mod security;
@@ -20,6 +21,11 @@ use security::{SecureDatabaseDirectory, SecurityError};
 
 #[allow(unused_imports)]
 pub use activity::{ActivityCursor, ActivityPage, ActivityRecord};
+#[allow(unused_imports)]
+pub use decisions::{
+    DecisionIdentity, DecisionKind, DecisionPayload, ErasureState, LearningDecisionPage,
+    LearningErasePaths,
+};
 
 pub const BRAIN_APPLICATION_ID: i32 = 0x4342_524e;
 pub const BRAIN_SCHEMA_VERSION: i32 = 1;
@@ -149,6 +155,12 @@ impl From<rusqlite::Error> for StorageError {
     }
 }
 
+impl From<io::Error> for StorageError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 impl From<SecurityError> for StorageError {
     fn from(error: SecurityError) -> Self {
         match error {
@@ -187,6 +199,7 @@ impl DatabaseKind {
 pub struct BrainDb {
     connection: Connection,
     deadline: Option<StorageDeadline>,
+    database_path: PathBuf,
 }
 
 impl fmt::Debug for BrainDb {
@@ -201,19 +214,25 @@ impl BrainDb {
         Ok(Self {
             connection,
             deadline: None,
+            database_path: paths.brain_db(),
         })
     }
 
     pub fn open_current(
         paths: &StoragePaths,
-        _role: OpenRole,
+        role: OpenRole,
         deadline: StorageDeadline,
     ) -> Result<Self, StorageError> {
         let connection = open_current(paths, BRAIN_DATABASE_NAME, DatabaseKind::Brain, deadline)?;
-        Ok(Self {
+        let database = Self {
             connection,
             deadline: Some(deadline),
-        })
+            database_path: paths.brain_db(),
+        };
+        if role == OpenRole::Hook && !database.erasure_state()?.complete {
+            return Err(StorageError::MigrationRequired);
+        }
+        Ok(database)
     }
 
     pub fn schema_sql() -> &'static str {

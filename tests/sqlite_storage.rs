@@ -2,14 +2,18 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use coding_brain::brain::decisions::{
+    DecisionContext, DecisionOutcome, DecisionRecord, DecisionType,
+};
 use coding_brain::brain::storage::{
-    ActivityCursor, BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, OpenRole,
-    REVIEW_APPLICATION_ID, REVIEW_SCHEMA_VERSION, ReviewDb, StorageDeadline, StorageError,
-    StoragePaths,
+    ActivityCursor, BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, DecisionIdentity,
+    DecisionKind, DecisionPayload, LearningErasePaths, OpenRole, REVIEW_APPLICATION_ID,
+    REVIEW_SCHEMA_VERSION, ReviewDb, StorageDeadline, StorageError, StoragePaths,
 };
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivityState,
@@ -43,6 +47,44 @@ fn private_tempdir() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     root
+}
+
+fn complete_decision(decision_id: &str, provider: AgentProvider) -> DecisionRecord {
+    DecisionRecord {
+        provider,
+        timestamp: "2026-08-04T12:00:00Z".into(),
+        pid: 42,
+        project: "sqlite-project".into(),
+        tool: Some("Bash".into()),
+        command: Some("cargo test".into()),
+        brain_action: "approve".into(),
+        brain_confidence: 0.91,
+        brain_reasoning: "bounded reason".into(),
+        user_action: "user_approve".into(),
+        context: Some(DecisionContext {
+            context_pct: Some(73),
+            last_tool_error: true,
+            error_message: Some("opaque supported detail".into()),
+            model: "model-v1".into(),
+            elapsed_secs: 123,
+            files_modified_count: 4,
+            total_tool_calls: 9,
+            has_file_conflict: true,
+            status: "waiting".into(),
+            recent_error_count: 2,
+            subagent_count: 1,
+            hour: Some(12),
+        }),
+        outcome: Some(DecisionOutcome::Error("exit 101".into())),
+        decision_type: DecisionType::Session,
+        suggested_at: Some(100),
+        resolved_at: Some(103),
+        override_reason: Some("explicit exception".into()),
+        decision_id: Some(decision_id.into()),
+        brain_decision_ms: Some(321),
+        cache_hit: Some(false),
+        canonical: Some(true),
+    }
 }
 
 fn activity_event(activity_id: &str, recorded_at_ms: u64, state: ActivityState) -> ActivityEvent {
@@ -91,6 +133,21 @@ fn identified_activity_event(
         provider_hints: vec!["hint".into()],
         provenance: SessionTargetProvenance::Structured,
     });
+    event
+}
+
+fn decision_activity_event(
+    activity_id: &str,
+    decision_id: &str,
+    recorded_at_ms: u64,
+    state: ActivityState,
+    provider: Option<AgentProvider>,
+) -> ActivityEvent {
+    let mut event = match provider {
+        Some(provider) => identified_activity_event(activity_id, recorded_at_ms, state, provider),
+        None => activity_event(activity_id, recorded_at_ms, state),
+    };
+    event.decision_id = Some(decision_id.into());
     event
 }
 
@@ -1313,9 +1370,9 @@ fn insert_decision(connection: &Connection, decision_id: &str) {
     connection
         .execute(
             "INSERT INTO decision_identities (
-                decision_id, provider, session_id, turn_id, tool_use_id,
+                decision_id, identity_kind, provider, session_id, turn_id, tool_use_id,
                 authority_action, decision_source, decided_at_ms
-             ) VALUES (?1, 'codex', 'session-1', 'turn-1', 'tool-1',
+             ) VALUES (?1, 'permission', 'codex', 'session-1', 'turn-1', 'tool-1',
                        'allow', 'model', 1)",
             [decision_id],
         )
@@ -1458,7 +1515,10 @@ fn fresh_brain_database_has_exact_security_pragmas() {
     assert_eq!(db.pragma_i64("secure_delete").unwrap(), 1);
     assert!(db.defensive_mode().unwrap());
     assert_eq!(db.limit(Limit::SQLITE_LIMIT_ATTACHED).unwrap(), 0);
-    assert_eq!(db.limit(Limit::SQLITE_LIMIT_LENGTH).unwrap(), 1024 * 1024);
+    assert_eq!(
+        db.limit(Limit::SQLITE_LIMIT_LENGTH).unwrap(),
+        1024 * 1024 + 64 * 1024
+    );
     assert_eq!(
         db.limit(Limit::SQLITE_LIMIT_SQL_LENGTH).unwrap(),
         1024 * 1024
@@ -1598,6 +1658,59 @@ fn preexisting_sidecars_are_rejected_before_database_creation() {
 
     assert!(matches!(error, StorageError::InvalidStorage(_)));
     assert!(!paths.brain_db().exists());
+}
+
+#[test]
+fn current_open_rejects_unknown_database_sidecars() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    fs::write(paths.db_dir().join("brain.sqlite3-unknown"), b"untrusted").unwrap();
+
+    let error = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, StorageError::InvalidStorage(_)));
+}
+
+#[test]
+fn current_open_rejects_unsafe_known_database_sidecars() {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let sidecar = paths.db_dir().join(format!("brain.sqlite3{suffix}"));
+        fs::write(&sidecar, b"untrusted").unwrap();
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = BrainDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(1)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, StorageError::InvalidStorage(_)), "{suffix}");
+    }
+
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let target = paths.db_dir().join("target");
+    fs::write(&target, b"untrusted").unwrap();
+    symlink(&target, paths.db_dir().join("brain.sqlite3-wal")).unwrap();
+
+    let error = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap_err();
+    assert!(matches!(error, StorageError::InvalidStorage(_)));
 }
 
 #[test]
@@ -1819,6 +1932,733 @@ fn decision_and_learning_payload_constraints_are_executable() {
 }
 
 #[test]
+fn decision_kinds_reject_incomplete_or_fabricated_authority() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+
+    for rejected in [
+        "INSERT INTO decision_identities (
+            decision_id, identity_kind, provider, decided_at_ms
+         ) VALUES ('permission-incomplete', 'permission', 'codex', 1)",
+        "INSERT INTO decision_identities (
+            decision_id, identity_kind, provider, session_id, turn_id, tool_use_id,
+            authority_action, decision_source, decided_at_ms
+         ) VALUES ('observation-smuggled', 'observation', 'codex', 'fake-session',
+                   'fake-turn', 'fake-tool', 'allow', 'native_provider', 1)",
+        "INSERT INTO decision_identities (
+            decision_id, identity_kind, provider, decided_at_ms
+         ) VALUES ('unknown-kind', 'unknown', 'codex', 1)",
+    ] {
+        assert_statement_rejected(&connection, rejected);
+    }
+
+    connection
+        .execute(
+            "INSERT INTO decision_identities (
+                decision_id, identity_kind, provider, decided_at_ms
+             ) VALUES ('observation-1', 'observation', 'claude', 1)",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn payload_kind_and_source_cursor_are_database_enforced() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute(
+            "INSERT INTO decision_identities (
+                decision_id, identity_kind, provider, decided_at_ms
+             ) VALUES ('observation-1', 'observation', 'codex', 1)",
+            [],
+        )
+        .unwrap();
+    insert_terminal_event(&connection, 1, "activity-1");
+
+    for rejected in [
+        "INSERT INTO decision_payloads (
+            decision_id, payload_kind, source_cursor, decision_record
+         ) VALUES ('observation-1', 'permission', 1, X'7b7d')",
+        "INSERT INTO decision_payloads (
+            decision_id, payload_kind, source_cursor, decision_record
+         ) VALUES ('observation-1', 'observation', 2, X'7b7d')",
+    ] {
+        assert_statement_rejected(&connection, rejected);
+    }
+
+    connection
+        .execute(
+            "INSERT INTO decision_payloads (
+                decision_id, payload_kind, source_cursor, decision_record
+             ) VALUES ('observation-1', 'observation', 1, X'7b7d')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO decision_identities (
+                decision_id, identity_kind, provider, decided_at_ms
+             ) VALUES ('observation-2', 'observation', 'codex', 2)",
+            [],
+        )
+        .unwrap();
+    assert_statement_rejected(
+        &connection,
+        "INSERT INTO decision_payloads (
+            decision_id, payload_kind, source_cursor, decision_record
+         ) VALUES ('observation-2', 'observation', 1, X'7b7d')",
+    );
+}
+
+#[test]
+fn decision_storage_round_trips_complete_permission_and_observation_records() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let observation_cursor = db
+        .append_activity(decision_activity_event(
+            "observation",
+            "observation-decision",
+            1,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    let permission_cursor = db
+        .append_activity(decision_activity_event(
+            "permission",
+            "permission-decision",
+            2,
+            ActivityState::Allowed,
+            Some(AgentProvider::Codex),
+        ))
+        .unwrap();
+    let observation = complete_decision("observation-decision", AgentProvider::Claude);
+    let mut permission = complete_decision("permission-decision", AgentProvider::Codex);
+    permission.user_action = "hook_proposal".into();
+
+    db.insert_decision(
+        &DecisionIdentity::observation("observation-decision", AgentProvider::Claude, 1),
+        &DecisionPayload::new(
+            DecisionKind::Observation,
+            observation_cursor,
+            observation.clone(),
+        ),
+    )
+    .unwrap();
+    db.insert_decision(
+        &DecisionIdentity::permission(
+            "permission-decision",
+            AgentProvider::Codex,
+            "session-permission",
+            "turn-permission",
+            "tool-permission",
+            PermissionAction::Allow,
+            "model",
+            2,
+        ),
+        &DecisionPayload::new(
+            DecisionKind::Permission,
+            permission_cursor,
+            permission.clone(),
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.decision_payload("observation-decision")
+            .unwrap()
+            .unwrap()
+            .record,
+        observation
+    );
+    assert_eq!(
+        db.decision_payload("permission-decision")
+            .unwrap()
+            .unwrap()
+            .record,
+        permission
+    );
+}
+
+#[test]
+fn maximum_decision_record_round_trips_with_bounded_typed_projections() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let cursor = db
+        .append_activity(decision_activity_event(
+            "maximum",
+            "maximum-decision",
+            1,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    let mut record = complete_decision("maximum-decision", AgentProvider::Codex);
+    record.command = Some("c".repeat(5000));
+    record.brain_reasoning.clear();
+    let mut payload = DecisionPayload::new(DecisionKind::Observation, cursor, record);
+    let base = payload.serialized_len().unwrap();
+    payload.record.brain_reasoning = "r".repeat(1024 * 1024 - base);
+    assert_eq!(payload.serialized_len().unwrap(), 1024 * 1024);
+
+    db.insert_decision(
+        &DecisionIdentity::observation("maximum-decision", AgentProvider::Codex, 1),
+        &payload,
+    )
+    .unwrap();
+    assert_eq!(
+        db.decision_payload("maximum-decision")
+            .unwrap()
+            .unwrap()
+            .record,
+        payload.record
+    );
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    let (command_len, reasoning_len): (i64, i64) = connection
+        .query_row(
+            "SELECT length(normalized_command), length(reasoning)
+             FROM decision_payloads WHERE decision_id = 'maximum-decision'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((command_len, reasoning_len), (4096, 4096));
+
+    let mut oversized = payload;
+    oversized.record.brain_reasoning.push('r');
+    assert!(matches!(
+        oversized.serialized_len(),
+        Err(StorageError::InvalidStorage(_))
+    ));
+}
+
+#[test]
+fn learning_requires_exact_permission_commit_and_paginates_by_source_cursor() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let proposal_cursor = db
+        .append_activity(decision_activity_event(
+            "proposal",
+            "proposal-decision",
+            1,
+            ActivityState::Allowed,
+            Some(AgentProvider::Codex),
+        ))
+        .unwrap();
+    let observation_cursor = db
+        .append_activity(decision_activity_event(
+            "observation",
+            "observation-decision",
+            2,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    let committed_cursor = db
+        .append_activity(decision_activity_event(
+            "committed",
+            "committed-decision",
+            3,
+            ActivityState::Allowed,
+            Some(AgentProvider::Codex),
+        ))
+        .unwrap();
+
+    for (decision_id, cursor, activity) in [
+        ("proposal-decision", proposal_cursor, "proposal"),
+        ("committed-decision", committed_cursor, "committed"),
+    ] {
+        let mut record = complete_decision(decision_id, AgentProvider::Codex);
+        record.user_action = "hook_proposal".into();
+        db.insert_decision(
+            &DecisionIdentity::permission(
+                decision_id,
+                AgentProvider::Codex,
+                format!("session-{activity}"),
+                format!("turn-{activity}"),
+                format!("tool-{activity}"),
+                PermissionAction::Allow,
+                "model",
+                cursor.get(),
+            ),
+            &DecisionPayload::new(DecisionKind::Permission, cursor, record),
+        )
+        .unwrap();
+    }
+    db.insert_decision(
+        &DecisionIdentity::observation("observation-decision", AgentProvider::Claude, 2),
+        &DecisionPayload::new(
+            DecisionKind::Observation,
+            observation_cursor,
+            complete_decision("observation-decision", AgentProvider::Claude),
+        ),
+    )
+    .unwrap();
+    drop(db);
+
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute(
+            "INSERT INTO permission_attempts (
+                attempt_id, provider, session_id, turn_id, tool_use_id, request_key,
+                authority_action, attempt_state, created_at_ms, updated_at_ms
+             ) VALUES ('attempt-committed', 'codex', 'session-committed', 'turn-committed',
+                       'tool-committed', 'request-committed', 'allow', 'decided', 3, 3)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO permission_commits (
+                attempt_id, decision_id, terminal_activity_id, provider, session_id,
+                turn_id, tool_use_id, authority_action, evidence_kind, delivery_state,
+                response_eligible, committed_at_ms
+             ) VALUES ('attempt-committed', 'committed-decision', 'committed', 'codex',
+                       'session-committed', 'turn-committed', 'tool-committed', 'allow',
+                       'provider_authority', 'pending', 1, 3)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap();
+    let learned = db.learning_decisions(10, 3 * 1024 * 1024).unwrap();
+    assert_eq!(
+        learned
+            .iter()
+            .filter_map(|payload| payload.record.decision_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["observation-decision", "committed-decision"]
+    );
+
+    let first = db
+        .learning_decisions_after(None, 1, 3 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(
+        first.decisions[0].record.decision_id.as_deref(),
+        Some("observation-decision")
+    );
+    assert_eq!(first.next_cursor, Some(observation_cursor));
+    let second = db
+        .learning_decisions_after(first.next_cursor, 1, 3 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(
+        second.decisions[0].record.decision_id.as_deref(),
+        Some("committed-decision")
+    );
+    assert!(second.next_cursor.is_none());
+
+    let erase = LearningErasePaths::new(root.path().join("brain"), Vec::new());
+    db.forget_learning(&erase).unwrap();
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    let identity_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM decision_identities WHERE decision_id = 'committed-decision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let commit_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM permission_commits WHERE decision_id = 'committed-decision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM decision_payloads WHERE decision_id = 'committed-decision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((identity_count, commit_count, payload_count), (1, 1, 0));
+}
+
+#[test]
+fn decision_reads_reject_a_source_activity_with_another_decision_id() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let original = db
+        .append_activity(decision_activity_event(
+            "original",
+            "observation-decision",
+            1,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    let unrelated = db
+        .append_activity(decision_activity_event(
+            "unrelated",
+            "another-decision",
+            2,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    db.insert_decision(
+        &DecisionIdentity::observation("observation-decision", AgentProvider::Codex, 1),
+        &DecisionPayload::new(
+            DecisionKind::Observation,
+            original,
+            complete_decision("observation-decision", AgentProvider::Codex),
+        ),
+    )
+    .unwrap();
+    drop(db);
+
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute(
+            "UPDATE decision_payloads SET source_cursor = ?1 WHERE decision_id = ?2",
+            params![unrelated.get() as i64, "observation-decision"],
+        )
+        .unwrap();
+    drop(connection);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        db.decision_payload("observation-decision"),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert!(matches!(
+        db.learning_decisions(10, 1024 * 1024),
+        Err(StorageError::InvalidStorage(_))
+    ));
+}
+
+#[test]
+fn decision_reads_reject_malformed_records_and_typed_projection_disagreement() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let cursor = db
+        .append_activity(decision_activity_event(
+            "observation",
+            "observation-decision",
+            1,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    db.insert_decision(
+        &DecisionIdentity::observation("observation-decision", AgentProvider::Codex, 1),
+        &DecisionPayload::new(
+            DecisionKind::Observation,
+            cursor,
+            complete_decision("observation-decision", AgentProvider::Codex),
+        ),
+    )
+    .unwrap();
+    drop(db);
+
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute(
+            "UPDATE decision_payloads SET normalized_command = 'different' \
+             WHERE decision_id = 'observation-decision'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.decision_payload("observation-decision"),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    drop(db);
+
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute(
+            "UPDATE decision_payloads SET normalized_command = 'cargo test', decision_record = X'7b7d' \
+             WHERE decision_id = 'observation-decision'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.learning_decisions(10, 1024 * 1024),
+        Err(StorageError::InvalidStorage(_))
+    ));
+}
+
+#[test]
+fn learning_row_lookahead_is_safe_at_the_sqlite_integer_boundary() {
+    let Ok(max_rows) = usize::try_from(i64::MAX) else {
+        return;
+    };
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let db = BrainDb::create_current(&paths).unwrap();
+
+    let page = db.learning_decisions_after(None, max_rows, 1024).unwrap();
+
+    assert!(page.decisions.is_empty());
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn forget_removes_payload_and_managed_learning_files_but_preserves_audit() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let cursor = db
+        .append_activity(decision_activity_event(
+            "observation",
+            "observation-decision",
+            1,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    db.insert_decision(
+        &DecisionIdentity::observation("observation-decision", AgentProvider::Codex, 1),
+        &DecisionPayload::new(
+            DecisionKind::Observation,
+            cursor,
+            complete_decision("observation-decision", AgentProvider::Codex),
+        ),
+    )
+    .unwrap();
+    let brain_root = root.path().join("brain");
+    let generation = brain_root.join("preferences-generations/gen-1");
+    fs::create_dir_all(&generation).unwrap();
+    fs::write(generation.join("global.json"), b"preferences").unwrap();
+    fs::write(brain_root.join("distill-watermark.json"), b"watermark").unwrap();
+    fs::write(brain_root.join("distill-trigger"), b"trigger").unwrap();
+    let legacy = root.path().join("frozen-legacy");
+    fs::create_dir_all(&legacy).unwrap();
+    for name in ["decisions.jsonl", "canonical.jsonl", "preferences.json"] {
+        fs::write(legacy.join(name), b"learning").unwrap();
+    }
+    fs::create_dir_all(legacy.join("preferences")).unwrap();
+    fs::write(legacy.join("preferences/project.json"), b"learning").unwrap();
+    let erase = LearningErasePaths::new(brain_root.clone(), vec![legacy.clone()]);
+
+    let generation = db.forget_learning(&erase).unwrap();
+
+    assert_eq!(db.erasure_state().unwrap().generation, generation);
+    assert!(db.erasure_state().unwrap().complete);
+    assert!(
+        db.decision_identity("observation-decision")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.decision_payload("observation-decision")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db.activity_by_id("observation", None, 10, 65536)
+            .unwrap()
+            .events
+            .len(),
+        1
+    );
+    assert!(!brain_root.join("preferences-generations").exists());
+    assert!(!brain_root.join("distill-watermark.json").exists());
+    assert!(!brain_root.join("distill-trigger").exists());
+    assert!(!legacy.join("decisions.jsonl").exists());
+    assert!(!legacy.join("canonical.jsonl").exists());
+    assert!(!legacy.join("preferences.json").exists());
+    assert!(!legacy.join("preferences").exists());
+
+    let next_generation = db.forget_learning(&erase).unwrap();
+    assert_eq!(next_generation, generation + 1);
+    assert!(db.erasure_state().unwrap().complete);
+}
+
+#[test]
+fn erasure_locks_are_private_and_absent_legacy_roots_stay_absent() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let brain_root = root.path().join("brain");
+    let existing = root.path().join("existing-legacy");
+    let absent = root.path().join("absent-legacy");
+    fs::create_dir(&existing).unwrap();
+    fs::set_permissions(&existing, fs::Permissions::from_mode(0o700)).unwrap();
+    let erase = LearningErasePaths::new(brain_root.clone(), vec![absent.clone(), existing.clone()]);
+
+    db.forget_learning(&erase).unwrap();
+
+    assert!(!absent.exists());
+    assert_eq!(
+        fs::metadata(&brain_root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for lock in [
+        existing.join("decisions.lock"),
+        brain_root.join("erasure.lock"),
+        brain_root.join("distill.lock"),
+    ] {
+        assert_eq!(
+            fs::metadata(lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn erasure_process_helper() {
+    let Some(root) = std::env::var_os("CODING_BRAIN_ERASURE_TEST_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let paths = StoragePaths::at(&root);
+    let mut db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(30)),
+    )
+    .unwrap();
+    let erase = LearningErasePaths::new(root.join("brain"), vec![root.join("legacy")]);
+    db.forget_learning(&erase).unwrap();
+}
+
+#[test]
+fn interrupted_erasure_fails_closed_and_resumes_at_the_same_generation() {
+    for stage in [
+        "after-in-progress",
+        "after-database-delete",
+        "after-external-delete",
+        "after-generation-delete",
+        "before-wal-truncate",
+        "after-wal-truncate",
+        "before-complete",
+        "after-complete",
+    ] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        let mut db = BrainDb::create_current(&paths).unwrap();
+        let cursor = db
+            .append_activity(decision_activity_event(
+                "process-observation",
+                "process-decision",
+                1,
+                ActivityState::Observed,
+                None,
+            ))
+            .unwrap();
+        db.insert_decision(
+            &DecisionIdentity::observation("process-decision", AgentProvider::Codex, 1),
+            &DecisionPayload::new(
+                DecisionKind::Observation,
+                cursor,
+                complete_decision("process-decision", AgentProvider::Codex),
+            ),
+        )
+        .unwrap();
+        drop(db);
+        let brain_root = root.path().join("brain");
+        let legacy = root.path().join("legacy");
+        fs::create_dir_all(brain_root.join("preferences-generations/gen-1")).unwrap();
+        fs::write(
+            brain_root.join("preferences-generations/gen-1/global.json"),
+            b"preferences",
+        )
+        .unwrap();
+        fs::write(brain_root.join("distill-watermark.json"), b"watermark").unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("decisions.jsonl"), b"learning").unwrap();
+        fs::write(legacy.join("canonical.jsonl"), b"learning").unwrap();
+        let marker = root.path().join("erasure-marker");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("erasure_process_helper")
+            .arg("--nocapture")
+            .env("CODING_BRAIN_ERASURE_TEST_ROOT", root.path())
+            .env("CODING_BRAIN_ERASURE_TEST_PAUSE", stage)
+            .env("CODING_BRAIN_ERASURE_TEST_MARKER", &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while !marker.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "erasure child did not reach {stage}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let mut db = BrainDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(2)),
+        )
+        .unwrap();
+        let interrupted = db.erasure_state().unwrap();
+        if stage == "after-complete" {
+            assert!(interrupted.complete, "{stage}");
+        } else {
+            assert!(!interrupted.complete, "{stage}");
+            assert!(matches!(
+                db.learning_decisions(10, 1024 * 1024),
+                Err(StorageError::MigrationRequired)
+            ));
+        }
+        let erase = LearningErasePaths::new(brain_root.clone(), vec![legacy.clone()]);
+        let generation = if stage == "after-in-progress" {
+            db.forget_learning(&erase).unwrap()
+        } else {
+            db.resume_forget_learning(&erase).unwrap()
+        };
+        assert_eq!(generation, interrupted.generation, "{stage}");
+        assert!(db.erasure_state().unwrap().complete, "{stage}");
+        assert_eq!(
+            db.resume_forget_learning(&erase).unwrap(),
+            generation,
+            "resume of complete generation must be a no-op at {stage}"
+        );
+        assert!(db.decision_payload("process-decision").unwrap().is_none());
+        assert!(!legacy.join("decisions.jsonl").exists());
+        assert!(!legacy.join("canonical.jsonl").exists());
+        assert!(!brain_root.join("preferences-generations").exists());
+        assert!(!brain_root.join("distill-watermark.json").exists());
+    }
+}
+
+#[test]
 fn activity_terminal_identity_is_all_or_none_and_typed() {
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
@@ -1861,9 +2701,9 @@ fn permission_commit_requires_matching_authority_identity_and_action() {
     connection
         .execute(
             "INSERT INTO decision_identities (
-                decision_id, provider, session_id, turn_id, tool_use_id,
+                decision_id, identity_kind, provider, session_id, turn_id, tool_use_id,
                 authority_action, decision_source, decided_at_ms
-             ) VALUES ('decision-1', 'codex', 'session-1', 'turn-1', 'tool-1',
+             ) VALUES ('decision-1', 'permission', 'codex', 'session-1', 'turn-1', 'tool-1',
                        'allow', 'model', 1)",
             [],
         )

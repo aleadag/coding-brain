@@ -41,11 +41,19 @@ pub struct BriefingOptions {
 /// Build a markdown briefing for the given project. Caller decides what to do
 /// with it (print, inject, save).
 pub fn build_briefing(opts: &BriefingOptions, cwd: &Path) -> String {
-    let project = opts.project.as_deref().unwrap_or("(global)");
     let all = read_learning_decisions();
+    build_briefing_with_decisions(opts, cwd, &all)
+}
+
+pub(crate) fn build_briefing_with_decisions(
+    opts: &BriefingOptions,
+    cwd: &Path,
+    all: &[DecisionRecord],
+) -> String {
+    let project = opts.project.as_deref().unwrap_or("(global)");
 
     let project_filter = opts.project.as_deref();
-    let recent: Vec<&DecisionRecord> = filter_recent_for_project(&all, project_filter);
+    let recent: Vec<&DecisionRecord> = filter_recent_for_project(all, project_filter);
 
     let prefs = project_filter
         .and_then(load_preferences_for_project)
@@ -98,7 +106,7 @@ pub fn build_briefing(opts: &BriefingOptions, cwd: &Path) -> String {
 // Filtering helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-fn filter_recent_for_project<'a>(
+pub(crate) fn filter_recent_for_project<'a>(
     all: &'a [DecisionRecord],
     project: Option<&str>,
 ) -> Vec<&'a DecisionRecord> {

@@ -132,7 +132,7 @@ fn run_once_with_decisions(
 }
 
 #[cfg(test)]
-fn run_once_with_inputs(
+pub(crate) fn run_once_with_inputs(
     paths: &CodingBrainPaths,
     cursor_decisions: &[DecisionRecord],
     learning_decisions: &[DecisionRecord],
@@ -288,24 +288,48 @@ pub(crate) fn forget_preferences_with(
     paths: &CodingBrainPaths,
     erase_source: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), DistillError> {
+    let root = brain_root(paths);
+    create_private_dir(&root)?;
+    let Some(erasure_lock) = try_acquire_named_lock(&root, "erasure.lock")? else {
+        return Err(DistillError::AlreadyRunning);
+    };
     let Some(lock) = try_acquire_lock(paths)? else {
         return Err(DistillError::AlreadyRunning);
     };
-    let root = brain_root(paths);
     let result = (|| {
         erase_source()?;
-        remove_file_if_present(&watermark_path(paths))?;
-        remove_file_if_present(&root.join("distill-trigger"))?;
-        let generations = generations_root(paths);
-        match fs::remove_dir_all(&generations) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        sync_directory(&root)?;
+        erase_published_preferences_at_root(&root)?;
         Ok(DistillOutcome::NotDue { pending: 0 })
     })();
-    finish_locked(&lock, result).map(|_| ())
+    let result = finish_locked(&lock, result).map(|_| ());
+    let unlock = FileExt::unlock(&erasure_lock).map_err(DistillError::Io);
+    result.and(unlock)
+}
+
+fn try_acquire_named_lock(root: &Path, name: &str) -> Result<Option<File>, DistillError> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(root.join(name))?;
+    set_file_mode(&lock)?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(Some(lock)),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn erase_published_preferences_at_root(root: &Path) -> io::Result<()> {
+    remove_file_if_present(&root.join("distill-watermark.json"))?;
+    remove_file_if_present(&root.join("distill-trigger"))?;
+    match fs::remove_dir_all(root.join("preferences-generations")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    sync_directory(root)
 }
 
 fn remove_file_if_present(path: &Path) -> io::Result<()> {

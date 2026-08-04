@@ -31,11 +31,20 @@ pub fn retrieve_similar(
     limit: usize,
     decision_type: Option<DecisionType>,
 ) -> Vec<DecisionRecord> {
+    let all = read_learning_decisions();
+    retrieve_similar_from(&all, tool, project, limit, decision_type)
+}
+
+pub(crate) fn retrieve_similar_from(
+    all: &[DecisionRecord],
+    tool: Option<&str>,
+    project: &str,
+    limit: usize,
+    decision_type: Option<DecisionType>,
+) -> Vec<DecisionRecord> {
     if limit == 0 {
         return Vec::new();
     }
-
-    let all = read_learning_decisions();
     if all.is_empty() {
         return Vec::new();
     }

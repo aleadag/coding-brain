@@ -63,7 +63,7 @@ impl DecisionType {
 }
 
 /// A single decision record: what the brain suggested and what the user did.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecisionRecord {
     pub provider: AgentProvider,
     pub timestamp: String,
@@ -115,7 +115,7 @@ pub fn gen_decision_id() -> String {
 
 /// Outcome of a decision, backfilled during distillation by looking at
 /// consecutive same-PID records and resolved test-runner outcomes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecisionOutcome {
     Success,
     Error(String),
@@ -123,7 +123,7 @@ pub enum DecisionOutcome {
 
 /// Snapshot of session state captured at decision time.
 /// Stored in JSONL for rich distillation. NOT sent to LLM directly.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionContext {
     pub context_pct: Option<u8>,
     pub last_tool_error: bool,
@@ -961,13 +961,11 @@ pub(crate) fn forget_at_with(
 }
 
 fn erase_decision_source(source_root: &std::path::Path) -> io::Result<()> {
-    let path = source_root.join("decisions.jsonl");
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    let pref_path = source_root.join("preferences.json");
-    if pref_path.exists() {
-        fs::remove_file(&pref_path)?;
+    for name in ["decisions.jsonl", "canonical.jsonl", "preferences.json"] {
+        let path = source_root.join(name);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
     }
     // Also clean per-project preference files
     let proj_dir = source_root.join("preferences");
