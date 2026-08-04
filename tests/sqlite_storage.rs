@@ -24,6 +24,12 @@ fn open_for_constraints(path: &std::path::Path) -> Connection {
     connection
 }
 
+fn private_tempdir() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    root
+}
+
 fn insert_attempt(connection: &Connection, attempt_id: &str, request_key: &str) {
     connection
         .execute(
@@ -98,6 +104,36 @@ fn assert_statement_rejected(connection: &Connection, sql: &str) {
     );
 }
 
+fn table_columns(connection: &Connection, table: &str) -> Vec<String> {
+    let sql = format!("PRAGMA table_info({table})");
+    connection
+        .prepare(&sql)
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn insert_lifecycle_session(
+    connection: &Connection,
+    provider: &str,
+    session_id: &str,
+    provider_session_id: Option<&str>,
+) {
+    connection
+        .execute(
+            "INSERT INTO lifecycle_sessions (
+                provider, session_id, cwd, provider_session_id,
+                latest_event, latest_sequence, latest_received_at_ms,
+                session_start_source, signature_event, signature_session_start_source
+             ) VALUES (?1, ?2, X'2F', ?3, 'session_start', 1, 1,
+                       'startup', 'session_start', 'startup')",
+            params![provider, session_id, provider_session_id],
+        )
+        .unwrap();
+}
+
 fn assert_current_brain_open_is_invalid(paths: &StoragePaths) {
     let error = BrainDb::open_current(
         paths,
@@ -126,7 +162,7 @@ fn assert_current_review_open_is_invalid(paths: &StoragePaths) {
 
 #[test]
 fn hook_open_never_creates_or_migrates() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
 
     let error = BrainDb::open_current(
@@ -142,7 +178,7 @@ fn hook_open_never_creates_or_migrates() {
 
 #[test]
 fn fresh_brain_database_has_exact_security_pragmas() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
 
     let db = BrainDb::create_current(&paths).unwrap();
@@ -186,7 +222,7 @@ fn frozen_schema_fixture_is_the_executed_schema() {
 
 #[test]
 fn database_directory_and_files_are_owner_only() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
 
     let brain = BrainDb::create_current(&paths).unwrap();
@@ -213,8 +249,8 @@ fn database_directory_and_files_are_owner_only() {
 
 #[test]
 fn unsafe_ancestor_and_database_entries_are_rejected() {
-    let root = tempfile::tempdir().unwrap();
-    let target = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
+    let target = private_tempdir();
     let linked_root = root.path().join("linked-state");
     symlink(target.path(), &linked_root).unwrap();
 
@@ -223,6 +259,7 @@ fn unsafe_ancestor_and_database_entries_are_rejected() {
 
     let state = root.path().join("state");
     fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     let paths = StoragePaths::at(&state);
     fs::create_dir(paths.db_dir()).unwrap();
     fs::set_permissions(paths.db_dir(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -239,8 +276,53 @@ fn unsafe_ancestor_and_database_entries_are_rejected() {
 }
 
 #[test]
+fn unsafe_state_root_mode_is_rejected_before_database_creation() {
+    let outer = private_tempdir();
+    let state_root = outer.path().join("state");
+    fs::create_dir(&state_root).unwrap();
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o770)).unwrap();
+    let paths = StoragePaths::at(&state_root);
+
+    let error = BrainDb::create_current(&paths).unwrap_err();
+
+    assert!(matches!(error, StorageError::InvalidStorage(_)));
+    assert!(!paths.db_dir().exists());
+}
+
+#[test]
+fn replaceable_non_sticky_ancestor_is_rejected_before_database_creation() {
+    let outer = private_tempdir();
+    let ancestor = outer.path().join("replaceable");
+    let state_root = ancestor.join("state");
+    fs::create_dir(&ancestor).unwrap();
+    fs::create_dir(&state_root).unwrap();
+    fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let paths = StoragePaths::at(&state_root);
+
+    let error = BrainDb::create_current(&paths).unwrap_err();
+
+    assert!(matches!(error, StorageError::InvalidStorage(_)));
+    assert!(!paths.db_dir().exists());
+}
+
+#[test]
+fn root_owned_sticky_temp_ancestor_remains_supported() {
+    let root = tempfile::Builder::new()
+        .prefix("coding-brain-sqlite-")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let paths = StoragePaths::at(root.path());
+
+    drop(BrainDb::create_current(&paths).unwrap());
+
+    assert!(paths.brain_db().is_file());
+}
+
+#[test]
 fn preexisting_sidecars_are_rejected_before_database_creation() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     fs::create_dir(paths.db_dir()).unwrap();
     fs::set_permissions(paths.db_dir(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -254,7 +336,7 @@ fn preexisting_sidecars_are_rejected_before_database_creation() {
 
 #[test]
 fn hook_open_rejects_incomplete_and_unsupported_schema_without_repair() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     drop(BrainDb::create_current(&paths).unwrap());
 
@@ -297,7 +379,7 @@ fn current_brain_open_rejects_missing_or_forged_frozen_schema_objects() {
          CREATE INDEX permission_commits_undelivered_audit
          ON permission_commits (attempt_id);",
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let paths = StoragePaths::at(root.path());
         drop(BrainDb::create_current(&paths).unwrap());
         let connection = open_for_constraints(&paths.brain_db());
@@ -315,7 +397,7 @@ fn current_review_open_rejects_missing_or_forged_frozen_schema_objects() {
         "DROP INDEX review_marks_surface_cursor;
          CREATE INDEX review_marks_surface_cursor ON review_marks (group_id);",
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let paths = StoragePaths::at(root.path());
         drop(ReviewDb::create_current(&paths).unwrap());
         let connection = open_for_constraints(&paths.review_db());
@@ -328,7 +410,7 @@ fn current_review_open_rejects_missing_or_forged_frozen_schema_objects() {
 
 #[test]
 fn current_open_fails_closed_when_sqlite_schema_is_corrupt() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     drop(BrainDb::create_current(&paths).unwrap());
     let connection = open_for_constraints(&paths.brain_db());
@@ -368,7 +450,7 @@ fn current_open_fails_closed_when_sqlite_schema_is_corrupt() {
 
 #[test]
 fn expired_deadline_fails_before_opening_storage() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     drop(BrainDb::create_current(&paths).unwrap());
 
@@ -384,7 +466,7 @@ fn expired_deadline_fails_before_opening_storage() {
 
 #[test]
 fn brain_schema_enforces_closed_domains_and_nonunique_request_identity() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     drop(BrainDb::create_current(&paths).unwrap());
     let connection = open_for_constraints(&paths.brain_db());
@@ -437,7 +519,7 @@ fn brain_schema_enforces_closed_domains_and_nonunique_request_identity() {
 
 #[test]
 fn decision_and_learning_payload_constraints_are_executable() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     drop(BrainDb::create_current(&paths).unwrap());
     let connection = open_for_constraints(&paths.brain_db());
@@ -472,7 +554,7 @@ fn decision_and_learning_payload_constraints_are_executable() {
 
 #[test]
 fn activity_terminal_identity_is_all_or_none_and_typed() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     drop(BrainDb::create_current(&paths).unwrap());
     let connection = open_for_constraints(&paths.brain_db());
@@ -503,7 +585,7 @@ fn activity_terminal_identity_is_all_or_none_and_typed() {
 
 #[test]
 fn permission_commit_requires_matching_authority_identity_and_action() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     drop(BrainDb::create_current(&paths).unwrap());
     let connection = open_for_constraints(&paths.brain_db());
@@ -556,7 +638,7 @@ fn permission_commit_requires_matching_authority_identity_and_action() {
 
 #[test]
 fn permission_commit_enforces_unique_references_and_closed_domains() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     drop(BrainDb::create_current(&paths).unwrap());
     let connection = open_for_constraints(&paths.brain_db());
@@ -647,85 +729,312 @@ fn permission_commit_enforces_unique_references_and_closed_domains() {
 
 #[test]
 fn lifecycle_schema_enforces_provider_qualified_topology() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     drop(BrainDb::create_current(&paths).unwrap());
     let connection = open_for_constraints(&paths.brain_db());
 
-    let orphan = connection.execute(
+    for rejected in [
+        "UPDATE lifecycle_meta SET next_sequence = 0 WHERE singleton = 1",
+        "INSERT INTO lifecycle_meta (singleton, next_sequence) VALUES (2, 1)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, provider_session_id,
+            latest_event, latest_sequence, latest_received_at_ms
+         ) VALUES ('codex', 'orphan', X'2F', 'missing', 'stop', 1, 1)",
         "INSERT INTO lifecycle_turns (
-            provider, session_id, turn_id, turn_state, sequence, updated_at_ms
-         ) VALUES ('codex', 'missing', 'turn-1', 'active', 1, 1)",
-        [],
-    );
-    assert!(orphan.is_err());
+            provider, session_id, continuity_state, turn_id, turn_open
+         ) VALUES ('codex', 'missing', 'current', 'turn-1', 1)",
+    ] {
+        assert_statement_rejected(&connection, rejected);
+    }
+
+    insert_lifecycle_session(&connection, "codex", "root-1", None);
+    insert_lifecycle_session(&connection, "codex", "root-2", None);
+    insert_lifecycle_session(&connection, "codex", "child-1", Some("root-1"));
+    insert_lifecycle_session(&connection, "claude", "claude-1", None);
+    insert_lifecycle_session(&connection, "antigravity", "agy-1", None);
 
     connection
-        .execute(
+        .execute_batch(
             "INSERT INTO lifecycle_sessions (
-                provider, session_id, provider_session_id, lifecycle_state, sequence, updated_at_ms
-             ) VALUES ('codex', 'session-1', 'root-1', 'active', 1, 1)",
-            [],
+                provider, session_id, cwd, latest_event, latest_sequence,
+                latest_received_at_ms, session_start_source
+             ) VALUES (
+                'codex', 'permission-fact', X'2F', 'permission_request', 2, 2, 'startup'
+             );
+             INSERT INTO lifecycle_leases (
+                provider, session_id, status_event, status_sequence,
+                status_received_at_ms, projected_status
+             ) VALUES (
+                'codex', 'permission-fact', 'permission_request', 2, 2, 'needs_input'
+             );
+             INSERT INTO lifecycle_turns (
+                provider, session_id, continuity_state, turn_id, turn_open, recent_position
+             ) VALUES
+                ('codex', 'root-1', 'current', 'turn-1', 0, NULL),
+                ('codex', 'root-1', 'recent', 'turn-1', 0, 0);",
         )
         .unwrap();
-    connection
-        .execute(
-            "INSERT INTO lifecycle_turns (
-                provider, session_id, turn_id, turn_state, sequence, updated_at_ms
-             ) VALUES ('codex', 'session-1', 'turn-1', 'active', 1, 1)",
-            [],
-        )
-        .unwrap();
-    let duplicate_active_turn = connection.execute(
-        "INSERT INTO lifecycle_turns (
-            provider, session_id, turn_id, turn_state, sequence, updated_at_ms
-         ) VALUES ('codex', 'session-1', 'turn-2', 'active', 2, 2)",
-        [],
-    );
-    assert!(duplicate_active_turn.is_err());
 
     for rejected in [
         "INSERT INTO lifecycle_sessions (
-            provider, session_id, provider_session_id, lifecycle_state, sequence, updated_at_ms
-         ) VALUES ('codex', 'session-2', 'root-1', 'active', 2, 2)",
+            provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
+         ) VALUES ('unknown', 'bad-provider', X'2F', 'stop', 1, 1)",
         "INSERT INTO lifecycle_sessions (
-            provider, session_id, lifecycle_state, sequence, updated_at_ms
-         ) VALUES ('codex', 'negative-session', 'idle', -1, 1)",
+            provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
+         ) VALUES ('codex', '', X'2F', 'stop', 1, 1)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
+         ) VALUES ('codex', printf('%0513d', 0), X'2F', 'stop', 1, 1)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
+         ) VALUES ('codex', 'empty-cwd', X'', 'stop', 1, 1)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
+         ) VALUES ('codex', 'long-cwd', zeroblob(4097), 'stop', 1, 1)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, transcript_path,
+            latest_event, latest_sequence, latest_received_at_ms
+         ) VALUES ('codex', 'long-transcript', X'2F', zeroblob(4097), 'stop', 1, 1)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
+         ) VALUES ('codex', 'zero-sequence', X'2F', 'stop', 0, 1)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence, latest_received_at_ms
+         ) VALUES ('codex', 'negative-time', X'2F', 'stop', 1, -1)",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence,
+            latest_received_at_ms, ignored_reason
+         ) VALUES ('codex', 'bad-ignore', X'2F', 'stop', 1, 1, 'unknown')",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence,
+            latest_received_at_ms, signature_event, signature_turn_id
+         ) VALUES ('codex', 'permission-signature', X'2F',
+                   'permission_request', 1, 1, 'permission_request', 'turn-1')",
+        "INSERT INTO lifecycle_sessions (
+            provider, session_id, cwd, latest_event, latest_sequence,
+            latest_received_at_ms, signature_detail_id
+         ) VALUES ('codex', 'detached-detail', X'2F', 'stop', 1, 1, 'request-key')",
+        "INSERT INTO lifecycle_leases (
+            provider, session_id, status_event, status_sequence,
+            status_received_at_ms, projected_status
+         ) VALUES ('codex', 'missing', 'stop', 1, 1, 'idle')",
+        "INSERT INTO lifecycle_leases (
+            provider, session_id, status_event, status_sequence,
+            status_received_at_ms, projected_status
+         ) VALUES ('codex', 'root-1', 'subagent_stop', 1, 1, 'idle')",
+        "INSERT INTO lifecycle_leases (
+            provider, session_id, status_event, status_sequence,
+            status_received_at_ms, projected_status
+         ) VALUES ('codex', 'root-1', 'stop', 0, 1, 'idle')",
         "INSERT INTO lifecycle_turns (
-            provider, session_id, turn_id, turn_state, sequence, updated_at_ms
-         ) VALUES ('codex', 'session-1', 'negative-turn', 'stopped', -1, 1)",
-        "INSERT INTO lifecycle_invocations (
-            provider, session_id, turn_id, invocation_id,
-            invocation_state, sequence, updated_at_ms
-         ) VALUES ('codex', 'session-1', 'missing-turn', 'orphan',
-                   'active', 1, 1)",
+            provider, session_id, continuity_state, turn_id, turn_open
+         ) VALUES ('codex', 'root-1', 'current', 'turn-2', 1)",
+        "INSERT INTO lifecycle_turns (
+            provider, session_id, continuity_state, turn_id, turn_open, recent_position
+         ) VALUES ('codex', 'root-1', 'recent', 'turn-2', 1, 1)",
+        "INSERT INTO lifecycle_turns (
+            provider, session_id, continuity_state, turn_id, turn_open, recent_position
+         ) VALUES ('codex', 'root-1', 'recent', 'turn-2', 0, 0)",
+        "INSERT INTO lifecycle_turns (
+            provider, session_id, continuity_state, turn_id, turn_open, recent_position
+         ) VALUES ('codex', 'root-1', 'recent', 'turn-2', 0, 32)",
     ] {
         assert_statement_rejected(&connection, rejected);
     }
+
     connection
-        .execute(
-            "INSERT INTO lifecycle_invocations (
-                provider, session_id, turn_id, invocation_id,
-                invocation_state, sequence, updated_at_ms
-             ) VALUES ('codex', 'session-1', 'turn-1', 'invocation-1',
-                       'active', 1, 1)",
-            [],
+        .execute_batch(
+            "INSERT INTO lifecycle_subagents (
+                provider, parent_session_id, agent_id, turn_id, subagent_state,
+                topology_slot, state_sequence, received_at_ms
+             ) VALUES ('codex', 'root-1', 'child-1', 'turn-1', 'active', 0, 2, 2);
+             INSERT INTO lifecycle_subagents (
+                provider, parent_session_id, agent_id, turn_id, subagent_state,
+                topology_slot, state_sequence, received_at_ms
+             ) VALUES ('codex', 'root-1', 'stopped-child', 'turn-0', 'stopped', 0, 1, 1);
+             INSERT INTO lifecycle_invocations (
+                provider, session_id, invocation_id, invocation_state,
+                initial_step, state_sequence, received_at_ms
+             ) VALUES ('antigravity', 'agy-1', 'invocation-1', 'active', 3, 2, 2);
+             INSERT INTO lifecycle_invocations (
+                provider, session_id, invocation_id, invocation_state,
+                initial_step, state_sequence, received_at_ms
+             ) VALUES ('antigravity', 'agy-1', 'invocation-0', 'stopped', NULL, 1, 1);
+             INSERT INTO lifecycle_invocation_steps (
+                provider, session_id, invocation_id, step, step_slot,
+                pre_tool_seen, post_tool_seen
+             ) VALUES ('antigravity', 'agy-1', 'invocation-1', 3, 0, 1, 0);",
         )
         .unwrap();
+
     for rejected in [
+        "INSERT INTO lifecycle_subagents (
+            provider, parent_session_id, agent_id, turn_id, subagent_state,
+            topology_slot, state_sequence, received_at_ms
+         ) VALUES ('codex', 'missing', 'orphan-child', 'turn-1', 'active', 0, 1, 1)",
+        "INSERT INTO lifecycle_subagents (
+            provider, parent_session_id, agent_id, turn_id, subagent_state,
+            topology_slot, state_sequence, received_at_ms
+         ) VALUES ('codex', 'root-2', 'child-1', 'turn-1', 'active', 0, 1, 1)",
+        "INSERT INTO lifecycle_subagents (
+            provider, parent_session_id, agent_id, turn_id, subagent_state,
+            topology_slot, state_sequence, received_at_ms
+         ) VALUES ('codex', 'root-1', 'other-active', 'turn-1', 'active', 0, 1, 1)",
+        "INSERT INTO lifecycle_subagents (
+            provider, parent_session_id, agent_id, turn_id, subagent_state,
+            topology_slot, state_sequence, received_at_ms
+         ) VALUES ('codex', 'root-1', 'overflow', 'turn-1', 'active', 64, 1, 1)",
+        "INSERT INTO lifecycle_subagents (
+            provider, parent_session_id, agent_id, turn_id, subagent_state,
+            topology_slot, state_sequence, received_at_ms
+         ) VALUES ('claude', 'claude-1', 'stopped', 'turn-1', 'stopped', 0, 1, 1)",
         "INSERT INTO lifecycle_invocations (
-            provider, session_id, turn_id, invocation_id,
-            invocation_state, sequence, updated_at_ms
-         ) VALUES ('codex', 'session-1', 'turn-1', 'invocation-2',
-                   'active', 2, 2)",
+            provider, session_id, invocation_id, invocation_state,
+            initial_step, state_sequence, received_at_ms
+         ) VALUES ('antigravity', 'agy-1', 'invocation-2', 'active', 4, 3, 3)",
         "INSERT INTO lifecycle_invocations (
-            provider, session_id, turn_id, invocation_id,
-            invocation_state, sequence, updated_at_ms
-         ) VALUES ('codex', 'session-1', 'turn-1', 'negative-invocation',
-                   'completed', -1, 1)",
+            provider, session_id, invocation_id, invocation_state,
+            initial_step, state_sequence, received_at_ms
+         ) VALUES ('codex', 'root-1', 'invocation-1', 'active', 0, 1, 1)",
+        "INSERT INTO lifecycle_invocations (
+            provider, session_id, invocation_id, invocation_state,
+            initial_step, state_sequence, received_at_ms
+         ) VALUES ('antigravity', 'missing', 'invocation-1', 'active', 0, 1, 1)",
+        "INSERT INTO lifecycle_invocation_steps (
+            provider, session_id, invocation_id, step, step_slot,
+            pre_tool_seen, post_tool_seen
+         ) VALUES ('antigravity', 'agy-1', 'missing', 4, 1, 1, 0)",
+        "INSERT INTO lifecycle_invocation_steps (
+            provider, session_id, invocation_id, step, step_slot,
+            pre_tool_seen, post_tool_seen
+         ) VALUES ('antigravity', 'agy-1', 'invocation-1', 4, 1, 0, 0)",
+        "INSERT INTO lifecycle_invocation_steps (
+            provider, session_id, invocation_id, step, step_slot,
+            pre_tool_seen, post_tool_seen
+         ) VALUES ('antigravity', 'agy-1', 'invocation-1', 4, 256, 1, 0)",
+        "INSERT INTO lifecycle_invocation_steps (
+            provider, session_id, invocation_id, step, step_slot,
+            pre_tool_seen, post_tool_seen
+         ) VALUES ('antigravity', 'agy-1', 'invocation-1', 4, 0, 0, 1)",
     ] {
         assert_statement_rejected(&connection, rejected);
     }
+}
+
+#[test]
+fn lifecycle_schema_maps_the_complete_non_permission_snapshot() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+
+    let expected = [
+        ("lifecycle_meta", ["singleton", "next_sequence"].as_slice()),
+        (
+            "lifecycle_sessions",
+            [
+                "provider",
+                "session_id",
+                "cwd",
+                "transcript_path",
+                "provider_session_id",
+                "latest_event",
+                "latest_sequence",
+                "latest_received_at_ms",
+                "session_start_source",
+                "ignored_reason",
+                "signature_event",
+                "signature_turn_id",
+                "signature_detail_id",
+                "signature_session_start_source",
+            ]
+            .as_slice(),
+        ),
+        (
+            "lifecycle_leases",
+            [
+                "provider",
+                "session_id",
+                "status_event",
+                "status_sequence",
+                "status_received_at_ms",
+                "projected_status",
+            ]
+            .as_slice(),
+        ),
+        (
+            "lifecycle_turns",
+            [
+                "provider",
+                "session_id",
+                "continuity_state",
+                "turn_id",
+                "turn_open",
+                "recent_position",
+            ]
+            .as_slice(),
+        ),
+        (
+            "lifecycle_subagents",
+            [
+                "provider",
+                "parent_session_id",
+                "agent_id",
+                "turn_id",
+                "subagent_state",
+                "topology_slot",
+                "state_sequence",
+                "received_at_ms",
+            ]
+            .as_slice(),
+        ),
+        (
+            "lifecycle_invocations",
+            [
+                "provider",
+                "session_id",
+                "invocation_id",
+                "invocation_state",
+                "initial_step",
+                "state_sequence",
+                "received_at_ms",
+            ]
+            .as_slice(),
+        ),
+        (
+            "lifecycle_invocation_steps",
+            [
+                "provider",
+                "session_id",
+                "invocation_id",
+                "step",
+                "step_slot",
+                "pre_tool_seen",
+                "post_tool_seen",
+            ]
+            .as_slice(),
+        ),
+    ];
+
+    for (table, columns) in expected {
+        let actual = table_columns(&connection, table);
+        assert_eq!(actual, columns, "unexpected columns for {table}");
+        assert!(
+            actual.iter().all(|column| !column.contains("permission")),
+            "permission state leaked into {table}"
+        );
+    }
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT next_sequence FROM lifecycle_meta WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -739,12 +1048,17 @@ fn required_query_indexes_are_frozen_in_brain_schema() {
         "activity_events_permission_identity",
         "decision_identities_authority",
         "decision_payloads_source_cursor",
-        "lifecycle_invocations_active_identity",
-        "lifecycle_invocations_exact",
-        "lifecycle_sessions_active_identity",
-        "lifecycle_sessions_active_topology",
-        "lifecycle_turns_active_identity",
+        "lifecycle_invocation_steps_exact",
+        "lifecycle_invocations_active",
+        "lifecycle_invocations_state",
+        "lifecycle_leases_status",
+        "lifecycle_sessions_latest",
+        "lifecycle_sessions_provider_parent",
+        "lifecycle_subagents_child",
+        "lifecycle_subagents_parent_state",
+        "lifecycle_turns_current",
         "lifecycle_turns_exact",
+        "lifecycle_turns_recent_position",
         "permission_attempts_request_active",
         "permission_commits_request_authority",
         "permission_commits_undelivered_audit",
@@ -770,7 +1084,7 @@ fn required_query_indexes_are_frozen_in_brain_schema() {
 
 #[test]
 fn fresh_review_database_is_isolated_and_constrained() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     drop(ReviewDb::create_current(&paths).unwrap());
     let connection = open_for_constraints(&paths.review_db());

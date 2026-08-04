@@ -6,9 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use super::super::secure_state::{
-    SecureStateError, open_or_create_nested, state_root_for_traversal,
-};
+use super::super::secure_state::state_root_for_traversal;
 
 #[derive(Debug)]
 pub(super) enum SecurityError {
@@ -27,15 +25,6 @@ impl From<io::Error> for SecurityError {
     }
 }
 
-impl From<SecureStateError> for SecurityError {
-    fn from(error: SecureStateError) -> Self {
-        match error {
-            SecureStateError::Io(error) => error.into(),
-            SecureStateError::InvalidStorage(reason) => Self::Invalid(reason),
-        }
-    }
-}
-
 pub(super) struct SecureDatabaseDirectory {
     descriptor: File,
     path: PathBuf,
@@ -43,8 +32,10 @@ pub(super) struct SecureDatabaseDirectory {
 
 impl SecureDatabaseDirectory {
     pub(super) fn prepare(state_root: &Path, create: bool) -> Result<Self, SecurityError> {
+        validate_or_create_state_root(state_root, create)?;
         if create {
-            open_or_create_nested(state_root, &[OsStr::new("db")])?;
+            let state_root = open_existing_directory(state_root)?;
+            open_or_create_directory_at(&state_root, OsStr::new("db"), true)?;
         }
         let path = state_root.join("db");
         let descriptor = open_existing_directory(&path)?;
@@ -126,6 +117,77 @@ impl SecureDatabaseDirectory {
     }
 }
 
+fn validate_or_create_state_root(state_root: &Path, create: bool) -> Result<(), SecurityError> {
+    let state_root = state_root_for_traversal(state_root);
+    let mut directory = open_directory(if state_root.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    })?;
+    let components = normal_components(&state_root)?;
+    if components.is_empty() {
+        return validate_private_state_root_metadata(&EntryMetadata::from(&directory.metadata()?));
+    }
+
+    for (index, name) in components.iter().enumerate() {
+        validate_safe_ancestor_metadata(&EntryMetadata::from(&directory.metadata()?))?;
+        directory = if create {
+            open_or_create_directory_at(&directory, name, index + 1 == components.len())?
+        } else {
+            open_directory_at(&directory, name)?
+        };
+        if index + 1 == components.len() {
+            validate_private_state_root_metadata(&EntryMetadata::from(&directory.metadata()?))?;
+        }
+    }
+    Ok(())
+}
+
+fn normal_components(path: &Path) -> Result<Vec<&OsStr>, SecurityError> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::RootDir | Component::CurDir => None,
+            Component::Normal(name) => Some(Ok(name)),
+            Component::ParentDir | Component::Prefix(_) => {
+                Some(Err(SecurityError::Invalid("invalid state directory path")))
+            }
+        })
+        .collect()
+}
+
+fn open_or_create_directory_at(
+    parent: &File,
+    name: &OsStr,
+    private: bool,
+) -> Result<File, SecurityError> {
+    let c_name = CString::new(name.as_bytes())
+        .map_err(|_| SecurityError::Invalid("invalid database directory name"))?;
+    let created = unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o700) } == 0;
+    if !created {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error.into());
+        }
+    }
+
+    let directory = open_directory_at(parent, name)?;
+    if created && unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let path_metadata = metadata_at(parent, &c_name)?;
+    let opened_metadata = EntryMetadata::from(&directory.metadata()?);
+    if created || private {
+        validate_private_state_root_metadata(&path_metadata)?;
+        validate_private_state_root_metadata(&opened_metadata)?;
+    }
+    if path_metadata.dev != opened_metadata.dev || path_metadata.ino != opened_metadata.ino {
+        return Err(SecurityError::Invalid(
+            "created directory changed during validation",
+        ));
+    }
+    Ok(directory)
+}
+
 fn open_existing_directory(path: &Path) -> Result<File, SecurityError> {
     let path = state_root_for_traversal(path);
     let mut directory = open_directory(if path.is_absolute() {
@@ -161,10 +223,16 @@ fn open_directory(path: &Path) -> io::Result<File> {
     }
 }
 
+#[allow(clippy::unnecessary_cast)] // libc mode constants vary in width across Unix targets.
 fn open_directory_at(parent: &File, name: &OsStr) -> Result<File, SecurityError> {
     let name = CString::new(name.as_bytes())
         .map_err(|_| SecurityError::Invalid("invalid database directory name"))?;
     let before = metadata_at(parent, &name)?;
+    if before.mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
+        return Err(SecurityError::Invalid(
+            "database directory component is not a directory",
+        ));
+    }
     let descriptor = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -199,6 +267,36 @@ fn validate_private_directory(directory: &File) -> Result<(), SecurityError> {
         return Err(SecurityError::Invalid(
             "database directory is not owner-only",
         ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::unnecessary_cast)] // libc mode constants vary in width across Unix targets.
+fn validate_safe_ancestor_metadata(metadata: &EntryMetadata) -> Result<(), SecurityError> {
+    if metadata.mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
+        return Err(SecurityError::Invalid(
+            "state directory ancestor is not a directory",
+        ));
+    }
+    if metadata.mode & 0o022 != 0 {
+        let sticky = metadata.mode & libc::S_ISVTX as u32 != 0;
+        let trusted_owner = metadata.uid == 0 || metadata.uid == unsafe { libc::geteuid() };
+        if !sticky || !trusted_owner {
+            return Err(SecurityError::Invalid(
+                "state directory ancestor is replaceable by another user",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::unnecessary_cast)] // libc mode constants vary in width across Unix targets.
+fn validate_private_state_root_metadata(metadata: &EntryMetadata) -> Result<(), SecurityError> {
+    if metadata.mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || metadata.uid != unsafe { libc::geteuid() }
+        || metadata.mode & 0o777 != 0o700
+    {
+        return Err(SecurityError::Invalid("state directory is not owner-only"));
     }
     Ok(())
 }
@@ -317,4 +415,23 @@ fn validate_local_filesystem(_directory: &File) -> Result<(), SecurityError> {
     Err(SecurityError::Invalid(
         "local filesystem validation is unsupported on this platform",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)] // libc mode constants vary in width across Unix targets.
+    fn private_state_root_metadata_rejects_foreign_owner() {
+        let metadata = EntryMetadata {
+            mode: libc::S_IFDIR as u32 | 0o700,
+            uid: unsafe { libc::geteuid() }.wrapping_add(1),
+            nlink: 1,
+            dev: 1,
+            ino: 1,
+        };
+
+        assert!(validate_private_state_root_metadata(&metadata).is_err());
+    }
 }
