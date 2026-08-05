@@ -2,6 +2,7 @@
 
 mod activity;
 mod decisions;
+mod legacy;
 mod lifecycle;
 mod permissions;
 mod review;
@@ -30,6 +31,11 @@ pub use activity::{ActivityCursor, ActivityPage, ActivityRecord};
 pub use decisions::{
     DecisionIdentity, DecisionKind, DecisionPayload, ErasureState, LearningDecisionPage,
     LearningErasePaths, LearningReadSession,
+};
+#[allow(unused_imports)]
+pub use legacy::{
+    LEGACY_EXPORT_PROFILE, LegacyFingerprint, LegacySnapshot, LegacySourceDescriptor,
+    LegacySourceKind, LegacySourceSet,
 };
 #[allow(unused_imports)]
 pub use permissions::{

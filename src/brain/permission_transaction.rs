@@ -2032,7 +2032,9 @@ fn valid_creation_identity(identity: &str) -> bool {
     )
 }
 
-fn validate_journal(journal: &PermissionTransactionJournal) -> Result<(), TransactionError> {
+pub(crate) fn validate_journal(
+    journal: &PermissionTransactionJournal,
+) -> Result<(), TransactionError> {
     if !matches!(journal.schema_version, 1 | JOURNAL_SCHEMA_VERSION)
         || !valid_id(&journal.transaction_id)
         || !valid_id(&journal.proposal.decision_id)
@@ -2314,7 +2316,7 @@ fn read_and_validate_journal(file: &mut File) -> Option<PermissionTransactionJou
     Some(journal)
 }
 
-fn decode_exact_journal(bytes: &[u8]) -> Option<PermissionTransactionJournal> {
+pub(crate) fn decode_exact_journal(bytes: &[u8]) -> Option<PermissionTransactionJournal> {
     let raw_numbers = serde_json::from_slice::<RawJournalNumbers<'_>>(bytes).ok()?;
     if !raw_numbers.are_lossless() {
         return None;
@@ -2324,6 +2326,13 @@ fn decode_exact_journal(bytes: &[u8]) -> Option<PermissionTransactionJournal> {
     deserializer.end().ok()?;
     let journal: PermissionTransactionJournal = serde_json::from_value(encoded.clone()).ok()?;
     (serde_json::to_value(&journal).ok()? == encoded).then_some(journal)
+}
+
+pub(crate) fn decode_exact_json(bytes: &[u8]) -> Option<serde_json::Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let UniqueJsonValue(value) = UniqueJsonValue::deserialize(&mut deserializer).ok()?;
+    deserializer.end().ok()?;
+    Some(value)
 }
 
 #[derive(Deserialize)]

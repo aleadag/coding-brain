@@ -39,7 +39,7 @@ static DECISION_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 #[cfg(test)]
 static TEST_RUN_ID: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
 
-const MAX_DECISION_RECORD_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_DECISION_RECORD_BYTES: u64 = 1024 * 1024;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Core types
@@ -993,7 +993,7 @@ pub fn read_all_decisions() -> Vec<DecisionRecord> {
         .collect()
 }
 
-fn parse_decision_value(
+pub(crate) fn parse_decision_value(
     json: &serde_json::Value,
     canonical_set: &std::collections::HashSet<String>,
 ) -> Option<DecisionRecord> {

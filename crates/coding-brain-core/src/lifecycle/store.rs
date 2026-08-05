@@ -570,6 +570,37 @@ impl LifecycleStore {
     }
 }
 
+/// Parse one complete frozen legacy lifecycle snapshot without opening locks or
+/// mutating its source directory.
+pub fn decode_legacy_snapshot(bytes: &[u8]) -> Result<LifecycleSnapshot, StoreError> {
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(StoreError::SnapshotTooLarge);
+    }
+    let header: SchemaHeader =
+        serde_json::from_slice(bytes).map_err(|_| StoreError::InvalidSnapshot)?;
+    if header.schema_version > LIFECYCLE_SCHEMA_VERSION {
+        return Err(StoreError::NewerSchema(header.schema_version));
+    }
+    if !matches!(header.schema_version, 1 | 2 | 3 | LIFECYCLE_SCHEMA_VERSION) {
+        return Err(StoreError::InvalidSnapshot);
+    }
+    let mut snapshot: LifecycleSnapshot =
+        serde_json::from_slice(bytes).map_err(|_| StoreError::InvalidSnapshot)?;
+    if header.schema_version == 1 {
+        snapshot = project_schema_one(snapshot);
+    }
+    if header.schema_version <= 2 {
+        snapshot = project_schema_two(snapshot);
+    }
+    if header.schema_version <= 3 {
+        snapshot = project_schema_three(snapshot);
+    }
+    if !valid_snapshot_shape(&snapshot) {
+        return Err(StoreError::InvalidSnapshot);
+    }
+    Ok(snapshot)
+}
+
 fn snapshot_permission_disposition(
     snapshot: &LifecycleSnapshot,
     identity: &LifecycleIdentity,

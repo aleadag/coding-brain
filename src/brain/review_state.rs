@@ -512,6 +512,29 @@ fn read_persisted(directory: &SecureStateDirectory) -> Result<PersistedState, Re
     Ok(state)
 }
 
+pub(crate) fn decode_legacy_snapshot(
+    bytes: &[u8],
+) -> Result<ReviewStateSnapshot, ReviewStateError> {
+    if bytes.len() > MAX_REVIEW_STATE_BYTES {
+        return Err(ReviewStateError::StateTooLarge);
+    }
+    let UniqueJsonValue(value) = serde_json::from_slice::<UniqueJsonValue>(bytes)?;
+    let state = serde_json::from_value::<PersistedState>(value)?;
+    validate_persisted(&state)?;
+    let mut snapshot = ReviewStateSnapshot::default();
+    for (surface, persisted) in state.surfaces {
+        snapshot.surfaces.insert(
+            surface,
+            SurfaceState {
+                revision: persisted.revision,
+                items: persisted.items,
+                last_archive: persisted.last_archive,
+            },
+        );
+    }
+    Ok(snapshot)
+}
+
 fn validate_persisted(state: &PersistedState) -> Result<(), ReviewStateError> {
     if state.schema_version != REVIEW_STATE_SCHEMA_VERSION {
         return Err(ReviewStateError::UnsupportedSchema(state.schema_version));

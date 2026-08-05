@@ -96,6 +96,10 @@ impl SecureStateDirectory {
         self.descriptor.sync_all()
     }
 
+    pub(crate) fn descriptor_clone(&self) -> io::Result<File> {
+        self.descriptor.try_clone()
+    }
+
     pub(crate) fn validate_path_correspondence(&self) -> Result<(), SecureStateError> {
         let current = Self::open_existing_strict(&self.display_path)?;
         let retained = SecureEntryMetadata::from(&self.descriptor.metadata()?);
