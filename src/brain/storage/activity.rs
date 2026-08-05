@@ -82,7 +82,7 @@ impl ActivityPage {
 }
 
 #[derive(Debug)]
-struct PreparedActivity {
+pub(super) struct PreparedActivity {
     event: ActivityEvent,
     payload: Vec<u8>,
     event_kind: &'static str,
@@ -98,7 +98,7 @@ struct TerminalIdentity {
     provider: &'static str,
     session_id: String,
     turn_id: String,
-    tool_use_id: String,
+    tool_use_id: Option<String>,
     action: &'static str,
 }
 
@@ -154,7 +154,7 @@ impl BrainDb {
                 .ok_or(StorageError::InvalidStorage(
                     "activity cursor space is exhausted",
                 ))?;
-            insert_activity(&transaction, cursor, activity)?;
+            insert_activity(&transaction, cursor, activity, None)?;
             cursors.push(ActivityCursor::try_from(cursor)?);
         }
         commit_before_deadline(self.deadline, || transaction.commit())?;
@@ -319,7 +319,7 @@ impl BrainDb {
     }
 }
 
-fn prepare_activity(event: ActivityEvent) -> Result<PreparedActivity, StorageError> {
+pub(super) fn prepare_activity(event: ActivityEvent) -> Result<PreparedActivity, StorageError> {
     if event.schema_version != ACTIVITY_SCHEMA_VERSION {
         return Err(StorageError::InvalidStorage(
             "unsupported activity payload schema",
@@ -356,7 +356,7 @@ fn prepare_activity(event: ActivityEvent) -> Result<PreparedActivity, StorageErr
     })
 }
 
-fn validated_high_water(connection: &Connection) -> Result<i64, StorageError> {
+pub(super) fn validated_high_water(connection: &Connection) -> Result<i64, StorageError> {
     let (high_water, retained_max) = connection.query_row(
         "SELECT activity_high_water, (SELECT max(source_cursor) FROM activity_events)
          FROM schema_meta WHERE singleton = 1",
@@ -382,24 +382,25 @@ fn terminal_identity(event: &ActivityEvent) -> Option<TerminalIdentity> {
         provider: session.provider.as_str(),
         session_id: session.session_id.clone(),
         turn_id: session.turn_id.clone()?,
-        tool_use_id: session.tool_use_id.clone()?,
+        tool_use_id: session.tool_use_id.clone(),
         action,
     })
 }
 
-fn insert_activity(
+pub(super) fn insert_activity(
     transaction: &Transaction<'_>,
     cursor: i64,
     activity: &PreparedActivity,
+    permission_attempt_id: Option<&str>,
 ) -> Result<(), StorageError> {
     let terminal = activity.terminal.as_ref();
     let inserted = transaction.execute(
         "INSERT INTO activity_events (
-            source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+            source_cursor, activity_id, event_kind, event_state, recorded_at_ms, permission_attempt_id,
             terminal_provider, terminal_session_id, terminal_turn_id,
             terminal_tool_use_id, terminal_action, outcome, correction, event_payload
          )
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
          WHERE NOT EXISTS (
              SELECT 1 FROM activity_events
              WHERE activity_id = ?2 AND event_kind <> ?3
@@ -410,10 +411,11 @@ fn insert_activity(
             activity.event_kind,
             activity.event_state,
             activity.recorded_at_ms,
+            permission_attempt_id,
             terminal.map(|value| value.provider),
             terminal.map(|value| value.session_id.as_str()),
             terminal.map(|value| value.turn_id.as_str()),
-            terminal.map(|value| value.tool_use_id.as_str()),
+            terminal.and_then(|value| value.tool_use_id.as_deref()),
             terminal.map(|value| value.action),
             activity.outcome,
             activity.correction,
@@ -507,7 +509,7 @@ fn decode_activity_row(row: &Row<'_>, payload: &[u8]) -> Result<ActivityRecord, 
         terminal.map(|value| value.provider.to_owned()),
         terminal.map(|value| value.session_id.clone()),
         terminal.map(|value| value.turn_id.clone()),
-        terminal.map(|value| value.tool_use_id.clone()),
+        terminal.and_then(|value| value.tool_use_id.clone()),
         terminal.map(|value| value.action.to_owned()),
         prepared.outcome.map(str::to_owned),
         prepared.correction.map(str::to_owned),
@@ -607,7 +609,7 @@ pub(super) fn apply_deadline(
     }
 }
 
-fn explain_query(
+pub(super) fn explain_query(
     connection: &Connection,
     sql: &str,
     deadline: Option<StorageDeadline>,

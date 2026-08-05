@@ -24,25 +24,44 @@ INSERT INTO schema_meta (
 
 CREATE TABLE permission_attempts (
     attempt_id TEXT PRIMARY KEY CHECK (length(attempt_id) BETWEEN 1 AND 512),
+    request_identity_key TEXT NOT NULL CHECK (
+        length(request_identity_key) = 64
+        AND request_identity_key NOT GLOB '*[^0-9a-f]*'
+    ),
     provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude', 'antigravity')),
     session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 512),
+    provider_session_id TEXT CHECK (
+        provider_session_id IS NULL
+        OR (length(provider_session_id) BETWEEN 1 AND 512 AND provider_session_id != session_id)
+    ),
     turn_id TEXT NOT NULL CHECK (length(turn_id) BETWEEN 1 AND 512),
-    tool_use_id TEXT NOT NULL CHECK (length(tool_use_id) BETWEEN 1 AND 512),
-    request_key TEXT NOT NULL CHECK (length(request_key) BETWEEN 1 AND 512),
-    authority_action TEXT NOT NULL CHECK (authority_action IN ('allow', 'deny')),
+    tool_use_id TEXT CHECK (tool_use_id IS NULL OR length(tool_use_id) BETWEEN 1 AND 512),
+    request_key TEXT NOT NULL CHECK (
+        length(request_key) = 64 AND request_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    cwd BLOB NOT NULL CHECK (length(cwd) BETWEEN 1 AND 4096),
+    project_id BLOB NOT NULL CHECK (length(project_id) BETWEEN 1 AND 4096),
+    tool_name TEXT NOT NULL CHECK (length(tool_name) BETWEEN 1 AND 512),
+    activity_id TEXT NOT NULL CHECK (length(activity_id) BETWEEN 1 AND 512),
+    authority_action TEXT CHECK (authority_action IS NULL OR authority_action IN ('allow', 'deny')),
     attempt_state TEXT NOT NULL CHECK (attempt_state IN ('evaluating', 'needs_input', 'decided', 'abandoned')),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms BETWEEN 0 AND 0x7fffffffffffffff),
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms BETWEEN created_at_ms AND 0x7fffffffffffffff),
-    UNIQUE (attempt_id, provider, session_id, turn_id, tool_use_id, authority_action)
+    UNIQUE (attempt_id, authority_action),
+    CHECK (
+        (attempt_state = 'decided' AND authority_action IS NOT NULL)
+        OR (attempt_state != 'decided' AND authority_action IS NULL)
+    )
 ) STRICT;
 
 CREATE INDEX permission_attempts_request_active
-ON permission_attempts (provider, session_id, turn_id, tool_use_id, request_key, updated_at_ms DESC)
+ON permission_attempts (request_identity_key, updated_at_ms DESC)
 WHERE attempt_state IN ('evaluating', 'needs_input', 'decided');
 
 CREATE TABLE decision_identities (
     decision_id TEXT PRIMARY KEY CHECK (length(decision_id) BETWEEN 1 AND 512),
     identity_kind TEXT NOT NULL CHECK (identity_kind IN ('permission', 'observation')),
+    permission_attempt_id TEXT,
     provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude', 'antigravity')),
     session_id TEXT CHECK (session_id IS NULL OR length(session_id) BETWEEN 1 AND 512),
     turn_id TEXT CHECK (turn_id IS NULL OR length(turn_id) BETWEEN 1 AND 512),
@@ -52,12 +71,17 @@ CREATE TABLE decision_identities (
     decided_at_ms INTEGER NOT NULL CHECK (decided_at_ms BETWEEN 0 AND 0x7fffffffffffffff),
     UNIQUE (decision_id, identity_kind),
     UNIQUE (decision_id, provider, session_id, turn_id, tool_use_id, authority_action),
+    UNIQUE (decision_id, permission_attempt_id, authority_action),
+    FOREIGN KEY (permission_attempt_id) REFERENCES permission_attempts (attempt_id),
+    FOREIGN KEY (permission_attempt_id, authority_action)
+        REFERENCES permission_attempts (attempt_id, authority_action),
     CHECK (
         (identity_kind = 'permission'
-         AND session_id IS NOT NULL AND turn_id IS NOT NULL AND tool_use_id IS NOT NULL
+         AND session_id IS NOT NULL AND turn_id IS NOT NULL
          AND authority_action IS NOT NULL AND decision_source IS NOT NULL)
         OR
         (identity_kind = 'observation'
+         AND permission_attempt_id IS NULL
          AND session_id IS NULL AND turn_id IS NULL AND tool_use_id IS NULL
          AND authority_action IS NULL AND decision_source IS NULL)
     )
@@ -89,6 +113,7 @@ CREATE TABLE activity_events (
     event_kind TEXT NOT NULL CHECK (event_kind IN ('decision', 'lifecycle', 'diagnostic')),
     event_state TEXT NOT NULL CHECK (event_state IN ('observed', 'evaluating', 'allowed', 'denied', 'abstained', 'error', 'delivered', 'delivery_failed', 'outcome', 'correction', 'interrupted', 'incomplete')),
     recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms BETWEEN 0 AND 0x7fffffffffffffff),
+    permission_attempt_id TEXT,
     terminal_provider TEXT CHECK (terminal_provider IS NULL OR terminal_provider IN ('codex', 'claude', 'antigravity')),
     terminal_session_id TEXT CHECK (terminal_session_id IS NULL OR length(terminal_session_id) BETWEEN 1 AND 512),
     terminal_turn_id TEXT CHECK (terminal_turn_id IS NULL OR length(terminal_turn_id) BETWEEN 1 AND 512),
@@ -98,12 +123,16 @@ CREATE TABLE activity_events (
     correction TEXT CHECK (correction IS NULL OR correction IN ('brain_right', 'brain_wrong', 'exception')),
     distilled_at_ms INTEGER CHECK (distilled_at_ms IS NULL OR distilled_at_ms BETWEEN 0 AND 0x7fffffffffffffff),
     event_payload BLOB NOT NULL CHECK (length(event_payload) <= 65536),
+    FOREIGN KEY (permission_attempt_id) REFERENCES permission_attempts (attempt_id),
+    FOREIGN KEY (permission_attempt_id, terminal_action)
+        REFERENCES permission_attempts (attempt_id, authority_action),
     CHECK (
         (terminal_provider IS NULL AND terminal_session_id IS NULL AND terminal_turn_id IS NULL AND terminal_tool_use_id IS NULL AND terminal_action IS NULL)
         OR
-        (terminal_provider IS NOT NULL AND terminal_session_id IS NOT NULL AND terminal_turn_id IS NOT NULL AND terminal_tool_use_id IS NOT NULL AND terminal_action IS NOT NULL)
+        (terminal_provider IS NOT NULL AND terminal_session_id IS NOT NULL AND terminal_turn_id IS NOT NULL AND terminal_action IS NOT NULL)
     ),
-    UNIQUE (activity_id, terminal_provider, terminal_session_id, terminal_turn_id, terminal_tool_use_id, terminal_action)
+    UNIQUE (activity_id, terminal_provider, terminal_session_id, terminal_turn_id, terminal_tool_use_id, terminal_action),
+    UNIQUE (activity_id, permission_attempt_id, terminal_action)
 ) STRICT;
 
 CREATE INDEX activity_events_cursor
@@ -130,27 +159,30 @@ WHERE distilled_at_ms IS NULL;
 
 CREATE TABLE permission_commits (
     attempt_id TEXT PRIMARY KEY,
+    transaction_id TEXT NOT NULL UNIQUE CHECK (length(transaction_id) BETWEEN 1 AND 512),
     decision_id TEXT NOT NULL UNIQUE,
     terminal_activity_id TEXT NOT NULL UNIQUE,
-    provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude', 'antigravity')),
-    session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 512),
-    turn_id TEXT NOT NULL CHECK (length(turn_id) BETWEEN 1 AND 512),
-    tool_use_id TEXT NOT NULL CHECK (length(tool_use_id) BETWEEN 1 AND 512),
     authority_action TEXT NOT NULL CHECK (authority_action IN ('allow', 'deny')),
     evidence_kind TEXT NOT NULL CHECK (evidence_kind IN ('provider_authority', 'deterministic_safety')),
     delivery_state TEXT NOT NULL CHECK (delivery_state IN ('not_required', 'pending', 'delivered', 'failed', 'unknown')),
     response_eligible INTEGER NOT NULL CHECK (response_eligible IN (0, 1)),
     committed_at_ms INTEGER NOT NULL CHECK (committed_at_ms BETWEEN 0 AND 0x7fffffffffffffff),
-    FOREIGN KEY (attempt_id, provider, session_id, turn_id, tool_use_id, authority_action)
-        REFERENCES permission_attempts (attempt_id, provider, session_id, turn_id, tool_use_id, authority_action),
-    FOREIGN KEY (decision_id, provider, session_id, turn_id, tool_use_id, authority_action)
-        REFERENCES decision_identities (decision_id, provider, session_id, turn_id, tool_use_id, authority_action),
-    FOREIGN KEY (terminal_activity_id, provider, session_id, turn_id, tool_use_id, authority_action)
-        REFERENCES activity_events (activity_id, terminal_provider, terminal_session_id, terminal_turn_id, terminal_tool_use_id, terminal_action)
+    FOREIGN KEY (attempt_id, authority_action)
+        REFERENCES permission_attempts (attempt_id, authority_action),
+    FOREIGN KEY (decision_id, attempt_id, authority_action)
+        REFERENCES decision_identities (decision_id, permission_attempt_id, authority_action),
+    FOREIGN KEY (terminal_activity_id, attempt_id, authority_action)
+        REFERENCES activity_events (activity_id, permission_attempt_id, terminal_action),
+    CHECK (evidence_kind != 'deterministic_safety' OR authority_action = 'deny'),
+    CHECK (
+        (response_eligible = 0 AND delivery_state = 'not_required')
+        OR
+        (response_eligible = 1 AND delivery_state IN ('pending', 'delivered', 'failed', 'unknown'))
+    )
 ) STRICT;
 
 CREATE INDEX permission_commits_request_authority
-ON permission_commits (provider, session_id, turn_id, tool_use_id, authority_action, committed_at_ms DESC);
+ON permission_commits (attempt_id, authority_action, committed_at_ms DESC);
 
 CREATE INDEX permission_commits_undelivered_audit
 ON permission_commits (delivery_state, committed_at_ms)

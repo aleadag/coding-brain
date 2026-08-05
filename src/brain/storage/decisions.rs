@@ -418,10 +418,9 @@ impl BrainDb {
              WHERE (i.identity_kind = 'observation'
                 OR (i.identity_kind = 'permission'
                     AND c.terminal_activity_id = a.activity_id
-                    AND c.provider = i.provider
-                    AND c.session_id = i.session_id
-                    AND c.turn_id = i.turn_id
-                    AND c.tool_use_id = i.tool_use_id
+                    AND c.attempt_id = i.permission_attempt_id
+                    AND a.permission_attempt_id = c.attempt_id
+                    AND a.terminal_action = c.authority_action
                     AND c.authority_action = i.authority_action))
                AND p.source_cursor > ?1
              ORDER BY p.source_cursor ASC, p.decision_id ASC LIMIT ?2",
@@ -968,7 +967,7 @@ impl TryFrom<StoredDecisionRecord> for DecisionRecord {
     }
 }
 
-fn serialize_record(record: &DecisionRecord) -> Result<Vec<u8>, StorageError> {
+pub(super) fn serialize_record(record: &DecisionRecord) -> Result<Vec<u8>, StorageError> {
     let bytes = serde_json::to_vec(&StoredDecisionRecord::from(record))
         .map_err(|_| StorageError::InvalidStorage("decision record is not serializable"))?;
     if bytes.len() > MAX_DECISION_RECORD_BYTES {

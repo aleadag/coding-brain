@@ -3,6 +3,7 @@
 mod activity;
 mod decisions;
 mod lifecycle;
+mod permissions;
 mod review;
 mod schema;
 mod security;
@@ -29,6 +30,11 @@ pub use activity::{ActivityCursor, ActivityPage, ActivityRecord};
 pub use decisions::{
     DecisionIdentity, DecisionKind, DecisionPayload, ErasureState, LearningDecisionPage,
     LearningErasePaths, LearningReadSession,
+};
+#[allow(unused_imports)]
+pub use permissions::{
+    AttemptId, CommittedPermission, DeliveryEvidence, PermissionAdmission, PermissionAttemptGuard,
+    PermissionEvidenceKind, PermissionState, PreparedPermissionCommit,
 };
 #[allow(unused_imports)]
 pub use review::{ReviewEligibility, ReviewEligibleOccurrence, ReviewSurfaceState};
@@ -127,6 +133,8 @@ pub enum StorageError {
     ReviewDispositionConflict,
     ReviewCapacityExceeded,
     ReviewRevisionOverflow,
+    PermissionAttemptMismatch,
+    PermissionAlreadyCommitted,
     Sqlite(rusqlite::Error),
     Io(io::Error),
 }
@@ -157,6 +165,12 @@ impl fmt::Display for StorageError {
             }
             Self::ReviewCapacityExceeded => formatter.write_str("review state key limit exceeded"),
             Self::ReviewRevisionOverflow => formatter.write_str("review surface revision overflow"),
+            Self::PermissionAttemptMismatch => {
+                formatter.write_str("permission attempt identity changed")
+            }
+            Self::PermissionAlreadyCommitted => {
+                formatter.write_str("permission attempt is already committed")
+            }
             Self::Sqlite(error) => write!(formatter, "SQLite storage failed: {error}"),
             Self::Io(error) => write!(formatter, "SQLite storage I/O failed: {error}"),
         }

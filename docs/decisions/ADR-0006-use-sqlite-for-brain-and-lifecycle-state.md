@@ -44,6 +44,14 @@ short transaction inserts the proposal, matching terminal activity, and exact
 immutable `Allow` or `Deny` authority. A failed or uncertain commit never makes
 the current hook response-eligible.
 
+Because admission precedes inference, an evaluating attempt has no authority
+action. Optional provider-session and tool-use evidence remains nullable. The
+authoritative relations instead use a non-null attempt/action anchor across the
+decision, terminal activity, and permission commit, which prevents SQLite null
+foreign-key semantics from weakening the boundary. Unanchored proposal and
+terminal rows are audit evidence only. The commit stores the exact permission
+transaction identifier.
+
 Only after commit may the hook write stdout. Delivery evidence is appended in a
 second short transaction. A crash or failed audit after successful stdout
 remains `DeliveryUnknown`; recovery never replays a provider response.

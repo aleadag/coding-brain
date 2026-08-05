@@ -1391,15 +1391,16 @@ fn lifecycle_load_rejects_cross_row_sequence_lease_topology_and_cardinality_corr
     }
 }
 
-fn insert_attempt(connection: &Connection, attempt_id: &str, request_key: &str) {
+fn insert_attempt(connection: &Connection, attempt_id: &str, _request_key: &str) {
     connection
         .execute(
             "INSERT INTO permission_attempts (
-                attempt_id, provider, session_id, turn_id, tool_use_id, request_key,
+                attempt_id, request_identity_key, provider, session_id, turn_id, tool_use_id, request_key,
+                cwd, project_id, tool_name, activity_id,
                 authority_action, attempt_state, created_at_ms, updated_at_ms
-             ) VALUES (?1, 'codex', 'session-1', 'turn-1', 'tool-1', ?2,
-                       'allow', 'decided', 1, 1)",
-            params![attempt_id, request_key],
+             ) VALUES (?1, ?2, 'codex', 'session-1', 'turn-1', 'tool-1', ?3,
+                       X'2F', X'7B7D', 'Bash', ?4, 'allow', 'decided', 1, 1)",
+            params![attempt_id, "a".repeat(64), "b".repeat(64), format!("activity-{attempt_id}")],
         )
         .unwrap();
 }
@@ -1413,6 +1414,19 @@ fn insert_decision(connection: &Connection, decision_id: &str) {
              ) VALUES (?1, 'permission', 'codex', 'session-1', 'turn-1', 'tool-1',
                        'allow', 'model', 1)",
             [decision_id],
+        )
+        .unwrap();
+}
+
+fn insert_anchored_decision(connection: &Connection, attempt_id: &str, decision_id: &str) {
+    connection
+        .execute(
+            "INSERT INTO decision_identities (
+                decision_id, identity_kind, permission_attempt_id, provider, session_id,
+                turn_id, tool_use_id, authority_action, decision_source, decided_at_ms
+             ) VALUES (?1, 'permission', ?2, 'codex', 'session-1', 'turn-1', 'tool-1',
+                       'allow', 'model', 1)",
+            params![decision_id, attempt_id],
         )
         .unwrap();
 }
@@ -1431,6 +1445,25 @@ fn insert_terminal_event(connection: &Connection, cursor: i64, activity_id: &str
         .unwrap();
 }
 
+fn insert_anchored_terminal_event(
+    connection: &Connection,
+    attempt_id: &str,
+    cursor: i64,
+    activity_id: &str,
+) {
+    connection
+        .execute(
+            "INSERT INTO activity_events (
+                source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+                permission_attempt_id, terminal_provider, terminal_session_id, terminal_turn_id,
+                terminal_tool_use_id, terminal_action, event_payload
+             ) VALUES (?1, ?2, 'decision', 'allowed', 1, ?3,
+                       'codex', 'session-1', 'turn-1', 'tool-1', 'allow', X'')",
+            params![cursor, activity_id, attempt_id],
+        )
+        .unwrap();
+}
+
 fn insert_commit(
     connection: &Connection,
     attempt_id: &str,
@@ -1442,11 +1475,11 @@ fn insert_commit(
 ) -> rusqlite::Result<usize> {
     connection.execute(
         "INSERT INTO permission_commits (
-            attempt_id, decision_id, terminal_activity_id, provider, session_id,
-            turn_id, tool_use_id, authority_action, evidence_kind, delivery_state,
+            attempt_id, transaction_id, decision_id, terminal_activity_id,
+            authority_action, evidence_kind, delivery_state,
             response_eligible, committed_at_ms
-         ) VALUES (?1, ?2, ?3, 'codex', 'session-1',
-                   'turn-1', 'tool-1', 'allow', ?4, ?5, ?6, 1)",
+         ) VALUES (?1, ?1 || '-transaction', ?2, ?3,
+                   'allow', ?4, ?5, ?6, 1)",
         params![
             attempt_id,
             decision_id,
@@ -1888,13 +1921,13 @@ fn brain_schema_enforces_closed_domains_and_nonunique_request_identity() {
     drop(BrainDb::create_current(&paths).unwrap());
     let connection = open_for_constraints(&paths.brain_db());
 
-    insert_attempt(&connection, "attempt-1", "same-request");
-    insert_attempt(&connection, "attempt-2", "same-request");
+    insert_attempt(&connection, "attempt-1", &"b".repeat(64));
+    insert_attempt(&connection, "attempt-2", &"b".repeat(64));
     assert_eq!(
         connection
             .query_row(
-                "SELECT count(*) FROM permission_attempts WHERE request_key = 'same-request'",
-                [],
+                "SELECT count(*) FROM permission_attempts WHERE request_key = ?1",
+                ["b".repeat(64)],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
@@ -2247,21 +2280,31 @@ fn learning_requires_exact_permission_commit_and_paginates_by_source_cursor() {
     connection
         .execute(
             "INSERT INTO permission_attempts (
-                attempt_id, provider, session_id, turn_id, tool_use_id, request_key,
+                attempt_id, request_identity_key, provider, session_id, turn_id, tool_use_id,
+                request_key, cwd, project_id, tool_name, activity_id,
                 authority_action, attempt_state, created_at_ms, updated_at_ms
-             ) VALUES ('attempt-committed', 'codex', 'session-committed', 'turn-committed',
-                       'tool-committed', 'request-committed', 'allow', 'decided', 3, 3)",
-            [],
+             ) VALUES ('attempt-committed', ?1, 'codex', 'session-committed', 'turn-committed',
+                       'tool-committed', ?2, X'2F', X'7B7D', 'Bash',
+                       'committed', 'allow', 'decided', 3, 3)",
+            params!["c".repeat(64), "d".repeat(64)],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "UPDATE decision_identities SET permission_attempt_id = 'attempt-committed'
+             WHERE decision_id = 'committed-decision';
+             UPDATE activity_events SET permission_attempt_id = 'attempt-committed'
+             WHERE activity_id = 'committed' AND terminal_action = 'allow'",
         )
         .unwrap();
     connection
         .execute(
             "INSERT INTO permission_commits (
-                attempt_id, decision_id, terminal_activity_id, provider, session_id,
-                turn_id, tool_use_id, authority_action, evidence_kind, delivery_state,
+                attempt_id, transaction_id, decision_id, terminal_activity_id,
+                authority_action, evidence_kind, delivery_state,
                 response_eligible, committed_at_ms
-             ) VALUES ('attempt-committed', 'committed-decision', 'committed', 'codex',
-                       'session-committed', 'turn-committed', 'tool-committed', 'allow',
+             ) VALUES ('attempt-committed', 'transaction-committed', 'committed-decision',
+                       'committed', 'allow',
                        'provider_authority', 'pending', 1, 3)",
             [],
         )
@@ -3346,9 +3389,9 @@ fn permission_commit_requires_matching_authority_identity_and_action() {
     connection
         .execute(
             "INSERT INTO decision_identities (
-                decision_id, identity_kind, provider, session_id, turn_id, tool_use_id,
+                decision_id, identity_kind, permission_attempt_id, provider, session_id, turn_id, tool_use_id,
                 authority_action, decision_source, decided_at_ms
-             ) VALUES ('decision-1', 'permission', 'codex', 'session-1', 'turn-1', 'tool-1',
+             ) VALUES ('decision-1', 'permission', 'attempt-1', 'codex', 'session-1', 'turn-1', 'tool-1',
                        'allow', 'model', 1)",
             [],
         )
@@ -3357,21 +3400,22 @@ fn permission_commit_requires_matching_authority_identity_and_action() {
         .execute(
             "INSERT INTO activity_events (
                 source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+                permission_attempt_id,
                 terminal_provider, terminal_session_id, terminal_turn_id,
                 terminal_tool_use_id, terminal_action, event_payload
              ) VALUES (1, 'activity-1', 'decision', 'allowed', 1,
-                       'codex', 'session-1', 'turn-1', 'tool-1', 'allow', X'')",
+                       'attempt-1', 'codex', 'session-1', 'turn-1', 'tool-1', 'allow', X'')",
             [],
         )
         .unwrap();
 
     let mismatch = connection.execute(
         "INSERT INTO permission_commits (
-            attempt_id, decision_id, terminal_activity_id, provider, session_id,
-            turn_id, tool_use_id, authority_action, evidence_kind, delivery_state,
+            attempt_id, transaction_id, decision_id, terminal_activity_id,
+            authority_action, evidence_kind, delivery_state,
             response_eligible, committed_at_ms
-         ) VALUES ('attempt-1', 'decision-1', 'activity-1', 'codex', 'session-1',
-                   'turn-1', 'tool-1', 'deny', 'provider_authority', 'pending', 1, 1)",
+         ) VALUES ('attempt-1', 'transaction-bad', 'decision-1', 'activity-1',
+                   'deny', 'provider_authority', 'pending', 1, 1)",
         [],
     );
     assert!(mismatch.is_err());
@@ -3379,12 +3423,81 @@ fn permission_commit_requires_matching_authority_identity_and_action() {
     connection
         .execute(
             "INSERT INTO permission_commits (
-                attempt_id, decision_id, terminal_activity_id, provider, session_id,
-                turn_id, tool_use_id, authority_action, evidence_kind, delivery_state,
+                attempt_id, transaction_id, decision_id, terminal_activity_id,
+                authority_action, evidence_kind, delivery_state,
                 response_eligible, committed_at_ms
-             ) VALUES ('attempt-1', 'decision-1', 'activity-1', 'codex', 'session-1',
-                       'turn-1', 'tool-1', 'allow', 'provider_authority', 'pending', 1, 1)",
+             ) VALUES ('attempt-1', 'transaction-1', 'decision-1', 'activity-1',
+                       'allow', 'provider_authority', 'pending', 1, 1)",
             [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn unanchored_permission_audit_is_valid_but_cannot_grant_authority() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+    insert_attempt(&connection, "attempt-1", &"b".repeat(64));
+    insert_decision(&connection, "decision-1");
+    insert_terminal_event(&connection, 1, "activity-1");
+
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM decision_identities WHERE decision_id = 'decision-1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert!(
+        insert_commit(
+            &connection,
+            "attempt-1",
+            "decision-1",
+            "activity-1",
+            "provider_authority",
+            "pending",
+            1,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn permission_attempt_schema_represents_pre_inference_identity_without_fabricated_authority() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+    let columns = table_columns(&connection, "permission_attempts");
+
+    for required in [
+        "request_identity_key",
+        "provider_session_id",
+        "cwd",
+        "project_id",
+        "tool_name",
+        "activity_id",
+    ] {
+        assert!(
+            columns.iter().any(|column| column == required),
+            "missing {required}"
+        );
+    }
+    connection
+        .execute(
+            "INSERT INTO permission_attempts (
+                attempt_id, request_identity_key, provider, session_id, provider_session_id,
+                turn_id, tool_use_id, request_key, cwd, project_id, tool_name, activity_id,
+                authority_action, attempt_state, created_at_ms, updated_at_ms
+             ) VALUES ('attempt-red', ?1, 'codex', 'session', NULL, 'turn', NULL,
+                       ?2, X'2F', X'7B7D', 'Bash', 'activity-red', NULL,
+                       'evaluating', 1, 1)",
+            params!["a".repeat(64), "b".repeat(64)],
         )
         .unwrap();
 }
@@ -3400,8 +3513,8 @@ fn permission_commit_enforces_unique_references_and_closed_domains() {
         ("attempt-2", "decision-2", 2, "activity-2"),
     ] {
         insert_attempt(&connection, attempt, attempt);
-        insert_decision(&connection, decision);
-        insert_terminal_event(&connection, cursor, activity);
+        insert_anchored_decision(&connection, attempt, decision);
+        insert_anchored_terminal_event(&connection, attempt, cursor, activity);
     }
     insert_commit(
         &connection,
@@ -3454,6 +3567,8 @@ fn permission_commit_enforces_unique_references_and_closed_domains() {
         ("unknown", "pending", 1),
         ("provider_authority", "maybe", 1),
         ("provider_authority", "pending", 2),
+        ("deterministic_safety", "pending", 1),
+        ("provider_authority", "delivered", 0),
     ] {
         assert!(
             insert_commit(
@@ -3473,8 +3588,8 @@ fn permission_commit_enforces_unique_references_and_closed_domains() {
         "attempt-2",
         "decision-2",
         "activity-2",
-        "deterministic_safety",
-        "delivered",
+        "provider_authority",
+        "not_required",
         0,
     )
     .unwrap();
@@ -3872,9 +3987,23 @@ fn required_query_indexes_are_frozen_in_brain_schema() {
     assert!(BRAIN_SCHEMA_V1.contains(
         "ON activity_events (terminal_provider, terminal_session_id, terminal_turn_id, terminal_tool_use_id, terminal_action, source_cursor DESC)"
     ));
-    assert!(BRAIN_SCHEMA_V1.contains(
-        "ON permission_commits (provider, session_id, turn_id, tool_use_id, authority_action, committed_at_ms DESC)"
-    ));
+    assert!(
+        BRAIN_SCHEMA_V1
+            .contains("ON permission_commits (attempt_id, authority_action, committed_at_ms DESC)")
+    );
+}
+
+#[test]
+fn permission_request_lookup_uses_the_bounded_partial_index() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let db = BrainDb::create_current(&paths).unwrap();
+    let plan = db.explain_permission_lookup().unwrap();
+    assert!(
+        plan.contains("permission_attempts_request_active"),
+        "{plan}"
+    );
+    assert!(!plan.contains("SCAN permission_attempts"), "{plan}");
 }
 
 #[test]

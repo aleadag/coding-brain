@@ -133,6 +133,13 @@ Each row represents one exact permission request. It stores a canonical,
 validated request-identity key plus typed provider, session, provider-session,
 turn, request-key, project, tool, activity ID, state, and timestamps.
 
+The indexed request-identity key is stable across sequential identical
+invocations and excludes the per-invocation attempt and activity IDs. Every
+lookup revalidates the typed columns. Optional provider-session and tool-use
+IDs remain null when the provider supplied no such evidence. The authority
+action is null while the attempt is evaluating and is set only by the atomic
+decision commit.
+
 The request-identity key includes the complete validated lifecycle identity
 plus request key and is indexed but not permanently unique. Every invocation
 has a unique attempt ID. The existing owner-only per-request OS advisory lock
@@ -173,6 +180,12 @@ identity and one terminal activity event. It stores the immutable `Allow` or
 `Deny` action, the exact authority identity, commit timestamp, transaction
 identifier, evidence basis, and whether the current invocation is eligible to
 emit a response.
+
+The non-null attempt/action anchor is repeated by the referenced decision and
+terminal activity tuples, so nullable provider facts cannot bypass a composite
+foreign key. Unanchored proposal or terminal evidence remains valid audit data
+but cannot satisfy a permission commit. The commit stores the exact bounded
+transaction identifier; it is never reconstructed from an attempt ID.
 
 Foreign keys and uniqueness constraints require the attempt identity,
 proposal, authority action, decision ID, activity ID, and terminal state to
