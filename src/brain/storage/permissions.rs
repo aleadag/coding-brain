@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use coding_brain_core::brain_activity::{
-    ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, MAX_ACTIVITY_EVENT_BYTES,
-    ProjectEvidence, SessionTarget, SessionTargetProvenance,
+    ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, ProjectEvidence,
+    SessionTarget, SessionTargetProvenance,
 };
 use coding_brain_core::lifecycle::{LifecycleIdentity, PermissionAction, PermissionAuthority};
 use coding_brain_core::project::ProjectId;
@@ -473,6 +473,8 @@ impl BrainDb {
         if authority != committed.authority {
             return Err(StorageError::PermissionAttemptMismatch);
         }
+        permission_fault("before-delivery-transaction")?;
+        super::activity::apply_deadline(&self.connection, Some(deadline))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -601,9 +603,7 @@ fn validated_permission_commit(
                     a.tool_name, a.activity_id,
                     d.decision_id, d.identity_kind, d.provider, d.session_id, d.turn_id,
                     d.tool_use_id, d.authority_action, d.decision_source,
-                    e.activity_id, e.event_state, e.terminal_provider, e.terminal_session_id,
-                    e.terminal_turn_id, e.terminal_tool_use_id, e.terminal_action,
-                    CASE WHEN length(e.event_payload) <= ?2 THEN e.event_payload END,
+                    e.source_cursor,
                     a.request_identity_key, a.request_key, a.created_at_ms, a.updated_at_ms,
                     d.decided_at_ms, e.recorded_at_ms, c.committed_at_ms
              FROM permission_commits c
@@ -618,7 +618,7 @@ fn validated_permission_commit(
               AND e.permission_attempt_id = c.attempt_id
               AND e.terminal_action = c.authority_action
              WHERE c.attempt_id = ?1 LIMIT 1",
-            params![attempt_id.as_str(), MAX_ACTIVITY_EVENT_BYTES as i64],
+            [attempt_id.as_str()],
             |row| {
                 Ok(CommitEvidenceRow {
                     transaction_id: row.get(0)?,
@@ -645,21 +645,14 @@ fn validated_permission_commit(
                     decision_tool_use: row.get(21)?,
                     decision_action: row.get(22)?,
                     decision_source: row.get(23)?,
-                    event_activity: row.get(24)?,
-                    event_state: row.get(25)?,
-                    event_provider: row.get(26)?,
-                    event_session: row.get(27)?,
-                    event_turn: row.get(28)?,
-                    event_tool_use: row.get(29)?,
-                    event_action: row.get(30)?,
-                    event_payload: row.get(31)?,
-                    request_identity_key: row.get(32)?,
-                    request_key: row.get(33)?,
-                    attempt_created_at_ms: row.get(34)?,
-                    attempt_updated_at_ms: row.get(35)?,
-                    decision_decided_at_ms: row.get(36)?,
-                    event_recorded_at_ms: row.get(37)?,
-                    commit_committed_at_ms: row.get(38)?,
+                    event_source_cursor: row.get(24)?,
+                    request_identity_key: row.get(25)?,
+                    request_key: row.get(26)?,
+                    attempt_created_at_ms: row.get(27)?,
+                    attempt_updated_at_ms: row.get(28)?,
+                    decision_decided_at_ms: row.get(29)?,
+                    event_recorded_at_ms: row.get(30)?,
+                    commit_committed_at_ms: row.get(31)?,
                 })
             },
         )
@@ -668,10 +661,6 @@ fn validated_permission_commit(
             "permission commit relations are incoherent",
         ))?;
     let action = parse_action(&row.action)?;
-    let expected_state = match action {
-        PermissionAction::Allow => "allowed",
-        PermissionAction::Deny => "denied",
-    };
     let delivery_valid = match row.response_eligible {
         0 => row.delivery == "not_required",
         1 => matches!(
@@ -680,14 +669,14 @@ fn validated_permission_commit(
         ),
         _ => false,
     };
-    let event_payload = row
-        .event_payload
-        .as_deref()
-        .ok_or(StorageError::InvalidStorage(
-            "permission terminal payload exceeds its size limit",
-        ))?;
-    let event: ActivityEvent = serde_json::from_slice(event_payload)
-        .map_err(|_| StorageError::InvalidStorage("permission terminal payload is corrupt"))?;
+    let high_water = super::activity::validated_high_water(connection)?;
+    let event_cursor = ActivityCursor::try_from(row.event_source_cursor)?;
+    if row.event_source_cursor > high_water {
+        return Err(StorageError::InvalidStorage(
+            "permission terminal cursor exceeds the activity high-water",
+        ));
+    }
+    let event = super::activity::validated_activity_at(connection, event_cursor)?.event;
     let event_session = event.session.as_ref().ok_or(StorageError::InvalidStorage(
         "permission terminal payload has no session",
     ))?;
@@ -727,17 +716,10 @@ fn validated_permission_commit(
         || row.attempt_action.as_deref() != Some(row.action.as_str())
         || row.decision_kind != "permission"
         || row.decision_action.as_deref() != Some(row.action.as_str())
-        || row.event_state != expected_state
-        || row.event_action.as_deref() != Some(row.action.as_str())
         || row.decision_provider != row.attempt_provider
         || row.decision_session.as_deref() != Some(row.attempt_session.as_str())
         || row.decision_turn.as_deref() != Some(row.attempt_turn.as_str())
         || row.decision_tool_use != row.attempt_tool_use
-        || row.event_provider.as_deref() != Some(row.attempt_provider.as_str())
-        || row.event_session.as_deref() != Some(row.attempt_session.as_str())
-        || row.event_turn.as_deref() != Some(row.attempt_turn.as_str())
-        || row.event_tool_use != row.attempt_tool_use
-        || row.event_activity != row.attempt_activity
         || event.activity_id != row.attempt_activity
         || event.schema_version != ACTIVITY_SCHEMA_VERSION
         || event.kind != ActivityKind::Decision
@@ -798,14 +780,7 @@ struct CommitEvidenceRow {
     decision_tool_use: Option<String>,
     decision_action: Option<String>,
     decision_source: Option<String>,
-    event_activity: String,
-    event_state: String,
-    event_provider: Option<String>,
-    event_session: Option<String>,
-    event_turn: Option<String>,
-    event_tool_use: Option<String>,
-    event_action: Option<String>,
-    event_payload: Option<Vec<u8>>,
+    event_source_cursor: i64,
     request_identity_key: String,
     request_key: String,
     attempt_created_at_ms: i64,
@@ -1114,6 +1089,12 @@ fn hook_record_as_decision(record: &HookDecisionRecord) -> DecisionRecord {
 #[cfg(test)]
 fn permission_fault(stage: &str) -> Result<(), StorageError> {
     let fault = std::env::var_os("CODING_BRAIN_SQLITE_PERMISSION_FAULT");
+    if stage == "before-delivery-transaction"
+        && fault.as_deref() == Some(std::ffi::OsStr::new("sleep-before-delivery-transaction"))
+    {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        return Ok(());
+    }
     if stage == "after-commit"
         && fault.as_deref() == Some(std::ffi::OsStr::new("abort-after-commit"))
     {
@@ -1155,7 +1136,9 @@ mod tests {
         AttemptId, BrainDb, DeliveryEvidence, PermissionAdmission, PermissionEvidenceKind,
         PermissionState, PreparedPermissionCommit, StorageDeadline,
     };
-    use crate::brain::storage::{OpenRole, StorageError, StoragePaths};
+    use crate::brain::storage::{OpenRole, ReviewDb, StorageError, StoragePaths};
+
+    const MODELED_PROVIDER_RESPONSE: &[u8] = b"{\"permission\":\"allow\"}\n";
 
     fn root() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -1299,7 +1282,12 @@ mod tests {
         let root = std::path::PathBuf::from(root);
         let paths = StoragePaths::at(&root);
         let request = admission("process-activity");
-        let mut db = open(&paths, Duration::from_secs(5));
+        let duration = if mode == "busy-delivery" {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(5)
+        };
+        let mut db = open(&paths, duration);
         let Some(guard) = db.admit_permission(request.clone()).unwrap() else {
             fs::write(root.join("loser"), b"loser").unwrap();
             return;
@@ -1310,7 +1298,10 @@ mod tests {
             wait_for(&root.join("release"));
             return;
         }
-        let commit_fault = if mode == "before-delivery-commit" {
+        let commit_fault = if matches!(
+            mode.as_str(),
+            "before-delivery-commit" | "busy-delivery" | "successful-delivery"
+        ) {
             None
         } else {
             Some(mode.as_str())
@@ -1332,8 +1323,33 @@ mod tests {
             )
             .unwrap(),
         );
+        if mode == "busy-delivery" {
+            let committed = result.unwrap();
+            fs::write(root.join("ready"), b"ready").unwrap();
+            wait_for(&root.join("start-delivery"));
+            unsafe {
+                std::env::set_var(
+                    "CODING_BRAIN_SQLITE_PERMISSION_FAULT",
+                    "sleep-before-delivery-transaction",
+                )
+            };
+            assert!(matches!(
+                db.record_delivery(&committed, DeliveryEvidence::Delivered),
+                Err(StorageError::Busy)
+            ));
+            fs::write(root.join("busy-returned"), b"busy").unwrap();
+            return;
+        }
+        if mode == "successful-delivery" {
+            let committed = result.unwrap();
+            fs::write(root.join("provider-response"), MODELED_PROVIDER_RESPONSE).unwrap();
+            db.record_delivery(&committed, DeliveryEvidence::Delivered)
+                .unwrap();
+            return;
+        }
         if mode == "before-delivery-commit" {
             let committed = result.unwrap();
+            fs::write(root.join("provider-response"), MODELED_PROVIDER_RESPONSE).unwrap();
             unsafe {
                 std::env::set_var(
                     "CODING_BRAIN_SQLITE_PERMISSION_FAULT",
@@ -1435,7 +1451,6 @@ mod tests {
             let paths = StoragePaths::at(root.path());
             drop(BrainDb::create_current(&paths).unwrap());
             let output = helper(root.path(), stage).wait_with_output().unwrap();
-            assert!(output.stdout.is_empty(), "{stage}");
             assert!(
                 output.status.success(),
                 "{stage}: {}",
@@ -1449,6 +1464,7 @@ mod tests {
                 committed,
                 "{stage}"
             );
+            assert!(!root.path().join("provider-response").exists(), "{stage}");
             assert!(!root.path().join("brain/permission-transactions").exists());
         }
     }
@@ -1461,8 +1477,8 @@ mod tests {
         let output = helper(root.path(), "abort-after-commit")
             .wait_with_output()
             .unwrap();
-        assert!(output.stdout.is_empty());
         assert!(!output.status.success());
+        assert!(!root.path().join("provider-response").exists());
         let attempt_id = AttemptId(fs::read_to_string(root.path().join("attempt-id")).unwrap());
         let reopened = open(&paths, Duration::from_secs(2));
         assert!(matches!(
@@ -1479,11 +1495,14 @@ mod tests {
         let output = helper(root.path(), "before-delivery-commit")
             .wait_with_output()
             .unwrap();
-        assert!(output.stdout.is_empty());
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(root.path().join("provider-response")).unwrap(),
+            MODELED_PROVIDER_RESPONSE
         );
         let attempt_id = AttemptId(fs::read_to_string(root.path().join("attempt-id")).unwrap());
         let reopened = open(&paths, Duration::from_secs(2));
@@ -1504,6 +1523,305 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn modeled_provider_response_is_written_only_after_commit_and_then_delivered() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let output = helper(root.path(), "successful-delivery")
+            .wait_with_output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(root.path().join("provider-response")).unwrap(),
+            MODELED_PROVIDER_RESPONSE
+        );
+        let attempt_id = AttemptId(fs::read_to_string(root.path().join("attempt-id")).unwrap());
+        let reopened = open(&paths, Duration::from_secs(2));
+        assert!(matches!(
+            reopened.permission_state(&attempt_id).unwrap(),
+            PermissionState::Delivered(_)
+        ));
+    }
+
+    #[test]
+    fn modeled_provider_response_failure_records_delivery_failed() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let request = admission("activity-1");
+        let mut db = open(&paths, Duration::from_secs(3));
+        let guard = db.admit_permission(request.clone()).unwrap().unwrap();
+        let committed = db
+            .commit_permission(
+                PreparedPermissionCommit::new(
+                    guard,
+                    proposal("decision-1"),
+                    terminal(&request, "decision-1"),
+                    PermissionAuthority {
+                        transaction_id: "transaction-1".into(),
+                        action: PermissionAction::Allow,
+                    },
+                    PermissionEvidenceKind::ProviderAuthority,
+                    true,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let response_sink = root.path().join("provider-response");
+        fs::create_dir(&response_sink).unwrap();
+        assert!(fs::write(&response_sink, MODELED_PROVIDER_RESPONSE).is_err());
+        db.record_delivery(&committed, DeliveryEvidence::Failed)
+            .unwrap();
+        assert!(matches!(
+            db.permission_state(committed.attempt_id()).unwrap(),
+            PermissionState::DeliveryFailed(_)
+        ));
+    }
+
+    #[test]
+    fn deterministic_safety_deny_is_authoritative_without_response_delivery() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let request = admission("activity-deny");
+        let mut deny_proposal = proposal("decision-deny");
+        deny_proposal.brain_action = "deny".into();
+        deny_proposal.user_action = "hook_deny".into();
+        let mut deny_terminal = terminal(&request, "decision-deny");
+        deny_terminal.state = ActivityState::Denied;
+        let mut db = open(&paths, Duration::from_secs(3));
+        let guard = db.admit_permission(request.clone()).unwrap().unwrap();
+        let committed = db
+            .commit_permission(
+                PreparedPermissionCommit::new(
+                    guard,
+                    deny_proposal,
+                    deny_terminal,
+                    PermissionAuthority {
+                        transaction_id: "transaction-deny".into(),
+                        action: PermissionAction::Deny,
+                    },
+                    PermissionEvidenceKind::DeterministicSafety,
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(!committed.response_eligible());
+        assert_eq!(
+            db.permission_decision(committed.attempt_id()).unwrap(),
+            Some(PermissionAuthority {
+                transaction_id: "transaction-deny".into(),
+                action: PermissionAction::Deny,
+            })
+        );
+        assert!(matches!(
+            db.record_delivery(&committed, DeliveryEvidence::Delivered),
+            Err(StorageError::PermissionAttemptMismatch)
+        ));
+        let (delivery_state, response_eligible): (String, i64) = db
+            .connection
+            .query_row(
+                "SELECT delivery_state, response_eligible FROM permission_commits
+                 WHERE attempt_id = ?1",
+                [committed.attempt_id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (delivery_state.as_str(), response_eligible),
+            ("not_required", 0)
+        );
+
+        let invalid_request = admission("activity-invalid");
+        let invalid_guard = db
+            .admit_permission(invalid_request.clone())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            PreparedPermissionCommit::new(
+                invalid_guard,
+                proposal("decision-invalid"),
+                terminal(&invalid_request, "decision-invalid"),
+                PermissionAuthority {
+                    transaction_id: "transaction-invalid".into(),
+                    action: PermissionAction::Allow,
+                },
+                PermissionEvidenceKind::DeterministicSafety,
+                false,
+            ),
+            Err(StorageError::PermissionAttemptMismatch)
+        ));
+    }
+
+    #[test]
+    fn permission_commit_and_lookup_ignore_more_than_sixteen_mib_of_history() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        let mut history_db = BrainDb::create_current(&paths).unwrap();
+        let request = admission("activity-current");
+        let history = (0..450)
+            .map(|index| {
+                let mut event = terminal(&request, &format!("history-decision-{index}"));
+                event.activity_id = format!("history-activity-{index}");
+                event.recorded_at_ms = 10 + index;
+                event.session = None;
+                event.state = ActivityState::Observed;
+                event.project.project_id = ProjectId::Temporary("p".repeat(4096));
+                event.project.cwd = format!("/{}", "c".repeat(4000)).into();
+                event.project.label = Some("l".repeat(4096));
+                event.tool = Some("t".repeat(4096));
+                event.normalized_command = Some("n".repeat(4096));
+                event.fingerprint = Some("f".repeat(4096));
+                event.rule_id = Some("r".repeat(4096));
+                event.reasoning = Some("e".repeat(4096));
+                event.decision_id = Some(format!("{}-{index}", "d".repeat(4080)));
+                event.supersedes = Some("s".repeat(4096));
+                event
+            })
+            .collect::<Vec<_>>();
+        history_db.append_activity_batch(&history).unwrap();
+        let history_bytes: i64 = history_db
+            .connection
+            .query_row(
+                "SELECT sum(length(event_payload)) FROM activity_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            history_bytes > 16 * 1024 * 1024,
+            "history contains only {history_bytes} serialized bytes"
+        );
+        drop(history_db);
+
+        let mut db = open(&paths, Duration::from_secs(5));
+        let guard = db.admit_permission(request.clone()).unwrap().unwrap();
+        let committed = db
+            .commit_permission(
+                PreparedPermissionCommit::new(
+                    guard,
+                    proposal("decision-current"),
+                    terminal(&request, "decision-current"),
+                    PermissionAuthority {
+                        transaction_id: "transaction-current".into(),
+                        action: PermissionAction::Allow,
+                    },
+                    PermissionEvidenceKind::ProviderAuthority,
+                    true,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            db.permission_decision(committed.attempt_id())
+                .unwrap()
+                .is_some()
+        );
+        let plan = db.explain_permission_lookup().unwrap();
+        assert!(
+            plan.contains("permission_attempts_request_active"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN permission_attempts"), "{plan}");
+    }
+
+    #[test]
+    fn corrupt_review_database_cannot_change_permission_or_delivery_authority() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        drop(ReviewDb::create_current(&paths).unwrap());
+        let request = admission("activity-1");
+        let mut db = open(&paths, Duration::from_secs(3));
+        let guard = db.admit_permission(request.clone()).unwrap().unwrap();
+        let committed = db
+            .commit_permission(
+                PreparedPermissionCommit::new(
+                    guard,
+                    proposal("decision-1"),
+                    terminal(&request, "decision-1"),
+                    PermissionAuthority {
+                        transaction_id: "transaction-1".into(),
+                        action: PermissionAction::Allow,
+                    },
+                    PermissionEvidenceKind::ProviderAuthority,
+                    true,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        fs::write(paths.review_db(), b"not sqlite").unwrap();
+        assert!(
+            ReviewDb::open_current(
+                &paths,
+                OpenRole::Hook,
+                StorageDeadline::after(Duration::from_millis(250)),
+            )
+            .is_err()
+        );
+        assert!(
+            db.permission_decision(committed.attempt_id())
+                .unwrap()
+                .is_some()
+        );
+        db.record_delivery(&committed, DeliveryEvidence::Delivered)
+            .unwrap();
+        assert!(matches!(
+            db.permission_state(committed.attempt_id()).unwrap(),
+            PermissionState::Delivered(_)
+        ));
+    }
+
+    #[test]
+    fn permission_failure_neither_creates_nor_mutates_review_storage() {
+        for review_exists in [false, true] {
+            let root = root();
+            let paths = StoragePaths::at(root.path());
+            drop(BrainDb::create_current(&paths).unwrap());
+            let review_before = if review_exists {
+                drop(ReviewDb::create_current(&paths).unwrap());
+                Some(fs::read(paths.review_db()).unwrap())
+            } else {
+                assert!(!paths.review_db().exists());
+                None
+            };
+            let request = admission("activity-1");
+            let mut db = open(&paths, Duration::from_secs(3));
+            let guard = db.admit_permission(request.clone()).unwrap().unwrap();
+            let prepared = PreparedPermissionCommit::new(
+                guard,
+                proposal("decision-1"),
+                terminal(&request, "decision-1"),
+                PermissionAuthority {
+                    transaction_id: "transaction-1".into(),
+                    action: PermissionAction::Allow,
+                },
+                PermissionEvidenceKind::ProviderAuthority,
+                true,
+            )
+            .unwrap();
+            let connection = rusqlite::Connection::open(paths.brain_db()).unwrap();
+            connection
+                .execute("UPDATE permission_attempts SET tool_name = 'Write'", [])
+                .unwrap();
+            drop(connection);
+            assert!(matches!(
+                db.commit_permission(prepared),
+                Err(StorageError::PermissionAttemptMismatch)
+            ));
+            match review_before {
+                Some(bytes) => assert_eq!(fs::read(paths.review_db()).unwrap(), bytes),
+                None => assert!(!paths.review_db().exists()),
+            }
+        }
     }
 
     #[test]
@@ -1593,6 +1911,19 @@ mod tests {
                 "UPDATE activity_events SET recorded_at_ms = 2 WHERE event_state = 'allowed'",
             ),
             (
+                "event kind",
+                "UPDATE activity_events SET event_kind = 'diagnostic'
+                 WHERE event_state = 'allowed'",
+            ),
+            (
+                "event source cursor range",
+                "UPDATE activity_events SET source_cursor = 0 WHERE event_state = 'allowed'",
+            ),
+            (
+                "event source cursor high water",
+                "UPDATE activity_events SET source_cursor = 4 WHERE event_state = 'allowed'",
+            ),
+            (
                 "commit timestamp",
                 "UPDATE permission_commits SET committed_at_ms = 2",
             ),
@@ -1628,7 +1959,10 @@ mod tests {
             drop(db);
             let connection = rusqlite::Connection::open(paths.brain_db()).unwrap();
             connection
-                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     PRAGMA ignore_check_constraints = ON;",
+                )
                 .unwrap();
             connection.execute(mutation, []).unwrap();
             drop(connection);
@@ -1839,6 +2173,48 @@ mod tests {
             reopened.permission_state(&committed.attempt_id).unwrap(),
             PermissionState::CommittedDeliveryUnknown(_)
         ));
+    }
+
+    #[test]
+    fn delivery_busy_wait_uses_only_the_remaining_absolute_deadline() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let mut child = helper(root.path(), "busy-delivery");
+        wait_for(&root.path().join("ready"));
+        let blocker = rusqlite::Connection::open(paths.brain_db()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        fs::write(root.path().join("start-delivery"), b"start").unwrap();
+        let status = child.wait().unwrap();
+        let elapsed = started.elapsed();
+        assert!(status.success());
+        assert!(root.path().join("busy-returned").exists());
+        assert!(
+            elapsed < Duration::from_millis(1_250),
+            "delivery busy wait reset the absolute deadline: {elapsed:?}"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        let attempt_id = AttemptId(fs::read_to_string(root.path().join("attempt-id")).unwrap());
+        let reopened = open(&paths, Duration::from_secs(2));
+        assert!(matches!(
+            reopened.permission_state(&attempt_id).unwrap(),
+            PermissionState::CommittedDeliveryUnknown(_)
+        ));
+        let connection = rusqlite::Connection::open(paths.brain_db()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM activity_events
+                     WHERE permission_attempt_id = ?1
+                       AND event_state IN ('delivered', 'delivery_failed')",
+                    [attempt_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

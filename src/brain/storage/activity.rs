@@ -529,14 +529,19 @@ pub(super) fn validated_activity_at(
     let mut statement = connection.prepare(
         "SELECT source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
                     terminal_provider, terminal_session_id, terminal_turn_id,
-                    terminal_tool_use_id, terminal_action, outcome, correction, event_payload
+                    terminal_tool_use_id, terminal_action, outcome, correction,
+                    CASE WHEN length(event_payload) <= ?2 THEN event_payload END
              FROM activity_events WHERE source_cursor = ?1",
     )?;
-    let mut rows = statement.query([cursor_i64(cursor)])?;
+    let mut rows = statement.query(params![cursor_i64(cursor), MAX_ACTIVITY_EVENT_BYTES as i64])?;
     let row = rows.next()?.ok_or(StorageError::InvalidStorage(
         "decision source activity is absent",
     ))?;
-    let payload = row.get::<_, Vec<u8>>(12)?;
+    let payload = row
+        .get::<_, Option<Vec<u8>>>(12)?
+        .ok_or(StorageError::InvalidStorage(
+            "activity payload is too large",
+        ))?;
     decode_activity_row(row, &payload)
 }
 
