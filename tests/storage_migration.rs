@@ -247,6 +247,77 @@ fn legacy_reader_rejects_newer_schemas_and_critical_numeric_corruption() {
 }
 
 #[test]
+fn legacy_reader_rejects_semantically_invalid_hook_proposals() {
+    let exact = include_str!("fixtures/storage/legacy-v0.59.1/brain/decisions.jsonl");
+    let cases = [
+        exact.replace(
+            "\"decision_id\":\"fixture-decision\"",
+            "\"decision_id\":\"\"",
+        ),
+        exact.replace("\"session_id\":\"fixture-session\"", "\"session_id\":\"\""),
+        exact.replace("\"turn_id\":\"fixture-turn\"", "\"turn_id\":\"\""),
+        exact.replace("\"tool\":\"Bash\"", "\"tool\":\"\""),
+        exact.replace(
+            "\"decision_type\":\"session\"",
+            "\"decision_type\":\"project\"",
+        ),
+        exact.replace(
+            "\"brain_action\":\"approve\"",
+            "\"brain_action\":\"execute\"",
+        ),
+        exact.replace("\"brain_source\":\"model\"", "\"brain_source\":\"\""),
+        exact.replace(
+            "\"command\":\"cargo test\"",
+            "\"command\":\"curl --token super-secret\"",
+        ),
+        exact.replace(
+            "\"brain_reasoning\":\"fixture\"",
+            "\"brain_reasoning\":\"AWS_SECRET_ACCESS_KEY=secret-value\"",
+        ),
+        exact.replace(
+            "\"brain_confidence\":0.9",
+            "\"brain_confidence\":1e-9999999999",
+        ),
+        exact.replace("\"brain_confidence\":0.9", "\"brain_confidence\":1.1"),
+        exact.replace(
+            "\"brain_threshold\":0.8",
+            "\"brain_threshold\":1e-9999999999",
+        ),
+        exact.replace("\"brain_threshold\":0.8", "\"brain_threshold\":1.1"),
+        exact.replace("\"resolved_at\":1", "\"resolved_at\":0"),
+        exact.replace(
+            "\"user_action\":\"hook_proposal\"",
+            "\"user_action\":\"deterministic_deny\"",
+        ),
+        exact
+            .replace(
+                "\"user_action\":\"hook_proposal\"",
+                "\"user_action\":\"deterministic_deny\"",
+            )
+            .replace("\"brain_action\":\"approve\"", "\"brain_action\":\"deny\""),
+        exact.replace(
+            "\"decision_id\":\"fixture-decision\"",
+            &format!("\"decision_id\":\"{}\"", "x".repeat(513)),
+        ),
+    ];
+
+    for (index, encoded) in cases.into_iter().enumerate() {
+        let root = private_tempdir();
+        write_private(
+            &root.path().join("brain/decisions.jsonl"),
+            encoded.as_bytes(),
+        );
+        assert!(
+            matches!(
+                LegacySourceSet::at(root.path()).unwrap().read_all_bounded(),
+                Err(StorageError::InvalidStorage(_))
+            ),
+            "case {index}"
+        );
+    }
+}
+
+#[test]
 fn authority_shaped_activity_with_diagnostic_field_is_not_skipped() {
     let root = private_tempdir();
     write_private(

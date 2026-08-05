@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::Deserialize;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 
 use crate::codex_transcript::CodexResumeEvidence;
 use crate::durable_file::durable_replace;
@@ -576,6 +577,11 @@ pub fn decode_legacy_snapshot(bytes: &[u8]) -> Result<LifecycleSnapshot, StoreEr
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(StoreError::SnapshotTooLarge);
     }
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    UniqueJson::deserialize(&mut deserializer).map_err(|_| StoreError::InvalidSnapshot)?;
+    deserializer
+        .end()
+        .map_err(|_| StoreError::InvalidSnapshot)?;
     let header: SchemaHeader =
         serde_json::from_slice(bytes).map_err(|_| StoreError::InvalidSnapshot)?;
     if header.schema_version > LIFECYCLE_SCHEMA_VERSION {
@@ -599,6 +605,77 @@ pub fn decode_legacy_snapshot(bytes: &[u8]) -> Result<LifecycleSnapshot, StoreEr
         return Err(StoreError::InvalidSnapshot);
     }
     Ok(snapshot)
+}
+
+struct UniqueJson;
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = UniqueJson;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<UniqueJson>()?.is_some() {}
+        Ok(UniqueJson)
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+            object.next_value::<UniqueJson>()?;
+        }
+        Ok(UniqueJson)
+    }
 }
 
 fn snapshot_permission_disposition(
@@ -1278,6 +1355,57 @@ mod tests {
             super::super::LifecycleEventKind::UserPromptSubmit,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn legacy_decoder_rejects_duplicate_nested_session_keys() {
+        let mut snapshot = LifecycleSnapshot::default();
+        snapshot.apply(prompt("session-duplicate", "turn-1"), 1);
+        let (session_key, state) = snapshot.sessions.iter().next().unwrap();
+        let session_key = serde_json::to_string(session_key).unwrap();
+        let state = serde_json::to_string(state).unwrap();
+        let encoded = format!(
+            "{{\"schema_version\":4,\"next_sequence\":{},\"sessions\":{{{session_key}:{state},{session_key}:{state}}}}}",
+            snapshot.next_sequence
+        );
+
+        assert!(matches!(
+            decode_legacy_snapshot(encoded.as_bytes()),
+            Err(StoreError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
+    fn legacy_decoder_rejects_duplicate_permission_authority_request_keys() {
+        let store = store();
+        let identity = open_turn(&store, AgentProvider::Codex, "session-authority", "turn-1");
+        let request_key = "a".repeat(64);
+        store
+            .ensure_permission_decision(
+                &identity,
+                &request_key,
+                PermissionDecision::Decided(PermissionAuthority {
+                    transaction_id: "transaction-authority".into(),
+                    action: PermissionAction::Allow,
+                }),
+            )
+            .unwrap();
+        let snapshot = store.read().unwrap().snapshot.unwrap();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let authority = serde_json::to_string(
+            &snapshot.sessions[&key("session-authority")].permission_authorities[&request_key],
+        )
+        .unwrap();
+        let needle = format!("\"permission_authorities\":{{\"{request_key}\":{authority}}}");
+        let duplicate = format!(
+            "\"permission_authorities\":{{\"{request_key}\":{authority},\"{request_key}\":{authority}}}"
+        );
+        let encoded = encoded.replacen(&needle, &duplicate, 1);
+
+        assert!(matches!(
+            decode_legacy_snapshot(encoded.as_bytes()),
+            Err(StoreError::InvalidSnapshot)
+        ));
     }
 
     fn provider_subagent_start(

@@ -13,9 +13,11 @@ use serde::Deserialize;
 
 use crate::brain::decisions::{
     DecisionRecord, HookDecisionRecord, MAX_DECISION_RECORD_BYTES, parse_decision_value,
+    validate_hook_decision_record,
 };
 use crate::brain::permission_transaction::{
-    PermissionTransactionJournal, decode_exact_journal, decode_exact_json, validate_journal,
+    PermissionTransactionJournal, decode_exact_journal, decode_exact_json,
+    hook_decision_numbers_are_lossless, validate_journal,
 };
 use crate::brain::review_state::{ReviewStateSnapshot, decode_legacy_snapshot as decode_review};
 use crate::brain::secure_state::{SecureStateDirectory, SecureStateError};
@@ -375,10 +377,16 @@ fn stream_decisions(
         let value = decode_exact_json(line).ok_or_else(|| invalid("invalid legacy decision"))?;
         let user_action = value.get("user_action").and_then(serde_json::Value::as_str);
         let decision = if matches!(user_action, Some("hook_proposal" | "deterministic_deny")) {
+            if !hook_decision_numbers_are_lossless(line) {
+                return Err(invalid("legacy hook decision contains a lossy number"));
+            }
             let record: HookDecisionRecord = serde_json::from_value(value.clone())
                 .map_err(|_| invalid("invalid legacy hook decision"))?;
             if serde_json::to_value(&record).ok().as_ref() != Some(&value) {
                 return Err(invalid("legacy hook decision is not exact"));
+            }
+            if !validate_hook_decision_record(&record) {
+                return Err(invalid("legacy hook decision is semantically invalid"));
             }
             LegacyDecision::Hook(record)
         } else {

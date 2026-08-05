@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::brain::client::BrainSuggestion;
-use coding_brain_core::brain_activity::ActivityEvent;
+use coding_brain_core::brain_activity::{
+    ActivityEvent, MAX_ACTIVITY_FIELD_BYTES, lossless_redacted_activity_text,
+};
+use coding_brain_core::lifecycle::MAX_ID_BYTES;
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::provider::AgentProvider;
 use fs2::FileExt;
@@ -662,6 +665,48 @@ impl HookDecisionRecord {
             turn_id: audit.turn_id.to_owned(),
         }
     }
+}
+
+pub(crate) fn validate_hook_decision_record(record: &HookDecisionRecord) -> bool {
+    let valid_id = |value: &str| {
+        !value.is_empty() && value.len() <= MAX_ID_BYTES && !value.chars().any(char::is_control)
+    };
+    let valid_text = |value: &str, allow_empty: bool| {
+        (allow_empty || !value.is_empty())
+            && value.len() <= MAX_ACTIVITY_FIELD_BYTES
+            && !value.chars().any(char::is_control)
+    };
+    let valid_probability = |value: f64| value.is_finite() && (0.0..=1.0).contains(&value);
+    let action_matches_source = match record.user_action.as_str() {
+        "hook_proposal" => matches!(record.brain_action.as_str(), "approve" | "deny" | "abstain"),
+        "deterministic_deny" => {
+            record.brain_action == "deny"
+                && matches!(
+                    record.brain_source.as_str(),
+                    "deterministic" | "provider_policy"
+                )
+        }
+        _ => false,
+    };
+
+    valid_text(&record.ts, false)
+        && valid_text(&record.project, false)
+        && valid_text(&record.tool, false)
+        && valid_text(&record.brain_source, false)
+        && valid_id(&record.decision_id)
+        && valid_id(&record.session_id)
+        && valid_id(&record.turn_id)
+        && record.decision_type == "session"
+        && action_matches_source
+        && valid_probability(record.brain_confidence)
+        && record.brain_threshold.is_none_or(valid_probability)
+        && record.resolved_at >= record.suggested_at
+        && lossless_redacted_activity_text(&record.command).as_deref()
+            == Some(record.command.as_str())
+        && lossless_redacted_activity_text(&record.brain_reasoning).as_deref()
+            == Some(record.brain_reasoning.as_str())
+        && serde_json::to_vec(record)
+            .is_ok_and(|serialized| serialized.len() as u64 <= MAX_DECISION_RECORD_BYTES)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

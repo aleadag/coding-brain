@@ -23,7 +23,6 @@ use std::path::Component;
 
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityState, MAX_ACTIVITY_EVENT_BYTES,
-    lossless_redacted_activity_text,
 };
 use coding_brain_core::lifecycle::{
     EnsurePermissionDecision, LifecycleIdentity, LifecycleStore, MAX_ID_BYTES, PermissionAction,
@@ -36,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use super::activity::{ActivityLog, ActivityStore, ActivityStoreError, LiveEvidenceBudget};
 use super::decisions::{
     DecisionStoreError, EnsureRecord, HookDecisionRecord, ensure_hook_record_at,
-    ensure_hook_record_at_bounded,
+    ensure_hook_record_at_bounded, validate_hook_decision_record,
 };
 use super::permission_request_lock::{
     PermissionRequestGuard, PermissionRequestLockStore, state_root_for_traversal,
@@ -2037,22 +2036,13 @@ pub(crate) fn validate_journal(
 ) -> Result<(), TransactionError> {
     if !matches!(journal.schema_version, 1 | JOURNAL_SCHEMA_VERSION)
         || !valid_id(&journal.transaction_id)
-        || !valid_id(&journal.proposal.decision_id)
+        || !validate_hook_decision_record(&journal.proposal)
         || !valid_id(&journal.terminal.activity_id)
         || journal.request_key.len() != 64
         || !journal
             .request_key
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || journal.proposal.decision_type != "session"
-        || !matches!(
-            journal.proposal.user_action.as_str(),
-            "hook_proposal" | "deterministic_deny"
-        )
-        || lossless_redacted_activity_text(&journal.proposal.command).as_deref()
-            != Some(journal.proposal.command.as_str())
-        || lossless_redacted_activity_text(&journal.proposal.brain_reasoning).as_deref()
-            != Some(journal.proposal.brain_reasoning.as_str())
         || journal.terminal.schema_version != ACTIVITY_SCHEMA_VERSION
         || !journal.terminal.state.is_terminal()
         || !journal.terminal.has_consistent_payload()
@@ -2351,6 +2341,18 @@ struct RawProposalNumbers<'a> {
     brain_threshold: Option<&'a serde_json::value::RawValue>,
 }
 
+pub(crate) fn hook_decision_numbers_are_lossless(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<RawProposalNumbers<'_>>(bytes)
+        .is_ok_and(|numbers| numbers.are_lossless())
+}
+
+impl RawProposalNumbers<'_> {
+    fn are_lossless(&self) -> bool {
+        lossless_f64_token(self.brain_confidence)
+            && self.brain_threshold.is_none_or(lossless_f64_token)
+    }
+}
+
 #[derive(Deserialize)]
 struct RawTerminalNumbers<'a> {
     #[serde(borrow)]
@@ -2361,8 +2363,7 @@ struct RawTerminalNumbers<'a> {
 
 impl RawJournalNumbers<'_> {
     fn are_lossless(&self) -> bool {
-        lossless_f64_token(self.proposal.brain_confidence)
-            && self.proposal.brain_threshold.is_none_or(lossless_f64_token)
+        self.proposal.are_lossless()
             && self.terminal.as_ref().is_none_or(|terminal| {
                 terminal.confidence.is_none_or(lossless_f64_token)
                     && terminal.threshold.is_none_or(lossless_f64_token)
