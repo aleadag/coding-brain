@@ -3742,7 +3742,30 @@ fn historical_permission_reads_are_bounded_and_learning_revalidates_the_full_tup
     );
     assert!(!authority.response_eligible);
     assert_eq!(authority.delivery_state, HistoricalDeliveryState::Unknown);
-    assert!(page.serialized_bytes > 0);
+    let exact_serialized_bytes = [
+        "historical-decision".len(),
+        "permission".len(),
+        "allow".len(),
+        "decision".len(),
+        "allowed".len(),
+        "allow".len(),
+        "journal_correlated".len(),
+        "legacy-transaction".len(),
+        64,
+        "unknown".len(),
+        std::mem::size_of::<i64>() * 2,
+    ]
+    .into_iter()
+    .sum::<usize>();
+    assert!(matches!(
+        db.historical_permission_authority_after(None, 1, exact_serialized_bytes - 1),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    let exact_page = db
+        .historical_permission_authority_after(None, 1, exact_serialized_bytes)
+        .unwrap();
+    assert_eq!(exact_page.authorities.len(), 1);
+    assert_eq!(exact_page.serialized_bytes, exact_serialized_bytes);
     assert!(matches!(
         db.historical_permission_authority_after(None, 1, 1),
         Err(StorageError::InvalidStorage(_))

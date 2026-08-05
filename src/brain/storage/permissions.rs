@@ -749,6 +749,7 @@ impl HistoricalAuthorityRow {
             self.provenance_kind.len(),
             self.transaction_id.as_deref().map_or(0, str::len),
             self.request_key.as_deref().map_or(0, str::len),
+            self.delivery_state.len(),
             std::mem::size_of::<i64>() * 2,
         ]
         .into_iter()
