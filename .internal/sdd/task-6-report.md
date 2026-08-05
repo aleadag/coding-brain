@@ -23,3 +23,11 @@ Pre-activation schema v1 now stores the complete typed attempt identity, honest 
 ## Runtime boundary
 
 The production provider hook remains on `PermissionTransactionJournal`; Task 6 adds only inactive SQLite APIs and tests. No `ATTACH` path or core SQLite dependency is introduced.
+
+## Independent-review follow-up
+
+- RED: a fresh-open corruption regression failed because `permission_state` accepted a valid-length but incorrect `request_identity_key`; the no-tool regression failed with `InvalidStorage("permission identity is incomplete")` from `decision_identity`.
+- Fresh authority validation now selects the complete stored attempt identity, recomputes its canonical request identity, bounds the terminal payload before deserialization, and requires the attempt update, decision, terminal event, and commit timestamps to agree in order and range. The shared validation path makes `permission_state`, `permission_decision`, and `record_delivery` fail closed on each deliberate corruption.
+- `DecisionIdentity::Permission` now preserves `tool_use_id: Option<String>` through identity materialization and source-event validation. A committed no-tool permission round-trips through `decision_identity`, `decision_payload`, and paged learning reads.
+- Focused follow-up evidence: 15 permission tests passed with 1 intentional helper ignored; 102 SQLite storage tests passed with 1 intentional helper ignored; both suites had 0 failures.
+- Fresh follow-up gates: the full workspace/all-target suite exited 0, including 1115 passed and 5 ignored in the main binary unit target; formatting, clippy with warnings denied, and the all-target build also exited 0.

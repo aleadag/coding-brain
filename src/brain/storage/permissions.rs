@@ -1,14 +1,15 @@
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use coding_brain_core::brain_activity::{
-    ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, ProjectEvidence,
-    SessionTarget, SessionTargetProvenance,
+    ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, MAX_ACTIVITY_EVENT_BYTES,
+    ProjectEvidence, SessionTarget, SessionTargetProvenance,
 };
 use coding_brain_core::lifecycle::{LifecycleIdentity, PermissionAction, PermissionAuthority};
 use coding_brain_core::project::ProjectId;
+use coding_brain_core::provider::AgentProvider;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
@@ -601,7 +602,10 @@ fn validated_permission_commit(
                     d.decision_id, d.identity_kind, d.provider, d.session_id, d.turn_id,
                     d.tool_use_id, d.authority_action, d.decision_source,
                     e.activity_id, e.event_state, e.terminal_provider, e.terminal_session_id,
-                    e.terminal_turn_id, e.terminal_tool_use_id, e.terminal_action, e.event_payload
+                    e.terminal_turn_id, e.terminal_tool_use_id, e.terminal_action,
+                    CASE WHEN length(e.event_payload) <= ?2 THEN e.event_payload END,
+                    a.request_identity_key, a.request_key, a.created_at_ms, a.updated_at_ms,
+                    d.decided_at_ms, e.recorded_at_ms, c.committed_at_ms
              FROM permission_commits c
              JOIN permission_attempts a
                ON a.attempt_id = c.attempt_id AND a.authority_action = c.authority_action
@@ -614,7 +618,7 @@ fn validated_permission_commit(
               AND e.permission_attempt_id = c.attempt_id
               AND e.terminal_action = c.authority_action
              WHERE c.attempt_id = ?1 LIMIT 1",
-            [attempt_id.as_str()],
+            params![attempt_id.as_str(), MAX_ACTIVITY_EVENT_BYTES as i64],
             |row| {
                 Ok(CommitEvidenceRow {
                     transaction_id: row.get(0)?,
@@ -649,6 +653,13 @@ fn validated_permission_commit(
                     event_tool_use: row.get(29)?,
                     event_action: row.get(30)?,
                     event_payload: row.get(31)?,
+                    request_identity_key: row.get(32)?,
+                    request_key: row.get(33)?,
+                    attempt_created_at_ms: row.get(34)?,
+                    attempt_updated_at_ms: row.get(35)?,
+                    decision_decided_at_ms: row.get(36)?,
+                    event_recorded_at_ms: row.get(37)?,
+                    commit_committed_at_ms: row.get(38)?,
                 })
             },
         )
@@ -669,13 +680,29 @@ fn validated_permission_commit(
         ),
         _ => false,
     };
-    let event: ActivityEvent = serde_json::from_slice(&row.event_payload)
+    let event_payload = row
+        .event_payload
+        .as_deref()
+        .ok_or(StorageError::InvalidStorage(
+            "permission terminal payload exceeds its size limit",
+        ))?;
+    let event: ActivityEvent = serde_json::from_slice(event_payload)
         .map_err(|_| StorageError::InvalidStorage("permission terminal payload is corrupt"))?;
     let event_session = event.session.as_ref().ok_or(StorageError::InvalidStorage(
         "permission terminal payload has no session",
     ))?;
-    let event_project = serde_json::from_slice::<ProjectId>(&row.attempt_project)
-        .map_err(|_| StorageError::InvalidStorage("permission project identity is corrupt"))?;
+    let stored_admission = stored_permission_admission(&row)?;
+    let event_project = &stored_admission.project_id;
+    let created_at_ms = u64::try_from(row.attempt_created_at_ms)
+        .map_err(|_| StorageError::InvalidStorage("permission attempt timestamp is invalid"))?;
+    let updated_at_ms = u64::try_from(row.attempt_updated_at_ms)
+        .map_err(|_| StorageError::InvalidStorage("permission attempt timestamp is invalid"))?;
+    let decision_at_ms = u64::try_from(row.decision_decided_at_ms)
+        .map_err(|_| StorageError::InvalidStorage("permission decision timestamp is invalid"))?;
+    let event_at_ms = u64::try_from(row.event_recorded_at_ms)
+        .map_err(|_| StorageError::InvalidStorage("permission event timestamp is invalid"))?;
+    let committed_at_ms = u64::try_from(row.commit_committed_at_ms)
+        .map_err(|_| StorageError::InvalidStorage("permission commit timestamp is invalid"))?;
     let source_matches = match row.evidence.as_str() {
         "provider_authority" => row.decision_source.as_deref() == Some("model"),
         "deterministic_safety" => row.decision_source.as_deref() == Some("deterministic_safety"),
@@ -683,6 +710,12 @@ fn validated_permission_commit(
     };
     if row.transaction_id.is_empty()
         || row.transaction_id.len() > 512
+        || request_identity_key(&stored_admission)? != row.request_identity_key
+        || created_at_ms > updated_at_ms
+        || updated_at_ms != decision_at_ms
+        || decision_at_ms != event_at_ms
+        || event_at_ms != committed_at_ms
+        || event.recorded_at_ms != event_at_ms
         || !matches!(
             row.evidence.as_str(),
             "provider_authority" | "deterministic_safety"
@@ -722,9 +755,9 @@ fn validated_permission_commit(
         || event_session.turn_id.as_deref() != Some(row.attempt_turn.as_str())
         || event_session.tool_use_id != row.attempt_tool_use
         || event_session.cwd.as_os_str().as_bytes() != row.attempt_cwd
-        || event_session.project_id != event_project
+        || event_session.project_id != *event_project
         || event.project.cwd.as_os_str().as_bytes() != row.attempt_cwd
-        || event.project.project_id != event_project
+        || event.project.project_id != *event_project
         || event.tool.as_deref() != Some(row.attempt_tool.as_str())
     {
         return Err(StorageError::InvalidStorage(
@@ -772,7 +805,54 @@ struct CommitEvidenceRow {
     event_turn: Option<String>,
     event_tool_use: Option<String>,
     event_action: Option<String>,
-    event_payload: Vec<u8>,
+    event_payload: Option<Vec<u8>>,
+    request_identity_key: String,
+    request_key: String,
+    attempt_created_at_ms: i64,
+    attempt_updated_at_ms: i64,
+    decision_decided_at_ms: i64,
+    event_recorded_at_ms: i64,
+    commit_committed_at_ms: i64,
+}
+
+fn stored_permission_admission(
+    row: &CommitEvidenceRow,
+) -> Result<PermissionAdmission, StorageError> {
+    let provider = match row.attempt_provider.as_str() {
+        "codex" => AgentProvider::Codex,
+        "claude" => AgentProvider::Claude,
+        "antigravity" => AgentProvider::Antigravity,
+        _ => {
+            return Err(StorageError::InvalidStorage(
+                "permission attempt provider is invalid",
+            ));
+        }
+    };
+    let lifecycle = LifecycleIdentity::try_new_with_provider_session(
+        provider,
+        row.attempt_session.clone(),
+        row.attempt_provider_session.clone(),
+        Some(row.attempt_turn.clone()),
+        None,
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(row.attempt_cwd.clone())),
+    )
+    .map_err(|_| StorageError::InvalidStorage("permission attempt identity is invalid"))?;
+    let project_id = serde_json::from_slice::<ProjectId>(&row.attempt_project)
+        .map_err(|_| StorageError::InvalidStorage("permission project identity is corrupt"))?;
+    let created_at_ms = u64::try_from(row.attempt_created_at_ms)
+        .map_err(|_| StorageError::InvalidStorage("permission attempt timestamp is invalid"))?;
+    let admission = PermissionAdmission::new(
+        lifecycle,
+        row.request_key.clone(),
+        project_id,
+        row.attempt_tool.clone(),
+        row.attempt_tool_use.clone(),
+        row.attempt_activity.clone(),
+        created_at_ms,
+        created_at_ms,
+    );
+    validate_admission(&admission)?;
+    Ok(admission)
 }
 
 fn require_exact_attempt(
@@ -1069,6 +1149,7 @@ mod tests {
     use coding_brain_core::provider::AgentProvider;
 
     use crate::brain::decisions::HookDecisionRecord;
+    use crate::brain::storage::DecisionIdentity;
 
     use super::{
         AttemptId, BrainDb, DeliveryEvidence, PermissionAdmission, PermissionEvidenceKind,
@@ -1482,6 +1563,141 @@ mod tests {
             reopened.permission_state(&attempt_id),
             Err(StorageError::InvalidStorage(_))
         ));
+    }
+
+    #[test]
+    fn fresh_authority_reads_and_delivery_reject_every_corrupt_identity_or_timestamp() {
+        for (label, mutation) in [
+            (
+                "request identity",
+                "UPDATE permission_attempts SET request_identity_key = printf('%064x', 11)",
+            ),
+            (
+                "request key",
+                "UPDATE permission_attempts SET request_key = printf('%064x', 11)",
+            ),
+            (
+                "attempt creation timestamp",
+                "UPDATE permission_attempts SET created_at_ms = 4",
+            ),
+            (
+                "attempt update timestamp",
+                "UPDATE permission_attempts SET updated_at_ms = 2",
+            ),
+            (
+                "decision timestamp",
+                "UPDATE decision_identities SET decided_at_ms = 2",
+            ),
+            (
+                "event timestamp",
+                "UPDATE activity_events SET recorded_at_ms = 2 WHERE event_state = 'allowed'",
+            ),
+            (
+                "commit timestamp",
+                "UPDATE permission_commits SET committed_at_ms = 2",
+            ),
+            (
+                "event payload bound",
+                "UPDATE activity_events
+                 SET event_payload = CAST(event_payload || printf('%65537s', '') AS BLOB)
+                 WHERE event_state = 'allowed'",
+            ),
+        ] {
+            let root = root();
+            let paths = StoragePaths::at(root.path());
+            drop(BrainDb::create_current(&paths).unwrap());
+            let request = admission("activity-1");
+            let mut db = open(&paths, Duration::from_secs(20));
+            let guard = db.admit_permission(request.clone()).unwrap().unwrap();
+            let committed = db
+                .commit_permission(
+                    PreparedPermissionCommit::new(
+                        guard,
+                        proposal("decision-1"),
+                        terminal(&request, "decision-1"),
+                        PermissionAuthority {
+                            transaction_id: "transaction-1".into(),
+                            action: PermissionAction::Allow,
+                        },
+                        PermissionEvidenceKind::ProviderAuthority,
+                        true,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            drop(db);
+            let connection = rusqlite::Connection::open(paths.brain_db()).unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .unwrap();
+            connection.execute(mutation, []).unwrap();
+            drop(connection);
+
+            let mut reopened = open(&paths, Duration::from_secs(5));
+            assert!(
+                matches!(
+                    reopened.permission_state(committed.attempt_id()),
+                    Err(StorageError::InvalidStorage(_))
+                ),
+                "permission_state accepted corrupt {label}"
+            );
+            assert!(
+                matches!(
+                    reopened.permission_decision(committed.attempt_id()),
+                    Err(StorageError::InvalidStorage(_))
+                ),
+                "permission_decision accepted corrupt {label}"
+            );
+            assert!(
+                matches!(
+                    reopened.record_delivery(&committed, DeliveryEvidence::Delivered),
+                    Err(StorageError::InvalidStorage(_))
+                ),
+                "record_delivery accepted corrupt {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_permission_without_tool_use_is_readable_by_decision_and_learning_apis() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let request = admission("activity-1");
+        let mut db = open(&paths, Duration::from_secs(5));
+        let guard = db.admit_permission(request.clone()).unwrap().unwrap();
+        let committed = db
+            .commit_permission(
+                PreparedPermissionCommit::new(
+                    guard,
+                    proposal("decision-1"),
+                    terminal(&request, "decision-1"),
+                    PermissionAuthority {
+                        transaction_id: "transaction-1".into(),
+                        action: PermissionAction::Allow,
+                    },
+                    PermissionEvidenceKind::ProviderAuthority,
+                    true,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let identity = db.decision_identity("decision-1").unwrap().unwrap();
+        let DecisionIdentity::Permission { tool_use_id, .. } = identity else {
+            panic!("committed permission materialized as an observation");
+        };
+        assert_eq!(tool_use_id, None);
+        assert_eq!(
+            db.decision_payload("decision-1")
+                .unwrap()
+                .unwrap()
+                .source_cursor,
+            committed.terminal_cursor()
+        );
+        let learned = db.learning_decisions(1, 1024 * 1024).unwrap();
+        assert_eq!(learned.len(), 1);
+        assert_eq!(learned[0].record.decision_id.as_deref(), Some("decision-1"));
     }
 
     #[test]

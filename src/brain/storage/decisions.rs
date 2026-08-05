@@ -47,7 +47,7 @@ pub enum DecisionIdentity {
         provider: AgentProvider,
         session_id: String,
         turn_id: String,
-        tool_use_id: String,
+        tool_use_id: Option<String>,
         authority_action: PermissionAction,
         decision_source: String,
         decided_at_ms: u64,
@@ -66,7 +66,7 @@ impl DecisionIdentity {
         provider: AgentProvider,
         session_id: impl Into<String>,
         turn_id: impl Into<String>,
-        tool_use_id: impl Into<String>,
+        tool_use_id: Option<String>,
         authority_action: PermissionAction,
         decision_source: impl Into<String>,
         decided_at_ms: u64,
@@ -76,7 +76,7 @@ impl DecisionIdentity {
             provider,
             session_id: session_id.into(),
             turn_id: turn_id.into(),
-            tool_use_id: tool_use_id.into(),
+            tool_use_id,
             authority_action,
             decision_source: decision_source.into(),
             decided_at_ms,
@@ -660,9 +660,7 @@ fn materialize_identity(
             row.3.ok_or(StorageError::InvalidStorage(
                 "permission identity is incomplete",
             ))?,
-            row.4.ok_or(StorageError::InvalidStorage(
-                "permission identity is incomplete",
-            ))?,
+            row.4,
             parse_action(row.5.as_deref())?,
             row.6.ok_or(StorageError::InvalidStorage(
                 "permission identity is incomplete",
@@ -759,7 +757,7 @@ fn validate_source_activity_event(
             || session.provider != *provider
             || session.session_id != *session_id
             || session.turn_id.as_deref() != Some(turn_id)
-            || session.tool_use_id.as_deref() != Some(tool_use_id)
+            || session.tool_use_id != *tool_use_id
         {
             return Err(StorageError::InvalidStorage(
                 "permission source activity disagrees with authority identity",
