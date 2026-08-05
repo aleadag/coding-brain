@@ -56,7 +56,9 @@ Only after commit may the hook write stdout. Delivery evidence is appended in a
 second short transaction. A crash or failed audit after successful stdout
 remains `DeliveryUnknown`; recovery never replays a provider response.
 Deterministic code-owned safety denies remain fail-closed when audit storage is
-unavailable.
+unavailable. A persisted deterministic-safety commit is always `Deny`, is not
+response-eligible, and records delivery as not required; it cannot create a
+provider-response delivery capability.
 
 ### Isolate operational review state
 

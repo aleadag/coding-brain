@@ -189,7 +189,7 @@ impl PreparedPermissionCommit {
             || self.authority.transaction_id.is_empty()
             || self.authority.transaction_id.len() > 512
             || (self.evidence_kind == PermissionEvidenceKind::DeterministicSafety
-                && self.authority.action != PermissionAction::Deny)
+                && (self.authority.action != PermissionAction::Deny || self.response_eligible))
         {
             return Err(StorageError::PermissionAttemptMismatch);
         }
@@ -709,7 +709,10 @@ fn validated_permission_commit(
             row.evidence.as_str(),
             "provider_authority" | "deterministic_safety"
         )
-        || (row.evidence == "deterministic_safety" && action != PermissionAction::Deny)
+        || (row.evidence == "deterministic_safety"
+            && (action != PermissionAction::Deny
+                || row.response_eligible != 0
+                || row.delivery != "not_required"))
         || !source_matches
         || !delivery_valid
         || row.attempt_state != "decided"
@@ -1133,8 +1136,8 @@ mod tests {
     use crate::brain::storage::DecisionIdentity;
 
     use super::{
-        AttemptId, BrainDb, DeliveryEvidence, PermissionAdmission, PermissionEvidenceKind,
-        PermissionState, PreparedPermissionCommit, StorageDeadline,
+        AttemptId, BrainDb, CommittedPermission, DeliveryEvidence, PermissionAdmission,
+        PermissionEvidenceKind, PermissionState, PreparedPermissionCommit, StorageDeadline,
     };
     use crate::brain::storage::{OpenRole, ReviewDb, StorageError, StoragePaths};
 
@@ -1658,6 +1661,95 @@ mod tests {
                 false,
             ),
             Err(StorageError::PermissionAttemptMismatch)
+        ));
+    }
+
+    #[test]
+    fn deterministic_safety_deny_cannot_be_response_eligible() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let request = admission("activity-response-eligible-deny");
+        let mut deny_proposal = proposal("decision-response-eligible-deny");
+        deny_proposal.brain_action = "deny".into();
+        deny_proposal.user_action = "hook_deny".into();
+        let mut deny_terminal = terminal(&request, "decision-response-eligible-deny");
+        deny_terminal.state = ActivityState::Denied;
+        let mut db = open(&paths, Duration::from_secs(3));
+        let guard = db.admit_permission(request).unwrap().unwrap();
+
+        assert!(matches!(
+            PreparedPermissionCommit::new(
+                guard,
+                deny_proposal,
+                deny_terminal,
+                PermissionAuthority {
+                    transaction_id: "transaction-response-eligible-deny".into(),
+                    action: PermissionAction::Deny,
+                },
+                PermissionEvidenceKind::DeterministicSafety,
+                true,
+            ),
+            Err(StorageError::PermissionAttemptMismatch)
+        ));
+    }
+
+    #[test]
+    fn fresh_reads_reject_response_eligible_deterministic_safety_corruption() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let request = admission("activity-corrupt-deterministic-deny");
+        let mut deny_proposal = proposal("decision-corrupt-deterministic-deny");
+        deny_proposal.brain_action = "deny".into();
+        deny_proposal.user_action = "hook_deny".into();
+        let mut deny_terminal = terminal(&request, "decision-corrupt-deterministic-deny");
+        deny_terminal.state = ActivityState::Denied;
+        let mut db = open(&paths, Duration::from_secs(3));
+        let guard = db.admit_permission(request).unwrap().unwrap();
+        let committed = db
+            .commit_permission(
+                PreparedPermissionCommit::new(
+                    guard,
+                    deny_proposal,
+                    deny_terminal,
+                    PermissionAuthority {
+                        transaction_id: "transaction-corrupt-deterministic-deny".into(),
+                        action: PermissionAction::Deny,
+                    },
+                    PermissionEvidenceKind::DeterministicSafety,
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let corrupted_capability = CommittedPermission {
+            response_eligible: true,
+            ..committed
+        };
+        drop(db);
+        let connection = rusqlite::Connection::open(paths.brain_db()).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE permission_commits
+                 SET response_eligible = 1, delivery_state = 'pending';",
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut reopened = open(&paths, Duration::from_secs(3));
+        assert!(matches!(
+            reopened.permission_state(corrupted_capability.attempt_id()),
+            Err(StorageError::InvalidStorage(_))
+        ));
+        assert!(matches!(
+            reopened.permission_decision(corrupted_capability.attempt_id()),
+            Err(StorageError::InvalidStorage(_))
+        ));
+        assert!(matches!(
+            reopened.record_delivery(&corrupted_capability, DeliveryEvidence::Delivered),
+            Err(StorageError::InvalidStorage(_))
         ));
     }
 

@@ -3596,6 +3596,61 @@ fn permission_commit_enforces_unique_references_and_closed_domains() {
 }
 
 #[test]
+fn deterministic_safety_commit_requires_deny_without_response_delivery() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute(
+            "INSERT INTO permission_attempts (
+                attempt_id, request_identity_key, provider, session_id, turn_id, tool_use_id,
+                request_key, cwd, project_id, tool_name, activity_id,
+                authority_action, attempt_state, created_at_ms, updated_at_ms
+             ) VALUES ('attempt-deterministic-deny', ?1, 'codex', 'session-1', 'turn-1',
+                       'tool-1', ?2, X'2F', X'7B7D', 'Bash', 'activity-deterministic-deny',
+                       'deny', 'decided', 1, 1)",
+            params!["a".repeat(64), "b".repeat(64)],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO decision_identities (
+                decision_id, identity_kind, permission_attempt_id, provider, session_id,
+                turn_id, tool_use_id, authority_action, decision_source, decided_at_ms
+             ) VALUES ('decision-deterministic-deny', 'permission',
+                       'attempt-deterministic-deny', 'codex', 'session-1', 'turn-1',
+                       'tool-1', 'deny', 'deterministic_safety', 1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO activity_events (
+                source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+                permission_attempt_id, terminal_provider, terminal_session_id,
+                terminal_turn_id, terminal_tool_use_id, terminal_action, event_payload
+             ) VALUES (1, 'activity-deterministic-deny', 'decision', 'denied', 1,
+                       'attempt-deterministic-deny', 'codex', 'session-1', 'turn-1',
+                       'tool-1', 'deny', X'')",
+            [],
+        )
+        .unwrap();
+
+    let invalid = connection.execute(
+        "INSERT INTO permission_commits (
+            attempt_id, transaction_id, decision_id, terminal_activity_id,
+            authority_action, evidence_kind, delivery_state,
+            response_eligible, committed_at_ms
+         ) VALUES ('attempt-deterministic-deny', 'transaction-deterministic-deny',
+                   'decision-deterministic-deny', 'activity-deterministic-deny',
+                   'deny', 'deterministic_safety', 'pending', 1, 1)",
+        [],
+    );
+    assert!(invalid.is_err());
+}
+
+#[test]
 fn lifecycle_schema_enforces_provider_qualified_topology() {
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());

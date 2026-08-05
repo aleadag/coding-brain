@@ -89,7 +89,7 @@ Record any pre-existing failure on `codexctl-dzlb9`; do not attribute it to the 
 | `decision_identities` | Primary key `decision_id`; typed `permission` rows require the complete immutable authority identity/action columns used by commit references, while typed `observation` rows keep only real non-authoritative provider/timestamp identity and require every authority field to be null. | Exact decision and authority-identity lookup. |
 | `decision_payloads` | Composite foreign key `(decision_id, payload_kind)` to the matching identity kind; bounded erasable learning fields plus the complete validated legacy-compatible decision payload. | Joined committed-learning query by source cursor. |
 | `activity_events` | Primary key `source_cursor` with `1..=i64::MAX` check; indexed, non-unique logical activity ID permits observed/terminal/delivery/outcome/correction rows for one activity; typed terminal action/identity columns retain the composite uniqueness required by permission-commit references. | Cursor pages, activity ID, permission identity, outcome, correction, and distillation indexes. |
-| `permission_commits` | One row per attempt; unique decision and terminal activity references; composite foreign keys require matching authority identity/action across attempt, decision, and terminal event; closed action/evidence/delivery domains; boolean `response_eligible` check. | Exact attempt/request authority and undelivered-audit lookup. |
+| `permission_commits` | One row per attempt; unique decision and terminal activity references; composite foreign keys require matching authority identity/action across attempt, decision, and terminal event; closed action/evidence/delivery domains; boolean `response_eligible` check; deterministic-safety evidence requires exactly deny, response-ineligible, and delivery-not-required. | Exact attempt/request authority and undelivered-audit lookup. |
 | lifecycle session/turn/invocation tables | Provider-qualified composite keys, bounded sequence values, and foreign keys from turns/invocations to sessions; no duplicate active identity. | Exact provider/session/turn and active-topology indexes. |
 | review `review_meta` / `review_marks` | Per-surface revision; nullable latest archive revision constrained to `1..=revision` and always null for Recent; exact surface/group/source-cursor key; closed disposition domain; no Brain tables or attachments. | Exact surface revision and bounded cursor-mark lookup. |
 
@@ -460,7 +460,7 @@ git commit -m "🗃️ feat: isolate review state in SQLite (codexctl-2o9fo)"
 - Concurrent identical requests have one active inference winner; sequential identical requests receive distinct attempts.
 - Proposal, terminal activity, and exact authority commit atomically before stdout.
 - Failed/uncertain commit emits no model response; fresh-open state determines committed versus absent without replay.
-- DeliveryFailed and DeliveryUnknown remain distinct; deterministic safety denies survive unavailable audit.
+- DeliveryFailed and DeliveryUnknown remain distinct. Persisted deterministic-safety authority is exactly `deny` with `response_eligible = 0` and `delivery_state = 'not_required'`; deterministic safety denies survive unavailable audit.
 - SQLite permission APIs and process fixtures create no permission journal, but the production hook remains on the legacy path until Task 8.
 - One absolute deadline begins before admission, includes inference time, and cannot be reset by later storage calls or busy retries.
 

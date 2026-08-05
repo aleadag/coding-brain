@@ -41,3 +41,11 @@ The production provider hook remains on `PermissionTransactionJournal`; Task 6 a
 - Adversarial coverage now includes deterministic-safety deny/non-response semantics, invalid deterministic allow rejection, more than 16 MiB of unrelated history with an indexed permission lookup, and both Brain-to-Review and Review-to-Brain failure isolation.
 - Focused evidence: 22 permission tests passed with 1 intentional helper ignored, and 102 SQLite storage tests passed with 1 intentional helper ignored; both suites had 0 failures.
 - Fresh final gates: the full workspace/all-target suite exited 0, including 1087 passed with 5 ignored in the core library target and 1122 passed with 5 ignored in the main binary library target; every integration target also reported 0 failures. Formatting, clippy with warnings denied, and the all-target build each exited 0 under `nix develop path:.`.
+
+## Third independent-review follow-up
+
+- RED: `PreparedPermissionCommit::new` accepted `DeterministicSafety` with `Deny` and `response_eligible = true`. A direct SQL fixture with otherwise coherent deny anchors also inserted `('deny', 'deterministic_safety', 'pending', 1)`. After bypassing check constraints, fresh state reads accepted the same corrupt eligible/pending tuple.
+- The adapter, frozen pre-activation schema and fixture, and `validated_permission_commit` now require deterministic-safety evidence to use exactly `authority_action = 'deny'`, `response_eligible = 0`, and `delivery_state = 'not_required'`. Fresh state, decision, and delivery operations fail closed if deliberate corruption violates that tuple.
+- The unified-storage specification, implementation plan, ADR-0006, and Task 6 brief now state the exact persisted tuple and that it cannot grant a provider-response delivery capability.
+- Focused evidence: 24 permission tests passed with 1 intentional helper ignored, and 103 SQLite storage tests passed with 1 intentional helper ignored; both suites had 0 failures.
+- Fresh final gates: the full workspace/all-target suite exited 0, including 1089 passed with 5 ignored in the core library target and 1124 passed with 5 ignored in the main binary library target; every integration target reported 0 failures. Formatting, clippy with warnings denied, and the all-target build each exited 0 under `nix develop path:.`.

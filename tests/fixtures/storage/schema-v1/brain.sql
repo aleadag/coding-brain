@@ -173,7 +173,11 @@ CREATE TABLE permission_commits (
         REFERENCES decision_identities (decision_id, permission_attempt_id, authority_action),
     FOREIGN KEY (terminal_activity_id, attempt_id, authority_action)
         REFERENCES activity_events (activity_id, permission_attempt_id, terminal_action),
-    CHECK (evidence_kind != 'deterministic_safety' OR authority_action = 'deny'),
+    CHECK (
+        evidence_kind != 'deterministic_safety'
+        OR
+        (authority_action = 'deny' AND response_eligible = 0 AND delivery_state = 'not_required')
+    ),
     CHECK (
         (response_eligible = 0 AND delivery_state = 'not_required')
         OR

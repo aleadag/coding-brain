@@ -304,6 +304,9 @@ later exact lifecycle or outcome evidence may claim tool execution.
 Deterministic safety denies continue to fail closed when persistence is
 unavailable. Their audit failure is reported through a bounded diagnostic, but
 storage failure never turns a deterministic deny into native/model approval.
+When persisted, deterministic-safety authority uses the exact tuple
+`authority_action = 'deny'`, `response_eligible = 0`, and
+`delivery_state = 'not_required'`; it never grants a response-delivery capability.
 
 ## Query and Maintenance Bounds
 
