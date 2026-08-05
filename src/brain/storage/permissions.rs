@@ -111,6 +111,50 @@ pub enum PermissionEvidenceKind {
     DeterministicSafety,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoricalPermissionProvenance {
+    ProposalTerminal,
+    JournalCorrelated,
+    LifecycleCorrelated,
+}
+
+impl HistoricalPermissionProvenance {
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "proposal_terminal" => Ok(Self::ProposalTerminal),
+            "journal_correlated" => Ok(Self::JournalCorrelated),
+            "lifecycle_correlated" => Ok(Self::LifecycleCorrelated),
+            _ => Err(StorageError::InvalidStorage(
+                "historical permission provenance is invalid",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoricalDeliveryState {
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalPermissionAuthority {
+    pub decision_id: String,
+    pub terminal_cursor: ActivityCursor,
+    pub action: PermissionAction,
+    pub provenance: HistoricalPermissionProvenance,
+    pub transaction_id: Option<String>,
+    pub request_key: Option<String>,
+    pub response_eligible: bool,
+    pub delivery_state: HistoricalDeliveryState,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HistoricalPermissionAuthorityPage {
+    pub authorities: Vec<HistoricalPermissionAuthority>,
+    pub next_cursor: Option<ActivityCursor>,
+    pub serialized_bytes: usize,
+}
+
 impl PermissionEvidenceKind {
     fn label(self) -> &'static str {
         match self {
@@ -575,6 +619,302 @@ impl BrainDb {
             self.deadline,
         )
     }
+
+    pub fn historical_permission_authority_after(
+        &self,
+        after: Option<ActivityCursor>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<HistoricalPermissionAuthorityPage, StorageError> {
+        if max_rows == 0 || max_bytes == 0 {
+            return Err(StorageError::InvalidStorage(
+                "historical permission read bounds are invalid",
+            ));
+        }
+        let row_limit = max_rows
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(StorageError::InvalidStorage(
+                "historical permission row bound is invalid",
+            ))?;
+        super::activity::apply_deadline(&self.connection, self.deadline)?;
+        let mut statement = self.connection.prepare(
+            "SELECT decision_id, terminal_source_cursor, decision_kind, authority_action,
+                    terminal_event_kind, terminal_event_state, terminal_action,
+                    provenance_kind, transaction_id, request_key,
+                    response_eligible, delivery_state
+             FROM historical_permission_authority
+                  INDEXED BY historical_permission_authority_cursor
+             WHERE terminal_source_cursor > ?1
+             ORDER BY terminal_source_cursor ASC, decision_id ASC LIMIT ?2",
+        )?;
+        let mut rows = statement.query(params![
+            after.map_or(0, |cursor| cursor.get() as i64),
+            row_limit
+        ])?;
+        let mut authorities = Vec::new();
+        let mut serialized_bytes = 0usize;
+        let mut has_more = false;
+        while let Some(row) = rows.next()? {
+            if authorities.len() == max_rows {
+                has_more = true;
+                break;
+            }
+            let raw = HistoricalAuthorityRow {
+                decision_id: row.get(0)?,
+                terminal_cursor: row.get(1)?,
+                decision_kind: row.get(2)?,
+                authority_action: row.get(3)?,
+                terminal_event_kind: row.get(4)?,
+                terminal_event_state: row.get(5)?,
+                terminal_action: row.get(6)?,
+                provenance_kind: row.get(7)?,
+                transaction_id: row.get(8)?,
+                request_key: row.get(9)?,
+                response_eligible: row.get(10)?,
+                delivery_state: row.get(11)?,
+            };
+            let row_bytes = raw.serialized_bytes()?;
+            let next_bytes =
+                serialized_bytes
+                    .checked_add(row_bytes)
+                    .ok_or(StorageError::InvalidStorage(
+                        "historical permission byte bound is exceeded",
+                    ))?;
+            if next_bytes > max_bytes {
+                if authorities.is_empty() {
+                    return Err(StorageError::InvalidStorage(
+                        "historical permission byte bound cannot hold the next row",
+                    ));
+                }
+                has_more = true;
+                break;
+            }
+            authorities.push(validated_historical_authority(&self.connection, raw)?);
+            serialized_bytes = next_bytes;
+            super::activity::ensure_deadline(self.deadline)?;
+        }
+        let next_cursor = has_more
+            .then(|| {
+                authorities
+                    .last()
+                    .map(|authority| authority.terminal_cursor)
+            })
+            .flatten();
+        Ok(HistoricalPermissionAuthorityPage {
+            authorities,
+            next_cursor,
+            serialized_bytes,
+        })
+    }
+
+    pub fn explain_historical_permission_lookup(&self) -> Result<String, StorageError> {
+        super::activity::explain_query(
+            &self.connection,
+            "EXPLAIN QUERY PLAN
+             SELECT decision_id FROM historical_permission_authority
+                  INDEXED BY historical_permission_authority_cursor
+             WHERE terminal_source_cursor > 0
+             ORDER BY terminal_source_cursor ASC, decision_id ASC LIMIT 1",
+            self.deadline,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct HistoricalAuthorityRow {
+    decision_id: String,
+    terminal_cursor: i64,
+    decision_kind: String,
+    authority_action: String,
+    terminal_event_kind: String,
+    terminal_event_state: String,
+    terminal_action: String,
+    provenance_kind: String,
+    transaction_id: Option<String>,
+    request_key: Option<String>,
+    response_eligible: i64,
+    delivery_state: String,
+}
+
+impl HistoricalAuthorityRow {
+    fn serialized_bytes(&self) -> Result<usize, StorageError> {
+        [
+            self.decision_id.len(),
+            self.decision_kind.len(),
+            self.authority_action.len(),
+            self.terminal_event_kind.len(),
+            self.terminal_event_state.len(),
+            self.terminal_action.len(),
+            self.provenance_kind.len(),
+            self.transaction_id.as_deref().map_or(0, str::len),
+            self.request_key.as_deref().map_or(0, str::len),
+            std::mem::size_of::<i64>() * 2,
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, size| total.checked_add(size))
+        .ok_or(StorageError::InvalidStorage(
+            "historical permission byte bound is exceeded",
+        ))
+    }
+}
+
+pub(super) fn validated_historical_authority(
+    connection: &rusqlite::Connection,
+    raw: HistoricalAuthorityRow,
+) -> Result<HistoricalPermissionAuthority, StorageError> {
+    let action = parse_action(&raw.authority_action)?;
+    let terminal_cursor = ActivityCursor::try_from(raw.terminal_cursor)?;
+    let provenance = HistoricalPermissionProvenance::parse(&raw.provenance_kind)?;
+    let provenance_matches_identifiers = match provenance {
+        HistoricalPermissionProvenance::ProposalTerminal => {
+            raw.transaction_id.is_none() && raw.request_key.is_none()
+        }
+        HistoricalPermissionProvenance::JournalCorrelated
+        | HistoricalPermissionProvenance::LifecycleCorrelated => {
+            raw.transaction_id.is_some() && raw.request_key.is_some()
+        }
+    };
+    let transaction_valid = raw
+        .transaction_id
+        .as_deref()
+        .is_none_or(|value| !value.is_empty() && value.len() <= 512);
+    let request_valid = raw.request_key.as_deref().is_none_or(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    });
+    let expected_state = match action {
+        PermissionAction::Allow => "allowed",
+        PermissionAction::Deny => "denied",
+    };
+    if raw.decision_kind != "permission"
+        || raw.terminal_event_kind != "decision"
+        || raw.terminal_event_state != expected_state
+        || raw.terminal_action != raw.authority_action
+        || raw.response_eligible != 0
+        || raw.delivery_state != "unknown"
+        || !provenance_matches_identifiers
+        || !transaction_valid
+        || !request_valid
+    {
+        return Err(StorageError::InvalidStorage(
+            "historical permission authority tuple is invalid",
+        ));
+    }
+    let decision = connection
+        .query_row(
+            "SELECT identity_kind, permission_attempt_id, provider, session_id, turn_id,
+                    tool_use_id, authority_action, decision_source, decided_at_ms
+             FROM decision_identities WHERE decision_id = ?1",
+            [&raw.decision_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StorageError::InvalidStorage(
+            "historical permission decision anchor is absent",
+        ))?;
+    let provider = match decision.2.as_str() {
+        "codex" => AgentProvider::Codex,
+        "claude" => AgentProvider::Claude,
+        "antigravity" => AgentProvider::Antigravity,
+        _ => {
+            return Err(StorageError::InvalidStorage(
+                "historical permission provider is invalid",
+            ));
+        }
+    };
+    let decided_at_ms = u64::try_from(decision.8).map_err(|_| {
+        StorageError::InvalidStorage("historical permission decision timestamp is invalid")
+    })?;
+    if decision.0 != "permission"
+        || decision.1.is_some()
+        || decision.6.as_deref() != Some(raw.authority_action.as_str())
+        || decision.7.as_deref() != Some("model")
+    {
+        return Err(StorageError::InvalidStorage(
+            "historical permission decision anchor is invalid",
+        ));
+    }
+    let identity = super::decisions::DecisionIdentity::permission(
+        raw.decision_id.clone(),
+        provider,
+        decision.3.ok_or(StorageError::InvalidStorage(
+            "historical permission decision identity is incomplete",
+        ))?,
+        decision.4.ok_or(StorageError::InvalidStorage(
+            "historical permission decision identity is incomplete",
+        ))?,
+        decision.5,
+        action,
+        "model",
+        decided_at_ms,
+    );
+    let high_water = super::activity::validated_high_water(connection)?;
+    if raw.terminal_cursor > high_water {
+        return Err(StorageError::InvalidStorage(
+            "historical permission terminal cursor exceeds the activity high-water",
+        ));
+    }
+    let activity = super::activity::validated_activity_at(connection, terminal_cursor)?;
+    super::decisions::validate_source_activity_event(&identity, &activity.event)?;
+    Ok(HistoricalPermissionAuthority {
+        decision_id: raw.decision_id,
+        terminal_cursor,
+        action,
+        provenance,
+        transaction_id: raw.transaction_id,
+        request_key: raw.request_key,
+        response_eligible: false,
+        delivery_state: HistoricalDeliveryState::Unknown,
+    })
+}
+
+pub(super) fn validated_historical_authority_by_decision(
+    connection: &rusqlite::Connection,
+    decision_id: &str,
+) -> Result<Option<HistoricalPermissionAuthority>, StorageError> {
+    let raw = connection
+        .query_row(
+            "SELECT decision_id, terminal_source_cursor, decision_kind, authority_action,
+                    terminal_event_kind, terminal_event_state, terminal_action,
+                    provenance_kind, transaction_id, request_key,
+                    response_eligible, delivery_state
+             FROM historical_permission_authority WHERE decision_id = ?1",
+            [decision_id],
+            |row| {
+                Ok(HistoricalAuthorityRow {
+                    decision_id: row.get(0)?,
+                    terminal_cursor: row.get(1)?,
+                    decision_kind: row.get(2)?,
+                    authority_action: row.get(3)?,
+                    terminal_event_kind: row.get(4)?,
+                    terminal_event_state: row.get(5)?,
+                    terminal_action: row.get(6)?,
+                    provenance_kind: row.get(7)?,
+                    transaction_id: row.get(8)?,
+                    request_key: row.get(9)?,
+                    response_eligible: row.get(10)?,
+                    delivery_state: row.get(11)?,
+                })
+            },
+        )
+        .optional()?;
+    raw.map(|raw| validated_historical_authority(connection, raw))
+        .transpose()
 }
 
 fn validated_permission_commit(
@@ -1131,13 +1471,15 @@ mod tests {
     use coding_brain_core::lifecycle::{LifecycleIdentity, PermissionAction, PermissionAuthority};
     use coding_brain_core::project::ProjectId;
     use coding_brain_core::provider::AgentProvider;
+    use rusqlite::params;
 
     use crate::brain::decisions::HookDecisionRecord;
-    use crate::brain::storage::DecisionIdentity;
+    use crate::brain::storage::{DecisionIdentity, DecisionKind, DecisionPayload};
 
     use super::{
         AttemptId, BrainDb, CommittedPermission, DeliveryEvidence, PermissionAdmission,
         PermissionEvidenceKind, PermissionState, PreparedPermissionCommit, StorageDeadline,
+        database_binding, hook_record_as_decision,
     };
     use crate::brain::storage::{OpenRole, ReviewDb, StorageError, StoragePaths};
 
@@ -1232,6 +1574,87 @@ mod tests {
 
     fn open(paths: &StoragePaths, duration: Duration) -> BrainDb {
         BrainDb::open_current(paths, OpenRole::Hook, StorageDeadline::after(duration)).unwrap()
+    }
+
+    #[test]
+    fn historical_authority_never_enters_live_permission_or_delivery_apis() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        let mut db = BrainDb::create_current(&paths).unwrap();
+        let historical_admission = admission("historical-activity");
+        let historical_decision_id = "historical-decision";
+        let cursor = db
+            .append_activity(terminal(&historical_admission, historical_decision_id))
+            .unwrap();
+        let historical_proposal = proposal(historical_decision_id);
+        db.insert_decision(
+            &DecisionIdentity::permission(
+                historical_decision_id,
+                AgentProvider::Codex,
+                "session-1",
+                "turn-1",
+                None,
+                PermissionAction::Allow,
+                "model",
+                3,
+            ),
+            &DecisionPayload::new(
+                DecisionKind::Permission,
+                cursor,
+                hook_record_as_decision(&historical_proposal),
+            ),
+        )
+        .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO historical_permission_authority (
+                    decision_id, terminal_source_cursor, decision_kind, authority_action,
+                    terminal_event_kind, terminal_event_state, terminal_action,
+                    provenance_kind, transaction_id, request_key,
+                    response_eligible, delivery_state
+                 ) VALUES (?1, ?2, 'permission', 'allow', 'decision', 'allowed', 'allow',
+                           'proposal_terminal', NULL, NULL, 0, 'unknown')",
+                params![historical_decision_id, cursor.get() as i64],
+            )
+            .unwrap();
+
+        drop(db);
+        let mut db = open(&paths, Duration::from_secs(1));
+        let live_guard = db
+            .admit_permission(admission("live-activity"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.permission_state(live_guard.attempt_id()).unwrap(),
+            PermissionState::Absent
+        );
+        assert_eq!(
+            db.permission_decision(live_guard.attempt_id()).unwrap(),
+            None
+        );
+        let fake_delivery = CommittedPermission {
+            attempt_id: live_guard.attempt_id().clone(),
+            terminal_cursor: cursor,
+            authority: PermissionAuthority {
+                transaction_id: "not-historical".into(),
+                action: PermissionAction::Allow,
+            },
+            response_eligible: true,
+            deadline: StorageDeadline::after(Duration::from_secs(1)),
+            database_binding: database_binding(&paths.brain_db()).unwrap(),
+        };
+        assert!(matches!(
+            db.record_delivery(&fake_delivery, DeliveryEvidence::Delivered),
+            Err(StorageError::PermissionAttemptMismatch)
+        ));
+        assert_eq!(
+            db.connection
+                .query_row("SELECT count(*) FROM permission_commits", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
     }
 
     fn wait_for(path: &std::path::Path) {

@@ -70,6 +70,7 @@ CREATE TABLE decision_identities (
     decision_source TEXT CHECK (decision_source IS NULL OR decision_source IN ('model', 'deterministic_safety', 'native_provider')),
     decided_at_ms INTEGER NOT NULL CHECK (decided_at_ms BETWEEN 0 AND 0x7fffffffffffffff),
     UNIQUE (decision_id, identity_kind),
+    UNIQUE (decision_id, identity_kind, authority_action),
     UNIQUE (decision_id, provider, session_id, turn_id, tool_use_id, authority_action),
     UNIQUE (decision_id, permission_attempt_id, authority_action),
     FOREIGN KEY (permission_attempt_id) REFERENCES permission_attempts (attempt_id),
@@ -132,7 +133,8 @@ CREATE TABLE activity_events (
         (terminal_provider IS NOT NULL AND terminal_session_id IS NOT NULL AND terminal_turn_id IS NOT NULL AND terminal_action IS NOT NULL)
     ),
     UNIQUE (activity_id, terminal_provider, terminal_session_id, terminal_turn_id, terminal_tool_use_id, terminal_action),
-    UNIQUE (activity_id, permission_attempt_id, terminal_action)
+    UNIQUE (activity_id, permission_attempt_id, terminal_action),
+    UNIQUE (source_cursor, event_kind, event_state, terminal_action)
 ) STRICT;
 
 CREATE INDEX activity_events_cursor
@@ -191,6 +193,48 @@ ON permission_commits (attempt_id, authority_action, committed_at_ms DESC);
 CREATE INDEX permission_commits_undelivered_audit
 ON permission_commits (delivery_state, committed_at_ms)
 WHERE delivery_state IN ('pending', 'unknown');
+
+CREATE TABLE historical_permission_authority (
+    decision_id TEXT PRIMARY KEY,
+    terminal_source_cursor INTEGER NOT NULL UNIQUE,
+    decision_kind TEXT NOT NULL CHECK (decision_kind = 'permission'),
+    authority_action TEXT NOT NULL CHECK (authority_action IN ('allow', 'deny')),
+    terminal_event_kind TEXT NOT NULL CHECK (terminal_event_kind = 'decision'),
+    terminal_event_state TEXT NOT NULL CHECK (terminal_event_state IN ('allowed', 'denied')),
+    terminal_action TEXT NOT NULL CHECK (terminal_action IN ('allow', 'deny')),
+    provenance_kind TEXT NOT NULL CHECK (
+        provenance_kind IN ('proposal_terminal', 'journal_correlated', 'lifecycle_correlated')
+    ),
+    transaction_id TEXT CHECK (
+        transaction_id IS NULL OR length(transaction_id) BETWEEN 1 AND 512
+    ),
+    request_key TEXT CHECK (
+        request_key IS NULL
+        OR (length(request_key) = 64 AND request_key NOT GLOB '*[^0-9a-f]*')
+    ),
+    response_eligible INTEGER NOT NULL CHECK (response_eligible = 0),
+    delivery_state TEXT NOT NULL CHECK (delivery_state = 'unknown'),
+    FOREIGN KEY (decision_id, decision_kind, authority_action)
+        REFERENCES decision_identities (decision_id, identity_kind, authority_action),
+    FOREIGN KEY (
+        terminal_source_cursor, terminal_event_kind, terminal_event_state, terminal_action
+    ) REFERENCES activity_events (source_cursor, event_kind, event_state, terminal_action),
+    CHECK (
+        (authority_action = 'allow' AND terminal_event_state = 'allowed')
+        OR (authority_action = 'deny' AND terminal_event_state = 'denied')
+    ),
+    CHECK (terminal_action = authority_action),
+    CHECK (
+        (provenance_kind = 'proposal_terminal'
+         AND transaction_id IS NULL AND request_key IS NULL)
+        OR
+        (provenance_kind IN ('journal_correlated', 'lifecycle_correlated')
+         AND transaction_id IS NOT NULL AND request_key IS NOT NULL)
+    )
+) STRICT;
+
+CREATE INDEX historical_permission_authority_cursor
+ON historical_permission_authority (terminal_source_cursor ASC, decision_id ASC);
 
 CREATE TABLE lifecycle_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),

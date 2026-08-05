@@ -33,7 +33,9 @@ pub use decisions::{
 };
 #[allow(unused_imports)]
 pub use permissions::{
-    AttemptId, CommittedPermission, DeliveryEvidence, PermissionAdmission, PermissionAttemptGuard,
+    AttemptId, CommittedPermission, DeliveryEvidence, HistoricalDeliveryState,
+    HistoricalPermissionAuthority, HistoricalPermissionAuthorityPage,
+    HistoricalPermissionProvenance, PermissionAdmission, PermissionAttemptGuard,
     PermissionEvidenceKind, PermissionState, PreparedPermissionCommit,
 };
 #[allow(unused_imports)]

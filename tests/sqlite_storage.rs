@@ -12,9 +12,9 @@ use coding_brain::brain::decisions::{
 };
 use coding_brain::brain::storage::{
     ActivityCursor, BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, DecisionIdentity,
-    DecisionKind, DecisionPayload, LearningErasePaths, OpenRole, REVIEW_APPLICATION_ID,
-    REVIEW_SCHEMA_VERSION, ReviewDb, ReviewEligibility, ReviewEligibleOccurrence, StorageDeadline,
-    StorageError, StoragePaths,
+    DecisionKind, DecisionPayload, HistoricalDeliveryState, HistoricalPermissionProvenance,
+    LearningErasePaths, OpenRole, REVIEW_APPLICATION_ID, REVIEW_SCHEMA_VERSION, ReviewDb,
+    ReviewEligibility, ReviewEligibleOccurrence, StorageDeadline, StorageError, StoragePaths,
 };
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivityState,
@@ -3596,6 +3596,283 @@ fn permission_commit_enforces_unique_references_and_closed_domains() {
 }
 
 #[test]
+fn historical_permission_authority_has_exact_closed_anchors_without_live_capability() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+    insert_decision(&connection, "historical-decision");
+    insert_terminal_event(&connection, 1, "historical-activity");
+
+    connection
+        .execute(
+            "INSERT INTO historical_permission_authority (
+                decision_id, terminal_source_cursor, decision_kind, authority_action,
+                terminal_event_kind, terminal_event_state, terminal_action,
+                provenance_kind, transaction_id, request_key,
+                response_eligible, delivery_state
+             ) VALUES ('historical-decision', 1, 'permission', 'allow',
+                       'decision', 'allowed', 'allow', 'proposal_terminal',
+                       NULL, NULL, 0, 'unknown')",
+            [],
+        )
+        .unwrap();
+
+    for rejected in [
+        "UPDATE historical_permission_authority SET decision_kind = 'observation'",
+        "UPDATE historical_permission_authority SET terminal_event_state = 'observed'",
+        "UPDATE historical_permission_authority SET terminal_action = 'deny'",
+        "UPDATE historical_permission_authority SET authority_action = 'deny'",
+        "UPDATE historical_permission_authority SET provenance_kind = 'inferred'",
+        "UPDATE historical_permission_authority SET provenance_kind = 'journal_correlated'",
+        "UPDATE historical_permission_authority SET provenance_kind = 'lifecycle_correlated'",
+        "UPDATE historical_permission_authority SET provenance_kind = 'proposal_terminal', transaction_id = 'transaction', request_key = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+        "UPDATE historical_permission_authority SET transaction_id = 'transaction-only'",
+        "UPDATE historical_permission_authority SET transaction_id = 'transaction', request_key = 'short'",
+        "UPDATE historical_permission_authority SET response_eligible = 1",
+        "UPDATE historical_permission_authority SET delivery_state = 'pending'",
+    ] {
+        assert_statement_rejected(&connection, rejected);
+    }
+}
+
+fn insert_historical_authority(
+    connection: &Connection,
+    decision_id: &str,
+    terminal_source_cursor: i64,
+    provenance: &str,
+    transaction_id: Option<&str>,
+    request_key: Option<&str>,
+) {
+    connection
+        .execute(
+            "INSERT INTO historical_permission_authority (
+                decision_id, terminal_source_cursor, decision_kind, authority_action,
+                terminal_event_kind, terminal_event_state, terminal_action,
+                provenance_kind, transaction_id, request_key,
+                response_eligible, delivery_state
+             ) VALUES (?1, ?2, 'permission', 'allow',
+                       'decision', 'allowed', 'allow', ?3, ?4, ?5, 0, 'unknown')",
+            params![
+                decision_id,
+                terminal_source_cursor,
+                provenance,
+                transaction_id,
+                request_key
+            ],
+        )
+        .unwrap();
+}
+
+#[test]
+fn historical_permission_reads_are_bounded_and_learning_revalidates_the_full_tuple() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let cursor = db
+        .append_activity(decision_activity_event(
+            "historical",
+            "historical-decision",
+            1,
+            ActivityState::Allowed,
+            Some(AgentProvider::Codex),
+        ))
+        .unwrap();
+    let mut record = complete_decision("historical-decision", AgentProvider::Codex);
+    record.user_action = "hook_proposal".into();
+    db.insert_decision(
+        &DecisionIdentity::permission(
+            "historical-decision",
+            AgentProvider::Codex,
+            "session-historical",
+            "turn-historical",
+            Some("tool-historical".into()),
+            PermissionAction::Allow,
+            "model",
+            1,
+        ),
+        &DecisionPayload::new(DecisionKind::Permission, cursor, record),
+    )
+    .unwrap();
+    drop(db);
+    let connection = open_for_constraints(&paths.brain_db());
+    insert_historical_authority(
+        &connection,
+        "historical-decision",
+        cursor.get() as i64,
+        "journal_correlated",
+        Some("legacy-transaction"),
+        Some(&"a".repeat(64)),
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM permission_commits", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(connection);
+
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap();
+    let page = db
+        .historical_permission_authority_after(None, 1, 1024)
+        .unwrap();
+    assert_eq!(page.authorities.len(), 1);
+    assert_eq!(page.next_cursor, None);
+    let authority = &page.authorities[0];
+    assert_eq!(authority.decision_id, "historical-decision");
+    assert_eq!(authority.terminal_cursor, cursor);
+    assert_eq!(authority.action, PermissionAction::Allow);
+    assert_eq!(
+        authority.provenance,
+        HistoricalPermissionProvenance::JournalCorrelated
+    );
+    assert_eq!(
+        authority.transaction_id.as_deref(),
+        Some("legacy-transaction")
+    );
+    assert_eq!(
+        authority.request_key.as_deref(),
+        Some("a".repeat(64).as_str())
+    );
+    assert!(!authority.response_eligible);
+    assert_eq!(authority.delivery_state, HistoricalDeliveryState::Unknown);
+    assert!(page.serialized_bytes > 0);
+    assert!(matches!(
+        db.historical_permission_authority_after(None, 1, 1),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert_eq!(
+        db.learning_decisions(10, 1024 * 1024).unwrap()[0]
+            .record
+            .decision_id
+            .as_deref(),
+        Some("historical-decision")
+    );
+}
+
+#[test]
+fn historical_permission_corruption_fails_closed_for_audit_and_learning() {
+    for corruption in [
+        "decision-kind",
+        "terminal-state",
+        "wrong-action",
+        "provenance",
+        "null-correlated-provenance",
+        "proposal-with-correlation",
+    ] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        let mut db = BrainDb::create_current(&paths).unwrap();
+        let cursor = db
+            .append_activity(decision_activity_event(
+                "historical",
+                "historical-decision",
+                1,
+                ActivityState::Allowed,
+                Some(AgentProvider::Codex),
+            ))
+            .unwrap();
+        let mut record = complete_decision("historical-decision", AgentProvider::Codex);
+        record.user_action = "hook_proposal".into();
+        db.insert_decision(
+            &DecisionIdentity::permission(
+                "historical-decision",
+                AgentProvider::Codex,
+                "session-historical",
+                "turn-historical",
+                Some("tool-historical".into()),
+                PermissionAction::Allow,
+                "model",
+                1,
+            ),
+            &DecisionPayload::new(DecisionKind::Permission, cursor, record),
+        )
+        .unwrap();
+        drop(db);
+        let connection = open_for_constraints(&paths.brain_db());
+        insert_historical_authority(
+            &connection,
+            "historical-decision",
+            cursor.get() as i64,
+            "proposal_terminal",
+            None,
+            None,
+        );
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        connection
+            .execute_batch(match corruption {
+                "decision-kind" => {
+                    "UPDATE historical_permission_authority SET decision_kind = 'observation'"
+                }
+                "terminal-state" => {
+                    "UPDATE historical_permission_authority SET terminal_event_state = 'observed'"
+                }
+                "wrong-action" => {
+                    "UPDATE historical_permission_authority SET terminal_action = 'deny'"
+                }
+                "provenance" => {
+                    "UPDATE historical_permission_authority SET provenance_kind = 'inferred'"
+                }
+                "null-correlated-provenance" => {
+                    "UPDATE historical_permission_authority SET provenance_kind = 'journal_correlated'"
+                }
+                "proposal-with-correlation" => {
+                    "UPDATE historical_permission_authority
+                     SET transaction_id = 'legacy-transaction',
+                         request_key = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
+                }
+                _ => unreachable!(),
+            })
+            .unwrap();
+        drop(connection);
+        let db = BrainDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                db.historical_permission_authority_after(None, 10, 1024),
+                Err(StorageError::InvalidStorage(_))
+            ),
+            "audit read accepted {corruption}"
+        );
+        assert!(
+            matches!(
+                db.learning_decisions(10, 1024 * 1024),
+                Err(StorageError::InvalidStorage(_))
+            ),
+            "learning accepted {corruption}"
+        );
+    }
+}
+
+#[test]
+fn historical_permission_query_uses_its_cursor_index() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let db = BrainDb::create_current(&paths).unwrap();
+    let plan = db.explain_historical_permission_lookup().unwrap();
+    assert!(
+        plan.contains("historical_permission_authority_cursor"),
+        "{plan}"
+    );
+    assert!(
+        !plan.contains("SCAN historical_permission_authority"),
+        "{plan}"
+    );
+}
+
+#[test]
 fn deterministic_safety_commit_requires_deny_without_response_delivery() {
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
@@ -4013,6 +4290,7 @@ fn required_query_indexes_are_frozen_in_brain_schema() {
         "activity_events_permission_identity",
         "decision_identities_authority",
         "decision_payloads_source_cursor",
+        "historical_permission_authority_cursor",
         "lifecycle_invocation_steps_exact",
         "lifecycle_invocations_active",
         "lifecycle_invocations_state",

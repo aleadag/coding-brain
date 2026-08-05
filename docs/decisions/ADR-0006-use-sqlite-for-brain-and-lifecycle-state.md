@@ -89,9 +89,15 @@ legacy mutation is a split-brain error and is never auto-merged. Review
 migration failure remains isolated from Brain publication.
 
 Exact matching historical proposal plus terminal `Allowed` or `Denied`
-activity imports as committed audit under ADR-0003, but every migrated commit is
-response-ineligible. Proposal-only, nonterminal, mismatched, or conflicting
-evidence creates no authority.
+activity imports into a separate frozen-v1 historical audit/learning relation,
+not live `permission_attempts` or `permission_commits`. Composite foreign keys
+bind its typed decision/action to the exact terminal cursor/kind/state/action.
+Closed proposal/terminal, journal-correlated, and lifecycle-correlated
+provenance must agree with exact transaction/request correlation facts. Every
+historical row is response-ineligible with delivery unknown and cannot satisfy
+live permission state, decision, admission, response, or delivery APIs.
+Proposal-only, nonterminal, mismatched, or conflicting evidence creates no
+historical authority.
 
 ### Make rollback explicit and bounded
 

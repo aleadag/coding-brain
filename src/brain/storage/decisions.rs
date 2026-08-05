@@ -409,19 +409,22 @@ impl BrainDb {
             "SELECT p.decision_id, i.identity_kind, i.provider, i.session_id, i.turn_id,
                     i.tool_use_id, i.authority_action, i.decision_source, i.decided_at_ms,
                     p.payload_kind, p.source_cursor, p.normalized_command, p.reasoning, p.note,
-                    p.decision_record
+                    p.decision_record,
+                    c.decision_id IS NOT NULL, h.decision_id IS NOT NULL
              FROM decision_payloads AS p
              JOIN decision_identities AS i ON i.decision_id = p.decision_id
                                            AND i.identity_kind = p.payload_kind
              JOIN activity_events AS a ON a.source_cursor = p.source_cursor
              LEFT JOIN permission_commits AS c ON c.decision_id = i.decision_id
+             LEFT JOIN historical_permission_authority AS h ON h.decision_id = i.decision_id
              WHERE (i.identity_kind = 'observation'
                 OR (i.identity_kind = 'permission'
-                    AND c.terminal_activity_id = a.activity_id
-                    AND c.attempt_id = i.permission_attempt_id
-                    AND a.permission_attempt_id = c.attempt_id
-                    AND a.terminal_action = c.authority_action
-                    AND c.authority_action = i.authority_action))
+                    AND ((c.terminal_activity_id = a.activity_id
+                          AND c.attempt_id = i.permission_attempt_id
+                          AND a.permission_attempt_id = c.attempt_id
+                          AND a.terminal_action = c.authority_action
+                          AND c.authority_action = i.authority_action)
+                         OR h.decision_id IS NOT NULL)))
                AND p.source_cursor > ?1
              ORDER BY p.source_cursor ASC, p.decision_id ASC LIMIT ?2",
         )?;
@@ -459,6 +462,8 @@ impl BrainDb {
                 row.get(13)?,
                 row.get::<_, Vec<u8>>(14)?,
             );
+            let live_authority = row.get::<_, i64>(15)? != 0;
+            let historical_authority = row.get::<_, i64>(16)? != 0;
             let next_total = total
                 .checked_add(raw.5.len())
                 .ok_or(StorageError::InvalidStorage("decision byte limit exceeded"))?;
@@ -477,6 +482,37 @@ impl BrainDb {
                 return Err(StorageError::InvalidStorage(
                     "decision payload disagrees with identity",
                 ));
+            }
+            match identity.kind() {
+                DecisionKind::Observation => {
+                    if live_authority || historical_authority {
+                        return Err(StorageError::InvalidStorage(
+                            "observation learning row contains permission authority",
+                        ));
+                    }
+                }
+                DecisionKind::Permission => {
+                    if live_authority == historical_authority {
+                        return Err(StorageError::InvalidStorage(
+                            "permission learning authority is ambiguous",
+                        ));
+                    }
+                    if historical_authority {
+                        let authority =
+                            super::permissions::validated_historical_authority_by_decision(
+                                &self.connection,
+                                &decision_id,
+                            )?
+                            .ok_or(StorageError::InvalidStorage(
+                                "historical permission learning authority is absent",
+                            ))?;
+                        if authority.terminal_cursor != payload.source_cursor {
+                            return Err(StorageError::InvalidStorage(
+                                "historical permission learning cursor is invalid",
+                            ));
+                        }
+                    }
+                }
             }
             let activity =
                 super::activity::validated_activity_at(&self.connection, payload.source_cursor)?;
@@ -726,7 +762,7 @@ fn validate_source_activity(
     validate_source_activity_event(identity, &activity.event)
 }
 
-fn validate_source_activity_event(
+pub(super) fn validate_source_activity_event(
     identity: &DecisionIdentity,
     event: &ActivityEvent,
 ) -> Result<(), StorageError> {

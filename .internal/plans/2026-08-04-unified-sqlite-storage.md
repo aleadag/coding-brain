@@ -90,10 +90,11 @@ Record any pre-existing failure on `codexctl-dzlb9`; do not attribute it to the 
 | `decision_payloads` | Composite foreign key `(decision_id, payload_kind)` to the matching identity kind; bounded erasable learning fields plus the complete validated legacy-compatible decision payload. | Joined committed-learning query by source cursor. |
 | `activity_events` | Primary key `source_cursor` with `1..=i64::MAX` check; indexed, non-unique logical activity ID permits observed/terminal/delivery/outcome/correction rows for one activity; typed terminal action/identity columns retain the composite uniqueness required by permission-commit references. | Cursor pages, activity ID, permission identity, outcome, correction, and distillation indexes. |
 | `permission_commits` | One row per attempt; unique decision and terminal activity references; composite foreign keys require matching authority identity/action across attempt, decision, and terminal event; closed action/evidence/delivery domains; boolean `response_eligible` check; deterministic-safety evidence requires exactly deny, response-ineligible, and delivery-not-required. | Exact attempt/request authority and undelivered-audit lookup. |
+| `historical_permission_authority` | Separate audit/learning relation anchored by composite foreign keys to one typed permission decision/action and one terminal activity cursor/kind/state/action; closed provenance agrees with exact transaction/request correlation facts; response eligibility is fixed false and delivery is fixed unknown. It has no attempt or live capability identity. | Bounded terminal-cursor audit/learning pages only. |
 | lifecycle session/turn/invocation tables | Provider-qualified composite keys, bounded sequence values, and foreign keys from turns/invocations to sessions; no duplicate active identity. | Exact provider/session/turn and active-topology indexes. |
 | review `review_meta` / `review_marks` | Per-surface revision; nullable latest archive revision constrained to `1..=revision` and always null for Recent; exact surface/group/source-cursor key; closed disposition domain; no Brain tables or attachments. | Exact surface revision and bounded cursor-mark lookup. |
 
-The checked-in schema fixture is authoritative. Approved pre-activation corrections amend schema v1 because no production activation or migration has occurred: Task 3 removes only accidental single-column `activity_id` uniqueness while retaining the terminal-identity composite authority key; Task 4 adds typed non-authoritative observation identities and a bounded complete learning payload without weakening permission identity constraints; Task 5 adds `review_meta.last_archive_revision` so undo cannot promote an older archived batch after the newest batch is undone; Task 6 represents pre-inference attempts without fabricated action or optional tool-use evidence, stores the complete typed request identity, and anchors authoritative decision/activity/commit tuples through a non-null attempt plus action while preserving unanchored non-authoritative proposal and terminal evidence. Permission commits retain the exact bounded transaction identifier. Any later DDL change must update its version, fixture, invariant tests, and supported-upgrade coverage before the same atomic commit.
+The checked-in schema fixture is authoritative. Approved pre-activation corrections amend schema v1 because no production activation or migration has occurred: Task 3 removes only accidental single-column `activity_id` uniqueness while retaining the terminal-identity composite authority key; Task 4 adds typed non-authoritative observation identities and a bounded complete learning payload without weakening permission identity constraints; Task 5 adds `review_meta.last_archive_revision` so undo cannot promote an older archived batch after the newest batch is undone; Task 6 represents pre-inference attempts without fabricated action or optional tool-use evidence, stores the complete typed request identity, and anchors authoritative decision/activity/commit tuples through a non-null attempt plus action while preserving unanchored non-authoritative proposal and terminal evidence. Permission commits retain the exact bounded transaction identifier. Task 7 adds a separate historical audit/learning relation for legacy proposal/terminal evidence that cannot honestly satisfy the live attempt/commit identity; it preserves delivery unknown without creating a live capability or changing the schema version. Any later DDL change must update its version, fixture, invariant tests, and supported-upgrade coverage before the same atomic commit.
 
 - [ ] **Step 1: Write failing foundation tests**
 
@@ -538,7 +539,7 @@ git commit -m "🔒 feat: commit permission authority atomically (codexctl-2o9fo
 - Publication is restartable at every crash point and never exposes a response-eligible partial authority database.
 - Final cutover locks/fingerprints all sources, publishes an incomplete generation, freezes legacy writers, then marks Brain complete.
 - The completed generation includes a frozen-source manifest; every model attempt cheaply rejects changed inode/size/time metadata or recreated legacy paths as split-brain.
-- Exact historical proposal plus terminal Allowed/Denied becomes response-ineligible commitment; mismatches remain incomplete/diagnostic.
+- Exact historical proposal plus terminal Allowed/Denied becomes a response-ineligible historical authority row with delivery unknown; it never becomes a live attempt, commit, or response capability. Mismatches remain incomplete/diagnostic.
 - The exact `4vh58` shape migrates without blocking unrelated projection and preserves DeliveryUnknown plus later outcome.
 - Review migration failure remains isolated and preserves `review-state.json`.
 
@@ -550,9 +551,15 @@ fn migration_reconciles_4vh58_without_response_authority() {
     let fixture = LegacyFixture::copy("permission-journal-4vh58");
     MigrationCoordinator::at(fixture.state_root()).run_non_hook().unwrap();
     let db = fixture.open_brain();
-    let commit = db.permission_commit("decision-4vh58").unwrap().unwrap();
-    assert!(!commit.response_eligible);
-    assert_eq!(commit.delivery, DeliveryState::Unknown);
+    let authority = db
+        .historical_permission_authority_after(None, 100, 1024 * 1024)
+        .unwrap()
+        .authorities
+        .into_iter()
+        .find(|authority| authority.decision_id == "decision-4vh58")
+        .unwrap();
+    assert!(!authority.response_eligible);
+    assert_eq!(authority.delivery_state, HistoricalDeliveryState::Unknown);
     assert!(db.outcome_for("activity-4vh58").unwrap().is_some());
 }
 ```

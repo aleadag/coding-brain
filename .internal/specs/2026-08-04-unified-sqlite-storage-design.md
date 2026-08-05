@@ -192,6 +192,17 @@ proposal, authority action, decision ID, activity ID, and terminal state to
 agree. A model-derived allow or deny exists only if this row and all referenced
 rows commit in the same SQLite transaction.
 
+Legacy authority that has no exact live attempt, transaction ID, or request key
+uses a separate frozen-v1 `historical_permission_authority` relation. Its
+composite foreign keys anchor one typed permission decision/action and one exact
+terminal activity cursor/kind/state/action. Closed provenance is
+`proposal_terminal`, `journal_correlated`, or `lifecycle_correlated` and must
+agree with its correlation fields: proposal/terminal-only rows have neither
+transaction ID nor request key, while correlated rows have both exact values.
+Every historical row fixes `response_eligible = false` and
+`delivery_state = unknown`; it has no attempt identity and cannot satisfy live
+permission or delivery APIs.
+
 ### `activity_events`
 
 This is the append-ordered audit ledger. A strictly increasing 64-bit integer is
@@ -414,13 +425,13 @@ error that disables model-derived responses and is never auto-merged.
 ### Legacy permission reconciliation
 
 A legacy proposal and exact matching terminal `Allowed` or `Denied` activity
-become one historical permission commit under ADR-0003's existing contract that
-activity is the authoritative decision-commit audit. A matching validated
-journal or still-retained lifecycle authority corroborates the import but is not
-required after lifecycle compaction. Migrated commits record their evidence
-basis and `response_eligible = false`, so no imported row can emit or replay a
-provider response. Proposal-only or nonterminal activity becomes an incomplete
-attempt without authority.
+become one historical authority row under ADR-0003's audit contract. This is
+separate from live `permission_attempts` and `permission_commits`: it records
+delivery unknown, is response-ineligible, and cannot emit or replay a provider
+response. A matching validated journal or still-retained lifecycle authority
+changes the closed provenance label only when the exact transaction ID and
+request key are both retained; it does not create live authority. Proposal-only
+or nonterminal activity creates no historical authority row.
 
 Pending journal evidence is reconciled inside the staging database. This
 preserves the `codexctl-4vh58` proposal, `Allowed`, delivery-unknown, and later
