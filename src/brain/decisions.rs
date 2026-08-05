@@ -700,6 +700,8 @@ pub(crate) fn validate_hook_decision_record(record: &HookDecisionRecord) -> bool
         && action_matches_source
         && valid_probability(record.brain_confidence)
         && record.brain_threshold.is_none_or(valid_probability)
+        && record.suggested_at <= i64::MAX as u64
+        && record.resolved_at <= i64::MAX as u64
         && record.resolved_at >= record.suggested_at
         && lossless_redacted_activity_text(&record.command).as_deref()
             == Some(record.command.as_str())

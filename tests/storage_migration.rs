@@ -318,6 +318,57 @@ fn legacy_reader_rejects_semantically_invalid_hook_proposals() {
 }
 
 #[test]
+fn legacy_hook_timestamps_must_fit_sqlite_signed_integers() {
+    let exact = include_str!("fixtures/storage/legacy-v0.59.1/brain/decisions.jsonl");
+    let signed_max = i64::MAX.to_string();
+    let signed_overflow = (i64::MAX as u64 + 1).to_string();
+    let at_signed_max = exact
+        .replace(
+            "\"suggested_at\":1",
+            &format!("\"suggested_at\":{signed_max}"),
+        )
+        .replace(
+            "\"resolved_at\":1",
+            &format!("\"resolved_at\":{signed_max}"),
+        );
+    let read = |encoded: &str| {
+        let root = private_tempdir();
+        write_private(
+            &root.path().join("brain/decisions.jsonl"),
+            encoded.as_bytes(),
+        );
+        LegacySourceSet::at(root.path()).unwrap().read_all_bounded()
+    };
+
+    assert!(read(&at_signed_max).is_ok());
+
+    for encoded in [
+        at_signed_max.replace(
+            &format!("\"suggested_at\":{signed_max}"),
+            &format!("\"suggested_at\":{signed_overflow}"),
+        ),
+        at_signed_max
+            .replace(
+                &format!("\"suggested_at\":{signed_max}"),
+                &format!("\"suggested_at\":{signed_overflow}"),
+            )
+            .replace(
+                &format!("\"resolved_at\":{signed_max}"),
+                &format!("\"resolved_at\":{signed_overflow}"),
+            ),
+        at_signed_max.replace(
+            &format!("\"resolved_at\":{signed_max}"),
+            &format!("\"resolved_at\":{signed_overflow}"),
+        ),
+    ] {
+        assert!(matches!(
+            read(&encoded),
+            Err(StorageError::InvalidStorage(_))
+        ));
+    }
+}
+
+#[test]
 fn authority_shaped_activity_with_diagnostic_field_is_not_skipped() {
     let root = private_tempdir();
     write_private(
