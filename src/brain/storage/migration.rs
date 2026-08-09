@@ -1088,7 +1088,7 @@ fn open_progress_entry(
     progress: &FreezeProgressDirectory,
     name: &str,
     flags: libc::c_int,
-    mode: libc::mode_t,
+    mode: libc::c_uint,
 ) -> Result<File, StorageError> {
     progress.validate_binding()?;
     let name = progress_name(name)?;

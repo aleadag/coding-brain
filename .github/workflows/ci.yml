@@ -37,11 +37,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
+      - name: Install cross
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo install cross --locked --git https://github.com/cross-rs/cross --branch main
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - run: cargo check --locked --release --target ${{ matrix.target }}
-      - run: cargo check --locked --release --features fault-injection --target ${{ matrix.target }}
+      - name: Check
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo check --locked --release --target ${{ matrix.target }}
+      - name: Check fault injection
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo check --locked --release --features fault-injection --target ${{ matrix.target }}
+      - name: Check with cross
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          cross check --locked --release --target ${{ matrix.target }}
+          cross check --locked --release --features fault-injection --target ${{ matrix.target }}
       - name: Test atomic journal publication
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo test --locked --lib --target x86_64-unknown-linux-musl publication_never_replaces_an_existing_final_name
@@ -80,7 +92,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: false
-      - run: cargo test --all-targets
+      - run: cargo test --all-targets -- --test-threads=1
       - name: Run live fault matrix
         run: CARGO_TARGET_DIR=target/fault-injection-release cargo test --locked --release --features fault-injection --test live_fault_matrix -- --test-threads=1
       - name: Verify release binary uses bundled SQLite

@@ -1123,7 +1123,7 @@ fn open_or_create_guard_directory(parent: &File, name: &str) -> Result<File, Sto
         )
     };
     if descriptor < 0 && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700 as libc::c_uint) } != 0 {
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700 as libc::mode_t) } != 0 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::AlreadyExists {
                 return Err(error.into());

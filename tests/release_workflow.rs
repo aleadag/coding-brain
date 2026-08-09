@@ -38,13 +38,17 @@ fn tag_release_runs_the_release_critical_quality_suite_before_building() {
 #[test]
 fn musl_release_targets_are_checked_before_tagging() {
     let workflow = include_str!("../.github/workflows/ci.yml");
-    let (_, musl) = workflow.split_once("\n  musl:\n").unwrap();
+    let musl = job(workflow, "musl", "fmt");
     for required in [
         "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-musl",
         "cargo check --locked --release --target ${{ matrix.target }}",
         "cargo check --locked --release --features fault-injection --target ${{ matrix.target }}",
         "sudo apt-get install -y musl-tools",
+        "- name: Install cross",
+        "cargo install cross --locked --git https://github.com/cross-rs/cross --branch main",
+        "cross check --locked --release --target ${{ matrix.target }}",
+        "cross check --locked --release --features fault-injection --target ${{ matrix.target }}",
         "cargo test --locked --lib --target x86_64-unknown-linux-musl publication_never_replaces_an_existing_final_name",
     ] {
         assert!(
@@ -52,6 +56,13 @@ fn musl_release_targets_are_checked_before_tagging() {
             "missing musl CI contract: {required}"
         );
     }
+}
+
+#[test]
+fn ci_bounds_parallel_tests_for_global_process_state() {
+    let workflow = include_str!("../.github/workflows/ci.yml");
+    let test = job(workflow, "test", "core-standalone");
+    assert_contract(test, "cargo test --all-targets -- --test-threads=1");
 }
 
 #[test]

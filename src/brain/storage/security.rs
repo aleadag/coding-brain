@@ -1030,7 +1030,7 @@ fn validate_local_filesystem(directory: &File) -> Result<(), SecurityError> {
     if unsafe { libc::fstatfs(directory.as_raw_fd(), status.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
-    if unsafe { status.assume_init() }.f_flags & libc::MNT_LOCAL != 0 {
+    if unsafe { status.assume_init() }.f_flags & libc::MNT_LOCAL as libc::c_uint != 0 {
         Ok(())
     } else {
         Err(SecurityError::Invalid(
