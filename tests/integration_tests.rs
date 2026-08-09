@@ -1,4 +1,5 @@
 use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use coding_brain::discovery;
@@ -8,6 +9,113 @@ use coding_brain::session::{
     AgentSession, CodexTaskState, RawAgentSession, SessionStatus, TelemetryStatus,
 };
 use coding_brain_core::provider::AgentProvider;
+
+#[test]
+fn current_runtime_writes_only_sqlite_and_session_links() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    let state_root = home.path().join(".local/state/coding-brain");
+
+    let doctor = std::process::Command::new(env!("CARGO_BIN_EXE_cbrain"))
+        .args(["doctor", "--json"])
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(state_root.join("db/brain.sqlite3").exists(), "{doctor:?}");
+
+    let lifecycle = serde_json::to_vec(&serde_json::json!({
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+        "cwd": project.path(),
+        "hook_event_name": "SessionStart"
+    }))
+    .unwrap();
+    let lifecycle_output = std::process::Command::new(env!("CARGO_BIN_EXE_cbrain"))
+        .args(["--lifecycle-hook", "--provider", "codex"])
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .current_dir(project.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.as_mut().unwrap().write_all(&lifecycle)?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(lifecycle_output.status.success(), "{lifecycle_output:?}");
+
+    let permission = serde_json::to_vec(&serde_json::json!({
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+        "cwd": project.path(),
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "Bash",
+        "tool_input": {"command": "rm -rf /"}
+    }))
+    .unwrap();
+    let permission_output = std::process::Command::new(env!("CARGO_BIN_EXE_cbrain"))
+        .arg("--permission-hook")
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .current_dir(project.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.as_mut().unwrap().write_all(&permission)?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(permission_output.status.success(), "{permission_output:?}");
+
+    let review_queue = std::process::Command::new(env!("CARGO_BIN_EXE_cbrain"))
+        .args(["--brain-review", "list"])
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(review_queue.status.success(), "{review_queue:?}");
+
+    let missing_canonical = std::process::Command::new(env!("CARGO_BIN_EXE_cbrain"))
+        .args(["--brain-mark-canonical", "missing-decision"])
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(!missing_canonical.status.success());
+
+    assert!(state_root.join("db/brain.sqlite3").exists());
+    // This fixture has no validated live-parent identity, so no authoritative
+    // session link is expected. The link store remains a separate optional file.
+    for legacy in [
+        "activity.jsonl",
+        "brain/decisions.jsonl",
+        "review-state.json",
+        "hooks/lifecycle.json",
+    ] {
+        assert!(
+            !state_root.join(legacy).exists(),
+            "unexpected live legacy store: {legacy}"
+        );
+    }
+    let journal_guard = state_root.join("brain/permission-transactions");
+    if journal_guard.exists() {
+        assert_eq!(
+            std::fs::read_dir(journal_guard).unwrap().count(),
+            0,
+            "live permission journals must not be created"
+        );
+    }
+}
 
 #[test]
 fn init_help_lists_all_provider_selectors() {
@@ -30,6 +138,7 @@ fn init_help_lists_all_provider_selectors() {
 #[test]
 fn init_provider_contract_covers_managed_paths_commands_and_compatibility_warning() {
     let home = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let project = tempfile::tempdir().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
 
@@ -66,6 +175,11 @@ fn init_provider_contract_covers_managed_paths_commands_and_compatibility_warnin
     }
 
     let compatibility_home = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        compatibility_home.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let compatibility_project = tempfile::tempdir().unwrap();
     std::fs::create_dir(compatibility_project.path().join(".git")).unwrap();
     let compatibility = std::process::Command::new(env!("CARGO_BIN_EXE_cbrain"))

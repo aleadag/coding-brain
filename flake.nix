@@ -25,6 +25,39 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+        nixCheckEntrypoint =
+          if pkgs.stdenv.isLinux then
+            pkgs.writeShellScript "coding-brain-nix-check" ''
+              ${pkgs.coreutils}/bin/chmod 0755 /
+              ${pkgs.coreutils}/bin/chmod 1777 /tmp
+              exec "$CBRAIN_NIX_REAL_CARGO" "$@"
+            ''
+          else
+            null;
+        nixCheckCargo =
+          if pkgs.stdenv.isLinux then
+            pkgs.writeShellScriptBin "cargo" ''
+              exec ${pkgs.bubblewrap}/bin/bwrap \
+                --die-with-parent \
+                --unshare-user \
+                --uid "$CBRAIN_NIX_CHECK_UID" \
+                --gid "$CBRAIN_NIX_CHECK_GID" \
+                --tmpfs / \
+                --dir /nix \
+                --ro-bind /nix/store /nix/store \
+                --dir "$NIX_BUILD_TOP" \
+                --bind "$NIX_BUILD_TOP" "$NIX_BUILD_TOP" \
+                --dir /bin \
+                --ro-bind /bin /bin \
+                --proc /proc \
+                --dev /dev \
+                --dir /tmp \
+                --tmpfs /tmp \
+                --chdir "$PWD" \
+                ${nixCheckEntrypoint} "$@"
+            ''
+          else
+            null;
       in
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
@@ -33,6 +66,13 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           checkType = "debug";
+          dontUseCargoParallelTests = true;
+          preCheck = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+            export CBRAIN_NIX_REAL_CARGO="$(command -v cargo)"
+            export CBRAIN_NIX_CHECK_UID="$(${pkgs.coreutils}/bin/id -u)"
+            export CBRAIN_NIX_CHECK_GID="$(${pkgs.coreutils}/bin/id -g)"
+            export PATH="${nixCheckCargo}/bin:$PATH"
+          '';
           nativeCheckInputs = [ pkgs.git ];
 
           meta = with pkgs.lib; {

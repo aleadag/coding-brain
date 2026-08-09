@@ -52,7 +52,9 @@ fn root_package_uses_exact_publication_allowlist() {
 #[test]
 fn changelog_is_cut_for_v0_59_1() {
     let changelog = include_str!("../CHANGELOG.md");
-    assert!(changelog.contains("## [Unreleased]\n\n## [0.59.1] - 2026-08-04"));
+    let unreleased = changelog.find("## [Unreleased]").unwrap();
+    let release = changelog.find("## [0.59.1] - 2026-08-04").unwrap();
+    assert!(unreleased < release);
     assert!(changelog.contains("`v0.59.0` tag failed before publication"));
 }
 

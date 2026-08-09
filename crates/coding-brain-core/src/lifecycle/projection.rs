@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::codex_transcript::CodexResumeEvidence;
 use crate::provider::{AgentProvider, AgentSessionKey};
 
 use super::input::{
@@ -62,9 +64,9 @@ pub struct StoppedSubagentState {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct EventSignature {
-    turn_id: Option<String>,
-    kind: LifecycleEventKind,
+pub struct LifecycleEventSignature {
+    pub turn_id: Option<String>,
+    pub kind: LifecycleEventKind,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -98,7 +100,7 @@ pub struct SessionLifecycleState {
     pub permission_request_events: BTreeMap<String, u8>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub permission_authorities: BTreeMap<String, PermissionAuthority>,
-    last_signature: Option<EventSignature>,
+    pub last_signature: Option<LifecycleEventSignature>,
 }
 
 impl SessionLifecycleState {
@@ -296,6 +298,12 @@ pub struct LifecycleSnapshot {
     pub sessions: BTreeMap<String, SessionLifecycleState>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordedLifecycleEvent {
+    pub outcome: ApplyOutcome,
+    pub sequence: u64,
+}
+
 impl Default for LifecycleSnapshot {
     fn default() -> Self {
         Self {
@@ -307,11 +315,168 @@ impl Default for LifecycleSnapshot {
 }
 
 impl LifecycleSnapshot {
+    pub fn reprove_codex_subagent_at(
+        &mut self,
+        identity: &super::LifecycleIdentity,
+        evidence: &CodexResumeEvidence,
+        received_at_ms: u64,
+    ) -> ApplyOutcome {
+        if identity.provider() != AgentProvider::Codex {
+            return ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent);
+        }
+        let (Some(parent_id), Some(turn_id), Some(transcript_path)) = (
+            identity.provider_session_id(),
+            identity.turn_id(),
+            identity.transcript_path(),
+        ) else {
+            return ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent);
+        };
+        let requested_path = lexical_normalize_path(&evidence.requested_transcript_path);
+        let canonical_identity_path = fs::canonicalize(transcript_path).ok();
+        let canonical_identity_is_file = canonical_identity_path
+            .as_deref()
+            .and_then(|path| fs::metadata(path).ok())
+            .is_some_and(|metadata| metadata.is_file());
+        let evidence_matches_identity = evidence.child_session_id == identity.session_id()
+            && evidence.provider_session_id == parent_id
+            && evidence.turn_id == turn_id
+            && requested_path.as_deref() == Some(transcript_path)
+            && canonical_identity_path.as_deref()
+                == Some(evidence.canonical_transcript_path.as_path())
+            && canonical_identity_is_file
+            && evidence.started_at_ms <= received_at_ms.saturating_add(5_000);
+        if let Some((owner_key, active)) = self.sessions.iter().find_map(|(storage_key, state)| {
+            AgentSessionKey::from_storage_key(storage_key)
+                .is_some_and(|key| key.provider == AgentProvider::Codex)
+                .then(|| {
+                    state
+                        .active_subagents
+                        .get(identity.session_id())
+                        .cloned()
+                        .map(|active| (storage_key.clone(), active))
+                })
+                .flatten()
+        }) {
+            if !self.topology_contains_session(AgentProvider::Codex, parent_id, &owner_key) {
+                return ApplyOutcome::Ignored(IgnoreReason::ProviderSessionMismatch);
+            }
+            if active.turn_id == turn_id {
+                return ApplyOutcome::Ignored(IgnoreReason::Duplicate);
+            }
+            if !evidence_matches_identity || evidence.started_at_ms <= active.received_at_ms {
+                return ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent);
+            }
+            if self.next_sequence == 0 || self.next_sequence >= u64::MAX - 1 {
+                return ApplyOutcome::Ignored(IgnoreReason::SequenceExhausted);
+            }
+            let sequence = self.next_sequence;
+            self.next_sequence += 1;
+            self.remove_linked_subagent_projection(AgentProvider::Codex, identity.session_id());
+            let parent = self
+                .sessions
+                .get_mut(&owner_key)
+                .expect("validated Codex topology owner");
+            parent.active_subagents.insert(
+                identity.session_id().to_owned(),
+                ActiveSubagentState {
+                    started_sequence: sequence,
+                    received_at_ms,
+                    turn_id: turn_id.to_owned(),
+                },
+            );
+            parent.latest_sequence = sequence;
+            parent.latest_received_at_ms = received_at_ms;
+            parent.ignored_reason = None;
+            return ApplyOutcome::Applied;
+        }
+        let Some(parent_key) =
+            self.stopped_subagent_owner_key(AgentProvider::Codex, parent_id, identity.session_id())
+        else {
+            return ApplyOutcome::Ignored(
+                if self.sessions.iter().any(|(storage_key, state)| {
+                    AgentSessionKey::from_storage_key(storage_key)
+                        .is_some_and(|key| key.provider == AgentProvider::Codex)
+                        && state.stopped_subagents.contains_key(identity.session_id())
+                }) {
+                    IgnoreReason::ProviderSessionMismatch
+                } else {
+                    IgnoreReason::UnprovenSubagent
+                },
+            );
+        };
+        let parent = &self.sessions[&parent_key];
+        let stopped = &parent.stopped_subagents[identity.session_id()];
+        if !evidence_matches_identity
+            || evidence.turn_id == stopped.turn_id
+            || evidence.started_at_ms <= stopped.received_at_ms
+        {
+            return ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent);
+        }
+        if parent.active_subagents.len() >= MAX_ACTIVE_SUBAGENTS {
+            return ApplyOutcome::Ignored(IgnoreReason::ActiveSubagentCapacity);
+        }
+        if self.next_sequence == 0 || self.next_sequence >= u64::MAX - 1 {
+            return ApplyOutcome::Ignored(IgnoreReason::SequenceExhausted);
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        let parent = self
+            .sessions
+            .get_mut(&parent_key)
+            .expect("validated Codex topology owner");
+        parent.stopped_subagents.remove(identity.session_id());
+        parent.active_subagents.insert(
+            identity.session_id().to_owned(),
+            ActiveSubagentState {
+                started_sequence: sequence,
+                received_at_ms,
+                turn_id: turn_id.to_owned(),
+            },
+        );
+        parent.latest_sequence = sequence;
+        parent.latest_received_at_ms = received_at_ms;
+        parent.ignored_reason = None;
+        ApplyOutcome::Applied
+    }
+
+    pub fn remove_permission_state(&mut self) {
+        for state in self.sessions.values_mut() {
+            state.permission_request_events.clear();
+            state.permission_authorities.clear();
+            state.antigravity_permission_requests.clear();
+            state.antigravity_child_events.retain(|_, bits| {
+                *bits &= ANTIGRAVITY_PRE_TOOL_BIT | ANTIGRAVITY_POST_TOOL_BIT;
+                *bits != 0
+            });
+            if state.last_signature.as_ref().is_some_and(|signature| {
+                matches!(signature.kind, LifecycleEventKind::PermissionRequest { .. })
+            }) {
+                state.last_signature = None;
+            }
+        }
+    }
+
+    pub fn record_at(
+        &mut self,
+        event: LifecycleEvent,
+        received_at_ms: u64,
+    ) -> RecordedLifecycleEvent {
+        let session_key =
+            AgentSessionKey::native(event.identity().provider(), event.identity().session_id())
+                .storage_key();
+        let outcome = self.apply(event, received_at_ms);
+        let sequence = match outcome {
+            ApplyOutcome::Applied => self.sessions[&session_key].latest_sequence,
+            ApplyOutcome::Ignored(_) => 0,
+        };
+        RecordedLifecycleEvent { outcome, sequence }
+    }
+
     pub fn apply(&mut self, event: LifecycleEvent, received_at_ms: u64) -> ApplyOutcome {
         let session_key =
             AgentSessionKey::native(event.identity().provider(), event.identity().session_id())
                 .storage_key();
-        let signature = EventSignature {
+        let signature = LifecycleEventSignature {
             turn_id: event.identity().turn_id().map(str::to_owned),
             kind: event.kind().clone(),
         };
@@ -624,7 +789,7 @@ impl LifecycleSnapshot {
                         request_key: Some(_),
                         ..
                     },
-                    Some(EventSignature {
+                    Some(LifecycleEventSignature {
                         turn_id: Some(last_turn_id),
                         kind:
                             LifecycleEventKind::PermissionRequest {
@@ -1082,10 +1247,28 @@ impl LifecycleSnapshot {
     }
 }
 
+fn lexical_normalize_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(normalized)
+}
+
 fn accept_event(
     state: &mut SessionLifecycleState,
     event: &LifecycleEvent,
-    signature: EventSignature,
+    signature: LifecycleEventSignature,
     sequence: u64,
     received_at_ms: u64,
 ) {
@@ -1149,6 +1332,30 @@ mod tests {
 
     fn prompt(turn: &str) -> LifecycleEvent {
         event(LifecycleEventName::UserPromptSubmit, Some(turn), None)
+    }
+
+    #[test]
+    fn pure_record_at_reports_the_applied_sequence_without_persistence() {
+        let mut snapshot = LifecycleSnapshot::default();
+
+        let first = snapshot.record_at(prompt("turn-1"), 100);
+        let duplicate = snapshot.record_at(prompt("turn-1"), 101);
+
+        assert_eq!(
+            first,
+            RecordedLifecycleEvent {
+                outcome: ApplyOutcome::Applied,
+                sequence: 1,
+            }
+        );
+        assert_eq!(
+            duplicate,
+            RecordedLifecycleEvent {
+                outcome: ApplyOutcome::Ignored(IgnoreReason::Duplicate),
+                sequence: 0,
+            }
+        );
+        assert_eq!(snapshot.next_sequence, 2);
     }
 
     fn pre_tool(turn: &str) -> LifecycleEvent {

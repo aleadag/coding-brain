@@ -11,6 +11,7 @@ use coding_brain_core::lifecycle::LifecycleIdentity;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 pub(super) use super::secure_state::state_root_for_traversal;
 use super::secure_state::{SecureStateDirectory, SecureStateError, open_or_create_nested};
 

@@ -1,37 +1,54 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+#[cfg(test)]
 use std::fmt;
+#[cfg(test)]
 use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
 use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+#[cfg(test)]
 use std::thread;
+#[cfg(test)]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use coding_brain_core::brain_activity::{
-    ACTIVITY_SCHEMA_VERSION, ActivityDiagnostics, ActivityEvent, ActivityItem, ActivityKind,
-    ActivityOutcome, ActivitySnapshot, ActivityState, AttentionItem, DEFAULT_INTERRUPTED_AFTER_MS,
-    DeliveryState, MAX_ACTIVITY_EVENT_BYTES, MIN_ACTIVITY_SCHEMA_VERSION, SnapshotLimits,
+    ACTIVITY_SCHEMA_VERSION, DEFAULT_INTERRUPTED_AFTER_MS, MAX_ACTIVITY_EVENT_BYTES,
+    MIN_ACTIVITY_SCHEMA_VERSION,
 };
+use coding_brain_core::brain_activity::{
+    ActivityDiagnostics, ActivityEvent, ActivityItem, ActivityKind, ActivityOutcome,
+    ActivitySnapshot, ActivityState, AttentionItem, DeliveryState, SnapshotLimits,
+};
+#[cfg(test)]
 use coding_brain_core::durable_file::durable_replace;
 use coding_brain_core::project::ProjectId;
 use coding_brain_core::review_state::{
     ReviewDisposition, ReviewKey, ReviewKeySetError, ReviewSurface, ReviewTarget,
     SurfaceReviewProjection, derive_review_key_set,
 };
+#[cfg(test)]
 use fs2::FileExt;
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use super::decisions::EnsureRecord;
 use super::review_state::ReviewStateSnapshot;
 
+#[cfg(test)]
 const LOCK_RETRY: Duration = Duration::from_millis(5);
+#[cfg(test)]
 const MAX_DIAGNOSTIC_OFFSETS: usize = 100;
+#[cfg(test)]
 const MAX_RETAINED_INTERRUPTED_LIFECYCLES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +94,7 @@ struct AttentionGroup {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub struct ActivityLimits {
     pub lock_timeout_ms: u64,
     pub compact_at_bytes: u64,
@@ -84,10 +102,12 @@ pub struct ActivityLimits {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct LiveEvidenceBudget {
     remaining: usize,
 }
 
+#[cfg(test)]
 impl LiveEvidenceBudget {
     pub(crate) fn new(maximum: usize) -> Self {
         Self { remaining: maximum }
@@ -106,6 +126,7 @@ impl LiveEvidenceBudget {
     }
 }
 
+#[cfg(test)]
 impl Default for ActivityLimits {
     fn default() -> Self {
         Self {
@@ -117,6 +138,7 @@ impl Default for ActivityLimits {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub struct ActivityStore {
     path: PathBuf,
     lock_path: PathBuf,
@@ -148,6 +170,17 @@ pub struct ActivityLog {
 }
 
 impl ActivityLog {
+    pub(crate) fn from_events(events: Vec<ActivityEvent>) -> Self {
+        let diagnostics = ActivityDiagnostics {
+            duplicate_terminal_states: duplicate_terminal_count(&events),
+            ..ActivityDiagnostics::default()
+        };
+        Self {
+            events,
+            diagnostics,
+        }
+    }
+
     pub fn events(&self) -> &[ActivityEvent] {
         &self.events
     }
@@ -184,7 +217,16 @@ impl ActivityLog {
     }
 }
 
+pub(crate) fn project_activity_events(
+    events: Vec<ActivityEvent>,
+    limits: SnapshotLimits,
+    now_ms: u64,
+) -> ActivitySnapshot {
+    project_snapshot(&ActivityLog::from_events(events), limits, now_ms)
+}
+
 #[derive(Debug)]
+#[cfg(test)]
 pub enum ActivityStoreError {
     Io(io::Error),
     LockTimeout,
@@ -196,12 +238,14 @@ pub enum ActivityStoreError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum AtomicReservationOutcome {
     Reserved,
     Duplicate,
     Cooldown,
 }
 
+#[cfg(test)]
 impl fmt::Display for ActivityStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -220,14 +264,17 @@ impl fmt::Display for ActivityStoreError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for ActivityStoreError {}
 
+#[cfg(test)]
 impl From<io::Error> for ActivityStoreError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
 }
 
+#[cfg(test)]
 impl From<serde_json::Error> for ActivityStoreError {
     fn from(error: serde_json::Error) -> Self {
         Self::Serialization(error)
@@ -235,6 +282,7 @@ impl From<serde_json::Error> for ActivityStoreError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(test)]
 struct DiagnosticRow {
     schema_version: u32,
     diagnostic: StoreDiagnostic,
@@ -242,11 +290,13 @@ struct DiagnosticRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg(test)]
 enum StoreDiagnostic {
     TruncatedTail { discarded_bytes: u64 },
     MalformedRows { count: usize },
 }
 
+#[cfg(test)]
 struct LockGuard<'a> {
     file: &'a File,
 }
@@ -317,17 +367,20 @@ impl ReadParseGate {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 enum LockKind {
     Shared,
     Exclusive,
 }
 
+#[cfg(test)]
 impl Drop for LockGuard<'_> {
     fn drop(&mut self) {
         let _ = FileExt::unlock(self.file);
     }
 }
 
+#[cfg(test)]
 impl ActivityStore {
     pub fn at(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
@@ -944,6 +997,7 @@ impl ActivityStore {
     }
 }
 
+#[cfg(test)]
 fn parse_activity_log(contents: &[u8]) -> Result<ActivityLog, ActivityStoreError> {
     let mut log = ActivityLog::default();
     let mut activity_kinds = HashMap::<String, ActivityKind>::new();
@@ -982,10 +1036,12 @@ fn parse_activity_log(contents: &[u8]) -> Result<ActivityLog, ActivityStoreError
     Ok(log)
 }
 
+#[cfg(test)]
 fn supported_activity_schema(version: u32) -> bool {
     (MIN_ACTIVITY_SCHEMA_VERSION..=ACTIVITY_SCHEMA_VERSION).contains(&version)
 }
 
+#[cfg(test)]
 fn lock_with_timeout(
     file: &File,
     timeout_ms: u64,
@@ -994,6 +1050,7 @@ fn lock_with_timeout(
     lock_with_timeout_observed(file, timeout_ms, kind, || {})
 }
 
+#[cfg(test)]
 fn lock_with_timeout_observed<F>(
     file: &File,
     timeout_ms: u64,
@@ -1032,6 +1089,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn repair_tail(file: &mut File) -> Result<Option<u64>, ActivityStoreError> {
     let length = file.metadata()?.len();
     if length == 0 {
@@ -1061,6 +1119,7 @@ fn repair_tail(file: &mut File) -> Result<Option<u64>, ActivityStoreError> {
     Ok(Some(tail_length))
 }
 
+#[cfg(test)]
 fn find_tail_start(file: &mut File, length: u64) -> io::Result<u64> {
     let mut cursor = length;
     let mut buffer = [0_u8; 8 * 1024];
@@ -1527,6 +1586,7 @@ fn duplicate_terminal_count(events: &[ActivityEvent]) -> usize {
         .count()
 }
 
+#[cfg(test)]
 fn write_diagnostic(
     writer: &mut impl Write,
     diagnostic: StoreDiagnostic,
@@ -1542,6 +1602,7 @@ fn write_diagnostic(
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_diagnostic(diagnostics: &mut ActivityDiagnostics, row: DiagnosticRow) {
     if !supported_activity_schema(row.schema_version) {
         diagnostics.malformed_rows += 1;
@@ -1560,6 +1621,7 @@ fn apply_diagnostic(diagnostics: &mut ActivityDiagnostics, row: DiagnosticRow) {
     }
 }
 
+#[cfg(test)]
 fn record_malformed(diagnostics: &mut ActivityDiagnostics, offset: u64) {
     diagnostics.malformed_rows += 1;
     if diagnostics.malformed_offsets.len() < MAX_DIAGNOSTIC_OFFSETS {
@@ -1567,12 +1629,14 @@ fn record_malformed(diagnostics: &mut ActivityDiagnostics, offset: u64) {
     }
 }
 
+#[cfg(test)]
 fn parent_dir(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
 }
 
+#[cfg(test)]
 fn epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1582,26 +1646,26 @@ fn epoch_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn set_dir_mode(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn set_dir_mode(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn set_file_mode(file: &File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     file.set_permissions(fs::Permissions::from_mode(0o600))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn set_file_mode(_file: &File) -> io::Result<()> {
     Ok(())
 }

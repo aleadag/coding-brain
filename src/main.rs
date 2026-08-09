@@ -21,6 +21,8 @@ mod provider_hooks;
 mod runtime;
 
 use std::io;
+#[cfg(feature = "fault-injection")]
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -47,6 +49,16 @@ pub(crate) enum ConfigAction {
     Validate,
     /// Write a sample .coding-brain.toml in the current directory.
     Init,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum StorageAction {
+    /// Export a bounded, non-executable audit archive.
+    ExportAudit { directory: std::path::PathBuf },
+    /// Export an exact frozen legacy-v0.59.1 archive.
+    ExportLegacy { directory: std::path::PathBuf },
+    /// Reset only the rebuildable Review SQLite database.
+    ResetReviewState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -88,6 +100,12 @@ pub(crate) enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+
+    /// Export or reset inactive SQLite storage.
+    Storage {
+        #[command(subcommand)]
+        action: StorageAction,
     },
 
     /// Onboarding wizard (brain, hooks, skills). See issue #257.
@@ -238,6 +256,30 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) permission_hook: bool,
 
+    #[cfg(feature = "fault-injection")]
+    #[arg(long, hide = true, value_enum)]
+    fault_point: Option<brain::storage::FaultPoint>,
+
+    #[cfg(feature = "fault-injection")]
+    #[arg(long, hide = true, value_enum)]
+    migration_fault_stage: Option<brain::storage::MigrationFaultStage>,
+
+    #[cfg(feature = "fault-injection")]
+    #[arg(long, hide = true)]
+    fault_capability: Option<PathBuf>,
+
+    #[cfg(feature = "fault-injection")]
+    #[arg(long, hide = true)]
+    fault_nonce: Option<String>,
+
+    #[cfg(feature = "fault-injection")]
+    #[arg(long, hide = true)]
+    fault_control_fd: Option<i32>,
+
+    #[cfg(feature = "fault-injection")]
+    #[arg(long, hide = true)]
+    fault_worker: bool,
+
     /// Internal isolated shell safety evaluator.
     #[arg(long, hide = true)]
     pub(crate) shell_safety_helper: bool,
@@ -336,17 +378,112 @@ fn select_mode(cli: &Cli) -> RunMode {
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
+    #[cfg(feature = "fault-injection")]
+    if fault_activation_requested(&cli) {
+        let paths = coding_brain_core::paths::CodingBrainPaths::resolve(
+            &coding_brain_core::paths::PathEnvironment::current(),
+        )
+        .map_err(|error| io::Error::other(format!("could not resolve storage paths: {error:?}")))?;
+        if let Some(activation) = fault_activation(&cli, paths.state_root())? {
+            let selection = activation.selection;
+            let state_root = activation.state_root.clone();
+            brain::storage::activate_fault(activation).map_err(io::Error::other)?;
+            if cli.fault_worker {
+                return brain::storage::run_fault_worker(&selection, &state_root)
+                    .map_err(io::Error::other);
+            }
+        }
+    }
     if cli.shell_safety_helper {
         brain::safety::run_helper()?;
         return Ok(());
     }
     let is_internal_hook =
         cli.permission_hook || cli.lifecycle_hook || cli.recovery_hook || cli.distill_once;
+    let is_storage_command = matches!(cli.command, Some(Command::Storage { .. }));
     let result = run_main(cli);
-    if result.is_ok() && !is_internal_hook {
+    if result.is_ok() && !is_internal_hook && !is_storage_command {
         maybe_print_star_prompt();
     }
     result
+}
+
+#[cfg(feature = "fault-injection")]
+fn fault_activation_requested(cli: &Cli) -> bool {
+    cli.fault_point.is_some()
+        || cli.migration_fault_stage.is_some()
+        || cli.fault_capability.is_some()
+        || cli.fault_nonce.is_some()
+        || cli.fault_control_fd.is_some()
+        || cli.fault_worker
+}
+
+#[cfg(feature = "fault-injection")]
+fn fault_activation(
+    cli: &Cli,
+    state_root: &Path,
+) -> io::Result<Option<brain::storage::FaultActivation>> {
+    if !fault_activation_requested(cli) {
+        return Ok(None);
+    }
+    let selection = match (cli.fault_point, cli.migration_fault_stage) {
+        (Some(point), None) => brain::storage::FaultSelection::Matrix(point),
+        (None, Some(stage)) => brain::storage::FaultSelection::MigrationRegression(stage),
+        _ => return Err(io::Error::other("exactly one fault selector is required")),
+    };
+    let (Some(capability), Some(nonce), Some(control_fd)) = (
+        cli.fault_capability.clone(),
+        cli.fault_nonce.clone(),
+        cli.fault_control_fd,
+    ) else {
+        return Err(io::Error::other("complete fault activation is required"));
+    };
+    if cli.permission_hook == cli.fault_worker {
+        return Err(io::Error::other("exactly one fault role is required"));
+    }
+    if cli.permission_hook
+        && (cli.shell_safety_helper
+            || cli.lifecycle_hook
+            || cli.recovery_hook
+            || matches!(cli.command.as_ref(), Some(Command::Storage { .. })))
+    {
+        return Err(io::Error::other(
+            "fault activation cannot be combined with a higher-precedence mode",
+        ));
+    }
+    match (cli.permission_hook, selection) {
+        (
+            true,
+            brain::storage::FaultSelection::Matrix(
+                brain::storage::FaultPoint::Checkpoint
+                | brain::storage::FaultPoint::MigrationPublish,
+            )
+            | brain::storage::FaultSelection::MigrationRegression(_),
+        ) => return Err(io::Error::other("fault point requires fault-worker role")),
+        (
+            false,
+            brain::storage::FaultSelection::Matrix(
+                brain::storage::FaultPoint::AdmissionWrite
+                | brain::storage::FaultPoint::InferenceExit
+                | brain::storage::FaultPoint::CommitBeforeCall
+                | brain::storage::FaultPoint::CommitAfterReturn
+                | brain::storage::FaultPoint::StdoutWrite
+                | brain::storage::FaultPoint::DeliveryWrite,
+            ),
+        ) => {
+            return Err(io::Error::other(
+                "fault point requires permission-hook role",
+            ));
+        }
+        _ => {}
+    }
+    Ok(Some(brain::storage::FaultActivation {
+        capability,
+        state_root: state_root.to_owned(),
+        nonce,
+        selection,
+        control_fd,
+    }))
 }
 
 fn maybe_print_star_prompt() {
@@ -439,17 +576,15 @@ fn early_config_action(cli: &Cli) -> Option<&ConfigAction> {
 }
 
 fn run_main(cli: Cli) -> io::Result<()> {
-    if cli.distill_once {
-        let paths = brain::distill::current_paths()?;
-        brain::distill::run_once(&paths).map_err(io::Error::other)?;
-        return Ok(());
-    }
     if cli.lifecycle_hook {
         lifecycle_hook::run(
             cli.provider.map(Into::into).unwrap_or_default(),
             cli.antigravity_hook_event.as_deref(),
         );
         return Ok(());
+    }
+    if let Some(Command::Storage { action }) = cli.command.as_ref() {
+        return run_storage_action(action);
     }
 
     // Initialize diagnostic logger if --log is set
@@ -479,6 +614,32 @@ fn run_main(cli: Cli) -> io::Result<()> {
         );
         return Ok(());
     }
+    if cli.permission_hook {
+        brain::permission_hook::run(
+            cfg.brain.as_ref(),
+            cli.provider.map(Into::into).unwrap_or_default(),
+            cli.antigravity_hook_event.as_deref(),
+        );
+        return Ok(());
+    }
+    let storage_paths = coding_brain_core::paths::CodingBrainPaths::resolve(
+        &coding_brain_core::paths::PathEnvironment::current(),
+    )
+    .map_err(|error| io::Error::other(format!("could not resolve storage paths: {error:?}")))?;
+    match brain::storage::MigrationCoordinator::at(storage_paths.state_root()).run_non_hook() {
+        Ok(_) => {}
+        Err(brain::storage::StorageError::Busy) if cli.distill_once => return Ok(()),
+        Err(error) => {
+            return Err(io::Error::other(format!(
+                "SQLite storage migration failed: {error}"
+            )));
+        }
+    }
+    let sqlite_paths = brain::storage::StoragePaths::at(storage_paths.state_root());
+    if cli.distill_once {
+        brain::distill::run_once(&storage_paths).map_err(io::Error::other)?;
+        return Ok(());
+    }
     if let Some(action) = early_config_action(&cli) {
         return match action {
             ConfigAction::Show => {
@@ -494,14 +655,6 @@ fn run_main(cli: Cli) -> io::Result<()> {
             ConfigAction::Validate => commands::validate_config(),
             ConfigAction::Init => commands::write_config_init(),
         };
-    }
-    if cli.permission_hook {
-        brain::permission_hook::run(
-            cfg.brain.as_ref(),
-            cli.provider.map(Into::into).unwrap_or_default(),
-            cli.antigravity_hook_event.as_deref(),
-        );
-        return Ok(());
     }
     let model_active = matches!(
         brain::resolve_gate_mode(cfg.brain.as_ref()).mode,
@@ -554,7 +707,7 @@ fn run_main(cli: Cli) -> io::Result<()> {
     }
 
     if let Some(ref id) = cli.brain_mark_canonical {
-        match brain::review::mark_by_id(id, None) {
+        match brain::review::mark_by_id_sqlite(&sqlite_paths, id, None) {
             Ok(()) => {
                 println!("Marked decision {id} as canonical.");
                 return Ok(());
@@ -569,10 +722,10 @@ fn run_main(cli: Cli) -> io::Result<()> {
     if let Some(ref maybe_arg) = cli.brain_review {
         match maybe_arg.as_deref() {
             Some("list") | Some("queue") | Some("print") => {
-                brain::review::print_queue();
+                brain::review::print_queue_sqlite(&sqlite_paths).map_err(io::Error::other)?;
             }
             _ => {
-                brain::review::run_interactive();
+                brain::review::run_interactive_sqlite(&sqlite_paths).map_err(io::Error::other)?;
             }
         }
         return Ok(());
@@ -581,6 +734,9 @@ fn run_main(cli: Cli) -> io::Result<()> {
     if let Some(ref command) = cli.command {
         match command {
             Command::Config { .. } => unreachable!("config commands are dispatched after loading"),
+            Command::Storage { .. } => {
+                unreachable!("storage commands are dispatched before loading configuration")
+            }
             Command::Init {
                 providers,
                 check,
@@ -728,6 +884,38 @@ fn run_main(cli: Cli) -> io::Result<()> {
 
     debug_assert_eq!(select_mode(&cli), RunMode::BrainTui);
     launch_brain_tui(app_theme)
+}
+
+fn run_storage_action(action: &StorageAction) -> io::Result<()> {
+    let resolved = coding_brain_core::paths::CodingBrainPaths::resolve(
+        &coding_brain_core::paths::PathEnvironment::current(),
+    )
+    .map_err(|error| {
+        io::Error::other(format!("failed to resolve Coding Brain state: {error:?}"))
+    })?;
+    let paths = brain::storage::StoragePaths::at(resolved.state_root());
+    match action {
+        StorageAction::ExportAudit { directory } => {
+            brain::storage::AuditExporter::new(&paths)
+                .export(directory)
+                .map_err(io::Error::other)?;
+            println!(
+                "Exported non-executable audit archive to {}",
+                directory.display()
+            );
+        }
+        StorageAction::ExportLegacy { directory } => {
+            brain::storage::LegacyExporter::new(&paths)
+                .export(directory)
+                .map_err(io::Error::other)?;
+            println!("Exported frozen legacy archive to {}", directory.display());
+        }
+        StorageAction::ResetReviewState => {
+            brain::storage::ReviewDb::reset(&paths).map_err(io::Error::other)?;
+            println!("Reset Review SQLite state.");
+        }
+    }
+    Ok(())
 }
 
 fn launch_brain_tui(theme: theme::Theme) -> io::Result<()> {

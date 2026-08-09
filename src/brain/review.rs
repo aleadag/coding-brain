@@ -12,10 +12,17 @@
 //! PR opening this module.
 
 use std::io::{self, BufRead, Write};
+use std::time::Duration;
 
-use super::decisions::{DecisionRecord, mark_canonical, read_all_decisions};
+use super::decisions::DecisionRecord;
+#[cfg(test)]
+use super::decisions::mark_canonical;
 use super::metrics::{compute_counterfactuals, compute_tier_stats};
 use super::risk::{RiskTier, classify_risk};
+use super::storage::{BrainDb, OpenRole, StorageDeadline, StorageError, StoragePaths};
+
+const REVIEW_PAGE_ROWS: usize = 4_096;
+const REVIEW_PAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A scored review candidate.
 #[derive(Debug, Clone)]
@@ -109,9 +116,17 @@ fn find_by_id<'a>(
         .find(|decision| decision.decision_id.as_deref() == Some(id))
 }
 
-/// Run an interactive review pass. Returns the number of items marked canonical.
-pub fn run_interactive() -> usize {
-    let decisions = read_all_decisions();
+pub fn run_interactive_sqlite(paths: &StoragePaths) -> Result<usize, String> {
+    let decisions = sqlite_decisions(paths)?;
+    Ok(run_interactive_with(decisions, |decision_id, note| {
+        mark_by_id_sqlite(paths, decision_id, note)
+    }))
+}
+
+fn run_interactive_with(
+    decisions: Vec<DecisionRecord>,
+    mut mark: impl FnMut(&str, Option<&str>) -> Result<(), String>,
+) -> usize {
     let queue = build_queue(&decisions);
 
     println!("Brain Review");
@@ -162,7 +177,7 @@ pub fn run_interactive() -> usize {
                         .as_deref()
                         .filter(|id| !id.trim().is_empty())
                     {
-                        match mark_canonical(id, None) {
+                        match mark(id, None) {
                             Ok(()) => {
                                 println!("  ✓ marked canonical");
                                 marked += 1;
@@ -187,7 +202,7 @@ pub fn run_interactive() -> usize {
                         .as_deref()
                         .filter(|id| !id.trim().is_empty())
                     {
-                        match mark_canonical(id, Some(note.trim())) {
+                        match mark(id, Some(note.trim())) {
                             Ok(()) => {
                                 println!("  ✓ marked canonical with note");
                                 marked += 1;
@@ -283,6 +298,7 @@ fn print_full_details(d: &DecisionRecord) {
 
 /// One-shot non-interactive helper for `--mark <id>` (called from the
 /// counterfactual report).
+#[cfg(test)]
 pub fn mark_by_id(decision_id: &str, note: Option<&str>) -> Result<(), String> {
     if decision_id.trim().is_empty() {
         return Err("decision id must not be empty".into());
@@ -290,10 +306,33 @@ pub fn mark_by_id(decision_id: &str, note: Option<&str>) -> Result<(), String> {
     mark_canonical(decision_id, note)
 }
 
-/// Print the review queue (non-interactive) — useful for piping into other tools.
-pub fn print_queue() {
-    let decisions = read_all_decisions();
-    let queue = build_queue(&decisions);
+pub fn mark_by_id_sqlite(
+    paths: &StoragePaths,
+    decision_id: &str,
+    note: Option<&str>,
+) -> Result<(), String> {
+    if decision_id.trim().is_empty() {
+        return Err("decision id must not be empty".into());
+    }
+    let mut database = BrainDb::open_current(
+        paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .map_err(sqlite_review_error)?;
+    database
+        .mark_decision_canonical(decision_id, note)
+        .map_err(sqlite_review_error)
+}
+
+pub fn print_queue_sqlite(paths: &StoragePaths) -> Result<(), String> {
+    let decisions = sqlite_decisions(paths)?;
+    print_queue_from(&decisions);
+    Ok(())
+}
+
+fn print_queue_from(decisions: &[DecisionRecord]) {
+    let queue = build_queue(decisions);
     let summaries: Vec<coding_brain_core::runtime::DecisionSummary> =
         decisions.iter().map(Into::into).collect();
     let tier_stats = compute_tier_stats(&summaries);
@@ -316,6 +355,43 @@ pub fn print_queue() {
     }
     if queue.is_empty() {
         println!("(empty)");
+    }
+}
+
+fn sqlite_decisions(paths: &StoragePaths) -> Result<Vec<DecisionRecord>, String> {
+    let database = BrainDb::open_current(
+        paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .map_err(sqlite_review_error)?;
+    let session = database
+        .learning_read_session()
+        .map_err(sqlite_review_error)?;
+    let mut after = None;
+    let mut decisions = Vec::new();
+    loop {
+        let page = session
+            .page_after(after, REVIEW_PAGE_ROWS, REVIEW_PAGE_BYTES)
+            .map_err(sqlite_review_error)?;
+        let next = page.next_cursor;
+        decisions.extend(page.into_records());
+        let Some(cursor) = next else {
+            break;
+        };
+        after = Some(cursor);
+    }
+    Ok(decisions)
+}
+
+fn sqlite_review_error(error: StorageError) -> String {
+    if matches!(error, StorageError::Busy) {
+        "SQLite decision storage is busy; no change was made".into()
+    } else {
+        format!(
+            "SQLite decision storage unavailable ({})",
+            error.fault_category().as_str()
+        )
     }
 }
 

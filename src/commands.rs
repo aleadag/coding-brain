@@ -335,57 +335,39 @@ fn activity_envelope(
     })
 }
 
-#[derive(Default)]
-struct HeadlessActivityCursor {
-    emitted: std::collections::HashSet<(String, usize)>,
-}
-
-impl HeadlessActivityCursor {
-    fn take_unseen(
-        &mut self,
-        events: &[coding_brain_core::brain_activity::ActivityEvent],
-    ) -> Result<Vec<coding_brain_core::brain_activity::ActivityEvent>, serde_json::Error> {
-        let mut occurrences = std::collections::HashMap::<String, usize>::new();
-        let mut current = std::collections::HashSet::new();
-        let mut unseen = Vec::new();
-        for event in events {
-            let encoded = serde_json::to_string(event)?;
-            let occurrence = occurrences.entry(encoded.clone()).or_default();
-            *occurrence += 1;
-            let key = (encoded, *occurrence);
-            if !self.emitted.contains(&key) {
-                unseen.push(event.clone());
-            }
-            current.insert(key);
-        }
-        self.emitted = current;
-        Ok(unseen)
-    }
-}
-
 /// Continuously emit normalized activity recorded by the hook/evaluation path.
 pub(crate) fn run_headless(tick_rate: Duration, json_mode: bool) -> io::Result<()> {
     let paths = crate::brain::distill::current_paths()?;
-    let activity =
-        crate::brain::activity::ActivityStore::at(paths.state_root().join("activity.jsonl"));
-    let mut cursor = HeadlessActivityCursor::default();
+    let storage_paths = crate::brain::storage::StoragePaths::at(paths.state_root());
+    let mut cursor = None;
 
     loop {
         if let Err(error) = crate::brain::distill::run_once(&paths) {
             eprintln!("Warning: Coding Brain preference catch-up failed: {error}");
         }
-        let log = match activity.read() {
-            Ok(log) => log,
-            Err(crate::brain::activity::ActivityStoreError::LockTimeout) => {
+        let page = match crate::brain::storage::BrainDb::open_current(
+            &storage_paths,
+            crate::brain::storage::OpenRole::NonHook,
+            crate::brain::storage::StorageDeadline::after(Duration::from_millis(250)),
+        )
+        .and_then(|database| database.activity_after_cursor(cursor, 4_096, 16 * 1024 * 1024))
+        {
+            Ok(page) => page,
+            Err(crate::brain::storage::StorageError::Busy) => {
                 std::thread::sleep(tick_rate);
                 continue;
             }
-            Err(error) => return Err(io::Error::other(error)),
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "SQLite activity storage unavailable ({})",
+                    error.fault_category().as_str()
+                )));
+            }
         };
-        for event in cursor.take_unseen(log.events()).map_err(io::Error::other)? {
-            emit_activity(&event, json_mode);
+        for record in page.events {
+            emit_activity(&record.event, json_mode);
+            cursor = Some(record.cursor);
         }
-        let _ = activity.compact_if_needed();
         std::thread::sleep(tick_rate);
     }
 }
@@ -569,27 +551,6 @@ mod headless_tests {
         assert_eq!(envelope["project_id"]["kind"], "stable");
         assert!(envelope.get("sessions").is_none());
         assert!(envelope.get("session").is_none());
-    }
-
-    #[test]
-    fn headless_cursor_survives_compaction_rewrites_without_replay_or_skip() {
-        let mut cursor = HeadlessActivityCursor::default();
-        let first = event("first", 1);
-        let retained = event("retained", 2);
-        let added = event("added", 3);
-
-        assert_eq!(
-            cursor
-                .take_unseen(&[first, retained.clone()])
-                .unwrap()
-                .len(),
-            2
-        );
-        let after_same_length_rewrite = cursor
-            .take_unseen(&[retained.clone(), added.clone()])
-            .unwrap();
-        assert_eq!(after_same_length_rewrite, vec![added.clone()]);
-        assert!(cursor.take_unseen(&[added]).unwrap().is_empty());
     }
 
     fn event(

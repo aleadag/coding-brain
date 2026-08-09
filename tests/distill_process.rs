@@ -1,41 +1,120 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 #[cfg(debug_assertions)]
 use std::time::Duration;
 use std::time::Instant;
 
+use coding_brain::brain::storage::{BrainDb, StoragePaths};
+use rusqlite::params;
+
+fn secure_state_root(home: &Path) {
+    for directory in [
+        home.to_path_buf(),
+        home.join("state"),
+        home.join("state/coding-brain"),
+    ] {
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 fn write_decisions(home: &Path, count: usize) {
-    let root = home.join("state/coding-brain/brain");
-    fs::create_dir_all(&root).unwrap();
-    let mut file = fs::File::create(root.join("decisions.jsonl")).unwrap();
-    for index in 1..=count {
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({
-                "ts": index.to_string(),
-                "pid": 1,
-                "project": if index % 2 == 0 { "alpha" } else { "beta" },
-                "tool": "Bash",
-                "command": "cargo test",
-                "brain_action": "approve",
-                "brain_confidence": 0.9,
-                "brain_reasoning": "fixture",
-                "user_action": "accept",
-                "decision_type": "session",
-                "decision_id": format!("dec_{index}"),
-            })
+    secure_state_root(home);
+    let paths = StoragePaths::at(&home.join("state/coding-brain"));
+    if !paths.brain_db().exists() {
+        drop(BrainDb::create_current(&paths).unwrap());
+    }
+    let mut database = rusqlite::Connection::open(paths.brain_db()).unwrap();
+    let existing: i64 = database
+        .query_row("SELECT count(*) FROM decision_identities", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let existing = usize::try_from(existing).unwrap();
+    assert!(existing <= count);
+    let transaction = database.transaction().unwrap();
+    for index in (existing + 1)..=count {
+        let decision_id = format!("dec_{index}");
+        let activity_id = format!("activity-{index}");
+        let activity = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "kind": "decision",
+            "activity_id": activity_id.clone(),
+            "recorded_at_ms": index,
+            "project": {
+                "project_id": { "kind": "temporary", "value": "distill-process" },
+                "cwd": "/work/distill-process",
+                "label": "distill-process"
+            },
+            "state": "observed",
+            "tool": "Bash",
+            "normalized_command": "cargo test",
+            "decision_id": decision_id.clone(),
+        }))
+        .unwrap();
+        let record = serde_json::to_vec(&serde_json::json!({
+            "provider": "codex",
+            "ts": index.to_string(),
+            "pid": 1,
+            "project": if index % 2 == 0 { "alpha" } else { "beta" },
+            "tool": "Bash",
+            "command": "cargo test",
+            "brain_action": "approve",
+            "brain_confidence": 0.9,
+            "brain_reasoning": "fixture",
+            "user_action": "accept",
+            "decision_type": "session",
+            "suggested_at": null,
+            "resolved_at": null,
+            "override_reason": null,
+            "decision_id": decision_id.clone(),
+            "brain_decision_ms": null,
+            "cache_hit": null,
+            "canonical": null,
+        }))
+        .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO activity_events (
+                    source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+                    event_payload
+                 ) VALUES (?1, ?2, 'decision', 'observed', ?1, ?3)",
+                params![index as i64, activity_id, activity],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO decision_identities (
+                    decision_id, identity_kind, provider, decided_at_ms
+                 ) VALUES (?1, 'observation', 'codex', ?2)",
+                params![decision_id, index as i64],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO decision_payloads (
+                    decision_id, payload_kind, source_cursor, normalized_command,
+                    reasoning, decision_record
+                 ) VALUES (?1, 'observation', ?2, 'cargo test', 'fixture', ?3)",
+                params![decision_id, index as i64, record],
+            )
+            .unwrap();
+    }
+    transaction
+        .execute(
+            "UPDATE schema_meta SET activity_high_water = ?1 WHERE singleton = 1",
+            [count as i64],
         )
         .unwrap();
-    }
-    file.sync_all().unwrap();
+    transaction.commit().unwrap();
 }
 
 fn command(home: &Path) -> Command {
+    secure_state_root(home);
     let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command
         .arg("--distill-once")
@@ -80,10 +159,20 @@ fn concurrent_workers_publish_one_complete_generation() {
     let home = tempfile::tempdir().unwrap();
     write_decisions(home.path(), 25);
 
-    let mut first = command(home.path()).spawn().unwrap();
-    let mut second = command(home.path()).spawn().unwrap();
-    assert!(first.wait().unwrap().success());
-    assert!(second.wait().unwrap().success());
+    let first = command(home.path()).spawn().unwrap();
+    let second = command(home.path()).spawn().unwrap();
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
 
     let watermark = watermark(home.path());
     assert_eq!(watermark["through_decision_id"], "dec_25");

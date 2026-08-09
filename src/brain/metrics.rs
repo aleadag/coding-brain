@@ -12,10 +12,11 @@ use super::decisions::{DecisionRecord, read_learning_decisions};
 /// operates on the summary form so the surface can be shared with the TUI
 /// (`ui/brain.rs`) without depending on brain-private types.
 fn read_all_summaries() -> Vec<DecisionSummary> {
-    read_learning_decisions()
-        .iter()
-        .map(DecisionSummary::from)
-        .collect()
+    summaries_from_decisions(&read_learning_decisions())
+}
+
+pub(crate) fn summaries_from_decisions(decisions: &[DecisionRecord]) -> Vec<DecisionSummary> {
+    decisions.iter().map(DecisionSummary::from).collect()
 }
 
 // ────────────────────────────────────────────────────────────────────────────

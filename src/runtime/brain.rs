@@ -1,7 +1,9 @@
 //! Bind Brain read contracts to the binary's brain subsystem.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +31,10 @@ use coding_brain_core::terminals::{
     execute_guarded_action_classified, probe_actionable_prompt_classified,
 };
 
+use crate::brain::storage::{
+    ActivityCursor, BrainDb, OpenRole, ReviewDb, ReviewEligibility, ReviewEligibleOccurrence,
+    StorageDeadline, StorageError, StoragePaths,
+};
 use crate::{brain, config};
 use brain::review_state::ReviewStateSnapshot;
 
@@ -132,6 +138,21 @@ impl LiveBrainSource {
         visible
     }
 
+    fn refresh_from_sqlite_store(
+        state_root: &Path,
+        limits: SnapshotLimits,
+    ) -> Result<BrainRefresh, BrainSourceError> {
+        let paths = StoragePaths::at(state_root);
+        let deadline = StorageDeadline::after(Duration::from_millis(250));
+        let brain_db = BrainDb::open_current(&paths, OpenRole::NonHook, deadline)
+            .map_err(|error| sqlite_storage_source_error(&error))?;
+        let review_db = ReviewDb::open_current(&paths, OpenRole::NonHook, deadline)
+            .map_err(|error| sqlite_storage_source_error(&error))?;
+        sqlite_refresh(&brain_db, &review_db, limits)
+            .map_err(|error| sqlite_storage_source_error(&error))
+    }
+
+    #[cfg(test)]
     fn refresh_from_store(
         state_root: &Path,
         limits: SnapshotLimits,
@@ -143,6 +164,7 @@ impl LiveBrainSource {
         )
     }
 
+    #[cfg(test)]
     fn refresh_from_store_with_activity_store(
         state_root: &Path,
         store: brain::activity::ActivityStore,
@@ -204,6 +226,7 @@ impl LiveBrainSource {
     }
 }
 
+#[cfg(test)]
 fn review_state_source_error(error: brain::review_state::ReviewStateError) -> BrainSourceError {
     match error {
         brain::review_state::ReviewStateError::Busy => BrainSourceError::Busy,
@@ -211,21 +234,260 @@ fn review_state_source_error(error: brain::review_state::ReviewStateError) -> Br
     }
 }
 
+#[allow(dead_code)] // Task 8 selects SQLite; Task 10 freezes the safe runtime failure seam.
+fn sqlite_storage_source_error(error: &StorageError) -> BrainSourceError {
+    if matches!(error, StorageError::Busy) {
+        BrainSourceError::Busy
+    } else {
+        BrainSourceError::Other(format!(
+            "SQLite storage unavailable ({}); keeping the last coherent view",
+            error.fault_category().as_str()
+        ))
+    }
+}
+
+const SQLITE_RUNTIME_PAGE_ROWS: usize = 4_096;
+const SQLITE_RUNTIME_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
+struct SqliteProjectionInput {
+    log: brain::activity::ActivityLog,
+    decisions: Vec<brain::storage::DecisionPayload>,
+    high_water: Option<ActivityCursor>,
+    activity_cursors: HashMap<String, ActivityCursor>,
+}
+
+fn load_sqlite_projection_input(database: &BrainDb) -> Result<SqliteProjectionInput, StorageError> {
+    let mut before = None;
+    let mut activity = Vec::new();
+    loop {
+        let page = database.read_activity_page(
+            before,
+            SQLITE_RUNTIME_PAGE_ROWS,
+            SQLITE_RUNTIME_PAGE_BYTES,
+        )?;
+        let next = page.next_cursor;
+        activity.extend(page.events);
+        let Some(cursor) = next else {
+            break;
+        };
+        before = Some(cursor);
+    }
+    activity.sort_by_key(|record| record.cursor);
+    let high_water = activity.last().map(|record| record.cursor);
+    let mut activity_cursors = HashMap::new();
+    for record in &activity {
+        activity_cursors.insert(record.event.activity_id.clone(), record.cursor);
+    }
+    let log = brain::activity::ActivityLog::from_events(
+        activity.into_iter().map(|record| record.event).collect(),
+    );
+
+    let session = database.learning_read_session()?;
+    let mut after = None;
+    let mut decisions = Vec::new();
+    loop {
+        let page =
+            session.page_after(after, SQLITE_RUNTIME_PAGE_ROWS, SQLITE_RUNTIME_PAGE_BYTES)?;
+        let next = page.next_cursor;
+        decisions.extend(page.decisions);
+        let Some(cursor) = next else {
+            break;
+        };
+        after = Some(cursor);
+    }
+    Ok(SqliteProjectionInput {
+        log,
+        decisions,
+        high_water,
+        activity_cursors,
+    })
+}
+
+fn sqlite_review_evidence(
+    input: &SqliteProjectionInput,
+    surface: ReviewSurface,
+    eligible: &BTreeSet<ReviewKey>,
+) -> Result<ReviewEligibility, StorageError> {
+    let mut cursors = HashMap::new();
+    match surface {
+        ReviewSurface::Review => {
+            for payload in &input.decisions {
+                let identity = brain::review::review_source_identity(&payload.record);
+                let key = ReviewKey::derive(ReviewSurface::Review, &identity);
+                cursors.insert(key, payload.source_cursor);
+            }
+        }
+        ReviewSurface::Attention | ReviewSurface::Diagnostics | ReviewSurface::Recent => {
+            for (activity_id, cursor) in &input.activity_cursors {
+                cursors.insert(ReviewKey::derive(surface, activity_id.as_bytes()), *cursor);
+            }
+        }
+    }
+    let occurrences = eligible
+        .iter()
+        .map(|key| {
+            cursors
+                .get(key)
+                .copied()
+                .map(|cursor| ReviewEligibleOccurrence::new(surface, *key, cursor))
+                .ok_or(StorageError::InvalidStorage(
+                    "review evidence cursor is absent",
+                ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ReviewEligibility::try_new(surface, input.high_water, occurrences)
+}
+
+fn corrected_sqlite_decisions(
+    input: &SqliteProjectionInput,
+) -> Vec<brain::decisions::DecisionRecord> {
+    let corrections = latest_corrections(input.log.events());
+    input
+        .decisions
+        .iter()
+        .map(|payload| {
+            let mut record = payload.record.clone();
+            if let Some(correction) = record
+                .decision_id
+                .as_deref()
+                .and_then(|decision_id| corrections.get(decision_id))
+            {
+                record.user_action = correction_user_action(*correction).into();
+            }
+            record
+        })
+        .collect()
+}
+
+fn sqlite_projection_evidence(
+    input: &SqliteProjectionInput,
+) -> Result<HashMap<ReviewSurface, ReviewEligibility>, StorageError> {
+    let empty = ReviewStateSnapshot::default();
+    let activity = brain::activity::project_snapshot_with_review(
+        &input.log,
+        SnapshotLimits::default(),
+        epoch_ms(),
+        &empty,
+        brain::activity::AttentionOrder::SeverityFirst,
+    )
+    .map_err(|_| StorageError::InvalidStorage("duplicate activity review identity"))?;
+    let decisions = corrected_sqlite_decisions(input);
+    let (_, _, review_eligible) = review_queue_from(decisions, input.log.events(), &empty)
+        .map_err(|_| StorageError::InvalidStorage("duplicate Review identity"))?;
+    let mut evidence = HashMap::new();
+    for surface in [
+        ReviewSurface::Attention,
+        ReviewSurface::Diagnostics,
+        ReviewSurface::Recent,
+    ] {
+        let eligible = activity
+            .eligible
+            .get(&surface)
+            .expect("activity projection includes every activity surface");
+        evidence.insert(surface, sqlite_review_evidence(input, surface, eligible)?);
+    }
+    evidence.insert(
+        ReviewSurface::Review,
+        sqlite_review_evidence(input, ReviewSurface::Review, &review_eligible)?,
+    );
+    Ok(evidence)
+}
+
+fn sqlite_review_snapshot(
+    review: &ReviewDb,
+    evidence: &HashMap<ReviewSurface, ReviewEligibility>,
+) -> Result<ReviewStateSnapshot, StorageError> {
+    let surfaces = [
+        ReviewSurface::Attention,
+        ReviewSurface::Review,
+        ReviewSurface::Diagnostics,
+        ReviewSurface::Recent,
+    ]
+    .into_iter()
+    .map(|surface| {
+        review.read_surface(
+            evidence
+                .get(&surface)
+                .expect("SQLite evidence includes every review surface"),
+        )
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    ReviewStateSnapshot::from_sqlite_surfaces(surfaces).map_err(StorageError::InvalidStorage)
+}
+
+fn sqlite_refresh(
+    brain_db: &BrainDb,
+    review_db: &ReviewDb,
+    limits: SnapshotLimits,
+) -> Result<BrainRefresh, StorageError> {
+    let input = load_sqlite_projection_input(brain_db)?;
+    let evidence = sqlite_projection_evidence(&input)?;
+    let review_state = sqlite_review_snapshot(review_db, &evidence)?;
+    let decisions = corrected_sqlite_decisions(&input)
+        .iter()
+        .map(DecisionSummary::from)
+        .collect::<Vec<_>>();
+    let activity_projection = brain::activity::project_snapshot_with_review(
+        &input.log,
+        limits,
+        epoch_ms(),
+        &review_state,
+        brain::activity::AttentionOrder::SeverityFirst,
+    )
+    .map_err(|_| StorageError::InvalidStorage("duplicate activity review identity"))?;
+    let records = corrected_sqlite_decisions(&input);
+    let (review_queue, review_projection, _) =
+        review_queue_from(records, input.log.events(), &review_state)
+            .map_err(|_| StorageError::InvalidStorage("duplicate Review identity"))?;
+    let refresh = BrainRefresh {
+        snapshot: activity_projection.snapshot,
+        review_queue,
+        scorecard: scorecard_from(&decisions, input.log.events()),
+        review_state: BrainReviewProjection {
+            attention: activity_projection.attention,
+            review: review_projection,
+            diagnostics: activity_projection.diagnostics,
+            recent: activity_projection.recent,
+        },
+    };
+    refresh
+        .validate_review_alignment()
+        .map_err(|_| StorageError::InvalidStorage("review projection is misaligned"))?;
+    Ok(refresh)
+}
+
+#[cfg(test)]
 struct OwnedSurfaceEvidence {
     eligible: BTreeSet<ReviewKey>,
 }
 
-fn fresh_surface_evidence(
-    state_root: &Path,
+#[allow(dead_code)] // Task 8 activates this pure seam when runtime storage selection changes.
+pub(crate) fn captured_sqlite_review_evidence<I, B>(
     surface: ReviewSurface,
-) -> Result<OwnedSurfaceEvidence, ReviewMutationError> {
-    fresh_surface_evidence_with_activity_store(
-        state_root,
+    source_high_water: Option<ActivityCursor>,
+    occurrences: I,
+) -> Result<ReviewEligibility, StorageError>
+where
+    I: IntoIterator<Item = (B, ActivityCursor)>,
+    B: AsRef<[u8]>,
+{
+    ReviewEligibility::try_new(
         surface,
-        brain::activity::ActivityStore::at(state_root.join("activity.jsonl")),
+        source_high_water,
+        occurrences
+            .into_iter()
+            .map(|(source_identity, source_cursor)| {
+                ReviewEligibleOccurrence::new(
+                    surface,
+                    ReviewKey::derive(surface, source_identity.as_ref()),
+                    source_cursor,
+                )
+            })
+            .collect(),
     )
 }
 
+#[cfg(test)]
 fn fresh_surface_evidence_with_activity_store(
     state_root: &Path,
     surface: ReviewSurface,
@@ -271,13 +533,6 @@ fn fresh_surface_evidence_with_activity_store(
     Ok(OwnedSurfaceEvidence { eligible })
 }
 
-pub(crate) fn fresh_eligible_review_keys(
-    state_root: &Path,
-    surface: ReviewSurface,
-) -> Result<BTreeSet<ReviewKey>, ReviewMutationError> {
-    Ok(fresh_surface_evidence(state_root, surface)?.eligible)
-}
-
 fn mutate_review_state_at(
     state_root: &Path,
     request: &coding_brain_core::review_state::ReviewMutationRequest,
@@ -285,10 +540,22 @@ fn mutate_review_state_at(
     request
         .validate()
         .map_err(ReviewMutationError::InvalidRequest)?;
-    let eligible = fresh_eligible_review_keys(state_root, request.surface)?;
-    brain::review_state::ReviewStateStore::at(state_root)
-        .mutate(request, &eligible)
-        .map_err(review_mutation_error)
+    let paths = StoragePaths::at(state_root);
+    let deadline = StorageDeadline::after(Duration::from_millis(250));
+    let database = BrainDb::open_current(&paths, OpenRole::NonHook, deadline)
+        .map_err(sqlite_review_mutation_error)?;
+    let input = load_sqlite_projection_input(&database).map_err(sqlite_review_mutation_error)?;
+    let evidence = sqlite_projection_evidence(&input).map_err(sqlite_review_mutation_error)?;
+    let mut review = ReviewDb::open_current(&paths, OpenRole::NonHook, deadline)
+        .map_err(sqlite_review_mutation_error)?;
+    review
+        .mutate(
+            request,
+            evidence
+                .get(&request.surface)
+                .expect("SQLite evidence includes every review surface"),
+        )
+        .map_err(sqlite_review_mutation_error)
 }
 
 #[cfg(test)]
@@ -308,6 +575,7 @@ fn mutate_review_state_at_with_activity_store(
         .map_err(review_mutation_error)
 }
 
+#[cfg(test)]
 fn review_activity_error(error: brain::activity::ActivityStoreError) -> ReviewMutationError {
     match error {
         brain::activity::ActivityStoreError::LockTimeout => ReviewMutationError::Busy,
@@ -315,6 +583,7 @@ fn review_activity_error(error: brain::activity::ActivityStoreError) -> ReviewMu
     }
 }
 
+#[cfg(test)]
 fn review_mutation_error(error: brain::review_state::ReviewStateError) -> ReviewMutationError {
     match error {
         brain::review_state::ReviewStateError::Busy => ReviewMutationError::Busy,
@@ -339,11 +608,28 @@ fn review_mutation_error(error: brain::review_state::ReviewStateError) -> Review
     }
 }
 
+fn sqlite_review_mutation_error(error: StorageError) -> ReviewMutationError {
+    match error {
+        StorageError::Busy => ReviewMutationError::Busy,
+        StorageError::CommitUncertain { .. } => ReviewMutationError::DurabilityUncertain,
+        StorageError::InvalidReviewRequest(error) => ReviewMutationError::InvalidRequest(error),
+        StorageError::StaleReviewRevision => ReviewMutationError::StaleRevision,
+        StorageError::ReviewTargetNotEligible => ReviewMutationError::TargetNoLongerEligible,
+        StorageError::ReviewCountMismatch => ReviewMutationError::CountMismatch,
+        StorageError::ReviewDispositionConflict => ReviewMutationError::DispositionConflict,
+        StorageError::ReviewCapacityExceeded => ReviewMutationError::CapacityExceeded,
+        other => ReviewMutationError::Other(match sqlite_storage_source_error(&other) {
+            BrainSourceError::Other(message) => message,
+            BrainSourceError::Busy => "SQLite review storage is busy".into(),
+        }),
+    }
+}
+
 impl BrainSource for LiveBrainSource {
     fn refresh(&self, limits: SnapshotLimits) -> Result<BrainRefresh, BrainSourceError> {
         let paths = brain::distill::current_paths()
             .map_err(|error| BrainSourceError::Other(error.to_string()))?;
-        Self::refresh_from_store(paths.state_root(), limits)
+        Self::refresh_from_sqlite_store(paths.state_root(), limits)
     }
 
     fn gate_mode(&self) -> BrainGateMode {
@@ -651,11 +937,16 @@ impl BrainActions for LiveBrainActions {
 
     fn record_correction(&self, correction: CorrectionInput) -> Result<(), String> {
         let paths = brain::distill::current_paths().map_err(|error| error.to_string())?;
-        record_correction_at_path(&paths.state_root().join("activity.jsonl"), correction)
+        record_correction_at_state_root(paths.state_root(), correction)
     }
 
     fn mark_canonical(&self, decision_id: &str, note: Option<String>) -> Result<(), String> {
-        brain::review::mark_by_id(decision_id, note.as_deref())
+        let paths = brain::distill::current_paths().map_err(|error| error.to_string())?;
+        brain::review::mark_by_id_sqlite(
+            &StoragePaths::at(paths.state_root()),
+            decision_id,
+            note.as_deref(),
+        )
     }
 
     fn preflight_session_action(
@@ -756,7 +1047,7 @@ impl LiveBrainActions {
         let link_path =
             coding_brain_core::lifecycle::coding_brain_state_root().join("session-links.jsonl");
         let projection = match link_path.try_exists() {
-            Ok(false) => SessionIdentityProjection::default(),
+            Ok(false) => return Err(SessionActionFailureCategory::AuthorityUnavailable),
             Ok(true) => coding_brain_core::session_links::SessionLinkStore::at(&link_path)
                 .read_projection()
                 .map_err(|_| SessionActionFailureCategory::AuthorityUnavailable)?,
@@ -873,12 +1164,9 @@ fn record_live_session_action_failure(
     category: SessionActionFailureCategory,
 ) -> SessionActionFailure {
     match brain::distill::current_paths() {
-        Ok(paths) => record_session_action_failure(
-            paths.state_root().join("activity.jsonl"),
-            attempt,
-            action,
-            category,
-        ),
+        Ok(paths) => {
+            record_sqlite_session_action_failure(paths.state_root(), attempt, action, category)
+        }
         Err(_) => SessionActionFailure {
             category,
             diagnostic_persisted: false,
@@ -886,14 +1174,70 @@ fn record_live_session_action_failure(
     }
 }
 
+fn record_sqlite_session_action_failure(
+    state_root: impl AsRef<Path>,
+    attempt: &SessionActionAttempt,
+    _action: Option<&TerminalSessionAction>,
+    category: SessionActionFailureCategory,
+) -> SessionActionFailure {
+    let paths = StoragePaths::at(state_root.as_ref());
+    let diagnostic_persisted = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .and_then(|mut database| {
+        database.append_activity(ActivityEvent {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            kind: ActivityKind::Diagnostic,
+            activity_id: format!("session_action:{}", attempt.attempt_id),
+            recorded_at_ms: epoch_ms(),
+            project: ProjectEvidence {
+                project_id: attempt.target.project_id.clone(),
+                cwd: attempt.target.cwd.clone(),
+                label: None,
+            },
+            session: Some(coding_brain_core::brain_activity::SessionTarget {
+                provider: attempt.target.provider,
+                session_id: attempt.target.session_id.clone(),
+                provider_session_id: None,
+                turn_id: None,
+                tool_use_id: None,
+                project_id: attempt.target.project_id.clone(),
+                cwd: attempt.target.cwd.clone(),
+                provider_hints: Vec::new(),
+                provenance: attempt.target.provenance,
+            }),
+            state: ActivityState::Error,
+            tool: Some("session_action".into()),
+            normalized_command: None,
+            fingerprint: None,
+            rule_id: Some(category.rule_id()),
+            confidence: None,
+            threshold: None,
+            reasoning: Some(category.safe_message().into()),
+            decision_id: None,
+            outcome: None,
+            correction: None,
+            note: None,
+            supersedes: None,
+        })
+    })
+    .is_ok();
+    SessionActionFailure {
+        category,
+        diagnostic_persisted,
+    }
+}
+
+#[cfg(test)]
 fn record_session_action_failure(
     path: impl Into<PathBuf>,
     attempt: &SessionActionAttempt,
     _action: Option<&TerminalSessionAction>,
     category: SessionActionFailureCategory,
 ) -> SessionActionFailure {
-    let store = brain::activity::ActivityStore::at(path.into());
-    let diagnostic_persisted = store
+    let diagnostic_persisted = brain::activity::ActivityStore::at(path.into())
         .append(ActivityEvent {
             schema_version: ACTIVITY_SCHEMA_VERSION,
             kind: ActivityKind::Diagnostic,
@@ -940,7 +1284,7 @@ fn action_target_matches(
     session: &AgentSession,
     target_provider: AgentProvider,
     target_provenance: SessionTargetProvenance,
-    target_session_id: &str,
+    _target_session_id: &str,
     projected_live: Option<&coding_brain_core::provider::LiveProcessIdentity>,
 ) -> bool {
     let live = session.live_process_identity();
@@ -951,20 +1295,13 @@ fn action_target_matches(
     match target_provenance {
         SessionTargetProvenance::Unknown => false,
         SessionTargetProvenance::Structured => {
-            if let Some(projected_live) = projected_live {
-                return live == projected_live;
-            }
-            session.session_id == target_session_id
-                && session.identity_provenance
-                    == coding_brain_core::session::SessionIdentityProvenance::Structured
+            projected_live.is_some_and(|expected| live == expected)
         }
-        SessionTargetProvenance::RecognizedProcessAttention => {
-            process_session_id(live) == target_session_id
-                || (is_process_only_session(session) && session.session_id == target_session_id)
-        }
+        SessionTargetProvenance::RecognizedProcessAttention => false,
     }
 }
 
+#[cfg(test)]
 fn process_session_id(identity: &coding_brain_core::provider::LiveProcessIdentity) -> String {
     format!(
         "live:{}:{}:{}:{}",
@@ -988,11 +1325,71 @@ fn discovery_process_session_id(
     )
 }
 
-fn is_process_only_session(session: &AgentSession) -> bool {
-    session.identity_provenance
-        == coding_brain_core::session::SessionIdentityProvenance::ProcessOnly
+fn record_correction_at_state_root(
+    state_root: &Path,
+    correction: CorrectionInput,
+) -> Result<(), String> {
+    let paths = StoragePaths::at(state_root);
+    let mut database = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .map_err(|error| sqlite_runtime_action_error(&error))?;
+    let source = database
+        .activity_by_id(
+            &correction.activity_id,
+            None,
+            SQLITE_RUNTIME_PAGE_ROWS,
+            SQLITE_RUNTIME_PAGE_BYTES,
+        )
+        .map_err(|error| sqlite_runtime_action_error(&error))?
+        .events
+        .into_iter()
+        .max_by_key(|record| record.cursor)
+        .map(|record| record.event)
+        .ok_or_else(|| format!("activity {} not found", correction.activity_id))?;
+    if source.kind != ActivityKind::Decision {
+        return Err(format!(
+            "correction requires Decision activity; {} is {:?}",
+            bounded_display(&source.activity_id),
+            source.kind
+        ));
+    }
+    database
+        .append_activity(ActivityEvent {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            kind: ActivityKind::Decision,
+            activity_id: correction.activity_id,
+            recorded_at_ms: epoch_ms(),
+            project: source.project,
+            session: source.session,
+            state: ActivityState::Correction,
+            tool: None,
+            normalized_command: None,
+            fingerprint: None,
+            rule_id: None,
+            confidence: None,
+            threshold: None,
+            reasoning: None,
+            decision_id: source.decision_id,
+            outcome: None,
+            correction: Some(correction.disposition),
+            note: correction.note,
+            supersedes: None,
+        })
+        .map(|_| ())
+        .map_err(|error| sqlite_runtime_action_error(&error))
 }
 
+fn sqlite_runtime_action_error(error: &StorageError) -> String {
+    match sqlite_storage_source_error(error) {
+        BrainSourceError::Busy => "SQLite storage is busy; no change was made".into(),
+        BrainSourceError::Other(message) => message,
+    }
+}
+
+#[cfg(test)]
 fn record_correction_at_path(path: &Path, correction: CorrectionInput) -> Result<(), String> {
     let store = brain::activity::ActivityStore::at(path);
     let source = store
@@ -1062,6 +1459,228 @@ mod tests {
     use crate::brain::review_state::ReviewStateSnapshot;
 
     #[test]
+    fn sqlite_storage_runtime_error_preserves_last_view_with_fixed_category() {
+        let error = StorageError::Io(std::io::Error::other("/private/operator/path token-secret"));
+
+        let BrainSourceError::Other(message) = sqlite_storage_source_error(&error) else {
+            panic!("storage I/O errors must remain an explicit runtime diagnostic");
+        };
+
+        assert_eq!(
+            message,
+            "SQLite storage unavailable (io); keeping the last coherent view"
+        );
+        assert!(!message.contains("private/operator"));
+        assert!(!message.contains("token-secret"));
+    }
+
+    #[test]
+    fn captured_sqlite_evidence_is_pure_inactive_and_preserves_opaque_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = ActivityCursor::try_from(1_u64).unwrap();
+        let second = ActivityCursor::try_from(2_u64).unwrap();
+        let opaque = vec![0xff; 32];
+        let evidence = captured_sqlite_review_evidence(
+            ReviewSurface::Review,
+            Some(second),
+            vec![(b"canonical".to_vec(), first), (opaque.clone(), second)],
+        )
+        .unwrap();
+
+        assert_eq!(evidence.source_high_water(), Some(second));
+        assert_eq!(evidence.occurrences().len(), 2);
+        assert_eq!(
+            evidence.occurrences()[1].key(),
+            ReviewKey::derive(ReviewSurface::Review, &opaque)
+        );
+        assert_eq!(
+            evidence.occurrences()[1].group_id(),
+            evidence.occurrences()[1].key().to_string()
+        );
+        assert!(
+            !temp.path().join("db/review.sqlite3").exists(),
+            "the Task 5 runtime seam must not select or create SQLite storage"
+        );
+    }
+
+    #[test]
+    fn live_refresh_reads_sqlite_without_creating_legacy_state() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = brain::storage::StoragePaths::at(temp.path());
+        let mut brain_db = brain::storage::BrainDb::create_current(&paths).unwrap();
+        brain::storage::ReviewDb::create_current(&paths).unwrap();
+        brain_db
+            .append_activity(source_event(ActivityKind::Decision))
+            .unwrap();
+
+        let refresh =
+            LiveBrainSource::refresh_from_sqlite_store(temp.path(), SnapshotLimits::default())
+                .unwrap();
+
+        assert_eq!(
+            refresh.snapshot.attention[0].activity.activity_id,
+            "activity-1"
+        );
+        for legacy in [
+            "activity.jsonl",
+            "brain/decisions.jsonl",
+            "review-state.json",
+        ] {
+            assert!(!temp.path().join(legacy).exists(), "created {legacy}");
+        }
+    }
+
+    #[test]
+    fn sqlite_review_snapshot_preserves_all_surface_state() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(temp.path());
+        let mut brain_db = BrainDb::create_current(&paths).unwrap();
+        let cursor = brain_db
+            .append_activity(source_event(ActivityKind::Decision))
+            .unwrap();
+        let mut review_db = ReviewDb::create_current(&paths).unwrap();
+        let surfaces = [
+            ReviewSurface::Attention,
+            ReviewSurface::Review,
+            ReviewSurface::Diagnostics,
+            ReviewSurface::Recent,
+        ];
+        let mut evidence = HashMap::new();
+        for surface in surfaces {
+            let key = ReviewKey::derive(surface, surface.as_str().as_bytes());
+            let captured = ReviewEligibility::try_new(
+                surface,
+                Some(cursor),
+                vec![ReviewEligibleOccurrence::new(surface, key, cursor)],
+            )
+            .unwrap();
+            review_db
+                .mutate(
+                    &ReviewMutationRequest {
+                        surface,
+                        expected_surface_revision: 0,
+                        operation: ReviewMutation::SetDisposition {
+                            keys: [key].into_iter().collect(),
+                            disposition: ReviewDisposition::Reviewed,
+                        },
+                    },
+                    &captured,
+                )
+                .unwrap();
+            if surface != ReviewSurface::Recent {
+                review_db
+                    .mutate(
+                        &ReviewMutationRequest {
+                            surface,
+                            expected_surface_revision: 1,
+                            operation: ReviewMutation::SetDisposition {
+                                keys: [key].into_iter().collect(),
+                                disposition: ReviewDisposition::Archived,
+                            },
+                        },
+                        &captured,
+                    )
+                    .unwrap();
+            }
+            evidence.insert(surface, captured);
+        }
+
+        let snapshot = sqlite_review_snapshot(&review_db, &evidence).unwrap();
+
+        for surface in surfaces {
+            let key = ReviewKey::derive(surface, surface.as_str().as_bytes());
+            let (revision, disposition, archived) = if surface == ReviewSurface::Recent {
+                (1, ReviewDisposition::Reviewed, 0)
+            } else {
+                (2, ReviewDisposition::Archived, 1)
+            };
+            assert_eq!(snapshot.surface_revision(surface), revision);
+            assert_eq!(snapshot.disposition(surface, &key), Some(disposition));
+            assert_eq!(snapshot.last_archive(surface).len(), archived);
+        }
+    }
+
+    #[test]
+    fn live_correction_appends_to_sqlite_only() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(temp.path());
+        let mut database = BrainDb::create_current(&paths).unwrap();
+        database
+            .append_activity(source_event(ActivityKind::Decision))
+            .unwrap();
+        drop(database);
+
+        record_correction_at_state_root(
+            temp.path(),
+            CorrectionInput {
+                activity_id: "activity-1".into(),
+                disposition: CorrectionDisposition::BrainRight,
+                note: Some("confirmed".into()),
+            },
+        )
+        .unwrap();
+
+        let database = BrainDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap();
+        let page = database
+            .activity_by_id("activity-1", None, 10, 128 * 1024)
+            .unwrap();
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.events[1].event.state, ActivityState::Correction);
+        assert_eq!(
+            page.events[1].event.correction,
+            Some(CorrectionDisposition::BrainRight)
+        );
+        assert!(!temp.path().join("activity.jsonl").exists());
+    }
+
+    #[test]
+    fn live_session_failure_diagnostic_appends_to_sqlite_only() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(temp.path());
+        BrainDb::create_current(&paths).unwrap();
+        let attempt = SessionActionAttempt {
+            attempt_id: "attempt-sqlite".into(),
+            target: SessionActionTarget {
+                provider: AgentProvider::Codex,
+                session_id: "session-sqlite".into(),
+                project_id: coding_brain_core::project::ProjectId::Stable("project-sqlite".into()),
+                cwd: PathBuf::from("/work/sqlite"),
+                provenance: SessionTargetProvenance::Structured,
+            },
+        };
+
+        let failure = record_sqlite_session_action_failure(
+            temp.path(),
+            &attempt,
+            None,
+            SessionActionFailureCategory::AuthorityUnavailable,
+        );
+
+        assert!(failure.diagnostic_persisted);
+        let database = BrainDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap();
+        let page = database
+            .activity_by_id("session_action:attempt-sqlite", None, 10, 128 * 1024)
+            .unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event.kind, ActivityKind::Diagnostic);
+        assert!(!temp.path().join("activity.jsonl").exists());
+    }
+
+    #[test]
     fn live_brain_actions_reject_empty_canonical_ids() {
         let actions = LiveBrainActions::default();
 
@@ -1070,6 +1689,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy JSONL review fixture; SQLite review mutation coverage is in sqlite_storage"]
     fn attention_action_is_rejected_after_item_resolves_into_recent() {
         let _env_lock = crate::config::HOME_ENV_LOCK
             .lock()
@@ -1119,6 +1739,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy JSONL review fixture; SQLite review mutation coverage is in sqlite_storage"]
     fn successful_attention_mutation_prunes_reviewed_keys_that_are_no_longer_eligible() {
         let _env_lock = crate::config::HOME_ENV_LOCK
             .lock()
@@ -1193,6 +1814,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy JSONL review fixture; SQLite revision coverage is in sqlite_storage"]
     fn archive_all_rejects_same_surface_revision_change() {
         let _env_lock = crate::config::HOME_ENV_LOCK
             .lock()
@@ -1300,6 +1922,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy JSONL review fixture; SQLite surface isolation is covered in sqlite_storage"]
     fn recent_review_does_not_invalidate_attention_and_rejects_archive_operations() {
         let _env_lock = crate::config::HOME_ENV_LOCK
             .lock()
@@ -1390,6 +2013,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy JSONL review fixture; SQLite undo coverage is in sqlite_storage"]
     fn later_archive_replaces_durable_undo_slot() {
         let _env_lock = crate::config::HOME_ENV_LOCK
             .lock()
@@ -1539,6 +2163,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy JSONL lock orchestration was replaced by SQLite transactions"]
     fn mutation_releases_authoritative_lock_before_waiting_on_review_lock() {
         let temp = tempfile::tempdir().unwrap();
         let state_root = temp.path().join("coding-brain");
@@ -1683,6 +2308,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy activity lock contention was replaced by SQLite busy handling"]
     fn live_brain_refresh_reports_busy_during_activity_lock_contention() {
         let _env_lock = crate::config::HOME_ENV_LOCK
             .lock()
@@ -2034,17 +2660,18 @@ mod tests {
             failure.category,
             SessionActionFailureCategory::AuthorityUnavailable
         );
-        assert!(failure.diagnostic_persisted);
+        assert!(!failure.diagnostic_persisted);
     }
 
     #[test]
     fn preflight_maps_recovery_prompt_to_continue_and_manual_text() {
         let request = SessionActionPreflightRequest::new(structured_target());
+        let projected = projected_target_fixture();
 
         let result = preflight_session_action_from(
             request,
-            vec![discovered_session(AgentProvider::Codex, "native-1")],
-            SessionIdentityProjection::default(),
+            vec![projected.matching_session],
+            projected.projection,
             |_| Ok(Some(ActionablePrompt::Continue)),
             |_, _| Ok(()),
         )
@@ -2061,10 +2688,11 @@ mod tests {
 
     #[test]
     fn preflight_maps_permission_prompt_to_allow_deny_and_manual_text() {
+        let projected = projected_target_fixture();
         let result = preflight_session_action_from(
             SessionActionPreflightRequest::new(structured_target()),
-            vec![discovered_session(AgentProvider::Codex, "native-1")],
-            SessionIdentityProjection::default(),
+            vec![projected.matching_session],
+            projected.projection,
             |_| Ok(Some(ActionablePrompt::Allow)),
             |_, _| Ok(()),
         )
@@ -2082,10 +2710,11 @@ mod tests {
 
     #[test]
     fn preflight_maps_no_prompt_to_manual_text_only() {
+        let projected = projected_target_fixture();
         let result = preflight_session_action_from(
             SessionActionPreflightRequest::new(structured_target()),
-            vec![discovered_session(AgentProvider::Codex, "native-1")],
-            SessionIdentityProjection::default(),
+            vec![projected.matching_session],
+            projected.projection,
             |_| Ok(None),
             |_, _| Ok(()),
         )
@@ -2124,33 +2753,16 @@ mod tests {
     }
 
     #[test]
-    fn preflight_multiple_structured_or_projected_exact_sessions_is_ambiguous_without_terminal_probe()
-     {
-        let structured = discovered_session(AgentProvider::Codex, "native-1");
+    fn preflight_multiple_projected_exact_sessions_is_ambiguous_without_terminal_probe() {
         let projected = projected_target_fixture();
         let mut projected_duplicate = projected.matching_session.clone();
         projected_duplicate.session_id = "different-discovery-id".into();
-        let cases = [
-            (
-                SessionActionPreflightRequest::new(structured_target()),
-                vec![structured.clone(), structured],
-                SessionIdentityProjection::default(),
-            ),
-            (
-                SessionActionPreflightRequest::new(structured_target()),
-                vec![projected.matching_session, projected_duplicate],
-                projected.projection,
-            ),
-        ];
-
-        for (request, sessions, projection) in cases {
-            assert_preflight_cardinality_failure(
-                request,
-                sessions,
-                projection,
-                SessionActionFailureCategory::ExactSessionAmbiguous,
-            );
-        }
+        assert_preflight_cardinality_failure(
+            SessionActionPreflightRequest::new(structured_target()),
+            vec![projected.matching_session, projected_duplicate],
+            projected.projection,
+            SessionActionFailureCategory::ExactSessionAmbiguous,
+        );
     }
 
     #[test]
@@ -2574,7 +3186,7 @@ mod tests {
             let live = session.live_process_identity().unwrap();
             let synthetic_live = process_session_id(&live);
 
-            assert!(action_target_matches(
+            assert!(!action_target_matches(
                 &session,
                 provider,
                 SessionTargetProvenance::Structured,
@@ -2588,7 +3200,7 @@ mod tests {
                 &synthetic_live,
                 None
             ));
-            assert!(action_target_matches(
+            assert!(!action_target_matches(
                 &session,
                 provider,
                 SessionTargetProvenance::RecognizedProcessAttention,
@@ -2626,7 +3238,7 @@ mod tests {
                 &synthetic_process,
                 None
             ));
-            assert!(action_target_matches(
+            assert!(!action_target_matches(
                 &session,
                 provider,
                 SessionTargetProvenance::RecognizedProcessAttention,
@@ -2673,7 +3285,7 @@ mod tests {
             "linked-native",
             Some(&live)
         ));
-        assert!(action_target_matches(
+        assert!(!action_target_matches(
             &session,
             AgentProvider::Claude,
             SessionTargetProvenance::Structured,
@@ -2689,7 +3301,7 @@ mod tests {
         let colliding_id = discovery_process_session_id(&live);
         session.session_id = colliding_id.clone();
 
-        assert!(action_target_matches(
+        assert!(!action_target_matches(
             &session,
             AgentProvider::Claude,
             SessionTargetProvenance::Structured,

@@ -1,4 +1,5 @@
-#![allow(dead_code)] // Task 3 APIs are integrated by the following recovery and hook tasks.
+#![cfg(test)]
+#![allow(dead_code)] // Frozen legacy persistence coverage; production reads through storage::legacy.
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -23,10 +24,10 @@ use std::path::Component;
 
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityState, MAX_ACTIVITY_EVENT_BYTES,
-    lossless_redacted_activity_text,
 };
+use coding_brain_core::lifecycle::test_support::LifecycleStore;
 use coding_brain_core::lifecycle::{
-    EnsurePermissionDecision, LifecycleIdentity, LifecycleStore, MAX_ID_BYTES, PermissionAction,
+    EnsurePermissionDecision, LifecycleIdentity, MAX_ID_BYTES, PermissionAction,
     PermissionAuthority, PermissionDecision, PermissionDisposition,
 };
 use fs2::FileExt;
@@ -36,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use super::activity::{ActivityLog, ActivityStore, ActivityStoreError, LiveEvidenceBudget};
 use super::decisions::{
     DecisionStoreError, EnsureRecord, HookDecisionRecord, ensure_hook_record_at,
-    ensure_hook_record_at_bounded,
+    ensure_hook_record_at_bounded, validate_hook_decision_record,
 };
 use super::permission_request_lock::{
     PermissionRequestGuard, PermissionRequestLockStore, state_root_for_traversal,
@@ -2032,25 +2033,18 @@ fn valid_creation_identity(identity: &str) -> bool {
     )
 }
 
-fn validate_journal(journal: &PermissionTransactionJournal) -> Result<(), TransactionError> {
+pub(crate) fn validate_journal(
+    journal: &PermissionTransactionJournal,
+) -> Result<(), TransactionError> {
     if !matches!(journal.schema_version, 1 | JOURNAL_SCHEMA_VERSION)
         || !valid_id(&journal.transaction_id)
-        || !valid_id(&journal.proposal.decision_id)
+        || !validate_hook_decision_record(&journal.proposal)
         || !valid_id(&journal.terminal.activity_id)
         || journal.request_key.len() != 64
         || !journal
             .request_key
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || journal.proposal.decision_type != "session"
-        || !matches!(
-            journal.proposal.user_action.as_str(),
-            "hook_proposal" | "deterministic_deny"
-        )
-        || lossless_redacted_activity_text(&journal.proposal.command).as_deref()
-            != Some(journal.proposal.command.as_str())
-        || lossless_redacted_activity_text(&journal.proposal.brain_reasoning).as_deref()
-            != Some(journal.proposal.brain_reasoning.as_str())
         || journal.terminal.schema_version != ACTIVITY_SCHEMA_VERSION
         || !journal.terminal.state.is_terminal()
         || !journal.terminal.has_consistent_payload()
@@ -2314,7 +2308,7 @@ fn read_and_validate_journal(file: &mut File) -> Option<PermissionTransactionJou
     Some(journal)
 }
 
-fn decode_exact_journal(bytes: &[u8]) -> Option<PermissionTransactionJournal> {
+pub(crate) fn decode_exact_journal(bytes: &[u8]) -> Option<PermissionTransactionJournal> {
     let raw_numbers = serde_json::from_slice::<RawJournalNumbers<'_>>(bytes).ok()?;
     if !raw_numbers.are_lossless() {
         return None;
@@ -2324,6 +2318,13 @@ fn decode_exact_journal(bytes: &[u8]) -> Option<PermissionTransactionJournal> {
     deserializer.end().ok()?;
     let journal: PermissionTransactionJournal = serde_json::from_value(encoded.clone()).ok()?;
     (serde_json::to_value(&journal).ok()? == encoded).then_some(journal)
+}
+
+pub(crate) fn decode_exact_json(bytes: &[u8]) -> Option<serde_json::Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let UniqueJsonValue(value) = UniqueJsonValue::deserialize(&mut deserializer).ok()?;
+    deserializer.end().ok()?;
+    Some(value)
 }
 
 #[derive(Deserialize)]
@@ -2342,6 +2343,18 @@ struct RawProposalNumbers<'a> {
     brain_threshold: Option<&'a serde_json::value::RawValue>,
 }
 
+pub(crate) fn hook_decision_numbers_are_lossless(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<RawProposalNumbers<'_>>(bytes)
+        .is_ok_and(|numbers| numbers.are_lossless())
+}
+
+impl RawProposalNumbers<'_> {
+    fn are_lossless(&self) -> bool {
+        lossless_f64_token(self.brain_confidence)
+            && self.brain_threshold.is_none_or(lossless_f64_token)
+    }
+}
+
 #[derive(Deserialize)]
 struct RawTerminalNumbers<'a> {
     #[serde(borrow)]
@@ -2352,8 +2365,7 @@ struct RawTerminalNumbers<'a> {
 
 impl RawJournalNumbers<'_> {
     fn are_lossless(&self) -> bool {
-        lossless_f64_token(self.proposal.brain_confidence)
-            && self.proposal.brain_threshold.is_none_or(lossless_f64_token)
+        self.proposal.are_lossless()
             && self.terminal.as_ref().is_none_or(|terminal| {
                 terminal.confidence.is_none_or(lossless_f64_token)
                     && terminal.threshold.is_none_or(lossless_f64_token)
@@ -3162,7 +3174,7 @@ mod tests {
     use coding_brain_core::brain_activity::{
         ActivityEvent, ActivityState, MAX_ACTIVITY_FIELD_BYTES,
     };
-    use coding_brain_core::lifecycle::{LifecycleSnapshot, LifecycleStore, PermissionDisposition};
+    use coding_brain_core::lifecycle::{LifecycleSnapshot, PermissionDisposition};
     use fs2::FileExt;
 
     use super::*;
@@ -4928,47 +4940,6 @@ mod tests {
             Err(TransactionError::InvalidJournal)
         ));
         assert!(!transaction_dir(temp.path()).exists());
-    }
-
-    #[test]
-    fn decoder_rejects_duplicate_keys_at_top_level_and_nested_objects() {
-        let encoded = serde_json::to_string(&journal("tx-duplicate-key")).unwrap();
-        let duplicate_top_level = encoded.replacen('{', "{\"schema_version\":1,", 1);
-        let duplicate_nested = encoded.replacen(
-            "\"proposal\":{",
-            "\"proposal\":{\"decision_type\":\"session\",",
-            1,
-        );
-
-        assert!(decode_exact_journal(duplicate_top_level.as_bytes()).is_none());
-        assert!(decode_exact_journal(duplicate_nested.as_bytes()).is_none());
-    }
-
-    #[test]
-    fn decoder_rejects_lossy_numbers_in_every_float_field() {
-        let encoded = serde_json::to_string(&journal("tx-lossy-number")).unwrap();
-        let fields = [
-            ("proposal.brain_confidence", "brain_confidence", "0.9"),
-            ("proposal.brain_threshold", "brain_threshold", "0.8"),
-            ("terminal.confidence", "confidence", "0.9"),
-            ("terminal.threshold", "threshold", "0.8"),
-        ];
-        let lossy_tokens = ["1e-9999999999", "18446744073709551616"];
-        let mut accepted = Vec::new();
-
-        for (path, key, original) in fields {
-            let needle = format!("\"{key}\":{original}");
-            for token in lossy_tokens {
-                let replacement = format!("\"{key}\":{token}");
-                let altered = encoded.replacen(&needle, &replacement, 1);
-                assert_ne!(altered, encoded, "missing fixture field {path}");
-                if decode_exact_journal(altered.as_bytes()).is_some() {
-                    accepted.push(format!("{path}={token}"));
-                }
-            }
-        }
-
-        assert!(accepted.is_empty(), "accepted lossy numbers: {accepted:?}");
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

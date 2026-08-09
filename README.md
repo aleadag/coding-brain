@@ -55,6 +55,8 @@ Coding Brain uses XDG paths and project-local identity:
 - project config: `.coding-brain.toml`
 - project identity: `.coding-brain/project.toml`
 
+Current Brain, lifecycle, permission, activity, and learning authority lives in `db/brain.sqlite3`; operational review state is isolated in `db/review.sqlite3`. Ordinary non-hook startup migrates the supported pre-SQLite Coding Brain state automatically. Hooks never migrate and fall back promptly to provider-native handling until cutover completes. `session-links.jsonl` remains a separate bounded navigation identity log.
+
 Project config cannot select `brain.endpoint`; that choice must come from the CLI or user config. A non-loopback endpoint produces a privacy advisory, and remote plaintext HTTP produces a stronger warning because context and credentials may be exposed in transit.
 
 Useful non-TUI commands include:
@@ -87,7 +89,7 @@ To make a fork learn independently, remove `.coding-brain/project.toml` in that 
 
 ## Architecture
 
-Coding Brain is a three-crate Rust workspace:
+Coding Brain is a three-crate Rust workspace. See the [storage architecture](docs/architecture.md) for the SQLite authority boundary, migration, review isolation, operating limits, exports, and erasure behavior.
 
 ```text
 coding-brain -> coding-brain-tui -> coding-brain-core

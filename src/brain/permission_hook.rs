@@ -4,6 +4,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -13,33 +14,42 @@ use coding_brain_core::brain_activity::{
     SessionTarget, bounded_redacted_activity_text, lossless_redacted_activity_text,
 };
 use coding_brain_core::codex_transcript::{CodexResumeEvidenceError, read_codex_resume_evidence};
-#[cfg(test)]
 use coding_brain_core::lifecycle::LifecycleEvent;
+#[cfg(test)]
+use coding_brain_core::lifecycle::test_support::LifecycleStore;
 use coding_brain_core::lifecycle::{
-    ApplyOutcome, IgnoreReason, LifecycleIdentity, LifecycleStore, PermissionDisposition,
-    coding_brain_state_root,
+    ApplyOutcome, IgnoreReason, PermissionAction, PermissionAuthority, PermissionDisposition,
 };
+#[cfg(test)]
+use coding_brain_core::lifecycle::{LifecycleIdentity, coding_brain_state_root};
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::project::ProjectIdentity;
-use coding_brain_core::provider::AgentProvider;
+use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use coding_brain_core::runtime::BrainGateMode;
 
 use super::UNSUPPORTED_PERMISSION_TOOL_REASON;
+#[cfg(test)]
 use super::activity::{ActivityStore, LiveEvidenceBudget};
 use super::client::BrainSuggestion;
 use super::decisions::{self, HookDecisionAudit, HookDecisionRecord};
+#[cfg(test)]
 use super::permission_request_lock::PermissionRequestLockStore;
+#[cfg(test)]
 use super::permission_transaction::{
     PermissionTransactionJournal, PermissionTransactionStore, RecoveryLimits, RecoveryReport,
     TransactionError, commit_live, recover_pending_with_guard,
 };
 use super::query::{self, BrainDecision, BrainDecisionRequest};
 use super::safety::SafetyDeny;
+use super::storage::{
+    BrainDb, DeliveryEvidence, OpenRole, PermissionAdmission, PermissionEvidenceKind,
+    PreparedPermissionCommit, StorageDeadline, StoragePaths,
+};
 use crate::config::BrainConfig;
 use crate::lifecycle_hook::read_bounded_hook_input;
-use crate::provider_hooks::{
-    PermissionHookRequest, ProviderPermissionPolicy, ShellCommandInput, parse_permission,
-};
+#[cfg(test)]
+use crate::provider_hooks::ShellCommandInput;
+use crate::provider_hooks::{PermissionHookRequest, ProviderPermissionPolicy, parse_permission};
 
 const HOOK_INFERENCE_TIMEOUT_MS: u64 = 25_000;
 const PERMISSION_ACTIVITY_LOCK_TIMEOUT_MS: u64 = 500;
@@ -393,6 +403,7 @@ fn write_diagnostic(stderr: &mut impl Write, diagnostic: impl fmt::Display) {
     let _ = writeln!(stderr, "cbrain permission hook: {diagnostic}");
 }
 
+#[cfg(test)]
 fn try_reprove_codex_subagent(
     store: &LifecycleStore,
     identity: &LifecycleIdentity,
@@ -418,6 +429,7 @@ fn try_reprove_codex_subagent(
     }
 }
 
+#[cfg(test)]
 fn permission_transaction_paths() -> Result<(PathBuf, PathBuf), HookDiagnostic> {
     let decisions_path = decisions::decisions_path();
     let Some(state_root) = decisions_path.parent().and_then(|brain| brain.parent()) else {
@@ -428,6 +440,7 @@ fn permission_transaction_paths() -> Result<(PathBuf, PathBuf), HookDiagnostic> 
     Ok((state_root.to_owned(), decisions_path))
 }
 
+#[cfg(test)]
 fn recovery_blocks_inference(report: RecoveryReport) -> bool {
     report.active != 0
         || report.invalid != 0
@@ -436,6 +449,7 @@ fn recovery_blocks_inference(report: RecoveryReport) -> bool {
         || report.pending != 0
 }
 
+#[cfg(test)]
 fn preflight_blocks_recovery(report: RecoveryReport) -> bool {
     report.active != 0
         || report.invalid != 0
@@ -443,6 +457,7 @@ fn preflight_blocks_recovery(report: RecoveryReport) -> bool {
         || report.removal_sync_uncertain != 0
 }
 
+#[cfg(test)]
 fn recover_before_inference(
     state_root: &std::path::Path,
     guard: &super::permission_request_lock::PermissionRequestGuard,
@@ -480,6 +495,7 @@ fn recover_before_inference(
     Ok(())
 }
 
+#[cfg(test)]
 fn preflight_live_decision_evidence(
     path: &std::path::Path,
     budget: &mut LiveEvidenceBudget,
@@ -525,6 +541,7 @@ fn preflight_live_decision_evidence(
     Ok(())
 }
 
+#[cfg(test)]
 fn preflight_live_destinations(
     decisions_path: &std::path::Path,
     activity_store: Option<&ActivityStore>,
@@ -540,6 +557,7 @@ fn preflight_live_destinations(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn commit_permission_transaction(
     state_root: &std::path::Path,
     decisions_path: &std::path::Path,
@@ -578,6 +596,7 @@ fn commit_permission_transaction(
     Ok(decision_id)
 }
 
+#[cfg(test)]
 fn run_with_gate_and_store<R, W, E, F>(
     stdin: R,
     stdout: W,
@@ -606,6 +625,7 @@ fn run_with_gate_and_store<R, W, E, F>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn run_with_gate_and_stores<R, W, E, F>(
     stdin: R,
     stdout: W,
@@ -636,6 +656,7 @@ fn run_with_gate_and_stores<R, W, E, F>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn run_provider_with_gate_and_stores<R, W, E, F>(
     stdin: R,
     stdout: W,
@@ -673,6 +694,7 @@ fn run_provider_with_gate_and_stores<R, W, E, F>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn run_provider_with_gate_and_stores_and_safety<R, W, E, S, F>(
     stdin: R,
     mut stdout: W,
@@ -734,7 +756,10 @@ fn run_provider_with_gate_and_stores_and_safety<R, W, E, S, F>(
     {
         Ok(Some(guard)) => guard,
         Ok(None) => {
-            write_diagnostic(&mut stderr, "permission request is already active");
+            write_diagnostic(
+                &mut stderr,
+                "duplicate permission request is already active or decided",
+            );
             if provider == AgentProvider::Antigravity {
                 write_failsafe_ask(&mut stdout, &mut stderr);
             }
@@ -1175,6 +1200,7 @@ fn write_failsafe_ask(stdout: &mut impl Write, stderr: &mut impl Write) {
     }
 }
 
+#[cfg(test)]
 fn run_with_gate<R, W, E, F>(
     stdin: R,
     stdout: W,
@@ -1205,6 +1231,7 @@ fn run_with_gate<R, W, E, F>(
     );
 }
 
+#[cfg(test)]
 fn run_with<R, W, E, F>(stdin: R, stdout: W, mut stderr: E, config: Option<&BrainConfig>, infer: F)
 where
     R: Read,
@@ -1219,6 +1246,7 @@ where
     run_with_gate(stdin, stdout, stderr, config, resolved.mode, infer);
 }
 
+#[cfg(test)]
 fn run_provider_with<R, W, E, F>(
     stdin: R,
     stdout: W,
@@ -1263,7 +1291,7 @@ pub(crate) fn run(
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
-    run_provider_with(
+    run_provider_with_sqlite(
         stdin.lock(),
         stdout.lock(),
         stderr.lock(),
@@ -1274,12 +1302,568 @@ pub(crate) fn run(
     );
 }
 
+fn run_provider_with_sqlite<R, W, E, F>(
+    stdin: R,
+    stdout: W,
+    stderr: E,
+    config: Option<&BrainConfig>,
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+    infer: F,
+) where
+    R: Read,
+    W: Write,
+    E: Write,
+    F: FnOnce(&BrainConfig, &str) -> Result<BrainSuggestion, String>,
+{
+    run_provider_with_sqlite_timeout(
+        stdin,
+        stdout,
+        stderr,
+        config,
+        provider,
+        antigravity_event,
+        Duration::from_millis(HOOK_INFERENCE_TIMEOUT_MS + PERMISSION_ACTIVITY_LOCK_TIMEOUT_MS),
+        infer,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_provider_with_sqlite_timeout<R, W, E, F>(
+    stdin: R,
+    mut stdout: W,
+    mut stderr: E,
+    config: Option<&BrainConfig>,
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+    storage_timeout: Duration,
+    infer: F,
+) where
+    R: Read,
+    W: Write,
+    E: Write,
+    F: FnOnce(&BrainConfig, &str) -> Result<BrainSuggestion, String>,
+{
+    let input = match read_bounded_hook_input(stdin) {
+        Ok(input) => input,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+    };
+    let request = match parse_permission(provider, antigravity_event, &input) {
+        Ok(request) => request,
+        Err(error) => {
+            write_diagnostic(&mut stderr, format!("invalid permission payload: {error}"));
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+    };
+    #[cfg(all(test, feature = "fault-injection"))]
+    let safety = if std::env::var_os("CODING_BRAIN_HOOK_LIVE_FAULT_IN_PROCESS_SAFETY").is_some() {
+        super::safety::evaluate_in_process(request.command.as_ref())
+    } else {
+        super::safety::evaluate_isolated(request.command.as_ref())
+    };
+    #[cfg(not(all(test, feature = "fault-injection")))]
+    let safety = super::safety::evaluate_isolated(request.command.as_ref());
+    let deterministic_deny = match &safety {
+        super::safety::SafetyEvaluation::Deny(deny) => Some(Some(deny)),
+        _ if request.provider_policy == ProviderPermissionPolicy::Denies => Some(None),
+        _ => None,
+    };
+    let safety_rule_id = match &safety {
+        super::safety::SafetyEvaluation::Deny(deny) => Some(deny.rule_id),
+        _ => None,
+    };
+    let paths = match current_paths() {
+        Ok(paths) => paths,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            if let Some(safety) = deterministic_deny {
+                emit_deterministic_deny(provider, safety, &mut stdout, &mut stderr);
+            } else if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+    };
+    let activity = match HookActivity::from_request(&request, &paths) {
+        Ok(activity) => activity,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            if let Some(safety) = deterministic_deny {
+                emit_deterministic_deny(provider, safety, &mut stdout, &mut stderr);
+            } else if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+    };
+    let storage_paths = StoragePaths::at(paths.state_root());
+    let deadline = StorageDeadline::after(storage_timeout);
+    let mut database = match BrainDb::open_current(&storage_paths, OpenRole::Hook, deadline) {
+        Ok(database) => database,
+        Err(error) => {
+            write_diagnostic(&mut stderr, format!("SQLite storage unavailable: {error}"));
+            if let Some(safety) = deterministic_deny {
+                emit_deterministic_deny(provider, safety, &mut stdout, &mut stderr);
+            } else if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+    };
+    let now = epoch_ms();
+    let admission = PermissionAdmission::new(
+        request.lifecycle.clone(),
+        request.request_key.clone(),
+        activity.project.project_id.clone(),
+        request.tool_name.clone(),
+        request.tool_use_id.clone(),
+        activity.activity_id.clone(),
+        now,
+        now,
+    );
+    #[cfg(all(test, feature = "fault-injection"))]
+    let admission_result =
+        if std::env::var_os("CODING_BRAIN_HOOK_UNARMED_ADMISSION_FAULT").is_some() {
+            Err(crate::brain::storage::StorageError::StorageFault {
+                operation: crate::brain::storage::StorageOperation::Admission,
+                category: crate::brain::storage::StorageFaultCategory::Full,
+            })
+        } else {
+            database.admit_permission(admission)
+        };
+    #[cfg(not(all(test, feature = "fault-injection")))]
+    let admission_result = database.admit_permission(admission);
+    let guard = match admission_result {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            write_diagnostic(
+                &mut stderr,
+                "permission transaction admission blocked: duplicate or already active permission request",
+            );
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+        Err(error) => {
+            write_diagnostic(&mut stderr, format!("permission admission failed: {error}"));
+            if let Some(safety) = deterministic_deny {
+                emit_deterministic_deny(provider, safety, &mut stdout, &mut stderr);
+            } else {
+                #[cfg(feature = "fault-injection")]
+                if provider == AgentProvider::Antigravity
+                    && crate::brain::storage::FaultPoint::AdmissionWrite.was_consumed()
+                {
+                    write_failsafe_ask(&mut stdout, &mut stderr);
+                }
+            }
+            return;
+        }
+    };
+
+    let lifecycle_probe = LifecycleEvent::permission_with_request_key(
+        request.lifecycle.clone(),
+        PermissionDisposition::NeedsInput,
+        request.request_key.clone(),
+    )
+    .expect("validated permission request has an exact lifecycle identity");
+    let mut lifecycle = match database.read_lifecycle() {
+        Ok(lifecycle) => lifecycle,
+        Err(error) => {
+            let mut terminal = activity.event(ActivityState::Error);
+            terminal.reasoning = Some("lifecycle admission unavailable".into());
+            let _ = database.finish_permission_without_authority(guard, terminal);
+            write_diagnostic(&mut stderr, format!("lifecycle admission failed: {error}"));
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+    };
+    let session_key =
+        AgentSessionKey::native(request.lifecycle.provider(), request.lifecycle.session_id())
+            .storage_key();
+    let mut lifecycle_outcome = if !lifecycle.sessions.contains_key(&session_key)
+        && lifecycle.sessions.len() >= coding_brain_core::lifecycle::MAX_SESSIONS
+    {
+        ApplyOutcome::Ignored(IgnoreReason::ActiveSubagentCapacity)
+    } else {
+        lifecycle.record_at(lifecycle_probe.clone(), now).outcome
+    };
+    let mut reproof_error = None;
+    if matches!(
+        lifecycle_outcome,
+        ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent | IgnoreReason::SubagentTurnMismatch)
+    ) && request.lifecycle.provider() == AgentProvider::Codex
+        && request.lifecycle.provider_session_id().is_some()
+    {
+        reproof_error = match request.lifecycle.transcript_path() {
+            Some(path) => match read_codex_resume_evidence(path) {
+                Ok(evidence) => {
+                    match database.reprove_codex_subagent(&request.lifecycle, &evidence, now) {
+                        Ok(
+                            ApplyOutcome::Applied | ApplyOutcome::Ignored(IgnoreReason::Duplicate),
+                        ) => None,
+                        Ok(ApplyOutcome::Ignored(_)) | Err(_) => {
+                            Some(CodexResumeEvidenceError::InvalidRecord)
+                        }
+                    }
+                }
+                Err(error) => Some(error),
+            },
+            None => Some(CodexResumeEvidenceError::MetadataMissing),
+        };
+        if reproof_error.is_none() {
+            lifecycle_outcome = database
+                .read_lifecycle()
+                .map(|mut lifecycle| lifecycle.record_at(lifecycle_probe, now).outcome)
+                .unwrap_or(ApplyOutcome::Ignored(IgnoreReason::UnprovenSubagent));
+        }
+    }
+    let lifecycle_error = match lifecycle_outcome {
+        ApplyOutcome::Applied => None,
+        ApplyOutcome::Ignored(reason) => Some(match reproof_error {
+            Some(error) => format!("UnprovenSubagent; Codex resume evidence: {error}"),
+            None => format!("{reason:?}"),
+        }),
+    };
+
+    let resolved = super::resolve_gate_mode(config);
+    if let Some(warning) = resolved.warning {
+        write_diagnostic(&mut stderr, warning);
+    }
+    let brain_request = BrainDecisionRequest {
+        project: request.project.clone(),
+        tool_name: request.tool_name.clone(),
+        tool_input: request
+            .command
+            .as_ref()
+            .map(|command| command.source.clone())
+            .unwrap_or_default(),
+        diff_digest: None,
+    };
+    let evaluation = match safety {
+        super::safety::SafetyEvaluation::Deny(safety) => HookEvaluation::Deny {
+            brain: None,
+            deterministic: true,
+            safety: Some(safety),
+            terminal_state: ActivityState::Denied,
+        },
+        _ if request.provider_policy == ProviderPermissionPolicy::Denies => HookEvaluation::Deny {
+            brain: None,
+            deterministic: true,
+            safety: None,
+            terminal_state: ActivityState::Denied,
+        },
+        super::safety::SafetyEvaluation::Indeterminate(error) => {
+            abstain_without_brain(error.reason())
+        }
+        super::safety::SafetyEvaluation::NoDeterministicDecision => {
+            if resolved.mode != BrainGateMode::Off
+                && request.command.is_some()
+                && let Err(error) = database.admit_model_attempt()
+            {
+                let mut terminal = activity.event(ActivityState::Error);
+                terminal.reasoning = Some("SQLite model admission unavailable".into());
+                if let Err(finish_error) =
+                    database.finish_permission_without_authority(guard, terminal)
+                {
+                    write_diagnostic(&mut stderr, finish_error);
+                }
+                write_diagnostic(&mut stderr, format!("model admission failed: {error}"));
+                if provider == AgentProvider::Antigravity {
+                    write_failsafe_ask(&mut stdout, &mut stderr);
+                }
+                return;
+            }
+            evaluate_request(
+                &brain_request,
+                config,
+                resolved.mode,
+                None,
+                request.command.is_some(),
+                infer,
+            )
+        }
+    };
+    let (
+        behavior,
+        deterministic,
+        response_message,
+        reason,
+        confidence,
+        threshold,
+        source,
+        terminal_state,
+    ) = match evaluation {
+        HookEvaluation::Allow {
+            brain,
+            terminal_state,
+        } => (
+            Some(PermissionBehavior::Allow),
+            false,
+            None,
+            brain.reasoning,
+            brain.confidence,
+            brain.threshold,
+            brain.source,
+            terminal_state,
+        ),
+        HookEvaluation::Deny {
+            brain: Some(brain),
+            deterministic: false,
+            safety: None,
+            terminal_state,
+        } => (
+            Some(PermissionBehavior::Deny),
+            false,
+            brain.message,
+            brain.reasoning,
+            brain.confidence,
+            brain.threshold,
+            brain.source,
+            terminal_state,
+        ),
+        HookEvaluation::Deny {
+            deterministic: true,
+            safety,
+            terminal_state,
+            ..
+        } => (
+            Some(PermissionBehavior::Deny),
+            true,
+            safety.as_ref().as_ref().map(|deny| deny.reason.clone()),
+            safety
+                .as_ref()
+                .map(|deny| deny.reason.clone())
+                .unwrap_or_else(|| "provider permission policy denied request".into()),
+            1.0,
+            None,
+            if safety.is_some() {
+                "deterministic"
+            } else {
+                "provider_policy"
+            },
+            terminal_state,
+        ),
+        HookEvaluation::Abstain {
+            brain: _inference,
+            reason,
+            terminal_state,
+        } => {
+            #[cfg(feature = "fault-injection")]
+            if _inference
+                .as_ref()
+                .is_some_and(|brain| brain.source == "error")
+                && let Err(error) = super::storage::hit_fault(
+                    super::storage::FaultPoint::InferenceExit,
+                    super::storage::FaultPosition::After,
+                )
+            {
+                write_diagnostic(&mut stderr, error);
+            }
+            let mut terminal = activity.event(terminal_state);
+            terminal.reasoning = Some(reason.clone());
+            if let Err(error) = database.finish_permission_without_authority(guard, terminal) {
+                write_diagnostic(&mut stderr, error);
+            }
+            if provider == AgentProvider::Antigravity {
+                write_failsafe_ask(&mut stdout, &mut stderr);
+            }
+            return;
+        }
+        _ => unreachable!("unsupported permission evaluation"),
+    };
+    if request.provider_policy == ProviderPermissionPolicy::RequiresAsk
+        && behavior == Some(PermissionBehavior::Allow)
+    {
+        let mut terminal = activity.event(ActivityState::Abstained);
+        terminal.reasoning = Some("provider permission policy requires confirmation".into());
+        let _ = database.finish_permission_without_authority(guard, terminal);
+        if provider == AgentProvider::Antigravity {
+            write_failsafe_ask(&mut stdout, &mut stderr);
+        }
+        return;
+    }
+    let behavior = behavior.expect("authority evaluations have behavior");
+    if behavior == PermissionBehavior::Allow
+        && let Some(reason) = lifecycle_error.as_deref()
+    {
+        let mut terminal = activity.event(ActivityState::Error);
+        terminal.reasoning = Some(format!("lifecycle admission ignored: {reason}"));
+        if let Err(error) = database.finish_permission_without_authority(guard, terminal) {
+            write_diagnostic(&mut stderr, error);
+        }
+        write_diagnostic(
+            &mut stderr,
+            format!("permission transaction lifecycle admission ignored: {reason}"),
+        );
+        if provider == AgentProvider::Antigravity {
+            write_failsafe_ask(&mut stdout, &mut stderr);
+        }
+        return;
+    }
+    if let Some(reason) = lifecycle_error.as_deref() {
+        write_diagnostic(
+            &mut stderr,
+            format!("permission transaction lifecycle admission ignored: {reason}"),
+        );
+    }
+    let serialized = match serialize_response(response_for_behavior(
+        provider,
+        behavior,
+        response_message.as_deref(),
+    )) {
+        Ok(serialized) => serialized,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            return;
+        }
+    };
+    let decision_id = decisions::gen_decision_id();
+    let bounded_reasoning = bounded_redacted_activity_text(&reason);
+    let audit = HookDecisionAudit {
+        provider: request.lifecycle.provider(),
+        project: &request.project,
+        tool: &request.tool_name,
+        command: activity.command.as_deref().unwrap_or_default(),
+        brain_action: if behavior == PermissionBehavior::Allow {
+            "approve"
+        } else {
+            "deny"
+        },
+        brain_confidence: confidence,
+        brain_reasoning: &bounded_reasoning,
+        brain_source: source,
+        brain_threshold: threshold,
+        session_id: request.lifecycle.session_id(),
+        turn_id: request.lifecycle.turn_id().unwrap_or_default(),
+    };
+    let proposal = HookDecisionRecord::from_audit(&audit, decision_id.clone(), audit.brain_action);
+    let mut terminal = activity.event(terminal_state);
+    terminal.decision_id = Some(decision_id.clone());
+    terminal.confidence = Some(confidence);
+    terminal.threshold = threshold;
+    terminal.reasoning = Some(bounded_reasoning);
+    terminal.rule_id = safety_rule_id.map(str::to_owned);
+    let authority = PermissionAuthority {
+        transaction_id: format!("sqlite-transaction-{decision_id}"),
+        action: if behavior == PermissionBehavior::Allow {
+            PermissionAction::Allow
+        } else {
+            PermissionAction::Deny
+        },
+    };
+    let prepared = match PreparedPermissionCommit::new(
+        guard,
+        proposal,
+        terminal,
+        authority,
+        if deterministic {
+            PermissionEvidenceKind::DeterministicSafety
+        } else {
+            PermissionEvidenceKind::ProviderAuthority
+        },
+        !deterministic,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            if deterministic {
+                emit_deterministic_deny(provider, None, &mut stdout, &mut stderr);
+            }
+            return;
+        }
+    };
+    let committed = match database.commit_permission(prepared) {
+        Ok(committed) => committed,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            if deterministic {
+                emit_deterministic_deny(provider, None, &mut stdout, &mut stderr);
+            }
+            return;
+        }
+    };
+    if !deterministic && !committed.response_eligible() {
+        write_diagnostic(&mut stderr, "committed permission is not response eligible");
+        return;
+    }
+    let delivery = match write_response(&mut stdout, &serialized) {
+        Ok(()) => DeliveryEvidence::Delivered,
+        Err(error) => {
+            #[cfg(feature = "fault-injection")]
+            if let Err(marker_error) = super::storage::hit_fault(
+                super::storage::FaultPoint::StdoutWrite,
+                super::storage::FaultPosition::After,
+            ) {
+                write_diagnostic(&mut stderr, marker_error);
+            }
+            write_diagnostic(&mut stderr, format!("could not write response: {error}"));
+            DeliveryEvidence::Failed
+        }
+    };
+    if !deterministic {
+        if let Err(error) = database.record_delivery(&committed, delivery) {
+            write_diagnostic(&mut stderr, error);
+        }
+    } else {
+        let mut event = activity.event(match delivery {
+            DeliveryEvidence::Delivered => ActivityState::Delivered,
+            DeliveryEvidence::Failed => ActivityState::DeliveryFailed,
+        });
+        event.decision_id = Some(decision_id);
+        if let Err(error) = database.append_activity(event) {
+            write_diagnostic(&mut stderr, error);
+        }
+    }
+}
+
+fn emit_deterministic_deny(
+    provider: AgentProvider,
+    safety: Option<&super::safety::SafetyDeny>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) {
+    let response = response_for_behavior(
+        provider,
+        PermissionBehavior::Deny,
+        safety.map(|deny| deny.reason.as_str()),
+    );
+    match serialize_response(response) {
+        Ok(serialized) => {
+            if let Err(error) = write_response(stdout, &serialized) {
+                write_diagnostic(stderr, error);
+            }
+        }
+        Err(error) => write_diagnostic(stderr, error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::ffi::OsString;
+    #[cfg(feature = "fault-injection")]
+    use std::fs::File;
     use std::fs::OpenOptions;
     use std::io::Cursor;
+    #[cfg(feature = "fault-injection")]
+    use std::io::Read as _;
+    #[cfg(feature = "fault-injection")]
+    use std::os::fd::{AsRawFd, FromRawFd};
+    #[cfg(feature = "fault-injection")]
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::panic::AssertUnwindSafe;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -1297,10 +1881,95 @@ mod tests {
         ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState,
         MAX_ACTIVITY_FIELD_BYTES, ProjectEvidence, bounded_redacted_activity_text,
     };
-    use coding_brain_core::lifecycle::{LifecycleEventKind, LifecycleStore, ProjectedStatus};
+    use coding_brain_core::lifecycle::{LifecycleEventKind, ProjectedStatus};
     use fs2::FileExt;
 
     struct FailingWriter;
+
+    #[cfg(feature = "fault-injection")]
+    struct LiveFaultFixture {
+        capability: PathBuf,
+        nonce: String,
+        point: crate::brain::storage::FaultPoint,
+        read: File,
+        write: Option<File>,
+    }
+
+    #[cfg(feature = "fault-injection")]
+    impl LiveFaultFixture {
+        fn new(root: &Path, point: crate::brain::storage::FaultPoint) -> Self {
+            let capability_dir = root.join("fault-capability");
+            std::fs::create_dir(&capability_dir).unwrap();
+            std::fs::set_permissions(&capability_dir, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let mut descriptors = [0; 2];
+            assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+            let read = unsafe { File::from_raw_fd(descriptors[0]) };
+            let write = unsafe { File::from_raw_fd(descriptors[1]) };
+            let metadata = write.metadata().unwrap();
+            let capability = capability_dir.join("fault.json");
+            let nonce = "permission-hook-live-fault".to_owned();
+            let record = serde_json::json!({
+                "version": 1,
+                "state_root": root.join(".local/state/coding-brain"),
+                "nonce": nonce,
+                "selection": { "kind": "matrix", "selection": point },
+                "control_device": metadata.dev(),
+                "control_inode": metadata.ino(),
+            });
+            std::fs::write(&capability, serde_json::to_vec(&record).unwrap()).unwrap();
+            std::fs::set_permissions(&capability, std::fs::Permissions::from_mode(0o600)).unwrap();
+            Self {
+                capability,
+                nonce,
+                point,
+                read,
+                write: Some(write),
+            }
+        }
+
+        fn run(
+            mut self,
+            root: &Path,
+            mode: &str,
+            provider: AgentProvider,
+        ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            let write = self.write.take().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "brain::permission_hook::tests::live_fault_hook_process_helper",
+                    "--nocapture",
+                ])
+                .env("CODING_BRAIN_HOOK_LIVE_FAULT_HOME", root)
+                .env("CODING_BRAIN_HOOK_LIVE_FAULT_IN_PROCESS_SAFETY", "1")
+                .env("CODING_BRAIN_HOOK_LIVE_FAULT_MODE", mode)
+                .env("CODING_BRAIN_HOOK_LIVE_FAULT_PROVIDER", provider.as_str())
+                .env("CODING_BRAIN_HOOK_LIVE_FAULT_CAPABILITY", &self.capability)
+                .env("CODING_BRAIN_HOOK_LIVE_FAULT_NONCE", &self.nonce)
+                .env(
+                    "CODING_BRAIN_HOOK_LIVE_FAULT_POINT",
+                    serde_json::to_string(&self.point).unwrap(),
+                )
+                .env(
+                    "CODING_BRAIN_HOOK_LIVE_FAULT_FD",
+                    write.as_raw_fd().to_string(),
+                )
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            drop(write);
+            assert!(status.success(), "{status:?}");
+            let mut marker = Vec::new();
+            self.read.read_to_end(&mut marker).unwrap();
+            let stdout = std::fs::read(root.join("live-fault-stdout")).unwrap_or_default();
+            let stderr = std::fs::read(root.join("live-fault-stderr")).unwrap_or_default();
+            (marker, stdout, stderr)
+        }
+    }
 
     impl Write for FailingWriter {
         fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
@@ -1522,6 +2191,420 @@ mod tests {
             timeout_ms: 60_000,
             ..BrainConfig::default()
         }
+    }
+
+    fn initialize_sqlite_hook_storage(home: &Path) -> PathBuf {
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for directory in [home.join(".local"), home.join(".local/state")] {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let state_root = home.join(".local/state/coding-brain");
+        crate::brain::storage::MigrationCoordinator::at(&state_root)
+            .run_non_hook()
+            .unwrap();
+        state_root
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    #[ignore]
+    fn live_fault_hook_process_helper() {
+        let Some(home) = std::env::var_os("CODING_BRAIN_HOOK_LIVE_FAULT_HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        let _environment = set_test_path_environment(&home);
+        let mode = std::env::var("CODING_BRAIN_HOOK_LIVE_FAULT_MODE").unwrap();
+        if mode != "admission-unarmed" {
+            let point =
+                serde_json::from_str(&std::env::var("CODING_BRAIN_HOOK_LIVE_FAULT_POINT").unwrap())
+                    .unwrap();
+            crate::brain::storage::activate_fault(crate::brain::storage::FaultActivation {
+                capability: std::env::var_os("CODING_BRAIN_HOOK_LIVE_FAULT_CAPABILITY")
+                    .unwrap()
+                    .into(),
+                state_root: home.join(".local/state/coding-brain"),
+                nonce: std::env::var("CODING_BRAIN_HOOK_LIVE_FAULT_NONCE").unwrap(),
+                selection: crate::brain::storage::FaultSelection::Matrix(point),
+                control_fd: std::env::var("CODING_BRAIN_HOOK_LIVE_FAULT_FD")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            })
+            .unwrap();
+        }
+        let provider = match std::env::var("CODING_BRAIN_HOOK_LIVE_FAULT_PROVIDER")
+            .unwrap()
+            .as_str()
+        {
+            "codex" => AgentProvider::Codex,
+            "claude" => AgentProvider::Claude,
+            "antigravity" => AgentProvider::Antigravity,
+            _ => panic!("unsupported fixture provider"),
+        };
+        let antigravity_event = (provider == AgentProvider::Antigravity).then_some("PreToolUse");
+        let input = permission_payload_for_provider_command(provider, "sh -c 'printf %s ok'");
+        let parsed = parse_permission(provider, antigravity_event, &input).unwrap();
+        if mode == "admission-unarmed" {
+            unsafe { std::env::set_var("CODING_BRAIN_HOOK_UNARMED_ADMISSION_FAULT", "1") };
+        }
+        if mode == "stdout" {
+            std::fs::write(
+                home.join(".local/state/coding-brain/brain/gate-mode"),
+                b"auto\n",
+            )
+            .unwrap();
+            let paths = StoragePaths::at(&home.join(".local/state/coding-brain"));
+            let mut database = BrainDb::open_current(
+                &paths,
+                OpenRole::NonHook,
+                StorageDeadline::after(Duration::from_secs(2)),
+            )
+            .unwrap();
+            let recorded = database
+                .record_lifecycle(
+                    LifecycleEvent::from_parts(
+                        parsed.lifecycle.clone(),
+                        LifecycleEventKind::UserPromptSubmit,
+                    )
+                    .unwrap(),
+                    1,
+                )
+                .unwrap();
+            assert_eq!(recorded.outcome, ApplyOutcome::Applied);
+        }
+        let mut stderr = Vec::new();
+        match mode.as_str() {
+            "admission" | "admission-unarmed" => {
+                let mut stdout = Vec::new();
+                run_provider_with_sqlite_timeout(
+                    Cursor::new(input),
+                    &mut stdout,
+                    &mut stderr,
+                    Some(&enabled_config()),
+                    provider,
+                    antigravity_event,
+                    Duration::from_secs(5),
+                    |_, _| panic!("admission fault must precede inference"),
+                );
+                std::fs::write(home.join("live-fault-stdout"), stdout).unwrap();
+            }
+            "inference" => {
+                let mut stdout = Vec::new();
+                run_provider_with_sqlite_timeout(
+                    Cursor::new(input),
+                    &mut stdout,
+                    &mut stderr,
+                    Some(&enabled_config()),
+                    provider,
+                    antigravity_event,
+                    Duration::from_secs(5),
+                    |_, _| {
+                        std::fs::write(home.join("live-fault-infer-called"), b"called").unwrap();
+                        Err("inference fixture exited nonzero".into())
+                    },
+                );
+                std::fs::write(home.join("live-fault-stdout"), stdout).unwrap();
+            }
+            "stdout" => {
+                run_provider_with_sqlite_timeout(
+                    Cursor::new(input),
+                    FailingWriter,
+                    &mut stderr,
+                    Some(&enabled_config()),
+                    provider,
+                    antigravity_event,
+                    Duration::from_secs(5),
+                    |_, _| {
+                        std::fs::write(home.join("live-fault-infer-called"), b"called").unwrap();
+                        Ok(suggestion(RuleAction::Approve, 0.99))
+                    },
+                );
+            }
+            _ => panic!("unsupported hook live-fault mode"),
+        }
+        std::fs::write(home.join("live-fault-stderr"), stderr).unwrap();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn live_admission_write_preserves_native_provider_fallbacks() {
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let state_root = initialize_sqlite_hook_storage(home.path());
+            let fixture = LiveFaultFixture::new(
+                home.path(),
+                crate::brain::storage::FaultPoint::AdmissionWrite,
+            );
+            let (marker, stdout, stderr) = fixture.run(home.path(), "admission", provider);
+            assert_eq!(
+                marker,
+                b"CBRAIN-FAULT-V1\0admission-write\0before\0-\n",
+                "{provider:?}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(
+                    stdout,
+                    br#"{"decision":"ask","reason":"Coding Brain abstained"}"#
+                );
+            } else {
+                assert!(stdout.is_empty(), "{provider:?}");
+            }
+            let connection =
+                rusqlite::Connection::open(state_root.join("db/brain.sqlite3")).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM permission_attempts", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{provider:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn unarmed_admission_fault_preserves_default_antigravity_output() {
+        let home = tempfile::tempdir().unwrap();
+        initialize_sqlite_hook_storage(home.path());
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "brain::permission_hook::tests::live_fault_hook_process_helper",
+                "--nocapture",
+            ])
+            .env("CODING_BRAIN_HOOK_LIVE_FAULT_HOME", home.path())
+            .env("CODING_BRAIN_HOOK_LIVE_FAULT_IN_PROCESS_SAFETY", "1")
+            .env("CODING_BRAIN_HOOK_LIVE_FAULT_MODE", "admission-unarmed")
+            .env("CODING_BRAIN_HOOK_LIVE_FAULT_PROVIDER", "antigravity")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status:?}");
+        assert_eq!(
+            std::fs::read(home.path().join("live-fault-stdout")).unwrap(),
+            b""
+        );
+        let stderr = std::fs::read(home.path().join("live-fault-stderr")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("permission admission failed"),
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn live_inference_exit_marks_error_and_preserves_native_provider_fallbacks() {
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let state_root = initialize_sqlite_hook_storage(home.path());
+            let fixture = LiveFaultFixture::new(
+                home.path(),
+                crate::brain::storage::FaultPoint::InferenceExit,
+            );
+            let (marker, stdout, stderr) = fixture.run(home.path(), "inference", provider);
+            assert!(
+                home.path().join("live-fault-infer-called").exists(),
+                "inference fixture was not called for {provider:?}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            assert_eq!(
+                marker,
+                b"CBRAIN-FAULT-V1\0inference-exit\0after\0-\n",
+                "{provider:?}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            if provider == AgentProvider::Antigravity {
+                assert_eq!(
+                    stdout,
+                    br#"{"decision":"ask","reason":"Coding Brain abstained"}"#
+                );
+            } else {
+                assert!(stdout.is_empty(), "{provider:?}");
+            }
+            let connection =
+                rusqlite::Connection::open(state_root.join("db/brain.sqlite3")).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM activity_events WHERE event_state = 'error'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "{provider:?}"
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM permission_commits", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{provider:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn live_stdout_write_marks_broken_pipe_before_delivery_failed_record() {
+        let home = tempfile::tempdir().unwrap();
+        let state_root = initialize_sqlite_hook_storage(home.path());
+        let fixture =
+            LiveFaultFixture::new(home.path(), crate::brain::storage::FaultPoint::StdoutWrite);
+        let (marker, stdout, stderr) = fixture.run(home.path(), "stdout", AgentProvider::Codex);
+        assert!(
+            home.path().join("live-fault-infer-called").exists(),
+            "inference fixture was not called: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(
+            marker,
+            b"CBRAIN-FAULT-V1\0stdout-write\0after\0-\n",
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(stdout.is_empty());
+        let connection = rusqlite::Connection::open(state_root.join("db/brain.sqlite3")).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM activity_events WHERE event_state = 'delivery_failed'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM permission_commits WHERE delivery_state = 'failed'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn sqlite_hook_deadline_expiry_after_slow_inference_emits_no_model_response() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _environment = set_test_path_environment(home.path());
+        initialize_sqlite_hook_storage(home.path());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_provider_with_sqlite_timeout(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            AgentProvider::Codex,
+            None,
+            Duration::from_millis(50),
+            |_, _| {
+                std::thread::sleep(Duration::from_millis(75));
+                Ok(suggestion(RuleAction::Approve, 0.99))
+            },
+        );
+
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr).is_ok());
+    }
+
+    #[test]
+    fn unavailable_sqlite_preserves_antigravity_native_ask_without_legacy_mutation() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _environment = set_test_path_environment(home.path());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_provider_with_sqlite_timeout(
+            Cursor::new(permission_payload_for_provider(
+                AgentProvider::Antigravity,
+                false,
+            )),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            AgentProvider::Antigravity,
+            Some("BeforeTool"),
+            Duration::from_millis(50),
+            |_, _| panic!("unavailable storage must not infer"),
+        );
+
+        let response: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(response["decision"], "ask");
+        let state_root = home.path().join(".local/state/coding-brain");
+        assert!(!state_root.join("activity.jsonl").exists());
+        assert!(!state_root.join("brain/decisions.jsonl").exists());
+        assert!(!state_root.join("brain/permission-transactions").exists());
+    }
+
+    #[test]
+    fn hard_wal_limit_blocks_inference_and_model_stdout() {
+        let _guard = crate::config::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _environment = set_test_path_environment(home.path());
+        let state_root = initialize_sqlite_hook_storage(home.path());
+        let wal = state_root.join("db/brain.sqlite3-wal");
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(crate::brain::storage::WAL_HARD_LIMIT_BYTES + 1)
+            .unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let inferred = Arc::new(AtomicUsize::new(0));
+        let inferred_by_hook = Arc::clone(&inferred);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        run_provider_with_sqlite_timeout(
+            Cursor::new(payload()),
+            &mut stdout,
+            &mut stderr,
+            Some(&enabled_config()),
+            AgentProvider::Codex,
+            None,
+            Duration::from_secs(1),
+            move |_, _| {
+                inferred_by_hook.fetch_add(1, Ordering::SeqCst);
+                Ok(suggestion(RuleAction::Approve, 0.99))
+            },
+        );
+
+        assert_eq!(inferred.load(Ordering::SeqCst), 0);
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr).is_ok());
     }
 
     fn run_test_with_gate<R, W, E, F>(

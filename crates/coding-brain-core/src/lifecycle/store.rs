@@ -1,41 +1,53 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use std::fs::{self, File, OpenOptions};
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+#[cfg(any(test, feature = "legacy-store-test-support"))]
+use std::path::Component;
+use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use std::thread;
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use fs2::FileExt;
 use serde::Deserialize;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use crate::codex_transcript::CodexResumeEvidence;
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use crate::durable_file::durable_replace;
 use crate::provider::{AgentProvider, AgentSessionKey};
 
 use super::{
-    ANTIGRAVITY_CHILD_BITS, ActiveSubagentState, ApplyOutcome, IgnoreReason,
-    LIFECYCLE_SCHEMA_VERSION, LifecycleEvent, LifecycleIdentity, LifecycleSnapshot,
-    MAX_ACTIVE_SUBAGENTS, MAX_ANTIGRAVITY_INVOCATION_STEPS, MAX_PERMISSION_REQUESTS_PER_TURN,
-    MAX_RECENT_TURNS, PERMISSION_BITS, PermissionDecision, PermissionDisposition,
+    ANTIGRAVITY_CHILD_BITS, LIFECYCLE_SCHEMA_VERSION, LifecycleSnapshot, MAX_ACTIVE_SUBAGENTS,
+    MAX_ANTIGRAVITY_INVOCATION_STEPS, MAX_PERMISSION_REQUESTS_PER_TURN, MAX_RECENT_TURNS,
+    PERMISSION_BITS, PermissionDisposition,
+};
+#[cfg(any(test, feature = "legacy-store-test-support"))]
+use super::{
+    ActiveSubagentState, ApplyOutcome, IgnoreReason, LifecycleEvent, LifecycleIdentity,
+    PermissionDecision, RecordedLifecycleEvent,
 };
 
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 pub const MAX_SESSIONS: usize = 128;
 pub const SESSION_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 const LOCK_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 const LOCK_RETRY: Duration = Duration::from_millis(5);
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 const MAX_CORRUPT_FILES: usize = 3;
 
 #[derive(Clone, Debug)]
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 pub struct LifecycleStore {
     root: PathBuf,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RecordedLifecycleEvent {
-    pub outcome: ApplyOutcome,
-    pub sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +62,7 @@ pub enum EnsurePermissionDecision {
     Present,
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 impl LifecycleStore {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -403,20 +416,9 @@ impl LifecycleStore {
         let lock = self.open_lock()?;
         let _guard = lock_with_timeout(&lock, LockKind::Exclusive)?;
         let mut snapshot = self.load_for_locked_update(received_at_ms)?;
-        let session_key =
-            AgentSessionKey::native(event.identity().provider(), event.identity().session_id())
-                .storage_key();
-        let outcome = snapshot.apply(event, received_at_ms);
-        let sequence = match outcome {
-            ApplyOutcome::Applied => snapshot
-                .sessions
-                .get(&session_key)
-                .map(|state| state.latest_sequence)
-                .ok_or(StoreError::Serialization)?,
-            ApplyOutcome::Ignored(_) => 0,
-        };
+        let recorded = snapshot.record_at(event, received_at_ms);
         self.persist_locked_snapshot(&snapshot)?;
-        Ok(RecordedLifecycleEvent { outcome, sequence })
+        Ok(recorded)
     }
 
     fn load_for_locked_update(&self, received_at_ms: u64) -> Result<LifecycleSnapshot, StoreError> {
@@ -586,6 +588,114 @@ impl LifecycleStore {
     }
 }
 
+/// Parse one complete frozen legacy lifecycle snapshot without opening locks or
+/// mutating its source directory.
+pub fn decode_legacy_snapshot(bytes: &[u8]) -> Result<LifecycleSnapshot, StoreError> {
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(StoreError::SnapshotTooLarge);
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    UniqueJson::deserialize(&mut deserializer).map_err(|_| StoreError::InvalidSnapshot)?;
+    deserializer
+        .end()
+        .map_err(|_| StoreError::InvalidSnapshot)?;
+    let header: SchemaHeader =
+        serde_json::from_slice(bytes).map_err(|_| StoreError::InvalidSnapshot)?;
+    if header.schema_version > LIFECYCLE_SCHEMA_VERSION {
+        return Err(StoreError::NewerSchema(header.schema_version));
+    }
+    if !matches!(header.schema_version, 1 | 2 | 3 | LIFECYCLE_SCHEMA_VERSION) {
+        return Err(StoreError::InvalidSnapshot);
+    }
+    let mut snapshot: LifecycleSnapshot =
+        serde_json::from_slice(bytes).map_err(|_| StoreError::InvalidSnapshot)?;
+    if header.schema_version == 1 {
+        snapshot = project_schema_one(snapshot);
+    }
+    if header.schema_version <= 2 {
+        snapshot = project_schema_two(snapshot);
+    }
+    if header.schema_version <= 3 {
+        snapshot = project_schema_three(snapshot);
+    }
+    if !valid_snapshot_shape(&snapshot) {
+        return Err(StoreError::InvalidSnapshot);
+    }
+    Ok(snapshot)
+}
+
+struct UniqueJson;
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = UniqueJson;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJson)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<UniqueJson>()?.is_some() {}
+        Ok(UniqueJson)
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+            object.next_value::<UniqueJson>()?;
+        }
+        Ok(UniqueJson)
+    }
+}
+
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn snapshot_permission_disposition(
     snapshot: &LifecycleSnapshot,
     identity: &LifecycleIdentity,
@@ -622,6 +732,7 @@ fn snapshot_permission_disposition(
     state.permission_disposition(request_key)
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn snapshot_permission_decision(
     snapshot: &LifecycleSnapshot,
     identity: &LifecycleIdentity,
@@ -714,6 +825,7 @@ struct SchemaHeader {
     schema_version: u32,
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 enum LoadedSnapshot {
     Missing,
     Healthy(LifecycleSnapshot),
@@ -722,21 +834,25 @@ enum LoadedSnapshot {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 enum LockKind {
     Shared,
     Exclusive,
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 struct LockGuard<'a> {
     file: &'a File,
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 impl Drop for LockGuard<'_> {
     fn drop(&mut self) {
         let _ = FileExt::unlock(self.file);
     }
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn lock_with_timeout(file: &File, kind: LockKind) -> Result<LockGuard<'_>, StoreError> {
     let deadline = Instant::now() + LOCK_TIMEOUT;
     loop {
@@ -1033,6 +1149,7 @@ fn project_schema_three(mut snapshot: LifecycleSnapshot) -> LifecycleSnapshot {
     snapshot
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn retain_sessions(snapshot: &mut LifecycleSnapshot, received_at_ms: u64) {
     for state in snapshot.sessions.values_mut() {
         state.stopped_subagents.retain(|_, stopped| {
@@ -1150,6 +1267,7 @@ fn retain_sessions(snapshot: &mut LifecycleSnapshot, received_at_ms: u64) {
     }
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn lexical_normalize_path(path: &Path) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -1178,6 +1296,7 @@ fn valid_path(path: &Path) -> bool {
         && path.to_string_lossy().len() <= super::MAX_PATH_BYTES
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn ensure_serialized_size(bytes: &[u8]) -> Result<(), StoreError> {
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         Err(StoreError::SnapshotTooLarge)
@@ -1186,6 +1305,7 @@ fn ensure_serialized_size(bytes: &[u8]) -> Result<(), StoreError> {
     }
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1195,19 +1315,19 @@ fn epoch_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-#[cfg(unix)]
+#[cfg(all(any(test, feature = "legacy-store-test-support"), unix))]
 fn set_dir_mode(path: &Path) -> Result<(), StoreError> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| StoreError::Io)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(any(test, feature = "legacy-store-test-support"), not(unix)))]
 fn set_dir_mode(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(any(test, feature = "legacy-store-test-support"), unix))]
 fn set_file_mode(file: &File) -> Result<(), StoreError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1215,7 +1335,7 @@ fn set_file_mode(file: &File) -> Result<(), StoreError> {
         .map_err(|_| StoreError::Io)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(any(test, feature = "legacy-store-test-support"), not(unix)))]
 fn set_file_mode(_file: &File) -> Result<(), StoreError> {
     Ok(())
 }
@@ -1263,6 +1383,57 @@ mod tests {
             super::super::LifecycleEventKind::UserPromptSubmit,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn legacy_decoder_rejects_duplicate_nested_session_keys() {
+        let mut snapshot = LifecycleSnapshot::default();
+        snapshot.apply(prompt("session-duplicate", "turn-1"), 1);
+        let (session_key, state) = snapshot.sessions.iter().next().unwrap();
+        let session_key = serde_json::to_string(session_key).unwrap();
+        let state = serde_json::to_string(state).unwrap();
+        let encoded = format!(
+            "{{\"schema_version\":4,\"next_sequence\":{},\"sessions\":{{{session_key}:{state},{session_key}:{state}}}}}",
+            snapshot.next_sequence
+        );
+
+        assert!(matches!(
+            decode_legacy_snapshot(encoded.as_bytes()),
+            Err(StoreError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
+    fn legacy_decoder_rejects_duplicate_permission_authority_request_keys() {
+        let store = store();
+        let identity = open_turn(&store, AgentProvider::Codex, "session-authority", "turn-1");
+        let request_key = "a".repeat(64);
+        store
+            .ensure_permission_decision(
+                &identity,
+                &request_key,
+                PermissionDecision::Decided(PermissionAuthority {
+                    transaction_id: "transaction-authority".into(),
+                    action: PermissionAction::Allow,
+                }),
+            )
+            .unwrap();
+        let snapshot = store.read().unwrap().snapshot.unwrap();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let authority = serde_json::to_string(
+            &snapshot.sessions[&key("session-authority")].permission_authorities[&request_key],
+        )
+        .unwrap();
+        let needle = format!("\"permission_authorities\":{{\"{request_key}\":{authority}}}");
+        let duplicate = format!(
+            "\"permission_authorities\":{{\"{request_key}\":{authority},\"{request_key}\":{authority}}}"
+        );
+        let encoded = encoded.replacen(&needle, &duplicate, 1);
+
+        assert!(matches!(
+            decode_legacy_snapshot(encoded.as_bytes()),
+            Err(StoreError::InvalidSnapshot)
+        ));
     }
 
     fn provider_subagent_start(

@@ -34,6 +34,10 @@ path = "src/main.rs"
 name = "coding_brain"
 path = "src/lib.rs"
 
+[features]
+default = []
+fault-injection = []
+
 [dependencies]
 # Workspace crates carry a `version` alongside `path` so the binary can be
 # published to crates.io. Local builds always use the path; crates.io strips
@@ -51,11 +55,15 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_mangen = "0.2"
 libc = "0.2"
+errno = "0.3.14"
 ctrlc = "3"
 fs2 = "0.4"
 tempfile = "3"
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "hooks", "limits", "load_extension"] }
 
 [dev-dependencies]
+coding-brain-core = { path = "crates/coding-brain-core", version = "0.59.1", features = ["legacy-store-test-support"] }
+syn = { version = "2", features = ["full", "visit"] }
 time = { version = "0.3", features = ["formatting"] }
 
 [profile.release]

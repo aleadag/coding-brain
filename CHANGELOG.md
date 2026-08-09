@@ -6,6 +6,19 @@ All notable changes to Coding Brain are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Coding Brain now uses `db/brain.sqlite3` as the sole live Brain, lifecycle,
+  permission, activity, and learning authority, with operational review state
+  isolated in `db/review.sqlite3`. Ordinary non-hook startup migrates supported
+  pre-SQLite Coding Brain state automatically; hooks never migrate and defer to
+  provider-native handling until storage is current.
+- Added bounded non-executable audit export, a frozen v0.59.1 downgrade export,
+  and an explicit review-only reset under `cbrain storage`. Live legacy JSONL,
+  lifecycle, review, and permission-journal writers are no longer production
+  persistence surfaces; `session-links.jsonl` remains the bounded navigation
+  identity log.
+
 ## [0.59.1] - 2026-08-04
 
 ### Fixed

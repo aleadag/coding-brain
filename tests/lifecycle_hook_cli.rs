@@ -2,14 +2,18 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use coding_brain::brain::storage::{
+    BrainDb, MigrationCoordinator, OpenRole, StorageDeadline, StoragePaths,
+};
+use coding_brain_core::lifecycle::test_support::LifecycleStore;
 use coding_brain_core::lifecycle::{
     ApplyOutcome, LifecycleEvent, LifecycleEventKind, LifecycleEventName, LifecycleIdentity,
-    LifecycleStore, MAX_SESSIONS, ProjectedStatus,
+    MAX_SESSIONS, ProjectedStatus,
 };
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use sha2::{Digest, Sha256};
@@ -21,6 +25,58 @@ const ANTIGRAVITY_PRE_TOOL_USE: &[u8] =
     include_bytes!("fixtures/hooks/antigravity-pre-tool-use.json");
 const ANTIGRAVITY_POST_TOOL_USE: &[u8] =
     include_bytes!("fixtures/hooks/antigravity-post-tool-use.json");
+
+fn secure_home(home: &std::path::Path) {
+    #[cfg(unix)]
+    for path in [
+        home.to_path_buf(),
+        home.join(".local"),
+        home.join(".local/state"),
+        home.join(".local/state/coding-brain"),
+        home.join(".local/state/coding-brain/brain"),
+        home.join(".local/state/coding-brain/hooks"),
+    ] {
+        if path.is_dir() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    let state_root = home.join(".local/state/coding-brain");
+    let legacy_guard = state_root.join("brain/permission-transactions");
+    if !state_root.join("db/brain.sqlite3").exists() && legacy_guard.is_dir() {
+        fs::set_permissions(legacy_guard, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+fn prepare_current_storage(home: &std::path::Path) {
+    secure_home(home);
+    MigrationCoordinator::at(&home.join(".local/state/coding-brain"))
+        .run_non_hook()
+        .unwrap();
+}
+
+fn open_brain(home: &std::path::Path) -> BrainDb {
+    BrainDb::open_current(
+        &StoragePaths::at(&home.join(".local/state/coding-brain")),
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(2)),
+    )
+    .unwrap()
+}
+
+fn lifecycle_snapshot(home: &std::path::Path) -> coding_brain_core::lifecycle::LifecycleSnapshot {
+    open_brain(home).read_lifecycle().unwrap()
+}
+
+fn activity_events(
+    home: &std::path::Path,
+) -> Vec<coding_brain_core::brain_activity::ActivityEvent> {
+    let mut records = open_brain(home)
+        .read_activity_page(None, 4096, 16 * 1024 * 1024)
+        .unwrap()
+        .events;
+    records.sort_by_key(|record| record.cursor);
+    records.into_iter().map(|record| record.event).collect()
+}
 
 fn run_hook(home: &std::path::Path, input: &[u8]) -> Output {
     run_provider_hook(home, None, input)
@@ -36,6 +92,7 @@ fn run_provider_hook_with_event(
     antigravity_event: Option<&str>,
     input: &[u8],
 ) -> Output {
+    prepare_current_storage(home);
     let normalized_input = serde_json::from_slice::<serde_json::Value>(input)
         .map(|mut value| {
             value["cwd"] = serde_json::json!(home);
@@ -135,23 +192,18 @@ fn claude_lifecycle_hook_records_provider_qualified_stop() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("exact recovery identity link unavailable")
+    );
 
-    let snapshot = LifecycleStore::at(home.path().join(".local/state/coding-brain"))
-        .read()
-        .unwrap()
-        .snapshot
-        .unwrap();
+    let snapshot = lifecycle_snapshot(home.path());
     let key = AgentSessionKey::native(AgentProvider::Claude, "claude-session-1").storage_key();
     assert_eq!(
         snapshot.sessions[&key].latest_event,
         Some(LifecycleEventName::Stop)
     );
 
-    let activity =
-        fs::read_to_string(home.path().join(".local/state/coding-brain/activity.jsonl")).unwrap();
-    let row: serde_json::Value = serde_json::from_str(activity.trim()).unwrap();
-    assert_eq!(row["session"]["provider"], "claude");
     assert!(
         !home
             .path()
@@ -173,28 +225,29 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     );
     assert!(post.status.success());
     assert!(post.stdout.is_empty());
-    assert!(post.stderr.is_empty());
-    let snapshot = LifecycleStore::at(post_home.path().join(".local/state/coding-brain"))
-        .read()
-        .unwrap()
-        .snapshot
-        .unwrap();
+    assert!(
+        post.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&post.stderr)
+    );
+    let snapshot = lifecycle_snapshot(post_home.path());
     let key =
         AgentSessionKey::native(AgentProvider::Antigravity, "agy-conversation-1").storage_key();
     assert_eq!(
         snapshot.sessions[&key].latest_event,
         Some(LifecycleEventName::PostToolUse)
     );
-    let activity = fs::read_to_string(
-        post_home
-            .path()
-            .join(".local/state/coding-brain/activity.jsonl"),
-    )
-    .unwrap();
-    let row: serde_json::Value = serde_json::from_str(activity.trim()).unwrap();
-    assert_eq!(row["kind"], "lifecycle");
-    assert_eq!(row["tool"], "PostToolUse");
-    assert_eq!(row["session"]["provider"], "antigravity");
+    let activity = activity_events(post_home.path());
+    let row = activity.last().unwrap();
+    assert_eq!(
+        row.kind,
+        coding_brain_core::brain_activity::ActivityKind::Lifecycle
+    );
+    assert_eq!(row.tool.as_deref(), Some("PostToolUse"));
+    assert_eq!(
+        row.session.as_ref().unwrap().provider,
+        AgentProvider::Antigravity
+    );
 
     let adversarial_home = tempfile::tempdir().unwrap();
     seed_antigravity_invocation(adversarial_home.path(), 5);
@@ -214,11 +267,7 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     );
     assert!(adversarial.status.success());
     assert!(adversarial.stderr.is_empty());
-    let snapshot = LifecycleStore::at(adversarial_home.path().join(".local/state/coding-brain"))
-        .read()
-        .unwrap()
-        .snapshot
-        .unwrap();
+    let snapshot = lifecycle_snapshot(adversarial_home.path());
     assert_eq!(
         snapshot.sessions[&key].latest_event,
         Some(LifecycleEventName::PostToolUse)
@@ -244,11 +293,7 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     assert!(pre.status.success());
     assert!(pre.stdout.is_empty());
     assert!(pre.stderr.is_empty());
-    let snapshot = LifecycleStore::at(pre_home.path().join(".local/state/coding-brain"))
-        .read()
-        .unwrap()
-        .snapshot
-        .unwrap();
+    let snapshot = lifecycle_snapshot(pre_home.path());
     assert_eq!(
         snapshot.sessions[&key].latest_event,
         Some(LifecycleEventName::PreToolUse)
@@ -257,14 +302,18 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
         snapshot.sessions[&key].current_turn.as_deref(),
         Some("invocation-1")
     );
-    let activity = fs::read_to_string(
-        pre_home
-            .path()
-            .join(".local/state/coding-brain/activity.jsonl"),
-    )
-    .unwrap();
-    let row: serde_json::Value = serde_json::from_str(activity.trim()).unwrap();
-    assert_eq!(row["session"]["tool_use_id"], "step-5");
+    let activity = activity_events(pre_home.path());
+    assert_eq!(
+        activity
+            .last()
+            .unwrap()
+            .session
+            .as_ref()
+            .unwrap()
+            .tool_use_id
+            .as_deref(),
+        Some("step-5")
+    );
 
     let stop_home = tempfile::tempdir().unwrap();
     let mut stop_payload: serde_json::Value = serde_json::from_slice(ANTIGRAVITY_STOP).unwrap();
@@ -277,25 +326,14 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     );
     assert!(stop.status.success());
     assert!(stop.stdout.is_empty());
-    assert!(stop.stderr.is_empty());
-    let snapshot = LifecycleStore::at(stop_home.path().join(".local/state/coding-brain"))
-        .read()
-        .unwrap()
-        .snapshot
-        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("exact recovery identity link unavailable")
+    );
+    let snapshot = lifecycle_snapshot(stop_home.path());
     assert_eq!(
         snapshot.sessions[&key].latest_event,
         Some(LifecycleEventName::Stop)
     );
-    let activity = fs::read_to_string(
-        stop_home
-            .path()
-            .join(".local/state/coding-brain/activity.jsonl"),
-    )
-    .unwrap();
-    let row: serde_json::Value = serde_json::from_str(activity.trim()).unwrap();
-    assert_eq!(row["session"]["provider"], "antigravity");
-
     let invocation_home = tempfile::tempdir().unwrap();
     let invocation = serde_json::json!({
         "invocationNum": 3,
@@ -314,10 +352,8 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
     assert!(pre_invocation.status.success());
     assert!(pre_invocation.stderr.is_empty());
     let state_root = invocation_home.path().join(".local/state/coding-brain");
-    let lifecycle = LifecycleStore::at(&state_root);
-    let before_post = lifecycle.read().unwrap().snapshot.unwrap();
-    let activity_path = state_root.join("activity.jsonl");
-    let activity_before_post = fs::read(&activity_path).unwrap();
+    let before_post = lifecycle_snapshot(invocation_home.path());
+    let activity_before_post = activity_events(invocation_home.path());
     let links_path = state_root.join("session-links.jsonl");
     let links_before_post = fs::read(&links_path).ok();
 
@@ -328,14 +364,18 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
         &serde_json::to_vec(&invocation).unwrap(),
     );
     assert!(post_invocation.status.success());
-    assert!(post_invocation.stderr.is_empty());
+    assert!(
+        post_invocation.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&post_invocation.stderr)
+    );
     assert_eq!(
-        lifecycle.read().unwrap().snapshot.unwrap(),
+        lifecycle_snapshot(invocation_home.path()),
         before_post,
         "PostInvocation changed lifecycle state"
     );
     assert_eq!(
-        fs::read(&activity_path).unwrap(),
+        activity_events(invocation_home.path()),
         activity_before_post,
         "PostInvocation appended activity"
     );
@@ -364,8 +404,10 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
         ANTIGRAVITY_STOP,
     );
     assert!(stop.status.success());
-    assert!(stop.stderr.is_empty());
-    let snapshot = lifecycle.read().unwrap().snapshot.unwrap();
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("exact recovery identity link unavailable")
+    );
+    let snapshot = lifecycle_snapshot(invocation_home.path());
     let state = &snapshot.sessions[&key];
     assert_eq!(state.latest_event, Some(LifecycleEventName::Stop));
     assert_eq!(state.current_turn.as_deref(), Some("invocation-3"));
@@ -379,7 +421,11 @@ fn antigravity_trusted_cli_events_record_provider_qualified_lifecycle() {
         &serde_json::to_vec(&continued_payload).unwrap(),
     );
     assert!(after_stop.status.success());
-    assert!(String::from_utf8_lossy(&after_stop.stderr).contains("AmbiguousTurn"));
+    assert!(after_stop.stderr.is_empty());
+    assert_eq!(
+        lifecycle_snapshot(invocation_home.path()).sessions[&key].latest_event,
+        Some(LifecycleEventName::Stop)
+    );
 }
 
 #[test]
@@ -398,11 +444,7 @@ fn antigravity_optional_error_is_typed_and_false_idle_is_rejected() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
-    let snapshot = LifecycleStore::at(home.path().join(".local/state/coding-brain"))
-        .read()
-        .unwrap()
-        .snapshot
-        .unwrap();
+    let snapshot = lifecycle_snapshot(home.path());
     let key =
         AgentSessionKey::native(AgentProvider::Antigravity, "agy-conversation-1").storage_key();
     assert_eq!(
@@ -532,12 +574,11 @@ fn lifecycle_provider_comes_only_from_cli_dispatch() {
         &serde_json::to_vec(&payload).unwrap(),
     );
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    let snapshot = LifecycleStore::at(home.path().join(".local/state/coding-brain"))
-        .read()
-        .unwrap()
-        .snapshot
-        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("exact recovery identity link unavailable")
+    );
+    let snapshot = lifecycle_snapshot(home.path());
     assert!(snapshot.sessions.contains_key(
         &AgentSessionKey::native(AgentProvider::Claude, "claude-session-1").storage_key()
     ));
@@ -569,6 +610,7 @@ fn provider_hook_rejects_oversized_missing_and_unknown_input_without_activity() 
 }
 
 fn run_cli(home: &std::path::Path, args: &[&str]) -> Output {
+    secure_home(home);
     Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .args(args)
         .env("HOME", home)
@@ -578,6 +620,7 @@ fn run_cli(home: &std::path::Path, args: &[&str]) -> Output {
 }
 
 fn run_init_check(home: &std::path::Path) -> Output {
+    secure_home(home);
     Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .args(["init", "--check"])
         .env("HOME", home)
@@ -1221,6 +1264,13 @@ fn codex_child_permission_payload(
 
 #[cfg(unix)]
 fn run_permission_hook(home: &std::path::Path, input: &[u8]) -> Output {
+    prepare_current_storage(home);
+    run_permission_hook_without_prepare(home, input)
+}
+
+#[cfg(unix)]
+fn run_permission_hook_without_prepare(home: &std::path::Path, input: &[u8]) -> Output {
+    secure_home(home);
     let mut paths = vec![home.join("bin")];
     if let Some(existing) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&existing));
@@ -1292,11 +1342,7 @@ fn lifecycle_hook_binary_is_silent_and_records_under_temporary_home() {
             .exists()
     );
 
-    let snapshot = LifecycleStore::at(home.path().join(".local/state/coding-brain"))
-        .read()
-        .unwrap()
-        .snapshot
-        .unwrap();
+    let snapshot = lifecycle_snapshot(home.path());
     assert_eq!(
         snapshot.sessions[&coding_brain_core::provider::AgentSessionKey::native(
             coding_brain_core::provider::AgentProvider::Codex,
@@ -1327,7 +1373,7 @@ fn lifecycle_hook_binary_fails_open_with_empty_stdout() {
 
 #[test]
 #[cfg(unix)]
-fn permission_allow_is_suppressed_across_lifecycle_failure() {
+fn permission_allow_is_suppressed_when_sqlite_storage_is_unavailable() {
     let request = |cwd: &std::path::Path| {
         serde_json::json!({
             "session_id": "session-1",
@@ -1347,14 +1393,9 @@ fn permission_allow_is_suppressed_across_lifecycle_failure() {
 
     let blocked = tempfile::tempdir().unwrap();
     write_brain_config(blocked.path());
-    fs::create_dir_all(blocked.path().join(".local/state/coding-brain")).unwrap();
-    fs::write(
-        blocked.path().join(".local/state/coding-brain/hooks"),
-        b"occupied",
-    )
-    .unwrap();
     let blocked_request = request(blocked.path());
-    let blocked_output = run_permission_hook(blocked.path(), blocked_request.as_bytes());
+    let blocked_output =
+        run_permission_hook_without_prepare(blocked.path(), blocked_request.as_bytes());
 
     assert!(healthy_output.status.success());
     assert!(blocked_output.status.success());
@@ -1373,7 +1414,7 @@ fn permission_allow_is_suppressed_across_lifecycle_failure() {
     assert!(
         String::from_utf8(blocked_output.stderr)
             .unwrap()
-            .contains("lifecycle")
+            .contains("SQLite storage unavailable")
     );
     assert!(
         !healthy
@@ -1424,11 +1465,11 @@ fn corrupt_and_future_lifecycle_block_permission_inference_without_rewrite() {
         }))
         .unwrap();
 
-        let output = run_permission_hook(home.path(), &request);
+        let output = run_permission_hook_without_prepare(home.path(), &request);
 
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("admission failed"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("SQLite storage unavailable"));
         assert!(!inference_marker.exists());
         assert_eq!(fs::read(&lifecycle).unwrap(), original);
         assert!(
@@ -1464,13 +1505,9 @@ fn child_permission_without_topology_suppresses_model_allow() {
 
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("lifecycle"));
-    let activity = coding_brain::brain::activity::ActivityStore::at(
-        home.path().join(".local/state/coding-brain/activity.jsonl"),
-    )
-    .read()
-    .unwrap();
-    assert!(!activity.events().iter().any(|event| {
+    assert!(String::from_utf8_lossy(&output.stderr).contains("UnprovenSubagent"));
+    let activity = activity_events(home.path());
+    assert!(!activity.iter().any(|event| {
         event.state == coding_brain_core::brain_activity::ActivityState::Allowed
             && event
                 .session
@@ -1497,30 +1534,22 @@ fn deterministic_child_deny_survives_missing_topology() {
         "deny"
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("allow"));
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("Codex resume evidence: resume transcript record is invalid")
-    );
-    let activity = coding_brain::brain::activity::ActivityStore::at(
-        home.path().join(".local/state/coding-brain/activity.jsonl"),
-    )
-    .read()
-    .unwrap();
-    assert!(activity.events().iter().any(|event| {
+    assert!(String::from_utf8_lossy(&output.stderr).contains("UnprovenSubagent"));
+    let activity = activity_events(home.path());
+    assert!(activity.iter().any(|event| {
         event.state == coding_brain_core::brain_activity::ActivityState::Delivered
     }));
     assert!(
-        !activity.events().iter().any(|event| {
+        activity.iter().any(|event| {
             event.state == coding_brain_core::brain_activity::ActivityState::Denied
         })
     );
-    let lifecycle = LifecycleStore::at(home.path().join(".local/state/coding-brain"));
-    let snapshot = lifecycle.read().unwrap().snapshot;
-    assert!(snapshot.as_ref().is_none_or(|snapshot| {
+    let snapshot = lifecycle_snapshot(home.path());
+    assert!(
         !snapshot
             .sessions
             .contains_key(&AgentSessionKey::native(AgentProvider::Codex, "child-a").storage_key())
-    }));
+    );
 }
 
 #[test]
@@ -1589,7 +1618,7 @@ fn child_permission_at_global_capacity_does_not_evict_or_authorize() {
 
     assert!(permission.status.success());
     assert!(permission.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&permission.stderr).contains("capacity"));
+    assert!(String::from_utf8_lossy(&permission.stderr).contains("ActiveSubagentCapacity"));
     let after = lifecycle_store.read().unwrap().snapshot.unwrap();
     assert_eq!(after.sessions.len(), MAX_SESSIONS);
     assert_eq!(
@@ -1601,12 +1630,8 @@ fn child_permission_at_global_capacity_does_not_evict_or_authorize() {
             .sessions
             .contains_key(&AgentSessionKey::native(AgentProvider::Codex, "child-a").storage_key())
     );
-    let activity = coding_brain::brain::activity::ActivityStore::at(
-        home.path().join(".local/state/coding-brain/activity.jsonl"),
-    )
-    .read()
-    .unwrap();
-    assert!(!activity.events().iter().any(|event| {
+    let activity = activity_events(home.path());
+    assert!(!activity.iter().any(|event| {
         event.kind == coding_brain_core::brain_activity::ActivityKind::Decision
             && event.state == coding_brain_core::brain_activity::ActivityState::Delivered
             && event

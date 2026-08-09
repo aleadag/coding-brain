@@ -27,6 +27,8 @@ pub mod risk;
 pub mod safety;
 pub(crate) mod secure_state;
 pub mod sequences;
+#[doc(hidden)]
+pub mod storage;
 
 pub(crate) const UNSUPPORTED_PERMISSION_TOOL_REASON: &str = "unsupported permission tool";
 
@@ -232,5 +234,78 @@ mod tests {
 
         write_gate_mode_at(&path, BrainGateMode::Auto).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "auto\n");
+    }
+
+    #[test]
+    fn sqlite_learning_page_records_drive_every_pure_consumer_seam() {
+        use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
+        use coding_brain_core::provider::AgentProvider;
+
+        use super::decisions::{DecisionRecord, DecisionType};
+        use super::storage::{ActivityCursor, DecisionKind, DecisionPayload, LearningDecisionPage};
+
+        let record = DecisionRecord {
+            provider: AgentProvider::Codex,
+            timestamp: "2026-08-04T12:00:00Z".into(),
+            pid: 1,
+            project: "alpha".into(),
+            tool: Some("Bash".into()),
+            command: Some("cargo test".into()),
+            brain_action: "approve".into(),
+            brain_confidence: 0.9,
+            brain_reasoning: "fixture".into(),
+            user_action: "accept".into(),
+            context: None,
+            outcome: None,
+            decision_type: DecisionType::Session,
+            suggested_at: None,
+            resolved_at: None,
+            override_reason: None,
+            decision_id: Some("decision-1".into()),
+            brain_decision_ms: Some(1),
+            cache_hit: Some(false),
+            canonical: Some(false),
+        };
+        let records = LearningDecisionPage {
+            decisions: vec![DecisionPayload::new(
+                DecisionKind::Observation,
+                ActivityCursor::try_from(1_u64).unwrap(),
+                record,
+            )],
+            next_cursor: None,
+            serialized_bytes: 1,
+        }
+        .into_records();
+
+        assert_eq!(
+            baseline::rules_baseline_classify(
+                records[0].tool.as_deref(),
+                records[0].command.as_deref()
+            ),
+            "approve"
+        );
+        assert_eq!(
+            briefing::filter_recent_for_project(&records, Some("alpha")).len(),
+            1
+        );
+        assert_eq!(
+            retrieval::retrieve_similar_from(&records, Some("Bash"), "alpha", 1, None).len(),
+            1
+        );
+        assert_eq!(metrics::summaries_from_decisions(&records).len(), 1);
+        let preferences = preferences::distill_preferences(&records);
+        let _ = insights::generate_insights(&records, &preferences);
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = CodingBrainPaths::resolve(&PathEnvironment::new(
+            Some(temp.path().join("config")),
+            Some(temp.path().join("state")),
+            Some(temp.path().to_path_buf()),
+        ))
+        .unwrap();
+        assert!(matches!(
+            distill::run_once_with_inputs(&paths, &records, &records).unwrap(),
+            distill::DistillOutcome::NotDue { .. }
+        ));
     }
 }
