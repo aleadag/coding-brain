@@ -21,6 +21,7 @@ pub(crate) use fault_injection::{
     activate as activate_fault, hit as hit_fault, run_worker as run_fault_worker,
 };
 
+use std::cell::Cell;
 use std::ffi::{CStr, OsStr};
 use std::fmt;
 use std::fs::File;
@@ -158,6 +159,25 @@ impl StorageFaultCategory {
 #[derive(Clone, Copy, Debug)]
 pub struct StorageDeadline(Instant);
 
+thread_local! {
+    // SQLite's timeout budget restarts for each lock event; keep one deadline
+    // across every busy callback made by the current synchronous operation.
+    static SQLITE_BUSY_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+fn retry_sqlite_busy_until_deadline(_attempt: i32) -> bool {
+    SQLITE_BUSY_DEADLINE.with(|deadline| {
+        let Some(deadline) = deadline.get() else {
+            return false;
+        };
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        Instant::now() < deadline
+    })
+}
+
 impl StorageDeadline {
     pub fn after(duration: Duration) -> Self {
         Self(Instant::now() + duration)
@@ -180,7 +200,9 @@ impl StorageDeadline {
     }
 
     fn apply(self, connection: &Connection) -> Result<(), StorageError> {
-        connection.busy_timeout(self.remaining()?)?;
+        self.ensure_remaining()?;
+        SQLITE_BUSY_DEADLINE.with(|deadline| deadline.set(Some(self.0)));
+        connection.busy_handler(Some(retry_sqlite_busy_until_deadline))?;
         Ok(())
     }
 }
