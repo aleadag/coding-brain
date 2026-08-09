@@ -40,6 +40,12 @@ const BRAIN_SCHEMA_V1: &str = include_str!("fixtures/storage/schema-v1/brain.sql
 const REVIEW_SCHEMA_V1: &str = include_str!("fixtures/storage/schema-v1/review.sql");
 
 fn open_for_constraints(path: &std::path::Path) -> Connection {
+    let path = path
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(path.file_name().unwrap());
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
