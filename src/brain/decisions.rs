@@ -1,11 +1,16 @@
 #![allow(dead_code)]
 
+#[cfg(test)]
 use std::fs::{self, OpenOptions};
+#[cfg(test)]
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
+#[cfg(test)]
 use crate::brain::client::BrainSuggestion;
 use coding_brain_core::brain_activity::{
     ActivityEvent, MAX_ACTIVITY_FIELD_BYTES, lossless_redacted_activity_text,
@@ -13,10 +18,13 @@ use coding_brain_core::brain_activity::{
 use coding_brain_core::lifecycle::MAX_ID_BYTES;
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::provider::AgentProvider;
+#[cfg(test)]
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use super::activity::LiveEvidenceBudget;
+use super::storage::{BrainDb, OpenRole, StorageDeadline, StorageError, StoragePaths};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Re-exports from sub-modules so that existing `brain::decisions::*` paths
@@ -262,6 +270,7 @@ pub(super) fn decisions_dir() -> PathBuf {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn decisions_path() -> PathBuf {
     decisions_dir().join("decisions.jsonl")
 }
@@ -300,6 +309,7 @@ fn timestamp_now() -> String {
     format!("{secs}")
 }
 
+#[cfg(test)]
 fn append_json_line(path: &std::path::Path, record: &serde_json::Value) -> io::Result<()> {
     let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
     line.push(b'\n');
@@ -326,6 +336,7 @@ fn append_json_line(path: &std::path::Path, record: &serde_json::Value) -> io::R
     FileExt::unlock(&lock)
 }
 
+#[cfg(test)]
 fn acquire_decisions_lock(path: &std::path::Path) -> io::Result<fs::File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -357,6 +368,7 @@ fn acquire_decisions_lock(path: &std::path::Path) -> io::Result<fs::File> {
     Ok(lock)
 }
 
+#[cfg(test)]
 fn repair_jsonl_tail(file: &mut fs::File) -> io::Result<()> {
     let length = file.metadata()?.len();
     if length == 0 {
@@ -385,6 +397,7 @@ fn repair_jsonl_tail(file: &mut fs::File) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn find_tail_start(file: &mut fs::File, length: u64) -> io::Result<u64> {
     let mut cursor = length;
     let mut buffer = [0_u8; 8 * 1024];
@@ -400,36 +413,36 @@ fn find_tail_start(file: &mut fs::File, length: u64) -> io::Result<u64> {
     Ok(0)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn set_directory_mode(path: &std::path::Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn set_directory_mode(_path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn set_file_mode(file: &fs::File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     file.set_permissions(fs::Permissions::from_mode(0o600))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn set_file_mode(_file: &fs::File) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn sync_directory(path: &std::path::Path) -> io::Result<()> {
     fs::File::open(path)?.sync_all()
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn sync_directory(_path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
@@ -488,6 +501,7 @@ fn snapshot_context(session: &crate::session::AgentSession) -> serde_json::Value
 /// Log a brain decision (suggestion + user response) to the local JSONL file.
 /// `decision_type` is retained in the record format for historical readers.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn log_decision(
     pid: u32,
     project: &str,
@@ -518,6 +532,7 @@ pub fn log_decision(
 /// Use this from the engine call site once instrumentation is wired; legacy
 /// `log_decision` call sites continue to work and emit `None` for those fields.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn log_decision_full(
     pid: u32,
     project: &str,
@@ -567,6 +582,7 @@ pub fn log_decision_full(
 /// Log a passive observation: a user action the brain was NOT involved in.
 /// These provide ground-truth training data — what the user does when
 /// deciding on their own. Same JSONL format so distillation picks them up.
+#[cfg(test)]
 pub fn log_observation(
     pid: u32,
     project: &str,
@@ -712,17 +728,20 @@ pub(crate) fn validate_hook_decision_record(record: &HookDecisionRecord) -> bool
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum EnsureRecord {
     Inserted,
     Present,
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) enum DecisionStoreError {
     Io(io::Error),
     OverBudget,
 }
 
+#[cfg(test)]
 impl std::fmt::Display for DecisionStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -732,8 +751,10 @@ impl std::fmt::Display for DecisionStoreError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for DecisionStoreError {}
 
+#[cfg(test)]
 impl From<io::Error> for DecisionStoreError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
@@ -744,14 +765,17 @@ impl From<io::Error> for DecisionStoreError {
 ///
 /// `hook_allow` and `hook_deny` mean that the decision was prepared; this
 /// hook does not receive a later execution confirmation from Codex.
+#[cfg(test)]
 pub(crate) fn append_hook_proposal(audit: &HookDecisionAudit<'_>) -> io::Result<String> {
     append_hook_audit(audit, "hook_proposal")
 }
 
+#[cfg(test)]
 pub(crate) fn append_deterministic(audit: &HookDecisionAudit<'_>) -> io::Result<String> {
     append_hook_audit(audit, "deterministic_deny")
 }
 
+#[cfg(test)]
 fn append_hook_audit(audit: &HookDecisionAudit<'_>, user_action: &str) -> io::Result<String> {
     let decision_id = gen_decision_id();
     let record = HookDecisionRecord::from_audit(audit, decision_id.clone(), user_action);
@@ -760,6 +784,7 @@ fn append_hook_audit(audit: &HookDecisionAudit<'_>, user_action: &str) -> io::Re
     Ok(decision_id)
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_hook_record_at(
     path: &std::path::Path,
     record: &HookDecisionRecord,
@@ -822,6 +847,7 @@ pub(crate) fn ensure_hook_record_at(
     Ok(EnsureRecord::Inserted)
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_hook_record_at_bounded(
     path: &std::path::Path,
     record: &HookDecisionRecord,
@@ -899,6 +925,7 @@ pub(crate) fn ensure_hook_record_at_bounded(
     Ok(EnsureRecord::Inserted)
 }
 
+#[cfg(test)]
 fn read_bounded_json_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
@@ -937,6 +964,7 @@ pub(crate) fn trigger_distill() {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Read decision stats for display.
+#[cfg(test)]
 pub fn read_stats() -> DecisionStats {
     let path = decisions_path();
     let content = match fs::read_to_string(&path) {
@@ -977,6 +1005,7 @@ pub fn read_stats() -> DecisionStats {
 }
 
 /// Clear all decision history and distilled preferences.
+#[cfg(test)]
 pub fn forget() -> Result<(), String> {
     let environment = PathEnvironment::current();
     let paths = CodingBrainPaths::resolve(&environment)
@@ -984,10 +1013,12 @@ pub fn forget() -> Result<(), String> {
     forget_at(&paths, &decisions_dir())
 }
 
+#[cfg(test)]
 fn forget_at(paths: &CodingBrainPaths, source_root: &std::path::Path) -> Result<(), String> {
     forget_at_with(paths, source_root, || {})
 }
 
+#[cfg(test)]
 pub(crate) fn forget_at_with(
     paths: &CodingBrainPaths,
     source_root: &std::path::Path,
@@ -1007,6 +1038,7 @@ pub(crate) fn forget_at_with(
     result.and(unlock)
 }
 
+#[cfg(test)]
 fn erase_decision_source(source_root: &std::path::Path) -> io::Result<()> {
     for name in ["decisions.jsonl", "canonical.jsonl", "preferences.json"] {
         let path = source_root.join(name);
@@ -1022,6 +1054,7 @@ fn erase_decision_source(source_root: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn read_all_decisions() -> Vec<DecisionRecord> {
     let path = decisions_path();
     let content = match fs::read_to_string(&path) {
@@ -1169,15 +1202,44 @@ pub(crate) fn parse_decision_value(
 }
 
 pub(crate) fn read_learning_decisions() -> Vec<DecisionRecord> {
-    read_distillation_decisions().1
+    let environment = PathEnvironment::current();
+    let Ok(paths) = CodingBrainPaths::resolve(&environment) else {
+        return Vec::new();
+    };
+    read_learning_decisions_from_sqlite(&StoragePaths::at(paths.state_root())).unwrap_or_default()
 }
 
+pub(crate) fn read_learning_decisions_from_sqlite(
+    paths: &StoragePaths,
+) -> Result<Vec<DecisionRecord>, StorageError> {
+    let database = BrainDb::open_current(
+        paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )?;
+    let session = database.learning_read_session()?;
+    let mut after = None;
+    let mut records = Vec::new();
+    loop {
+        let page = session.page_after(after, 4_096, 16 * 1024 * 1024)?;
+        let next = page.next_cursor;
+        records.extend(page.into_records());
+        let Some(cursor) = next else {
+            break;
+        };
+        after = Some(cursor);
+    }
+    Ok(records)
+}
+
+#[cfg(test)]
 pub(crate) fn read_learning_decisions_from_activity(
     events: &[ActivityEvent],
 ) -> Vec<DecisionRecord> {
     filter_learning_decisions(read_all_decisions(), events)
 }
 
+#[cfg(test)]
 pub(crate) fn read_distillation_decisions() -> (Vec<DecisionRecord>, Vec<DecisionRecord>) {
     let decisions = read_all_decisions();
     let environment = PathEnvironment::new(
@@ -1227,12 +1289,14 @@ pub(crate) fn filter_learning_decisions(
 // Canonical-marks side store
 // ────────────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 fn canonical_path() -> PathBuf {
     decisions_dir().join("canonical.jsonl")
 }
 
 /// Persist a canonical mark for the given decision id.
 /// Idempotent: appending the same id twice is harmless — the set dedupes on read.
+#[cfg(test)]
 pub fn mark_canonical(decision_id: &str, note: Option<&str>) -> Result<(), String> {
     let path = canonical_path();
     if let Some(parent) = path.parent() {
@@ -1262,6 +1326,7 @@ pub fn mark_canonical(decision_id: &str, note: Option<&str>) -> Result<(), Strin
 }
 
 /// Read the set of decision ids that have been marked canonical.
+#[cfg(test)]
 pub fn read_canonical_ids() -> std::collections::HashSet<String> {
     let path = canonical_path();
     let content = match fs::read_to_string(&path) {
@@ -1285,9 +1350,15 @@ pub fn read_canonical_ids() -> std::collections::HashSet<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+    use crate::brain::storage::{DecisionIdentity, DecisionKind, DecisionPayload};
     use crate::rules::RuleAction;
-    use coding_brain_core::brain_activity::ActivityKind;
+    use coding_brain_core::brain_activity::{
+        ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, ProjectEvidence,
+    };
+    use coding_brain_core::project::ProjectId;
 
     fn hook_record(decision_id: &str, brain_action: &str) -> HookDecisionRecord {
         HookDecisionRecord {
@@ -1343,6 +1414,60 @@ mod tests {
         std::fs::write(&path, format!("{extended}\n")).unwrap();
         assert!(ensure_hook_record_at(&path, &record).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn learning_compatibility_reader_uses_sqlite_not_legacy_jsonl() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(temp.path());
+        let mut database = BrainDb::create_current(&paths).unwrap();
+        let cursor = database
+            .append_activity(ActivityEvent {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                kind: ActivityKind::Decision,
+                activity_id: "sqlite-activity".into(),
+                recorded_at_ms: 1,
+                project: ProjectEvidence {
+                    project_id: ProjectId::Stable("project".into()),
+                    cwd: "/work/project".into(),
+                    label: None,
+                },
+                session: None,
+                state: ActivityState::Observed,
+                tool: None,
+                normalized_command: None,
+                fingerprint: None,
+                rule_id: None,
+                confidence: None,
+                threshold: None,
+                reasoning: None,
+                decision_id: Some("sqlite-decision".into()),
+                outcome: None,
+                correction: None,
+                note: None,
+                supersedes: None,
+            })
+            .unwrap();
+        let mut record = make_decision("Bash", "project", "user_approve");
+        record.decision_id = Some("sqlite-decision".into());
+        database
+            .insert_decision(
+                &DecisionIdentity::observation("sqlite-decision", AgentProvider::Codex, 1),
+                &DecisionPayload::new(DecisionKind::Observation, cursor, record),
+            )
+            .unwrap();
+        std::fs::create_dir_all(temp.path().join("brain")).unwrap();
+        std::fs::write(
+            temp.path().join("brain/decisions.jsonl"),
+            b"legacy source must not be consulted\n",
+        )
+        .unwrap();
+
+        let records = read_learning_decisions_from_sqlite(&paths).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision_id.as_deref(), Some("sqlite-decision"));
     }
 
     #[test]

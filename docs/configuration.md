@@ -31,7 +31,7 @@ Loopback endpoints keep model requests on the machine. Coding Brain warns when a
 
 ## Review lifecycle state
 
-Attention, Review, Diagnostics, and Recent keep independent review state under the Coding Brain state root. The same evidence can therefore be NEW in one view and reviewed in another. Review state changes only operational visibility: `activity.jsonl`, decisions, corrections, canonical marks, learning, permission and execution authority, and Scorecard calculations remain unchanged. Archiving an item does not purge its evidence.
+Attention, Review, Diagnostics, and Recent keep independent review state under the Coding Brain state root. The same evidence can therefore be NEW in one view and reviewed in another. Review state changes only operational visibility: Brain activity, decisions, corrections, canonical marks, learning, permission and execution authority, and Scorecard calculations remain unchanged. Archiving an item does not purge its evidence.
 
 Use these keys in an active itemized view:
 
@@ -48,9 +48,15 @@ Recent supports only `a` and `A`; it cannot be archived or restored. Attention, 
 
 On first run, retained items are all NEW. For a large existing queue, use `A` to review the visible items, then `D` to archive reviewed items after checking each confirmation. Repeat after refresh if more retained items become visible. This cleanup is surface-local and does not delete source evidence.
 
-The state is stored in `review-state.json` and coordinated through `review-state.lock`. Do not edit either file while Coding Brain is running. To reset all four surfaces to NEW, stop every Coding Brain process and remove only `review-state.json`; leave `activity.jsonl` and the rest of the state root intact. The next successful refresh recreates review state from retained evidence.
+The state is stored separately from permission and audit authority in `$XDG_STATE_HOME/coding-brain/db/review.sqlite3`. A review database failure disables review refreshes and mutations without changing coherent permission or audit evidence in `brain.sqlite3`; the TUI keeps its last coherent view. To reset all four surfaces to NEW, stop every Coding Brain process and run:
 
-Coding Brain fails the review refresh or mutation when the state file, lock, or directory is invalid or unsafe. It does not automatically migrate, repair, delete, or purge that state. Stop the processes and inspect ownership, file type, links, and Unix modes before retrying; use the explicit `review-state.json` reset only when discarding operational review progress is intended.
+```bash
+cbrain storage reset-review-state
+```
+
+The reset takes an exclusive owner-only gate and returns Busy instead of unlinking a database that is still open. It replaces only `review.sqlite3`; the next successful refresh rebuilds operational review state from retained Brain evidence.
+
+Coding Brain fails the review refresh or mutation when the database, reset gate, or directory is invalid or unsafe. Stop the processes and inspect ownership, file type, links, and Unix modes before retrying; use the explicit reset only when discarding operational review progress is intended.
 
 Each surface can retain at most 10,000 review keys. A mutation that would exceed this overload limit fails with `CapacityExceeded`; the additional eligible item remains NEW and is not evicted, and it appears when included by the surface's display limit. No older reviewed or archived key is evicted.
 
@@ -135,17 +141,18 @@ For a normal Git clone with a usable network origin, `cbrain init` is optional f
 | --- | --- |
 | User config | `$XDG_CONFIG_HOME/coding-brain/config.toml` |
 | User state | `$XDG_STATE_HOME/coding-brain/` |
-| Review lifecycle state | `$XDG_STATE_HOME/coding-brain/review-state.json` |
-| Review lifecycle lock | `$XDG_STATE_HOME/coding-brain/review-state.lock` |
-| Lifecycle snapshot | `$XDG_STATE_HOME/coding-brain/hooks/lifecycle.json` |
+| Brain, lifecycle, permission, activity, and learning authority | `$XDG_STATE_HOME/coding-brain/db/brain.sqlite3` |
+| Operational review state | `$XDG_STATE_HOME/coding-brain/db/review.sqlite3` |
+| Review reset gate | `$XDG_STATE_HOME/coding-brain/db/review-reset.lock` |
+| Migration gate | `$XDG_STATE_HOME/coding-brain/db/migration.lock` |
+| Native-session/process links | `$XDG_STATE_HOME/coding-brain/session-links.jsonl` |
 | Brain prompts | `$XDG_STATE_HOME/coding-brain/brain/prompts/` |
-| Permission transaction journals | `$XDG_STATE_HOME/coding-brain/brain/permission-transactions/` |
 | Project config | `.coding-brain.toml` |
 | Project identity | `.coding-brain/project.toml` |
 | Codex managed hooks | project `.codex/hooks.json` or user `~/.codex/hooks.json` |
 | Claude managed hooks | `~/.claude/settings.json` |
 | Antigravity managed hooks | `~/.gemini/config/hooks.json` |
 
-Permission transaction journals are private internal recovery state, not configuration or a supported hand-editing surface. On Unix, Coding Brain requires the directory to be mode `0700` and journal files to be mode `0600`, with ownership bound to the current effective user.
+The `db/` directory is owner-only and must be on a supported local filesystem. SQLite sidecars such as `brain.sqlite3-wal` and `brain.sqlite3-shm` are private internal state, not supported hand-editing surfaces. `session-links.jsonl` remains a separate bounded navigation log; it is not permission authority and is not part of the SQLite transaction boundary.
 
 If `XDG_STATE_HOME` is unset, Coding Brain uses `~/.local/state`. Removing `.coding-brain/project.toml` and rerunning init deliberately creates a new project identity; use that only when a fork should learn independently.

@@ -14,16 +14,26 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use coding_brain_core::brain_activity::{ActivityKind, ActivityState};
-use coding_brain_core::lifecycle::{LifecycleStore, StoreCondition, coding_brain_state_root};
+#[cfg(test)]
+use coding_brain_core::lifecycle::StoreCondition;
+use coding_brain_core::lifecycle::coding_brain_state_root;
+#[cfg(test)]
+use coding_brain_core::lifecycle::test_support::LifecycleStore;
 
+#[cfg(test)]
 use crate::brain::activity::ActivityStore;
+#[cfg(test)]
 use crate::brain::permission_transaction::{
-    RecoveryLimits as PermissionRecoveryLimits, RecoveryReport as PermissionRecoveryReport,
-    TransactionError as PermissionTransactionError, recover_pending,
+    RecoveryReport as PermissionRecoveryReport, TransactionError as PermissionTransactionError,
+};
+use crate::brain::storage::{
+    BrainDb, IntegrityHealth, MigrationCoordinator, MigrationHealth, MigrationStatus, OpenRole,
+    StorageDeadline, StorageError, StorageHealth, StoragePaths, WalHealth,
 };
 
 use coding_brain_core::provider::AgentProvider;
@@ -73,7 +83,23 @@ pub struct Check {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CheckEvidence {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     provider_files: Vec<ProviderFileEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    storage: Option<StorageEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StorageEvidence {
+    database_path: String,
+    schema_version: Option<i32>,
+    sqlite_version: String,
+    migration_status: String,
+    wal_bytes: Option<u64>,
+    wal_health: Option<String>,
+    integrity_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,12 +134,7 @@ impl From<&ProviderHookFileInspection> for ProviderFileEvidence {
 /// together.
 pub fn run_all_checks() -> Vec<Check> {
     let mut checks = Vec::new();
-    if let Some(check) = permission_transaction_recovery_check(recover_pending(
-        &coding_brain_state_root(),
-        PermissionRecoveryLimits::startup(),
-    )) {
-        checks.push(check);
-    }
+    checks.push(sqlite_storage_check_at(&coding_brain_state_root()));
     if let Some(check) =
         provider_hook_recovery_check(crate::init::provider_hooks::recover_hook_transaction())
     {
@@ -162,6 +183,7 @@ fn provider_hook_recovery_check(
     }
 }
 
+#[cfg(test)]
 fn permission_transaction_recovery_check(
     result: Result<PermissionRecoveryReport, PermissionTransactionError>,
 ) -> Option<Check> {
@@ -246,6 +268,138 @@ fn permission_transaction_recovery_check(
     })
 }
 
+fn sqlite_storage_check_at(state_root: &Path) -> Check {
+    let migration = match MigrationCoordinator::at(state_root).inspect() {
+        Ok(status) => status,
+        Err(error) => return sqlite_storage_check_from_result(Err(error)),
+    };
+    if migration != MigrationStatus::Complete {
+        return Check {
+            name: "SQLite storage".into(),
+            status: CheckStatus::Advisory,
+            message: "SQLite storage migration is not complete".into(),
+            fix_hint: Some(
+                "Run a non-hook Coding Brain command to complete storage migration.".into(),
+            ),
+            evidence: Some(CheckEvidence {
+                provider_files: Vec::new(),
+                storage: Some(StorageEvidence {
+                    database_path: "$XDG_STATE_HOME/coding-brain/db/brain.sqlite3".into(),
+                    schema_version: None,
+                    sqlite_version: rusqlite::version().into(),
+                    migration_status: migration_status_label(migration).into(),
+                    wal_bytes: None,
+                    wal_health: None,
+                    integrity_state: "not_checked".into(),
+                    error_category: None,
+                }),
+            }),
+        };
+    }
+    let paths = StoragePaths::at(state_root);
+    let result = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .and_then(|database| database.health());
+    sqlite_storage_check_from_result(result)
+}
+
+fn sqlite_storage_check_from_result(result: Result<StorageHealth, StorageError>) -> Check {
+    match result {
+        Ok(health) => {
+            let (status, message, fix_hint) = match health.wal {
+                WalHealth::Normal => (
+                    CheckStatus::Pass,
+                    "SQLite storage is current; integrity requires an explicit deep check".into(),
+                    None,
+                ),
+                WalHealth::Warning => (
+                    CheckStatus::Advisory,
+                    "SQLite WAL is above the warning threshold".into(),
+                    Some("Run bounded non-hook storage maintenance.".into()),
+                ),
+                WalHealth::HardLimit => (
+                    CheckStatus::Fail,
+                    "SQLite WAL requires maintenance before model inference".into(),
+                    Some("Run bounded non-hook storage maintenance before retrying.".into()),
+                ),
+            };
+            Check {
+                name: "SQLite storage".into(),
+                status,
+                message,
+                fix_hint,
+                evidence: Some(CheckEvidence {
+                    provider_files: Vec::new(),
+                    storage: Some(StorageEvidence {
+                        database_path: health.database_path.into(),
+                        schema_version: Some(health.schema_version),
+                        sqlite_version: health.sqlite_version.into(),
+                        migration_status: match health.migration {
+                            MigrationHealth::Complete => "complete",
+                            MigrationHealth::InProgress => "in_progress",
+                        }
+                        .into(),
+                        wal_bytes: Some(health.wal_bytes),
+                        wal_health: Some(
+                            match health.wal {
+                                WalHealth::Normal => "normal",
+                                WalHealth::Warning => "warning",
+                                WalHealth::HardLimit => "hard_limit",
+                            }
+                            .into(),
+                        ),
+                        integrity_state: match health.integrity {
+                            IntegrityHealth::NotChecked => "not_checked",
+                            IntegrityHealth::Ok => "ok",
+                            IntegrityHealth::Corrupt => "corrupt",
+                        }
+                        .into(),
+                        error_category: None,
+                    }),
+                }),
+            }
+        }
+        Err(error) => {
+            let category = error.fault_category().as_str();
+            Check {
+                name: "SQLite storage".into(),
+                status: CheckStatus::Fail,
+                message: format!("SQLite storage check failed ({category})"),
+                fix_hint: Some(
+                    "Inspect storage capacity, ownership, and integrity; then rerun `cbrain doctor`."
+                        .into(),
+                ),
+                evidence: Some(CheckEvidence {
+                    provider_files: Vec::new(),
+                    storage: Some(StorageEvidence {
+                        database_path: "$XDG_STATE_HOME/coding-brain/db/brain.sqlite3".into(),
+                        schema_version: None,
+                        sqlite_version: rusqlite::version().into(),
+                        migration_status: "unknown".into(),
+                        wal_bytes: None,
+                        wal_health: None,
+                        integrity_state: "unknown".into(),
+                        error_category: Some(category.into()),
+                    }),
+                }),
+            }
+        }
+    }
+}
+
+fn migration_status_label(status: MigrationStatus) -> &'static str {
+    match status {
+        MigrationStatus::Building => "building",
+        MigrationStatus::Verified => "verified",
+        MigrationStatus::BrainPublishedIncomplete => "brain_published_incomplete",
+        MigrationStatus::LegacyFrozen => "legacy_frozen",
+        MigrationStatus::Complete => "complete",
+    }
+}
+
 /// Human-readable renderer. Lays out one row per check, two-space
 /// indent, fixed-width name column so messages align.
 pub fn render_checks(checks: &[Check]) -> String {
@@ -280,6 +434,26 @@ pub fn render_checks(checks: &[Check]) -> String {
                     "      {} — {}\n",
                     escape_provider_path(&file.path),
                     classification,
+                ));
+            }
+            if let Some(storage) = &evidence.storage {
+                out.push_str(&format!(
+                    "      {} — schema={}, SQLite={}, migration={}, WAL={} ({}) integrity={}{}\n",
+                    storage.database_path,
+                    storage
+                        .schema_version
+                        .map_or_else(|| "unknown".into(), |version| version.to_string()),
+                    storage.sqlite_version,
+                    storage.migration_status,
+                    storage
+                        .wal_bytes
+                        .map_or_else(|| "unknown".into(), |bytes| bytes.to_string()),
+                    storage.wal_health.as_deref().unwrap_or("unknown"),
+                    storage.integrity_state,
+                    storage
+                        .error_category
+                        .as_deref()
+                        .map_or_else(String::new, |category| format!(", error={category}")),
                 ));
             }
         }
@@ -597,6 +771,7 @@ fn check_provider_setup(provider: AgentProvider, evidence: ProviderSetupEvidence
     };
     let evidence = (state != ProviderSetupState::Current).then(|| CheckEvidence {
         provider_files: evidence.hooks.files.iter().map(Into::into).collect(),
+        storage: None,
     });
     Check {
         name: format!("{} setup", provider.label()),
@@ -787,9 +962,39 @@ fn check_codex_hook_trust_at(home: Option<&std::path::Path>, cwd: &std::path::Pa
 }
 
 fn check_lifecycle_state() -> Check {
-    check_lifecycle_state_with_store(&LifecycleStore::at(coding_brain_state_root()))
+    check_lifecycle_state_at(&coding_brain_state_root())
 }
 
+fn check_lifecycle_state_at(state_root: &Path) -> Check {
+    let paths = StoragePaths::at(state_root);
+    match BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .and_then(|database| database.read_lifecycle())
+    {
+        Ok(_) => Check {
+            name: "lifecycle state".into(),
+            status: CheckStatus::Pass,
+            message: "SQLite lifecycle state readable".into(),
+            fix_hint: None,
+            evidence: None,
+        },
+        Err(error) => Check {
+            name: "lifecycle state".into(),
+            status: CheckStatus::Advisory,
+            message: format!(
+                "SQLite lifecycle state unavailable ({})",
+                error.fault_category().as_str()
+            ),
+            fix_hint: Some("Run `cbrain doctor` after storage migration or maintenance.".into()),
+            evidence: None,
+        },
+    }
+}
+
+#[cfg(test)]
 fn check_lifecycle_state_with_store(store: &LifecycleStore) -> Check {
     let (status, message, fix_hint) = match store.read() {
         Ok(view) => match view.condition {
@@ -840,27 +1045,54 @@ fn check_outcome_telemetry() -> Check {
         Ok(paths) => paths,
         Err(_) => return outcome_telemetry_unavailable(),
     };
-    check_outcome_telemetry_with_store(&ActivityStore::at(
-        paths.state_root().join("activity.jsonl"),
-    ))
+    check_outcome_telemetry_at(paths.state_root())
+}
+
+fn check_outcome_telemetry_at(state_root: &Path) -> Check {
+    let storage_paths = StoragePaths::at(state_root);
+    let database = match BrainDb::open_current(
+        &storage_paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    ) {
+        Ok(database) => database,
+        Err(_) => return outcome_telemetry_unavailable(),
+    };
+    let mut page = match database.read_activity_page(None, 4_096, 32 * 1024 * 1024) {
+        Ok(page) => page,
+        Err(_) => return outcome_telemetry_unavailable(),
+    };
+    page.events.sort_by_key(|record| record.cursor);
+    let events = page
+        .events
+        .into_iter()
+        .map(|record| record.event)
+        .collect::<Vec<_>>();
+    check_outcome_telemetry_with_events(&events)
 }
 
 fn outcome_telemetry_unavailable() -> Check {
     Check {
         name: "outcome telemetry".into(),
         status: CheckStatus::Advisory,
-        message: "activity store unavailable".into(),
+        message: "SQLite activity unavailable".into(),
         fix_hint: Some("Check state-directory ownership and permissions.".into()),
         evidence: None,
     }
 }
 
+#[cfg(test)]
 fn check_outcome_telemetry_with_store(store: &ActivityStore) -> Check {
     let log = match store.read() {
         Ok(log) => log,
         Err(_) => return outcome_telemetry_unavailable(),
     };
+    check_outcome_telemetry_with_events(log.events())
+}
 
+fn check_outcome_telemetry_with_events(
+    events: &[coding_brain_core::brain_activity::ActivityEvent],
+) -> Check {
     fn invocation_key(
         event: &coding_brain_core::brain_activity::ActivityEvent,
     ) -> Option<(&str, &str, &str)> {
@@ -873,7 +1105,7 @@ fn check_outcome_telemetry_with_store(store: &ActivityStore) -> Check {
     }
 
     let mut invocation_recency = HashMap::new();
-    for event in log.events() {
+    for event in events {
         if event.kind != ActivityKind::Lifecycle
             || !matches!(event.tool.as_deref(), Some("PreToolUse" | "PostToolUse"))
         {
@@ -899,7 +1131,7 @@ fn check_outcome_telemetry_with_store(store: &ActivityStore) -> Check {
         .collect::<HashSet<_>>();
 
     let mut invocation_evidence = HashMap::new();
-    for event in log.events().iter().rev() {
+    for event in events.iter().rev() {
         if event.kind != ActivityKind::Lifecycle {
             continue;
         }
@@ -956,8 +1188,7 @@ fn check_outcome_telemetry_with_store(store: &ActivityStore) -> Check {
     }
 
     let mut decisions = HashMap::<&str, DecisionEvidence>::new();
-    for event in log
-        .events()
+    for event in events
         .iter()
         .filter(|event| event.kind == ActivityKind::Decision)
     {
@@ -1224,6 +1455,7 @@ fn check_terminal_capabilities() -> Vec<Check> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     use coding_brain_core::brain_activity::{
         ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivityState,
@@ -1558,7 +1790,7 @@ mod tests {
 
         assert_eq!(check.status, CheckStatus::Advisory);
         assert_eq!(exit_code(std::slice::from_ref(&check)), 0);
-        assert!(check.message.contains("activity store unavailable"));
+        assert!(check.message.contains("SQLite activity unavailable"));
         assert!(!check.message.contains(&temp.path().display().to_string()));
         assert!(
             check
@@ -1663,6 +1895,63 @@ mod tests {
         let out = render_checks(&[]);
         assert!(out.contains("cbrain doctor"));
         assert!(out.contains("0 passed"));
+    }
+
+    #[test]
+    fn sqlite_storage_doctor_evidence_is_complete_and_redacted() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = crate::brain::storage::StoragePaths::at(root.path());
+        drop(crate::brain::storage::BrainDb::create_current(&paths).unwrap());
+
+        let check = sqlite_storage_check_at(root.path());
+        let json = serde_json::to_string(&check).unwrap();
+
+        assert_eq!(check.name, "SQLite storage");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(json.contains("$XDG_STATE_HOME/coding-brain/db/brain.sqlite3"));
+        assert!(json.contains("schema_version"));
+        assert!(json.contains("sqlite_version"));
+        assert!(json.contains("migration_status"));
+        assert!(json.contains("wal_bytes"));
+        assert!(json.contains("integrity_state"));
+        assert!(json.contains("not_checked"));
+        assert!(!json.contains(&root.path().display().to_string()));
+    }
+
+    #[test]
+    fn sqlite_storage_doctor_uses_fixed_error_categories() {
+        let check = sqlite_storage_check_from_result(Err(StorageError::Io(io::Error::other(
+            "/private/operator/path: token-secret",
+        ))));
+        let json = serde_json::to_string(&check).unwrap();
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(json.contains("\"error_category\":\"io\""));
+        assert!(!json.contains("private/operator"));
+        assert!(!json.contains("token-secret"));
+    }
+
+    #[test]
+    fn lifecycle_and_activity_doctor_checks_use_only_sqlite() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+
+        let lifecycle = check_lifecycle_state_at(root.path());
+        let activity = check_outcome_telemetry_at(root.path());
+
+        assert_eq!(lifecycle.status, CheckStatus::Pass);
+        assert_eq!(activity.status, CheckStatus::Skipped);
+        for legacy in [
+            "activity.jsonl",
+            "brain/decisions.jsonl",
+            "review-state.json",
+            "hooks/lifecycle.json",
+        ] {
+            assert!(!root.path().join(legacy).exists(), "created {legacy}");
+        }
     }
 
     #[test]

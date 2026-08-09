@@ -43,6 +43,7 @@ fn musl_release_targets_are_checked_before_tagging() {
         "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-musl",
         "cargo check --locked --release --target ${{ matrix.target }}",
+        "cargo check --locked --release --features fault-injection --target ${{ matrix.target }}",
         "sudo apt-get install -y musl-tools",
         "cargo test --locked --lib --target x86_64-unknown-linux-musl publication_never_replaces_an_existing_final_name",
     ] {
@@ -51,6 +52,148 @@ fn musl_release_targets_are_checked_before_tagging() {
             "missing musl CI contract: {required}"
         );
     }
+}
+
+#[test]
+fn ci_runs_live_fault_matrix_with_isolated_release_artifacts() {
+    let workflow = include_str!("../.github/workflows/ci.yml");
+    let test = job(workflow, "test", "core-standalone");
+    for required in [
+        "fail-fast: false",
+        "CARGO_TARGET_DIR=target/fault-injection-release",
+        "cargo test --locked --release --features fault-injection --test live_fault_matrix -- --test-threads=1",
+    ] {
+        assert_contract(test, required);
+    }
+
+    let cache = uses_step(test, "Swatinem/rust-cache@v2");
+    assert_contract(cache, "save-if: false");
+
+    let matrix = named_step(test, "Run live fault matrix");
+    assert_eq!(
+        test.matches("target/fault-injection-release").count(),
+        matrix.matches("target/fault-injection-release").count(),
+        "the feature target must be referenced only by the live matrix step"
+    );
+    assert_no_artifact_uploads(test);
+
+    let linkage = named_step(test, "Verify release binary uses bundled SQLite");
+    assert_contract(linkage, "CARGO_TARGET_DIR=target/release-default");
+    assert!(!linkage.contains("fault-injection"));
+}
+
+#[test]
+#[should_panic(expected = "test job must not upload artifacts")]
+fn artifact_upload_guard_rejects_broad_test_job_uploads() {
+    let test_job =
+        "\n      - uses: actions/upload-artifact@v4\n        with:\n          path: target/\n";
+    assert_no_artifact_uploads(test_job);
+}
+
+#[test]
+fn official_release_nix_and_package_paths_remain_feature_free() {
+    let release = include_str!("../.github/workflows/release.yml");
+    let build = job(release, "build", "publish-core");
+    assert_contract(build, "cargo build --release --target ${{ matrix.target }}");
+    assert_contract(build, "actions/upload-artifact@v4");
+    assert_contract(build, "- name: Package");
+    assert!(
+        !release.contains("fault-injection"),
+        "official release build, upload, and publish commands must remain feature-free"
+    );
+
+    let flake = include_str!("../flake.nix");
+    assert_contract(flake, "buildRustPackage");
+    assert_contract(flake, "checkType = \"debug\"");
+    assert!(
+        !flake.contains("fault-injection"),
+        "Nix build and package commands must remain feature-free"
+    );
+}
+
+#[test]
+fn ci_release_binary_rejects_dynamic_system_sqlite() {
+    let workflow = include_str!("../.github/workflows/ci.yml");
+    let test = job(workflow, "test", "core-standalone");
+    let step = named_step(test, "Verify release binary uses bundled SQLite");
+    assert_contract(step, "CARGO_TARGET_DIR=target/release-default");
+    assert_contract(step, "cargo build --locked --release");
+    assert!(!step.contains("fault-injection"));
+
+    let linux = shell_branch(
+        step,
+        "if [ \"$RUNNER_OS\" = \"Linux\" ]; then",
+        "elif [ \"$RUNNER_OS\" = \"macOS\" ]; then",
+    );
+    assert_fail_closed_linkage_check(
+        linux,
+        "linux_linkage",
+        "ldd $CARGO_TARGET_DIR/release/cbrain",
+        "release binary dynamically requires libsqlite3",
+    );
+
+    let macos = shell_branch(step, "elif [ \"$RUNNER_OS\" = \"macOS\" ]; then", "fi");
+    assert_fail_closed_linkage_check(
+        macos,
+        "macos_linkage",
+        "otool -L $CARGO_TARGET_DIR/release/cbrain",
+        "release binary dynamically requires libsqlite3",
+    );
+}
+
+fn named_step<'a>(job: &'a str, name: &str) -> &'a str {
+    let marker = format!("      - name: {name}\n");
+    let (_, step) = job
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("missing workflow step: {name}"));
+    step.split_once("\n      - ").map_or(step, |(step, _)| step)
+}
+
+fn uses_step<'a>(job: &'a str, action: &str) -> &'a str {
+    let marker = format!("      - uses: {action}\n");
+    let (_, step) = job
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("missing workflow action: {action}"));
+    step.split_once("\n      - ").map_or(step, |(step, _)| step)
+}
+
+fn assert_no_artifact_uploads(job: &str) {
+    assert!(
+        !job.contains("actions/upload-artifact"),
+        "test job must not upload artifacts"
+    );
+}
+
+fn shell_branch<'a>(step: &'a str, start: &str, end: &str) -> &'a str {
+    let (_, branch) = step
+        .split_once(start)
+        .unwrap_or_else(|| panic!("missing shell branch: {start}"));
+    branch
+        .split_once(end)
+        .unwrap_or_else(|| panic!("unterminated shell branch: {start}"))
+        .0
+}
+
+fn assert_fail_closed_linkage_check(
+    branch: &str,
+    output_variable: &str,
+    inspector: &str,
+    error: &str,
+) {
+    let capture = format!("{output_variable}=\"$({inspector})\"");
+    let search = format!("grep -F libsqlite3 <<<\"${output_variable}\"");
+    let capture_index = branch.find(&capture).unwrap_or_else(|| {
+        panic!("{inspector} must be a standalone capture so a nonzero exit fails the step")
+    });
+    let search_index = branch
+        .find(&search)
+        .unwrap_or_else(|| panic!("captured {inspector} output is not checked for libsqlite3"));
+    assert!(
+        capture_index < search_index,
+        "{inspector} output must be captured before it is searched"
+    );
+    assert_contract(branch, error);
+    assert_contract(branch, "exit 1");
 }
 
 fn job<'a>(workflow: &'a str, name: &str, next: &str) -> &'a str {

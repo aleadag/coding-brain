@@ -2,6 +2,7 @@ use rusqlite::config::DbConfig;
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OptionalExtension};
 
+use super::maintenance::WAL_AUTOCHECKPOINT_PAGES;
 use super::{
     BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, DatabaseKind, REVIEW_APPLICATION_ID,
     REVIEW_SCHEMA_VERSION, StorageDeadline, StorageError,
@@ -21,7 +22,8 @@ const MAX_FUNCTION_ARGS: i32 = 32;
 const MAX_LIKE_PATTERN_BYTES: i32 = 4_096;
 const MAX_VARIABLES: i32 = 1_024;
 const MAX_TRIGGER_DEPTH: i32 = 16;
-const MAX_FROZEN_SCHEMA_OBJECTS: usize = 64;
+// Schema v1 contains 70 objects including SQLite-generated unique indexes.
+const MAX_FROZEN_SCHEMA_OBJECTS: usize = 72;
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SchemaObject {
@@ -49,6 +51,11 @@ pub(super) fn configure_connection(
         after_call(deadline)?;
     }
     before_call(connection, deadline)?;
+    connection.execute_batch(&format!(
+        "PRAGMA wal_autocheckpoint = {WAL_AUTOCHECKPOINT_PAGES};"
+    ))?;
+    after_call(deadline)?;
+    before_call(connection, deadline)?;
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
     after_call(deadline)?;
     before_call(connection, deadline)?;
@@ -64,7 +71,7 @@ pub(super) fn initialize_current(
 ) -> Result<(), StorageError> {
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)?;
     let result = (|| {
-        connection.execute_batch("PRAGMA journal_mode = WAL;")?;
+        connection.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL;")?;
         let (application_id, schema_version, schema_sql) = match kind {
             DatabaseKind::Brain => (BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BRAIN_SCHEMA_SQL),
             DatabaseKind::Review => (
@@ -118,7 +125,7 @@ pub(super) fn verify_current(
     }
 }
 
-fn verify_frozen_schema(
+pub(super) fn verify_frozen_schema(
     connection: &Connection,
     kind: DatabaseKind,
     deadline: StorageDeadline,

@@ -315,6 +315,7 @@ impl SecureStateDirectory {
         Ok(file)
     }
 
+    #[cfg(test)]
     pub(super) fn create_regular_exclusive(&self, name: &CStr) -> Result<File, SecureStateError> {
         let descriptor = unsafe {
             libc::openat(
@@ -358,6 +359,7 @@ impl SecureStateDirectory {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn publish_regular<F>(
         &self,
         source_name: &CStr,

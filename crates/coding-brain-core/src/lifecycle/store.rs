@@ -1,35 +1,51 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use std::fs::{self, File, OpenOptions};
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+#[cfg(any(test, feature = "legacy-store-test-support"))]
+use std::path::Component;
+use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use std::thread;
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use fs2::FileExt;
 use serde::Deserialize;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use crate::codex_transcript::CodexResumeEvidence;
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 use crate::durable_file::durable_replace;
 use crate::provider::{AgentProvider, AgentSessionKey};
 
 use super::{
-    ANTIGRAVITY_CHILD_BITS, ActiveSubagentState, ApplyOutcome, IgnoreReason,
-    LIFECYCLE_SCHEMA_VERSION, LifecycleEvent, LifecycleIdentity, LifecycleSnapshot,
-    MAX_ACTIVE_SUBAGENTS, MAX_ANTIGRAVITY_INVOCATION_STEPS, MAX_PERMISSION_REQUESTS_PER_TURN,
-    MAX_RECENT_TURNS, PERMISSION_BITS, PermissionDecision, PermissionDisposition,
-    RecordedLifecycleEvent,
+    ANTIGRAVITY_CHILD_BITS, LIFECYCLE_SCHEMA_VERSION, LifecycleSnapshot, MAX_ACTIVE_SUBAGENTS,
+    MAX_ANTIGRAVITY_INVOCATION_STEPS, MAX_PERMISSION_REQUESTS_PER_TURN, MAX_RECENT_TURNS,
+    PERMISSION_BITS, PermissionDisposition,
+};
+#[cfg(any(test, feature = "legacy-store-test-support"))]
+use super::{
+    ActiveSubagentState, ApplyOutcome, IgnoreReason, LifecycleEvent, LifecycleIdentity,
+    PermissionDecision, RecordedLifecycleEvent,
 };
 
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 pub const MAX_SESSIONS: usize = 128;
 pub const SESSION_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 const LOCK_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 const LOCK_RETRY: Duration = Duration::from_millis(5);
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 const MAX_CORRUPT_FILES: usize = 3;
 
 #[derive(Clone, Debug)]
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 pub struct LifecycleStore {
     root: PathBuf,
 }
@@ -46,6 +62,7 @@ pub enum EnsurePermissionDecision {
     Present,
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 impl LifecycleStore {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -678,6 +695,7 @@ impl<'de> Visitor<'de> for UniqueJsonVisitor {
     }
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn snapshot_permission_disposition(
     snapshot: &LifecycleSnapshot,
     identity: &LifecycleIdentity,
@@ -714,6 +732,7 @@ fn snapshot_permission_disposition(
     state.permission_disposition(request_key)
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn snapshot_permission_decision(
     snapshot: &LifecycleSnapshot,
     identity: &LifecycleIdentity,
@@ -806,6 +825,7 @@ struct SchemaHeader {
     schema_version: u32,
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 enum LoadedSnapshot {
     Missing,
     Healthy(LifecycleSnapshot),
@@ -814,21 +834,25 @@ enum LoadedSnapshot {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 enum LockKind {
     Shared,
     Exclusive,
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 struct LockGuard<'a> {
     file: &'a File,
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 impl Drop for LockGuard<'_> {
     fn drop(&mut self) {
         let _ = FileExt::unlock(self.file);
     }
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn lock_with_timeout(file: &File, kind: LockKind) -> Result<LockGuard<'_>, StoreError> {
     let deadline = Instant::now() + LOCK_TIMEOUT;
     loop {
@@ -1125,6 +1149,7 @@ fn project_schema_three(mut snapshot: LifecycleSnapshot) -> LifecycleSnapshot {
     snapshot
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn retain_sessions(snapshot: &mut LifecycleSnapshot, received_at_ms: u64) {
     for state in snapshot.sessions.values_mut() {
         state.stopped_subagents.retain(|_, stopped| {
@@ -1242,6 +1267,7 @@ fn retain_sessions(snapshot: &mut LifecycleSnapshot, received_at_ms: u64) {
     }
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn lexical_normalize_path(path: &Path) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -1270,6 +1296,7 @@ fn valid_path(path: &Path) -> bool {
         && path.to_string_lossy().len() <= super::MAX_PATH_BYTES
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn ensure_serialized_size(bytes: &[u8]) -> Result<(), StoreError> {
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         Err(StoreError::SnapshotTooLarge)
@@ -1278,6 +1305,7 @@ fn ensure_serialized_size(bytes: &[u8]) -> Result<(), StoreError> {
     }
 }
 
+#[cfg(any(test, feature = "legacy-store-test-support"))]
 fn epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1287,19 +1315,19 @@ fn epoch_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-#[cfg(unix)]
+#[cfg(all(any(test, feature = "legacy-store-test-support"), unix))]
 fn set_dir_mode(path: &Path) -> Result<(), StoreError> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| StoreError::Io)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(any(test, feature = "legacy-store-test-support"), not(unix)))]
 fn set_dir_mode(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(any(test, feature = "legacy-store-test-support"), unix))]
 fn set_file_mode(file: &File) -> Result<(), StoreError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1307,7 +1335,7 @@ fn set_file_mode(file: &File) -> Result<(), StoreError> {
         .map_err(|_| StoreError::Io)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(any(test, feature = "legacy-store-test-support"), not(unix)))]
 fn set_file_mode(_file: &File) -> Result<(), StoreError> {
     Ok(())
 }

@@ -22,12 +22,51 @@ use coding_brain_core::terminals::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 use super::activity::{ActivityStore, ActivityStoreError, AtomicReservationOutcome};
+use super::storage::{
+    BrainDb, OpenRole, RecoveryReservationOutcome, StorageDeadline, StoragePaths,
+};
 use crate::config::BrainConfig;
 
 pub const MAX_RECOVERY_REASON_BYTES: usize = 160;
 const MAX_RECOVERY_QUEUE: usize = 64;
 const MAX_RECOVERY_WORKERS: usize = 2;
+const RECOVERY_STORAGE_TIMEOUT: Duration = Duration::from_millis(25_500);
+
+fn reserve_recovery_sqlite(
+    database: &mut BrainDb,
+    target: &RecoveryTargetSnapshot,
+    now_ms: u64,
+    cooldown: Duration,
+) -> Result<ReservationOutcome, String> {
+    let attempt = serde_json::to_string(&target.attempt)
+        .map_err(|_| "recovery reservation identity failed".to_string())?;
+    let session = target.attempt.session.storage_key();
+    let (ephemeral, epoch_order) = match target.attempt.epoch {
+        RecoveryEpoch::LifecycleSequence(sequence) => (false, sequence),
+        RecoveryEpoch::ProcessPrompt {
+            last_message_ts, ..
+        } => (true, last_message_ts.max(1)),
+    };
+    database
+        .reserve_recovery(
+            &attempt,
+            &session,
+            target.attempt.session.provider,
+            &target.attempt.session.session_id,
+            ephemeral,
+            epoch_order,
+            now_ms,
+            cooldown.as_millis().try_into().unwrap_or(u64::MAX),
+        )
+        .map(|outcome| match outcome {
+            RecoveryReservationOutcome::Reserved => ReservationOutcome::Reserved,
+            RecoveryReservationOutcome::Duplicate => ReservationOutcome::Duplicate,
+            RecoveryReservationOutcome::Cooldown => ReservationOutcome::Cooldown,
+        })
+        .map_err(|_| "recovery reservation failed".to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryDecision {
@@ -431,11 +470,13 @@ where
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub struct RecoveryReservationStore {
     activity: ActivityStore,
     cooldown_duration: Duration,
 }
 
+#[cfg(test)]
 impl RecoveryReservationStore {
     pub fn at(path: impl Into<PathBuf>, cooldown_duration: Duration) -> Self {
         Self {
@@ -547,19 +588,29 @@ fn run_hook_with<R: Read, W: Write, E: Write>(
         }
     };
     let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
-    let lifecycle = coding_brain_core::lifecycle::LifecycleStore::at(&state_root);
-    let activity_path = state_root.join("activity.jsonl");
-    let activity = ActivityStore::at(&activity_path);
+    let paths = StoragePaths::at(&state_root);
+    let mut database = match BrainDb::open_current(
+        &paths,
+        OpenRole::Hook,
+        StorageDeadline::after(RECOVERY_STORAGE_TIMEOUT),
+    ) {
+        Ok(database) => database,
+        Err(_) => {
+            write_recovery_diagnostic(&mut stderr, "SQLite storage unavailable");
+            return;
+        }
+    };
     let links = coding_brain_core::session_links::SessionLinkStore::at(
         state_root.join("session-links.jsonl"),
     );
-    let recorded = match crate::lifecycle_hook::persist_provider_hook(
+    let recorded = match crate::lifecycle_hook::persist_provider_hook_sqlite(
         provider,
         antigravity_event,
         &input,
-        &lifecycle,
-        Some(&activity),
-        Some(&links),
+        &mut database,
+        &links,
+        crate::provider_hooks::live_parent_process(provider),
+        crate::provider_hooks::revalidate_live_process,
     ) {
         Ok(recorded) => recorded,
         Err(_) => {
@@ -580,16 +631,19 @@ fn run_hook_with<R: Read, W: Write, E: Write>(
     let Some(session) = hook_session(&recorded) else {
         return;
     };
-    let initial = match hook_target(&lifecycle, &session, recorded.sequence) {
+    let initial = match hook_target(&database, &session, recorded.sequence) {
         Ok(target) => target,
         Err(_) => return,
     };
-    let reservations = RecoveryReservationStore::at(&activity_path, Duration::from_secs(10));
     let threshold = super::pref_store::adaptive_threshold(Some("recovery")).unwrap_or(0.60);
+    let database = std::cell::RefCell::new(database);
     let reserve = |target: &RecoveryTargetSnapshot| {
-        reservations
-            .reserve(target, epoch_ms())
-            .map_err(|_| "recovery reservation failed".to_string())
+        reserve_recovery_sqlite(
+            &mut database.borrow_mut(),
+            target,
+            epoch_ms(),
+            Duration::from_secs(10),
+        )
     };
     let outcome = if provider == AgentProvider::Antigravity {
         execute_antigravity_recovery_with(
@@ -601,9 +655,17 @@ fn run_hook_with<R: Read, W: Write, E: Write>(
                     super::client::infer_recovery(config, RECOVERY_PROMPT)
                 })
             },
-            || hook_target(&lifecycle, &session, recorded.sequence),
+            || hook_target(&database.borrow(), &session, recorded.sequence),
             reserve,
-            |state| append_recovery_audit(&activity, &session, &initial, state, threshold),
+            |state| {
+                append_recovery_audit_sqlite(
+                    &mut database.borrow_mut(),
+                    &session,
+                    &initial,
+                    state,
+                    threshold,
+                )
+            },
             |_| {
                 let bytes = serde_json::to_vec(&antigravity_continue_envelope(
                     "recovery approved by local model",
@@ -625,9 +687,17 @@ fn run_hook_with<R: Read, W: Write, E: Write>(
                     super::client::infer_recovery(config, RECOVERY_PROMPT)
                 })
             },
-            || hook_target(&lifecycle, &session, recorded.sequence),
+            || hook_target(&database.borrow(), &session, recorded.sequence),
             reserve,
-            |state| append_recovery_audit(&activity, &session, &initial, state, threshold),
+            |state| {
+                append_recovery_audit_sqlite(
+                    &mut database.borrow_mut(),
+                    &session,
+                    &initial,
+                    state,
+                    threshold,
+                )
+            },
             |_| {
                 if session.provider == AgentProvider::Codex {
                     deliver_guarded_codex_continue_with(&session, execute_guarded_action_classified)
@@ -637,11 +707,17 @@ fn run_hook_with<R: Read, W: Write, E: Write>(
                         .map_err(recovery_delivery_failure)
                 }
             },
-            |target| hook_postflight_matches(&lifecycle, &session, target),
+            |target| hook_postflight_matches(&database.borrow(), &session, target),
         )
     };
     if outcome.diagnostic_category().is_some()
-        && append_recovery_diagnostic(&activity, &session, &initial, outcome).is_err()
+        && append_recovery_diagnostic_sqlite(
+            &mut database.borrow_mut(),
+            &session,
+            &initial,
+            outcome,
+        )
+        .is_err()
     {
         write_recovery_diagnostic(&mut stderr, "recovery diagnostic persistence failed");
     }
@@ -665,15 +741,17 @@ fn hook_session(recorded: &crate::lifecycle_hook::RecordedProviderHook) -> Optio
 }
 
 fn hook_target(
-    lifecycle: &coding_brain_core::lifecycle::LifecycleStore,
+    database: &BrainDb,
     session: &AgentSession,
     sequence: u64,
 ) -> Result<RecoveryTargetSnapshot, String> {
     let key = AgentSessionKey::native(session.provider, &session.session_id);
-    let view = lifecycle.read().map_err(|_| "lifecycle read failed")?;
-    let state = view
-        .snapshot
-        .and_then(|snapshot| snapshot.sessions.get(&key.storage_key()).cloned())
+    let state = database
+        .read_lifecycle()
+        .map_err(|_| "lifecycle read failed")?
+        .sessions
+        .get(&key.storage_key())
+        .cloned()
         .ok_or("lifecycle evidence missing")?;
     if state.latest_sequence != sequence
         || state.latest_event != Some(coding_brain_core::lifecycle::LifecycleEventName::Stop)
@@ -696,7 +774,7 @@ fn hook_target(
 }
 
 fn hook_postflight_matches(
-    lifecycle: &coding_brain_core::lifecycle::LifecycleStore,
+    database: &BrainDb,
     session: &AgentSession,
     target: &RecoveryTargetSnapshot,
 ) -> Result<(), String> {
@@ -711,15 +789,12 @@ fn hook_postflight_matches(
     let RecoveryEpoch::LifecycleSequence(sequence) = target.attempt.epoch else {
         return Err("recovery epoch changed".into());
     };
-    let view = lifecycle.read().map_err(|_| "lifecycle read failed")?;
-    let state = view
-        .snapshot
-        .and_then(|snapshot| {
-            snapshot
-                .sessions
-                .get(&target.attempt.session.storage_key())
-                .cloned()
-        })
+    let state = database
+        .read_lifecycle()
+        .map_err(|_| "lifecycle read failed")?
+        .sessions
+        .get(&target.attempt.session.storage_key())
+        .cloned()
         .ok_or("lifecycle evidence missing")?;
     if state.latest_sequence != sequence
         || state.latest_event != Some(coding_brain_core::lifecycle::LifecycleEventName::Stop)
@@ -731,6 +806,7 @@ fn hook_postflight_matches(
     Ok(())
 }
 
+#[cfg(test)]
 fn append_recovery_audit(
     activity: &ActivityStore,
     session: &AgentSession,
@@ -774,6 +850,49 @@ fn append_recovery_audit(
         .map_err(|_| "recovery audit persistence failed".to_string())
 }
 
+fn append_recovery_audit_sqlite(
+    database: &mut BrainDb,
+    session: &AgentSession,
+    target: &RecoveryTargetSnapshot,
+    state: ActivityState,
+    threshold: f64,
+) -> Result<(), String> {
+    let attempt = serde_json::to_string(&target.attempt)
+        .map_err(|_| "recovery audit serialization failed".to_string())?;
+    let fingerprint = target.evidence_json()?;
+    database
+        .append_activity(ActivityEvent {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            kind: ActivityKind::Decision,
+            activity_id: format!("recovery_delivery:{attempt}"),
+            recorded_at_ms: epoch_ms(),
+            project: recovery_project(session, target),
+            session: Some(recovery_session_target(session, target)),
+            state,
+            tool: Some("recovery".into()),
+            normalized_command: None,
+            fingerprint: Some(fingerprint),
+            rule_id: Some("recovery".into()),
+            confidence: None,
+            threshold: Some(threshold),
+            reasoning: Some(
+                match state {
+                    ActivityState::DeliveryFailed => "guarded recovery delivery failed",
+                    ActivityState::Delivered => "guarded recovery delivered",
+                    _ => "guarded recovery evaluating",
+                }
+                .into(),
+            ),
+            decision_id: None,
+            outcome: None,
+            correction: None,
+            note: None,
+            supersedes: None,
+        })
+        .map(|_| ())
+        .map_err(|_| "recovery audit persistence failed".to_string())
+}
+
 fn recovery_project(session: &AgentSession, target: &RecoveryTargetSnapshot) -> ProjectEvidence {
     ProjectEvidence {
         project_id: ProjectId::Temporary(format!(
@@ -812,6 +931,7 @@ fn recovery_diagnostic_id(attempt: &RecoveryAttemptKey, category: &str) -> Resul
     ))
 }
 
+#[cfg(test)]
 fn append_recovery_diagnostic(
     activity: &ActivityStore,
     session: &AgentSession,
@@ -820,6 +940,17 @@ fn append_recovery_diagnostic(
 ) -> Result<bool, String> {
     activity
         .append_if_absent(recovery_diagnostic_event(session, target, outcome)?)
+        .map_err(|_| "recovery diagnostic persistence failed".to_string())
+}
+
+fn append_recovery_diagnostic_sqlite(
+    database: &mut BrainDb,
+    session: &AgentSession,
+    target: &RecoveryTargetSnapshot,
+    outcome: RecoveryExecution,
+) -> Result<bool, String> {
+    database
+        .append_recovery_activity_if_absent(recovery_diagnostic_event(session, target, outcome)?)
         .map_err(|_| "recovery diagnostic persistence failed".to_string())
 }
 
@@ -1050,8 +1181,15 @@ impl RecoveryCoordinator {
             evaluate,
             Arc::new(|event| {
                 let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
-                ActivityStore::at(state_root.join("activity.jsonl"))
-                    .append_if_absent(event)
+                let paths = StoragePaths::at(&state_root);
+                let mut database = BrainDb::open_current(
+                    &paths,
+                    OpenRole::NonHook,
+                    StorageDeadline::after(Duration::from_secs(1)),
+                )
+                .map_err(|_| "recovery diagnostic storage unavailable".to_string())?;
+                database
+                    .append_recovery_activity_if_absent(event)
                     .map_err(|_| "recovery diagnostic persistence failed".to_string())
             }),
         )
@@ -1214,21 +1352,25 @@ fn scan_recovery_work(
     let sessions = coding_brain_core::discovery::scan_agent_sessions_with_state(&mut discovery);
     drop(discovery);
     let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
-    let lifecycle = coding_brain_core::lifecycle::LifecycleStore::at(&state_root)
-        .read()
-        .ok()
-        .and_then(|view| view.snapshot);
+    let paths = StoragePaths::at(&state_root);
+    let Ok(mut database) = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    ) else {
+        return Vec::new();
+    };
+    let lifecycle = database.read_lifecycle().ok();
     let links = coding_brain_core::session_links::SessionLinkStore::at(
         state_root.join("session-links.jsonl"),
     )
     .read_projection()
     .ok();
-    let activity = ActivityStore::at(state_root.join("activity.jsonl"));
-    scan_recovery_sessions(
+    scan_recovery_sessions_sqlite(
         sessions,
         lifecycle.as_ref(),
         links.as_ref(),
-        &activity,
+        &mut database,
         |session| {
             probe_actionable_prompt(session).map(|evidence| {
                 (
@@ -1240,6 +1382,30 @@ fn scan_recovery_work(
     )
 }
 
+fn scan_recovery_sessions_sqlite(
+    sessions: Vec<AgentSession>,
+    lifecycle: Option<&coding_brain_core::lifecycle::LifecycleSnapshot>,
+    links: Option<&coding_brain_core::session_links::SessionIdentityProjection>,
+    database: &mut BrainDb,
+    probe: impl Fn(&AgentSession) -> Result<(u64, bool), String>,
+) -> Vec<RecoveryPollWork> {
+    sessions
+        .into_iter()
+        .filter_map(|session| {
+            let (prompt_fingerprint, recoverable) = probe(&session).ok()?;
+            let (target, process_only) =
+                recovery_target_for_session(&session, prompt_fingerprint, lifecycle, links)?;
+            if process_only {
+                append_process_attention_sqlite(database, &session, &target).ok()?;
+                return None;
+            }
+            recoverable.then_some(RecoveryPollWork { session, target })
+        })
+        .take(MAX_RECOVERY_QUEUE + 1)
+        .collect()
+}
+
+#[cfg(test)]
 fn scan_recovery_sessions(
     sessions: Vec<AgentSession>,
     lifecycle: Option<&coding_brain_core::lifecycle::LifecycleSnapshot>,
@@ -1255,6 +1421,7 @@ fn scan_recovery_sessions(
                 recovery_target_for_session(&session, prompt_fingerprint, lifecycle, links)?;
             if process_only {
                 append_process_attention(activity, &session, &target).ok()?;
+                return None;
             }
             recoverable.then_some(RecoveryPollWork { session, target })
         })
@@ -1359,8 +1526,8 @@ fn refresh_poll_evidence_from(
     let session = resolve_current_poll_session(work, sessions)?;
     let prompt_fingerprint = probe(&session)?;
     let target = recovery_target_for_session(&session, prompt_fingerprint, lifecycle, links)
-        .map(|(target, _)| target)
-        .ok_or_else(|| "recovery target unavailable".to_string())?;
+        .and_then(|(target, process_only)| (!process_only).then_some(target))
+        .ok_or_else(|| "recovery session-link authority unavailable".to_string())?;
     Ok(RefreshedPollEvidence { session, target })
 }
 
@@ -1369,10 +1536,14 @@ fn refresh_poll_evidence(work: &RecoveryPollWork) -> Result<RefreshedPollEvidenc
         &mut coding_brain_core::discovery::ProviderDiscoveryState::default(),
     );
     let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
-    let lifecycle = coding_brain_core::lifecycle::LifecycleStore::at(&state_root)
-        .read()
-        .ok()
-        .and_then(|view| view.snapshot);
+    let paths = StoragePaths::at(&state_root);
+    let database = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .map_err(|_| "recovery SQLite storage unavailable".to_string())?;
+    let lifecycle = database.read_lifecycle().ok();
     let links = coding_brain_core::session_links::SessionLinkStore::at(
         state_root.join("session-links.jsonl"),
     )
@@ -1399,9 +1570,14 @@ fn evaluate_poll_work(
     let config = crate::config::Config::load();
     let mode = super::resolve_gate_mode(config.brain.as_ref()).mode;
     let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
-    let activity = ActivityStore::at(state_root.join("activity.jsonl"));
-    let reservations =
-        RecoveryReservationStore::at(state_root.join("activity.jsonl"), Duration::from_secs(10));
+    let paths = StoragePaths::at(&state_root);
+    let database = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(RECOVERY_STORAGE_TIMEOUT),
+    )
+    .ok()?;
+    let database = std::cell::RefCell::new(database);
     let threshold = super::pref_store::adaptive_threshold(Some("recovery")).unwrap_or(0.60);
     let outcome = execute_recovery_with(
         mode,
@@ -1414,11 +1590,22 @@ fn evaluate_poll_work(
         },
         || refresh_poll_target(work),
         |target| {
-            reservations
-                .reserve(target, epoch_ms())
-                .map_err(|_| "recovery reservation failed".to_string())
+            reserve_recovery_sqlite(
+                &mut database.borrow_mut(),
+                target,
+                epoch_ms(),
+                Duration::from_secs(10),
+            )
         },
-        |state| append_recovery_audit(&activity, &work.session, &work.target, state, threshold),
+        |state| {
+            append_recovery_audit_sqlite(
+                &mut database.borrow_mut(),
+                &work.session,
+                &work.target,
+                state,
+                threshold,
+            )
+        },
         |target| {
             let refreshed = refresh_poll_evidence(work).map_err(|_| {
                 RecoveryDeliveryFailure::NotSent(GuardedActionFailureCategory::CaptureUnavailable)
@@ -1522,17 +1709,19 @@ fn poll_postflight_matches(
     }
     if let RecoveryEpoch::LifecycleSequence(sequence) = target.attempt.epoch {
         let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
-        let view = coding_brain_core::lifecycle::LifecycleStore::at(state_root)
-            .read()
-            .map_err(|_| "lifecycle read failed")?;
-        let state = view
-            .snapshot
-            .and_then(|snapshot| {
-                snapshot
-                    .sessions
-                    .get(&target.attempt.session.storage_key())
-                    .cloned()
-            })
+        let paths = StoragePaths::at(&state_root);
+        let database = BrainDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(1)),
+        )
+        .map_err(|_| "lifecycle storage unavailable")?;
+        let state = database
+            .read_lifecycle()
+            .map_err(|_| "lifecycle read failed")?
+            .sessions
+            .get(&target.attempt.session.storage_key())
+            .cloned()
             .ok_or("lifecycle evidence missing")?;
         if state.latest_sequence != sequence || state.current_turn != target.turn_id {
             return Err("postflight lifecycle evidence changed".into());
@@ -1541,6 +1730,7 @@ fn poll_postflight_matches(
     Ok(())
 }
 
+#[cfg(test)]
 fn append_process_attention(
     activity: &ActivityStore,
     session: &AgentSession,
@@ -1589,6 +1779,57 @@ fn append_process_attention(
     };
     activity
         .append_if_absent(event)
+        .map(|_| ())
+        .map_err(|_| "recovery attention persistence failed".into())
+}
+
+fn append_process_attention_sqlite(
+    database: &mut BrainDb,
+    session: &AgentSession,
+    target: &RecoveryTargetSnapshot,
+) -> Result<(), String> {
+    let fingerprint = target.evidence_json()?;
+    let attempt = serde_json::to_string(&target.attempt)
+        .map_err(|_| "recovery attention identity failed".to_string())?;
+    let attempt_id = compact_fingerprint(&attempt);
+    let project_id =
+        ProjectId::Temporary(format!("recovery:{}", target.attempt.session.storage_key()));
+    database
+        .append_recovery_activity_if_absent(ActivityEvent {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            kind: ActivityKind::Decision,
+            activity_id: format!("actionable_prompt_attention:{attempt_id:016x}"),
+            recorded_at_ms: epoch_ms(),
+            project: ProjectEvidence {
+                project_id: project_id.clone(),
+                cwd: PathBuf::from(&session.cwd),
+                label: None,
+            },
+            session: Some(SessionTarget {
+                provider: target.attempt.session.provider,
+                session_id: target.attempt.session.session_id.clone(),
+                provider_session_id: None,
+                turn_id: None,
+                tool_use_id: None,
+                project_id,
+                cwd: PathBuf::from(&session.cwd),
+                provider_hints: Vec::new(),
+                provenance: coding_brain_core::brain_activity::SessionTargetProvenance::RecognizedProcessAttention,
+            }),
+            state: ActivityState::Abstained,
+            tool: Some("agent_prompt".into()),
+            normalized_command: None,
+            fingerprint: Some(fingerprint),
+            rule_id: Some("actionable_prompt_attention".into()),
+            confidence: None,
+            threshold: None,
+            reasoning: Some("recognized actionable agent prompt".into()),
+            decision_id: None,
+            outcome: None,
+            correction: None,
+            note: None,
+            supersedes: None,
+        })
         .map(|_| ())
         .map_err(|_| "recovery attention persistence failed".into())
 }
@@ -2214,7 +2455,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_refresh_resolves_one_current_live_session_and_expires_stale_status_or_timestamp() {
+    fn poll_refresh_rejects_a_target_when_its_session_link_disappears() {
         let mut initial_session = process_session(AgentProvider::Claude);
         initial_session.status = SessionStatus::WaitingInput;
         let (initial_target, _) =
@@ -2227,10 +2468,14 @@ mod tests {
         current.status = SessionStatus::Processing;
         current.last_message_ts += 1;
 
-        let refreshed =
-            refresh_poll_evidence_from(&work, vec![current], None, None, |_| Ok(42)).unwrap();
-        assert_eq!(refreshed.target.status, SessionStatus::Processing);
-        assert_eq!(refreshed.target.last_message_ts, 1_001);
+        assert!(
+            refresh_poll_evidence_from(&work, vec![current.clone()], None, None, |_| Ok(42))
+                .is_err(),
+            "a process-only target must not survive revalidation without a session link"
+        );
+        let mut refreshed_target = initial_target.clone();
+        refreshed_target.status = current.status;
+        refreshed_target.last_message_ts = current.last_message_ts;
 
         let sends = std::cell::Cell::new(0);
         let outcome = execute_recovery_with(
@@ -2238,7 +2483,7 @@ mod tests {
             initial_target,
             0.60,
             || Ok(suggestion(0.91)),
-            || Ok(refreshed.target.clone()),
+            || Ok(refreshed_target.clone()),
             |_| Ok(ReservationOutcome::Reserved),
             |_| Ok(()),
             |_| {
@@ -2275,7 +2520,7 @@ mod tests {
                 scan_recovery_sessions(vec![session.clone()], None, None, &activity, |_| {
                     Ok((42, true))
                 });
-            assert_eq!(recognized.len(), 1);
+            assert!(recognized.is_empty());
         }
         let events = activity.read().unwrap();
         assert_eq!(events.events().len(), 1);
@@ -2309,6 +2554,30 @@ mod tests {
             assert!(work.is_empty());
         }
         assert_eq!(permission_activity.read().unwrap().events().len(), 1);
+    }
+
+    #[test]
+    fn sqlite_process_attention_is_visibility_only_without_session_link_authority() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(temp.path());
+        let mut database = BrainDb::create_current(&paths).unwrap();
+        let session = process_session(AgentProvider::Antigravity);
+
+        let work = scan_recovery_sessions_sqlite(vec![session], None, None, &mut database, |_| {
+            Ok((42, true))
+        });
+
+        assert!(work.is_empty());
+        let activity = database.activity_after_cursor(None, 10, 64 * 1024).unwrap();
+        assert_eq!(activity.events.len(), 1);
+        assert_eq!(activity.events[0].event.state, ActivityState::Abstained);
+        assert_eq!(
+            activity.events[0].event.rule_id.as_deref(),
+            Some("actionable_prompt_attention")
+        );
     }
 
     #[test]

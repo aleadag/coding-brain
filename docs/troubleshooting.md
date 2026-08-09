@@ -51,19 +51,23 @@ Before treating a future `agy` release as fixed, repeat the isolated real-binary
 
 Codex and Claude continuation, process-only sessions, and prompts outside a structured response contract require guarded tmux input. Coding Brain acts only when current process identity maps to one pane and immediate prompt recapture reproduces the expected provider-specific evidence. If tmux is missing, a pane is ambiguous, or the prompt changed, the semantic action remains unresolved instead of sending input. Press `x` on the exact Live activity to preflight current availability; only the recognized semantic actions appear, while `t` accepts bounded hidden manual text after you confirm with Enter. Semantic dispatch independently revalidates the exact target and prompt. Manual-text dispatch revalidates the exact target, backend, and bounded capture but does not require prompt equality.
 
-## Live shows INCOMPLETE or Doctor reports permission transaction recovery
+## Live shows INCOMPLETE
 
 Run `cbrain doctor` before changing any state. `INCOMPLETE` with `permission evaluation timed out` means a permission evaluation became stale without terminal evidence. It does not prove that the hook died, that Coding Brain delivered a response, or that the provider executed the command.
 
-Interpret the `Permission transaction recovery` row as follows:
+Permission authority and matching terminal activity now commit atomically in `brain.sqlite3`; there is no live permission-journal recovery queue. If Doctor reports a SQLite storage failure, diagnose that database instead of editing frozen legacy JSONL or journal files.
 
-- Pass means Doctor recovered the reported number of valid transactions.
-- Advisory means a permission hook still owns an active transaction. Let the hook finish, then rerun `cbrain doctor`.
-- Fail means recovery found invalid, over-budget, unresolved, removal-sync-uncertain, or unreadable evidence. The evidence remains retained and permission handling stays fail-closed.
+## SQLite migration is incomplete
 
-For an over-budget failure, `over_budget_store` identifies `journal_count`, `journal_bytes`, `decisions.jsonl`, or `activity.jsonl`, and `over_budget_limit` gives the enforced count or byte limit. The private journal directory is `$XDG_STATE_HOME/coding-brain/brain/permission-transactions/`; the destination stores are under the same Coding Brain state root.
+Lifecycle, permission, and recovery hooks never migrate storage. Until a complete current Brain database is available, they perform no model inference and leave the request to the provider's native handling.
 
-Do not delete, rename, truncate, or edit a retained journal to clear the row. Stop the affected agent processes, back up the complete `$XDG_STATE_HOME/coding-brain/` directory, and inspect the named store and its permissions before planning maintenance. Preserve invalid or uncertain evidence for diagnosis. After correcting the underlying ownership, capacity, or store-integrity problem, rerun `cbrain doctor` and let its bounded recovery confirm the result.
+Run an ordinary non-hook command to perform the automatic migration:
+
+```bash
+cbrain doctor
+```
+
+Migration stages and validates the supported legacy set, publishes same-directory SQLite databases, then freezes migrated sources read-only. Do not edit, unfreeze, or delete those sources: a later mutation is treated as split brain and is not merged. The `cbrain storage` subcommands require current storage and do not initiate migration.
 
 ## Brain endpoint warnings
 
@@ -73,11 +77,11 @@ Project `.coding-brain.toml` cannot change the endpoint. Set it in `$XDG_CONFIG_
 
 ## State is unavailable or corrupt
 
-Coding Brain state is under `$XDG_STATE_HOME/coding-brain/`, normally `~/.local/state/coding-brain/`. Check ownership and permissions for that directory. A newer-schema advisory means the state was written by a newer build; upgrade before writing it again.
+Coding Brain state is under `$XDG_STATE_HOME/coding-brain/`, normally `~/.local/state/coding-brain/`. The authoritative database is `db/brain.sqlite3`; operational review state is `db/review.sqlite3`. Check ownership and permissions for the state and `db/` directories. The database directory must be on a supported local filesystem; network and unrecognized filesystem types are rejected. A newer-schema advisory means the state was written by a newer build; upgrade before writing it again.
 
-Activity and preference files use bounded, repair-aware writes. Do not assume the next hook event repairs every lifecycle failure: permission hooks preserve corrupt or newer lifecycle authority evidence and fail closed without quarantining, replacing, initializing, or writing a fallback snapshot. Back up and inspect the state reported by Doctor before changing it.
+Doctor's routine storage row checks schema, migration state, and WAL size. It intentionally reports integrity as `not_checked` because it does not run the bounded deep integrity API; no public CLI command currently exposes that deep check. A WAL at 16 MiB is advisory. At 64 MiB it blocks model inference until bounded non-hook maintenance succeeds, while deterministic safety denies remain fail-closed.
 
-Current activity rows use schema v3 and lifecycle snapshots use schema v4. A rollback binary that supports only lifecycle schema v3 rejects a v4 snapshot. If rollback matters, back up the complete `$XDG_STATE_HOME/coding-brain/` directory before upgrading rather than copying only `activity.jsonl`.
+Do not delete or replace a corrupt authoritative database with frozen legacy files. Coding Brain preserves the last coherent TUI view and never rebuilds published corrupt authority from stale sources. A failure confined to `review.sqlite3` leaves coherent Brain permission and audit evidence unchanged; after stopping all Coding Brain processes, `cbrain storage reset-review-state` discards only operational review progress.
 
 ## Agent Deck attach fails
 
@@ -89,7 +93,15 @@ The raw installer exits before downloading or writing when `${INSTALL_DIR:-/usr/
 
 ## Rollback and purge
 
-Normal startup and doctor do not modify old data. Before purge, reinstall the old build and rerun its init command if you need to roll back.
+Before downgrading from SQLite, stop Coding Brain and create the verified frozen compatibility export expected by v0.59.1:
+
+```bash
+cbrain storage export-legacy /absolute/new/export-directory
+```
+
+An audit export is not a downgrade export. `cbrain storage export-audit <directory>` marks its archive non-executable and cannot recreate live permission authority. Neither exporter dual-writes or changes live state.
+
+Automatic migration applies only to supported pre-SQLite Coding Brain state. It does not migrate the older `codexctl` executable's config or state paths.
 
 `cbrain init --remove` removes managed hooks and the onboarding marker while preserving data. `cbrain init --purge` previews the documented current and legacy global config/state targets, rechecks each target after confirmation, and deletes them. Purge is irreversible. It preserves project `.coding-brain.toml`, `.coding-brain/project.toml`, unrelated hooks, and sibling XDG files.
 

@@ -2,12 +2,24 @@
 
 mod activity;
 mod decisions;
+mod export;
+#[cfg(feature = "fault-injection")]
+mod fault_injection;
 mod legacy;
 mod lifecycle;
+mod maintenance;
+mod migration;
 mod permissions;
 mod review;
 mod schema;
 mod security;
+
+#[cfg(feature = "fault-injection")]
+#[allow(unused_imports)]
+pub(crate) use fault_injection::{
+    Activation as FaultActivation, FaultPoint, FaultPosition, FaultSelection, MigrationFaultStage,
+    activate as activate_fault, hit as hit_fault, run_worker as run_fault_worker,
+};
 
 use std::ffi::{CStr, OsStr};
 use std::fmt;
@@ -21,22 +33,30 @@ use coding_brain_core::review_state::ReviewRequestError;
 use fs2::FileExt;
 use rusqlite::config::DbConfig;
 use rusqlite::limits::Limit;
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use security::{SecureDatabaseDirectory, SecurityError};
 
 #[allow(unused_imports)]
-pub use activity::{ActivityCursor, ActivityPage, ActivityRecord};
+pub use activity::{ActivityCursor, ActivityPage, ActivityRecord, RecoveryReservationOutcome};
 #[allow(unused_imports)]
 pub use decisions::{
     DecisionIdentity, DecisionKind, DecisionPayload, ErasureState, LearningDecisionPage,
     LearningErasePaths, LearningReadSession,
 };
+pub use export::{AuditExporter, LegacyExporter};
 #[allow(unused_imports)]
 pub use legacy::{
-    LEGACY_EXPORT_PROFILE, LegacyFingerprint, LegacySnapshot, LegacySourceDescriptor,
-    LegacySourceKind, LegacySourceSet,
+    LEGACY_EXPORT_PROFILE, LegacyFingerprint, LegacyFreezeArtifact, LegacyFreezeIdentity,
+    LegacySnapshot, LegacySourceDescriptor, LegacySourceKind, LegacySourceSet, LegacyWriterGuard,
 };
+#[allow(unused_imports)]
+pub use maintenance::{
+    IntegrityHealth, MaintenanceOutcome, MigrationHealth, StorageHealth, WAL_AUTOCHECKPOINT_PAGES,
+    WAL_HARD_LIMIT_BYTES, WAL_WARNING_BYTES, WalHealth,
+};
+#[allow(unused_imports)]
+pub use migration::{FrozenSourceManifest, MigrationCoordinator, MigrationStatus};
 #[allow(unused_imports)]
 pub use permissions::{
     AttemptId, CommittedPermission, DeliveryEvidence, HistoricalDeliveryState,
@@ -55,6 +75,7 @@ pub const REVIEW_SCHEMA_VERSION: i32 = 1;
 const BRAIN_DATABASE_NAME: &CStr = c"brain.sqlite3";
 const REVIEW_DATABASE_NAME: &CStr = c"review.sqlite3";
 const REVIEW_RESET_GATE_NAME: &CStr = c"review-reset.lock";
+const MIGRATION_LOCK_NAME: &CStr = c"migration.lock";
 
 #[derive(Debug, Clone)]
 pub struct StoragePaths {
@@ -95,6 +116,45 @@ pub enum OpenRole {
     NonHook,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageOperation {
+    Open,
+    Read,
+    Admission,
+    Commit,
+    Delivery,
+    Checkpoint,
+    Maintenance,
+    Integrity,
+    Activity,
+    Decision,
+    Lifecycle,
+    Review,
+    Migration,
+    Export,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageFaultCategory {
+    Busy,
+    Full,
+    Io,
+    Corrupt,
+    Other,
+}
+
+impl StorageFaultCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Full => "full",
+            Self::Io => "io",
+            Self::Corrupt => "corrupt",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct StorageDeadline(Instant);
 
@@ -128,7 +188,18 @@ impl StorageDeadline {
 #[derive(Debug)]
 pub enum StorageError {
     Busy,
+    MaintenanceRequired,
+    HookMaintenanceForbidden,
+    StorageFault {
+        operation: StorageOperation,
+        category: StorageFaultCategory,
+    },
+    CommitUncertain {
+        operation: StorageOperation,
+        category: StorageFaultCategory,
+    },
     MigrationRequired,
+    MigrationActive,
     UnsupportedSchema {
         application_id: i32,
         schema_version: i32,
@@ -151,7 +222,30 @@ impl fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Busy => formatter.write_str("SQLite storage deadline elapsed or storage is busy"),
+            Self::MaintenanceRequired => {
+                formatter.write_str("SQLite storage maintenance is required")
+            }
+            Self::HookMaintenanceForbidden => {
+                formatter.write_str("hook processes cannot run SQLite maintenance")
+            }
+            Self::StorageFault {
+                operation,
+                category,
+            } => write!(
+                formatter,
+                "SQLite storage {operation:?} failed ({})",
+                category.as_str()
+            ),
+            Self::CommitUncertain {
+                operation,
+                category,
+            } => write!(
+                formatter,
+                "SQLite storage {operation:?} commit result is uncertain ({})",
+                category.as_str()
+            ),
             Self::MigrationRequired => formatter.write_str("SQLite storage migration is required"),
+            Self::MigrationActive => formatter.write_str("SQLite storage migration is active"),
             Self::UnsupportedSchema {
                 application_id,
                 schema_version,
@@ -197,13 +291,23 @@ impl std::error::Error for StorageError {
 
 impl From<rusqlite::Error> for StorageError {
     fn from(error: rusqlite::Error) -> Self {
-        if matches!(
-            error.sqlite_error_code(),
-            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-        ) {
-            Self::Busy
-        } else {
-            Self::Sqlite(error)
+        maintenance::map_sqlite_error(StorageOperation::Read, false, error)
+    }
+}
+
+impl StorageError {
+    pub fn fault_category(&self) -> StorageFaultCategory {
+        match self {
+            Self::Busy => StorageFaultCategory::Busy,
+            Self::StorageFault { category, .. } | Self::CommitUncertain { category, .. } => {
+                *category
+            }
+            Self::Io(_) => StorageFaultCategory::Io,
+            Self::InvalidStorage(_) => StorageFaultCategory::Corrupt,
+            Self::Sqlite(error) => {
+                maintenance::sqlite_fault_category(error).unwrap_or(StorageFaultCategory::Other)
+            }
+            _ => StorageFaultCategory::Other,
         }
     }
 }
@@ -252,6 +356,7 @@ impl DatabaseKind {
 pub struct BrainDb {
     connection: Connection,
     deadline: Option<StorageDeadline>,
+    role: OpenRole,
     database_path: PathBuf,
     learning_root: PathBuf,
 }
@@ -268,6 +373,7 @@ impl BrainDb {
         Ok(Self {
             connection,
             deadline: None,
+            role: OpenRole::NonHook,
             database_path: paths.brain_db(),
             learning_root: paths.brain_learning_root(),
         })
@@ -278,10 +384,14 @@ impl BrainDb {
         role: OpenRole,
         deadline: StorageDeadline,
     ) -> Result<Self, StorageError> {
+        if role == OpenRole::Hook {
+            migration::hook_preflight(paths)?;
+        }
         let connection = open_current(paths, BRAIN_DATABASE_NAME, DatabaseKind::Brain, deadline)?;
         let database = Self {
             connection,
             deadline: Some(deadline),
+            role,
             database_path: paths.brain_db(),
             learning_root: paths.brain_learning_root(),
         };
@@ -293,6 +403,226 @@ impl BrainDb {
 
     pub fn schema_sql() -> &'static str {
         schema::BRAIN_SCHEMA_SQL
+    }
+
+    fn create_staging(
+        paths: &StoragePaths,
+        database_name: &CStr,
+        generation: u64,
+    ) -> Result<Self, StorageError> {
+        if generation == 0 || generation > i64::MAX as u64 {
+            return Err(StorageError::InvalidStorage(
+                "migration generation is out of range",
+            ));
+        }
+        let directory = SecureDatabaseDirectory::prepare(&paths.state_root, true)?;
+        let connection =
+            create_current_in_directory(&directory, database_name, DatabaseKind::Brain)?;
+        let updated = connection.execute(
+            "UPDATE schema_meta
+             SET migration_state = 'in_progress', migration_generation = ?1
+             WHERE singleton = 1 AND migration_state = 'complete' AND migration_generation = 0",
+            [generation as i64],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::InvalidStorage(
+                "staging migration metadata is invalid",
+            ));
+        }
+        Ok(Self {
+            connection,
+            deadline: None,
+            role: OpenRole::NonHook,
+            database_path: directory
+                .path()
+                .join(OsStr::from_bytes(database_name.to_bytes())),
+            learning_root: paths.brain_learning_root(),
+        })
+    }
+
+    fn open_published_incomplete(paths: &StoragePaths) -> Result<Self, StorageError> {
+        Self::open_incomplete_named(paths, BRAIN_DATABASE_NAME, None, false)
+    }
+
+    fn open_published_for_completion(
+        paths: &StoragePaths,
+        generation: u64,
+    ) -> Result<Self, StorageError> {
+        Self::open_incomplete_named(paths, BRAIN_DATABASE_NAME, Some(generation), true)
+    }
+
+    fn complete_published_migration(
+        self,
+        paths: &StoragePaths,
+        generation: u64,
+    ) -> Result<(), StorageError> {
+        if generation == 0 || generation > i64::MAX as u64 {
+            return Err(StorageError::InvalidStorage(
+                "migration generation is out of range",
+            ));
+        }
+        let updated = self.connection.execute(
+            "UPDATE schema_meta
+             SET migration_state = 'complete'
+             WHERE singleton = 1 AND migration_state = 'in_progress'
+                   AND migration_generation = ?1",
+            [generation as i64],
+        )?;
+        if updated > 1 {
+            return Err(StorageError::InvalidStorage(
+                "published migration completion metadata is invalid",
+            ));
+        }
+        migration::migration_fault("after-database-complete");
+        self.finish_published(paths)
+    }
+
+    fn open_staging_incomplete(
+        paths: &StoragePaths,
+        database_name: &CStr,
+        generation: u64,
+    ) -> Result<Self, StorageError> {
+        Self::open_incomplete_named(paths, database_name, Some(generation), false)
+    }
+
+    fn open_incomplete_named(
+        paths: &StoragePaths,
+        database_name: &CStr,
+        expected_generation: Option<u64>,
+        allow_complete: bool,
+    ) -> Result<Self, StorageError> {
+        let directory = SecureDatabaseDirectory::prepare(&paths.state_root, false)?;
+        directory.reject_untrusted_entries(database_name, true)?;
+        let database_path = directory
+            .path()
+            .join(OsStr::from_bytes(database_name.to_bytes()));
+        let connection = open_connection(&database_path)?;
+        schema::configure_connection(&connection, None)?;
+        let metadata = connection.query_row(
+            "SELECT application_id, schema_version, schema_generation,
+                    migration_state, migration_generation
+             FROM schema_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
+        if metadata.0 != BRAIN_APPLICATION_ID
+            || metadata.1 != BRAIN_SCHEMA_VERSION
+            || metadata.2 != BRAIN_SCHEMA_VERSION
+            || (!allow_complete && metadata.3 != "in_progress")
+            || (allow_complete && !matches!(metadata.3.as_str(), "in_progress" | "complete"))
+            || metadata.4 <= 0
+            || expected_generation.is_some_and(|generation| metadata.4 != generation as i64)
+        {
+            return Err(StorageError::InvalidStorage(
+                "published migration metadata is invalid",
+            ));
+        }
+        directory.validate_after_open(database_name)?;
+        directory.validate_path_correspondence()?;
+        Ok(Self {
+            connection,
+            deadline: None,
+            role: OpenRole::NonHook,
+            database_path,
+            learning_root: paths.brain_learning_root(),
+        })
+    }
+
+    fn discard_staging(
+        self,
+        paths: &StoragePaths,
+        database_name: &CStr,
+    ) -> Result<(), StorageError> {
+        self.connection
+            .close()
+            .map_err(|(_, error)| StorageError::Sqlite(error))?;
+        SecureDatabaseDirectory::prepare(&paths.state_root, false)?
+            .remove_database(database_name)?;
+        Ok(())
+    }
+
+    fn finish_staging(
+        self,
+        paths: &StoragePaths,
+        database_name: &CStr,
+    ) -> Result<(), StorageError> {
+        let checkpoint = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| {
+                maintenance::map_sqlite_error(StorageOperation::Checkpoint, false, error)
+            })?;
+        if checkpoint != (0, 0, 0) {
+            return Err(StorageError::InvalidStorage(
+                "staging WAL checkpoint is incomplete",
+            ));
+        }
+        let journal_mode: String =
+            self.connection
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+        if journal_mode != "delete" {
+            return Err(StorageError::InvalidStorage(
+                "staging journal mode did not close cleanly",
+            ));
+        }
+        self.connection
+            .close()
+            .map_err(|(_, error)| StorageError::Sqlite(error))?;
+        let directory = SecureDatabaseDirectory::prepare(&paths.state_root, false)?;
+        directory.validate_database_without_sidecars(database_name)?;
+        directory.sync_database(database_name)?;
+        directory.validate_path_correspondence()?;
+        Ok(())
+    }
+
+    fn finish_published(self, paths: &StoragePaths) -> Result<(), StorageError> {
+        let journal_mode: String =
+            self.connection
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        if journal_mode != "wal" {
+            return Err(StorageError::InvalidStorage(
+                "published database did not enter WAL mode",
+            ));
+        }
+        let checkpoint = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| {
+                maintenance::map_sqlite_error(StorageOperation::Checkpoint, false, error)
+            })?;
+        if checkpoint != (0, 0, 0) {
+            return Err(StorageError::InvalidStorage(
+                "published WAL checkpoint is incomplete",
+            ));
+        }
+        self.connection
+            .close()
+            .map_err(|(_, error)| StorageError::Sqlite(error))?;
+        let directory = SecureDatabaseDirectory::prepare(&paths.state_root, false)?;
+        directory.validate_database_without_sidecars(BRAIN_DATABASE_NAME)?;
+        directory.sync_database(BRAIN_DATABASE_NAME)?;
+        directory.validate_path_correspondence()?;
+        Ok(())
     }
 
     pub fn application_id(&self) -> Result<i32, StorageError> {
@@ -311,6 +641,7 @@ impl BrainDb {
             "synchronous" => "PRAGMA synchronous",
             "trusted_schema" => "PRAGMA trusted_schema",
             "user_version" => "PRAGMA user_version",
+            "wal_autocheckpoint" => "PRAGMA wal_autocheckpoint",
             _ => return Err(StorageError::InvalidStorage("unsupported pragma query")),
         };
         Ok(self.connection.query_row(sql, [], |row| row.get(0))?)
@@ -381,6 +712,79 @@ impl ReviewDb {
         let reset_guard = acquire_review_reset_guard(paths, false, false)?;
         deadline.ensure_remaining()?;
         Self::open_current_after_guard(reset_guard, deadline)
+    }
+
+    pub(super) fn open_frozen_for_export(
+        paths: &StoragePaths,
+        deadline: StorageDeadline,
+    ) -> Result<Self, StorageError> {
+        deadline.ensure_remaining()?;
+        let reset_guard = acquire_review_reset_guard(paths, true, false)?;
+        deadline.ensure_remaining()?;
+        reset_guard.directory.validate_path_correspondence()?;
+        let before = reset_guard
+            .directory
+            .closed_database_identity(REVIEW_DATABASE_NAME)?;
+        let connection = Connection::open_with_flags(
+            reset_guard
+                .directory
+                .path()
+                .join(OsStr::from_bytes(REVIEW_DATABASE_NAME.to_bytes())),
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW
+                | OpenFlags::SQLITE_OPEN_EXRESCODE,
+        )?;
+        deadline.apply(&connection)?;
+        schema::configure_connection(&connection, Some(deadline))?;
+        let application_id = connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+        let schema_version = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        let foreign_key_error = connection
+            .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+            .optional()?;
+        deadline.ensure_remaining()?;
+        schema::verify_frozen_schema(&connection, DatabaseKind::Review, deadline)?;
+        let valid_meta_rows = connection.query_row(
+            "SELECT count(*) FROM review_meta
+             WHERE surface IN ('attention', 'review', 'diagnostics', 'recent')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        deadline.ensure_remaining()?;
+        if application_id != REVIEW_APPLICATION_ID
+            || schema_version != REVIEW_SCHEMA_VERSION
+            || journal_mode != "delete"
+        {
+            return Err(StorageError::UnsupportedSchema {
+                application_id,
+                schema_version,
+            });
+        }
+        if integrity != "ok" || foreign_key_error.is_some() || valid_meta_rows != 4 {
+            return Err(StorageError::InvalidStorage(
+                "frozen review database validation failed",
+            ));
+        }
+        reset_guard
+            .directory
+            .validate_after_open(REVIEW_DATABASE_NAME)?;
+        reset_guard.directory.validate_path_correspondence()?;
+        let after = reset_guard
+            .directory
+            .closed_database_identity(REVIEW_DATABASE_NAME)?;
+        if before != after {
+            return Err(StorageError::InvalidStorage(
+                "frozen review database changed during validation",
+            ));
+        }
+        Ok(Self {
+            connection,
+            _reset_guard: reset_guard,
+            deadline: Some(deadline),
+        })
     }
 
     fn open_current_after_guard(
@@ -502,9 +906,12 @@ fn open_current(
     kind: DatabaseKind,
     deadline: StorageDeadline,
 ) -> Result<Connection, StorageError> {
-    deadline.ensure_remaining()?;
-    let directory = SecureDatabaseDirectory::prepare(&paths.state_root, false)?;
-    open_current_in_directory(&directory, database_name, kind, deadline)
+    (|| {
+        deadline.ensure_remaining()?;
+        let directory = SecureDatabaseDirectory::prepare(&paths.state_root, false)?;
+        open_current_in_directory(&directory, database_name, kind, deadline)
+    })()
+    .map_err(|error| maintenance::map_storage_error(StorageOperation::Open, false, error))
 }
 
 fn open_current_in_directory(

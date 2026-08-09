@@ -7,7 +7,9 @@ use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, ProjectEvidence,
     SessionTarget, SessionTargetProvenance,
 };
-use coding_brain_core::lifecycle::{LifecycleIdentity, PermissionAction, PermissionAuthority};
+use coding_brain_core::lifecycle::{
+    ApplyOutcome, LifecycleEvent, LifecycleIdentity, PermissionAction, PermissionAuthority,
+};
 use coding_brain_core::project::ProjectId;
 use coding_brain_core::provider::AgentProvider;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -280,6 +282,15 @@ impl BrainDb {
         &mut self,
         admission: PermissionAdmission,
     ) -> Result<Option<PermissionAttemptGuard>, StorageError> {
+        self.admit_permission_inner(admission).map_err(|error| {
+            super::maintenance::map_storage_error(super::StorageOperation::Admission, false, error)
+        })
+    }
+
+    fn admit_permission_inner(
+        &mut self,
+        admission: PermissionAdmission,
+    ) -> Result<Option<PermissionAttemptGuard>, StorageError> {
         validate_admission(&admission)?;
         let deadline = self.deadline.ok_or(StorageError::InvalidStorage(
             "permission admission requires a hook deadline",
@@ -315,9 +326,45 @@ impl BrainDb {
             .map(super::activity::prepare_activity)
             .collect::<Result<Vec<_>, _>>()?;
         super::activity::apply_deadline(&self.connection, Some(deadline))?;
+        #[cfg(feature = "fault-injection")]
+        if super::hit_fault(
+            super::FaultPoint::AdmissionWrite,
+            super::FaultPosition::Before,
+        )? {
+            return Err(StorageError::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                None,
+            )));
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::maintenance::sqlite_fault("permission-admission-body")?;
+        transaction.execute(
+            "UPDATE permission_attempts
+             SET attempt_state = 'abandoned', updated_at_ms = max(updated_at_ms, ?1)
+             WHERE request_identity_key = ?2 AND attempt_state = 'evaluating'",
+            params![
+                i64::try_from(admission.observed_at_ms).map_err(|_| {
+                    StorageError::InvalidStorage("permission timestamp is invalid")
+                })?,
+                request_identity_key.as_str()
+            ],
+        )?;
+        let duplicate = transaction
+            .query_row(
+                "SELECT 1 FROM permission_attempts INDEXED BY permission_attempts_request_active
+                 WHERE request_identity_key = ?1
+                   AND attempt_state IN ('evaluating', 'needs_input', 'decided')
+                 ORDER BY updated_at_ms DESC LIMIT 1",
+                [&request_identity_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if duplicate {
+            return Ok(None);
+        }
         let now = i64::try_from(admission.observed_at_ms)
             .map_err(|_| StorageError::InvalidStorage("permission timestamp is invalid"))?;
         let updated = i64::try_from(admission.evaluating_at_ms)
@@ -367,7 +414,14 @@ impl BrainDb {
                 Some(attempt_id.as_str()),
             )?;
         }
-        super::activity::commit_before_deadline(Some(deadline), || transaction.commit())?;
+        super::activity::commit_before_deadline(
+            Some(deadline),
+            super::StorageOperation::Admission,
+            || transaction.commit(),
+        )
+        .map_err(|error| {
+            super::maintenance::map_storage_error(super::StorageOperation::Admission, true, error)
+        })?;
         Ok(Some(PermissionAttemptGuard {
             attempt_id,
             admission,
@@ -379,6 +433,73 @@ impl BrainDb {
     }
 
     pub(crate) fn commit_permission(
+        &mut self,
+        prepared: PreparedPermissionCommit,
+    ) -> Result<CommittedPermission, StorageError> {
+        self.commit_permission_inner(prepared).map_err(|error| {
+            super::maintenance::map_storage_error(super::StorageOperation::Commit, false, error)
+        })
+    }
+
+    pub(crate) fn finish_permission_without_authority(
+        &mut self,
+        guard: PermissionAttemptGuard,
+        terminal: ActivityEvent,
+    ) -> Result<ActivityCursor, StorageError> {
+        if guard.database_binding != database_binding(&self.database_path)?
+            || !matches!(
+                terminal.state,
+                ActivityState::Abstained | ActivityState::Error
+            )
+            || terminal.activity_id != guard.admission.activity_id
+            || terminal.decision_id.is_some()
+        {
+            return Err(StorageError::PermissionAttemptMismatch);
+        }
+        guard.deadline.ensure_remaining()?;
+        let recorded_at_ms = terminal.recorded_at_ms;
+        let prepared = super::activity::prepare_activity(terminal)?;
+        super::activity::apply_deadline(&self.connection, Some(guard.deadline))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_exact_attempt(&transaction, &guard)?;
+        let updated = transaction.execute(
+            "UPDATE permission_attempts SET attempt_state = 'needs_input', updated_at_ms = ?1
+             WHERE attempt_id = ?2 AND attempt_state = 'evaluating' AND authority_action IS NULL",
+            params![
+                i64::try_from(recorded_at_ms).map_err(|_| {
+                    StorageError::InvalidStorage("permission timestamp is invalid")
+                })?,
+                guard.attempt_id.as_str()
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::PermissionAttemptMismatch);
+        }
+        let current = super::activity::validated_high_water(&transaction)?;
+        let cursor = current.checked_add(1).ok_or(StorageError::InvalidStorage(
+            "activity cursor space is exhausted",
+        ))?;
+        transaction.execute(
+            "UPDATE schema_meta SET activity_high_water = ?1 WHERE singleton = 1",
+            [cursor],
+        )?;
+        super::activity::insert_activity(
+            &transaction,
+            cursor,
+            &prepared,
+            Some(guard.attempt_id.as_str()),
+        )?;
+        super::activity::commit_before_deadline(
+            Some(guard.deadline),
+            super::StorageOperation::Commit,
+            || transaction.commit(),
+        )?;
+        ActivityCursor::try_from(cursor)
+    }
+
+    fn commit_permission_inner(
         &mut self,
         prepared: PreparedPermissionCommit,
     ) -> Result<CommittedPermission, StorageError> {
@@ -400,7 +521,32 @@ impl BrainDb {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::maintenance::sqlite_fault("permission-commit-body")?;
         require_exact_attempt(&transaction, &prepared.guard)?;
+        let mut response_eligible = prepared.response_eligible;
+        if prepared.evidence_kind != PermissionEvidenceKind::DeterministicSafety
+            && prepared.authority.action == PermissionAction::Allow
+        {
+            let mut lifecycle = super::lifecycle::load_lifecycle_snapshot(
+                &transaction,
+                Some(prepared.guard.deadline),
+            )?;
+            let event = LifecycleEvent::permission_with_authority(
+                prepared.guard.admission.lifecycle.clone(),
+                prepared.guard.admission.request_key.clone(),
+                prepared.authority.clone(),
+            )
+            .map_err(|_| StorageError::PermissionAttemptMismatch)?;
+            let lifecycle_applied = matches!(
+                lifecycle
+                    .record_at(event, prepared.terminal.recorded_at_ms)
+                    .outcome,
+                ApplyOutcome::Applied
+            );
+            lifecycle.remove_permission_state();
+            response_eligible &=
+                lifecycle_applied && super::lifecycle::validate_snapshot(&lifecycle).is_ok();
+        }
         let decided_at = i64::try_from(prepared.terminal.recorded_at_ms)
             .map_err(|_| StorageError::InvalidStorage("permission timestamp is invalid"))?;
         let updated = transaction.execute(
@@ -461,7 +607,7 @@ impl BrainDb {
                 proposal_bytes,
             ],
         )?;
-        let delivery_state = if prepared.response_eligible {
+        let delivery_state = if response_eligible {
             "pending"
         } else {
             "not_required"
@@ -479,26 +625,67 @@ impl BrainDb {
                 action,
                 prepared.evidence_kind.label(),
                 delivery_state,
-                i64::from(prepared.response_eligible),
+                i64::from(response_eligible),
                 decided_at,
             ],
         )?;
         permission_fault("before-commit")?;
-        super::activity::commit_before_deadline(Some(prepared.guard.deadline), || {
-            transaction.commit()
+        super::activity::commit_before_deadline(
+            Some(prepared.guard.deadline),
+            super::StorageOperation::Commit,
+            || {
+                super::maintenance::sqlite_fault("permission-commit-commit")?;
+                #[cfg(feature = "fault-injection")]
+                match super::hit_fault(
+                    super::FaultPoint::CommitBeforeCall,
+                    super::FaultPosition::Before,
+                ) {
+                    Ok(true) => std::process::abort(),
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+                    }
+                }
+                transaction.commit()
+            },
+        )
+        .map_err(|error| {
+            super::maintenance::map_storage_error(super::StorageOperation::Commit, true, error)
         })?;
+        #[cfg(feature = "fault-injection")]
+        if super::hit_fault(
+            super::FaultPoint::CommitAfterReturn,
+            super::FaultPosition::After,
+        )? {
+            std::process::abort();
+        }
         permission_fault("after-commit")?;
         Ok(CommittedPermission {
             attempt_id: prepared.guard.attempt_id,
             terminal_cursor: ActivityCursor::try_from(cursor)?,
             authority: prepared.authority,
-            response_eligible: prepared.response_eligible,
+            response_eligible,
             deadline: prepared.guard.deadline,
             database_binding: prepared.guard.database_binding,
         })
     }
 
     pub fn record_delivery(
+        &mut self,
+        committed: &CommittedPermission,
+        evidence: DeliveryEvidence,
+    ) -> Result<ActivityCursor, StorageError> {
+        self.record_delivery_inner(committed, evidence)
+            .map_err(|error| {
+                super::maintenance::map_storage_error(
+                    super::StorageOperation::Delivery,
+                    false,
+                    error,
+                )
+            })
+    }
+
+    fn record_delivery_inner(
         &mut self,
         committed: &CommittedPermission,
         evidence: DeliveryEvidence,
@@ -522,6 +709,7 @@ impl BrainDb {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::maintenance::sqlite_fault("permission-delivery-body")?;
         let (activity_id, payload): (String, Vec<u8>) = transaction
             .query_row(
                 "SELECT c.terminal_activity_id, a.event_payload
@@ -573,7 +761,33 @@ impl BrainDb {
             return Err(StorageError::PermissionAttemptMismatch);
         }
         permission_fault("before-delivery-commit")?;
-        super::activity::commit_before_deadline(Some(deadline), || transaction.commit())?;
+        super::activity::commit_before_deadline(
+            Some(deadline),
+            super::StorageOperation::Delivery,
+            || {
+                super::maintenance::sqlite_fault("permission-delivery-commit")?;
+                #[cfg(feature = "fault-injection")]
+                match super::hit_fault(
+                    super::FaultPoint::DeliveryWrite,
+                    super::FaultPosition::Before,
+                ) {
+                    Ok(true) => {
+                        return Err(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR_FSYNC),
+                            None,
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+                    }
+                }
+                transaction.commit()
+            },
+        )
+        .map_err(|error| {
+            super::maintenance::map_storage_error(super::StorageOperation::Delivery, true, error)
+        })?;
         ActivityCursor::try_from(cursor)
     }
 
@@ -1460,6 +1674,14 @@ fn permission_fault(_stage: &str) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(feature = "fault-injection")]
+    use std::fs::File;
+    #[cfg(feature = "fault-injection")]
+    use std::io::Read;
+    #[cfg(feature = "fault-injection")]
+    use std::os::fd::{AsRawFd, FromRawFd};
+    #[cfg(feature = "fault-injection")]
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
     use std::thread;
@@ -1472,7 +1694,8 @@ mod tests {
     use coding_brain_core::lifecycle::{LifecycleIdentity, PermissionAction, PermissionAuthority};
     use coding_brain_core::project::ProjectId;
     use coding_brain_core::provider::AgentProvider;
-    use rusqlite::params;
+    use rusqlite::{ffi, params};
+    use sha2::{Digest, Sha256};
 
     use crate::brain::decisions::HookDecisionRecord;
     use crate::brain::storage::{DecisionIdentity, DecisionKind, DecisionPayload};
@@ -1482,9 +1705,92 @@ mod tests {
         PermissionEvidenceKind, PermissionState, PreparedPermissionCommit, StorageDeadline,
         database_binding, hook_record_as_decision,
     };
-    use crate::brain::storage::{OpenRole, ReviewDb, StorageError, StoragePaths};
+    use crate::brain::storage::{
+        OpenRole, ReviewDb, StorageError, StorageFaultCategory, StorageOperation, StoragePaths,
+    };
 
     const MODELED_PROVIDER_RESPONSE: &[u8] = b"{\"permission\":\"allow\"}\n";
+
+    #[cfg(feature = "fault-injection")]
+    struct LiveFaultFixture {
+        capability: std::path::PathBuf,
+        nonce: String,
+        point: crate::brain::storage::FaultPoint,
+        read: File,
+        write: Option<File>,
+    }
+
+    #[cfg(feature = "fault-injection")]
+    impl LiveFaultFixture {
+        fn new(root: &std::path::Path, point: crate::brain::storage::FaultPoint) -> Self {
+            let capability_dir = root.join("fault-capability");
+            fs::create_dir(&capability_dir).unwrap();
+            fs::set_permissions(&capability_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut descriptors = [0; 2];
+            assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+            let read = unsafe { File::from_raw_fd(descriptors[0]) };
+            let write = unsafe { File::from_raw_fd(descriptors[1]) };
+            let metadata = write.metadata().unwrap();
+            let capability = capability_dir.join("fault.json");
+            let nonce = "permission-live-fault".to_owned();
+            let record = serde_json::json!({
+                "version": 1,
+                "state_root": root,
+                "nonce": nonce,
+                "selection": { "kind": "matrix", "selection": point },
+                "control_device": metadata.dev(),
+                "control_inode": metadata.ino(),
+            });
+            fs::write(&capability, serde_json::to_vec(&record).unwrap()).unwrap();
+            fs::set_permissions(&capability, fs::Permissions::from_mode(0o600)).unwrap();
+            Self {
+                capability,
+                nonce,
+                point,
+                read,
+                write: Some(write),
+            }
+        }
+
+        fn spawn(&mut self, root: &std::path::Path, mode: &str) -> std::process::Child {
+            let write = self.write.take().unwrap();
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "brain::storage::permissions::tests::live_fault_process_helper",
+                    "--nocapture",
+                ])
+                .env("CODING_BRAIN_PERMISSION_LIVE_FAULT_ROOT", root)
+                .env("CODING_BRAIN_PERMISSION_LIVE_FAULT_MODE", mode)
+                .env(
+                    "CODING_BRAIN_PERMISSION_LIVE_FAULT_CAPABILITY",
+                    &self.capability,
+                )
+                .env("CODING_BRAIN_PERMISSION_LIVE_FAULT_NONCE", &self.nonce)
+                .env(
+                    "CODING_BRAIN_PERMISSION_LIVE_FAULT_POINT",
+                    serde_json::to_string(&self.point).unwrap(),
+                )
+                .env(
+                    "CODING_BRAIN_PERMISSION_LIVE_FAULT_FD",
+                    write.as_raw_fd().to_string(),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            drop(write);
+            child
+        }
+
+        fn marker(mut self) -> Vec<u8> {
+            let mut marker = Vec::new();
+            self.read.read_to_end(&mut marker).unwrap();
+            marker
+        }
+    }
 
     fn root() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -1493,6 +1799,7 @@ mod tests {
     }
 
     fn admission(activity_id: &str) -> PermissionAdmission {
+        let request_key = format!("{:x}", Sha256::digest(activity_id.as_bytes()));
         PermissionAdmission::new(
             LifecycleIdentity::try_new(
                 AgentProvider::Codex,
@@ -1502,7 +1809,7 @@ mod tests {
                 "/work/project".into(),
             )
             .unwrap(),
-            "a".repeat(64),
+            request_key,
             ProjectId::Temporary("project-1".into()),
             "Bash",
             None,
@@ -1792,6 +2099,203 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    #[ignore]
+    fn live_fault_process_helper() {
+        let Some(root) = std::env::var_os("CODING_BRAIN_PERMISSION_LIVE_FAULT_ROOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let mode = std::env::var("CODING_BRAIN_PERMISSION_LIVE_FAULT_MODE").unwrap();
+        let point = serde_json::from_str(
+            &std::env::var("CODING_BRAIN_PERMISSION_LIVE_FAULT_POINT").unwrap(),
+        )
+        .unwrap();
+        let activation = crate::brain::storage::FaultActivation {
+            capability: std::env::var_os("CODING_BRAIN_PERMISSION_LIVE_FAULT_CAPABILITY")
+                .unwrap()
+                .into(),
+            state_root: root.clone(),
+            nonce: std::env::var("CODING_BRAIN_PERMISSION_LIVE_FAULT_NONCE").unwrap(),
+            selection: crate::brain::storage::FaultSelection::Matrix(point),
+            control_fd: std::env::var("CODING_BRAIN_PERMISSION_LIVE_FAULT_FD")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        };
+        crate::brain::storage::activate_fault(activation).unwrap();
+        let paths = StoragePaths::at(&root);
+        let request = admission("live-fault-activity");
+        let mut db = open(&paths, Duration::from_secs(5));
+        if mode == "admission" {
+            let result = db.admit_permission(request);
+            assert!(matches!(
+                result,
+                Err(StorageError::StorageFault {
+                    operation: StorageOperation::Admission,
+                    category: StorageFaultCategory::Full,
+                })
+            ));
+            return;
+        }
+        let guard = db.admit_permission(request.clone()).unwrap().unwrap();
+        fs::write(
+            root.join("live-fault-attempt-id"),
+            guard.attempt_id().as_str(),
+        )
+        .unwrap();
+        let committed = db
+            .commit_permission(
+                PreparedPermissionCommit::new(
+                    guard,
+                    proposal("live-fault-decision"),
+                    terminal(&request, "live-fault-decision"),
+                    PermissionAuthority {
+                        transaction_id: "live-fault-transaction".into(),
+                        action: PermissionAction::Allow,
+                    },
+                    PermissionEvidenceKind::ProviderAuthority,
+                    true,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        if mode == "delivery" {
+            let result = db.record_delivery(&committed, DeliveryEvidence::Delivered);
+            assert!(matches!(
+                result,
+                Err(StorageError::CommitUncertain {
+                    operation: StorageOperation::Delivery,
+                    category: StorageFaultCategory::Io,
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn live_admission_write_fires_before_transaction_and_maps_full() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let mut fixture = LiveFaultFixture::new(
+            root.path(),
+            crate::brain::storage::FaultPoint::AdmissionWrite,
+        );
+        let status = fixture.spawn(root.path(), "admission").wait().unwrap();
+        assert!(status.success(), "{status:?}");
+        assert_eq!(
+            fixture.marker(),
+            b"CBRAIN-FAULT-V1\0admission-write\0before\0-\n"
+        );
+        let connection = rusqlite::Connection::open(paths.brain_db()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM permission_attempts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(feature = "fault-injection")]
+    fn assert_live_commit_abort(
+        point: crate::brain::storage::FaultPoint,
+        marker: &[u8],
+        expected_commits: i64,
+    ) {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let mut fixture = LiveFaultFixture::new(root.path(), point);
+        let status = fixture.spawn(root.path(), "commit").wait().unwrap();
+        assert!(!status.success(), "fault helper unexpectedly survived");
+        assert_eq!(fixture.marker(), marker);
+        let attempt_id =
+            AttemptId(fs::read_to_string(root.path().join("live-fault-attempt-id")).unwrap());
+        let connection = rusqlite::Connection::open(paths.brain_db()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM permission_attempts WHERE attempt_state = 'evaluating'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1 - expected_commits
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM permission_commits", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            expected_commits
+        );
+        let database = open(&paths, Duration::from_secs(2));
+        if expected_commits == 0 {
+            assert_eq!(
+                database.permission_state(&attempt_id).unwrap(),
+                PermissionState::Absent
+            );
+        } else {
+            assert!(matches!(
+                database.permission_state(&attempt_id).unwrap(),
+                PermissionState::CommittedDeliveryUnknown(authority)
+                    if authority.action == PermissionAction::Allow
+            ));
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn live_commit_points_bracket_the_sqlite_commit_return() {
+        assert_live_commit_abort(
+            crate::brain::storage::FaultPoint::CommitBeforeCall,
+            b"CBRAIN-FAULT-V1\0commit-before-call\0before\0-\n",
+            0,
+        );
+        assert_live_commit_abort(
+            crate::brain::storage::FaultPoint::CommitAfterReturn,
+            b"CBRAIN-FAULT-V1\0commit-after-return\0after\0-\n",
+            1,
+        );
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn live_delivery_write_keeps_committed_authority_pending() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let mut fixture = LiveFaultFixture::new(
+            root.path(),
+            crate::brain::storage::FaultPoint::DeliveryWrite,
+        );
+        let status = fixture.spawn(root.path(), "delivery").wait().unwrap();
+        assert!(status.success(), "{status:?}");
+        assert_eq!(
+            fixture.marker(),
+            b"CBRAIN-FAULT-V1\0delivery-write\0before\0-\n"
+        );
+        let attempt_id =
+            AttemptId(fs::read_to_string(root.path().join("live-fault-attempt-id")).unwrap());
+        let database = open(&paths, Duration::from_secs(2));
+        assert!(matches!(
+            database.permission_state(&attempt_id).unwrap(),
+            PermissionState::CommittedDeliveryUnknown(authority)
+                if authority.action == PermissionAction::Allow
+        ));
+        let connection = rusqlite::Connection::open(paths.brain_db()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM permission_commits", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn identical_admission_has_one_active_winner_and_sequential_attempts_are_distinct() {
         let root = root();
@@ -1814,6 +2318,97 @@ mod tests {
         assert!(matches!(
             contender_db.permission_state(second.attempt_id()).unwrap(),
             PermissionState::Absent
+        ));
+    }
+
+    #[test]
+    fn extended_faults_are_mapped_at_permission_call_site_boundaries() {
+        let root = root();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        let mut db = open(&paths, Duration::from_secs(2));
+
+        let admission_error = super::super::maintenance::with_sqlite_fault(
+            "permission-admission-body",
+            ffi::SQLITE_FULL,
+            || db.admit_permission(admission("fault-admission")),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            admission_error,
+            StorageError::StorageFault {
+                operation: StorageOperation::Admission,
+                category: StorageFaultCategory::Full,
+            }
+        ));
+
+        let commit_admission = admission("fault-commit");
+        let guard = db
+            .admit_permission(commit_admission.clone())
+            .unwrap()
+            .unwrap();
+        let commit_error = super::super::maintenance::with_sqlite_fault(
+            "permission-commit-commit",
+            ffi::SQLITE_IOERR_FSYNC,
+            || {
+                db.commit_permission(
+                    PreparedPermissionCommit::new(
+                        guard,
+                        proposal("fault-commit-decision"),
+                        terminal(&commit_admission, "fault-commit-decision"),
+                        PermissionAuthority {
+                            transaction_id: "fault-commit-transaction".into(),
+                            action: PermissionAction::Allow,
+                        },
+                        PermissionEvidenceKind::ProviderAuthority,
+                        true,
+                    )
+                    .unwrap(),
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            commit_error,
+            StorageError::CommitUncertain {
+                operation: StorageOperation::Commit,
+                category: StorageFaultCategory::Io,
+            }
+        ));
+
+        let delivery_admission = admission("fault-delivery");
+        let guard = db
+            .admit_permission(delivery_admission.clone())
+            .unwrap()
+            .unwrap();
+        let committed = db
+            .commit_permission(
+                PreparedPermissionCommit::new(
+                    guard,
+                    proposal("fault-delivery-decision"),
+                    terminal(&delivery_admission, "fault-delivery-decision"),
+                    PermissionAuthority {
+                        transaction_id: "fault-delivery-transaction".into(),
+                        action: PermissionAction::Allow,
+                    },
+                    PermissionEvidenceKind::ProviderAuthority,
+                    true,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let delivery_error = super::super::maintenance::with_sqlite_fault(
+            "permission-delivery-commit",
+            ffi::SQLITE_IOERR_FSYNC,
+            || db.record_delivery(&committed, DeliveryEvidence::Delivered),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            delivery_error,
+            StorageError::CommitUncertain {
+                operation: StorageOperation::Delivery,
+                category: StorageFaultCategory::Io,
+            }
         ));
     }
 

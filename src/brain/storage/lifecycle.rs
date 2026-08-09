@@ -3,8 +3,10 @@ use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use coding_brain_core::codex_transcript::CodexResumeEvidence;
+use coding_brain_core::lifecycle::LifecycleIdentity;
 use coding_brain_core::lifecycle::{
-    ActiveSubagentState, IgnoreReason, LIFECYCLE_SCHEMA_VERSION, LifecycleEvent,
+    ActiveSubagentState, ApplyOutcome, IgnoreReason, LIFECYCLE_SCHEMA_VERSION, LifecycleEvent,
     LifecycleEventKind, LifecycleEventName, LifecycleEventSignature, LifecycleSnapshot,
     MAX_ACTIVE_SUBAGENTS, MAX_ANTIGRAVITY_INVOCATION_STEPS, MAX_RECENT_TURNS, ProjectedStatus,
     RecordedLifecycleEvent, SessionLifecycleState, SessionStartSource, StoppedSubagentState,
@@ -37,11 +39,35 @@ struct SessionRow {
 }
 
 impl BrainDb {
+    pub fn reprove_codex_subagent(
+        &mut self,
+        identity: &LifecycleIdentity,
+        evidence: &CodexResumeEvidence,
+        received_at_ms: u64,
+    ) -> Result<ApplyOutcome, StorageError> {
+        apply_deadline(&self.connection, self.deadline)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut snapshot = load_lifecycle_snapshot(&transaction, self.deadline)?;
+        let outcome = snapshot.reprove_codex_subagent_at(identity, evidence, received_at_ms);
+        validate_snapshot(&snapshot)?;
+        persist_lifecycle_snapshot(&transaction, &snapshot, self.deadline)?;
+        super::activity::commit_before_deadline(
+            self.deadline,
+            super::StorageOperation::Lifecycle,
+            || transaction.commit(),
+        )?;
+        Ok(outcome)
+    }
+
     pub fn read_lifecycle(&self) -> Result<LifecycleSnapshot, StorageError> {
         apply_deadline(&self.connection, self.deadline)?;
         let transaction = self.connection.unchecked_transaction()?;
         let snapshot = load_lifecycle_snapshot(&transaction, self.deadline)?;
-        transaction.commit()?;
+        transaction.commit().map_err(|error| {
+            super::maintenance::map_sqlite_error(super::StorageOperation::Read, false, error)
+        })?;
         ensure_deadline(self.deadline)?;
         Ok(snapshot)
     }
@@ -51,19 +77,66 @@ impl BrainDb {
         event: LifecycleEvent,
         received_at_ms: u64,
     ) -> Result<RecordedLifecycleEvent, StorageError> {
+        self.record_lifecycle_inner(event, received_at_ms)
+            .map_err(|error| {
+                super::maintenance::map_storage_error(
+                    super::StorageOperation::Lifecycle,
+                    false,
+                    error,
+                )
+            })
+    }
+
+    fn record_lifecycle_inner(
+        &mut self,
+        event: LifecycleEvent,
+        received_at_ms: u64,
+    ) -> Result<RecordedLifecycleEvent, StorageError> {
         apply_deadline(&self.connection, self.deadline)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::maintenance::sqlite_fault("lifecycle-body")?;
         let mut snapshot = load_lifecycle_snapshot(&transaction, self.deadline)?;
         let recorded = snapshot.record_at(event, received_at_ms);
         snapshot.remove_permission_state();
         validate_snapshot(&snapshot)?;
         persist_lifecycle_snapshot(&transaction, &snapshot, self.deadline)?;
         ensure_deadline(self.deadline)?;
-        transaction.commit()?;
+        super::activity::commit_before_deadline(
+            self.deadline,
+            super::StorageOperation::Lifecycle,
+            || {
+                super::maintenance::sqlite_fault("lifecycle-commit")?;
+                transaction.commit()
+            },
+        )?;
         ensure_deadline(self.deadline)?;
         Ok(recorded)
+    }
+
+    pub(super) fn import_lifecycle_snapshot(
+        &mut self,
+        mut snapshot: LifecycleSnapshot,
+    ) -> Result<(), StorageError> {
+        snapshot.remove_permission_state();
+        validate_snapshot(&snapshot)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::maintenance::sqlite_fault("lifecycle-import-body")?;
+        persist_lifecycle_snapshot(&transaction, &snapshot, self.deadline)?;
+        super::activity::commit_before_deadline(
+            self.deadline,
+            super::StorageOperation::Lifecycle,
+            || {
+                super::maintenance::sqlite_fault("lifecycle-import-commit")?;
+                transaction.commit()
+            },
+        )
+        .map_err(|error| {
+            super::maintenance::map_storage_error(super::StorageOperation::Lifecycle, false, error)
+        })
     }
 }
 
@@ -81,7 +154,7 @@ fn apply_deadline(
     }
 }
 
-fn load_lifecycle_snapshot(
+pub(super) fn load_lifecycle_snapshot(
     connection: &Connection,
     deadline: Option<StorageDeadline>,
 ) -> Result<LifecycleSnapshot, StorageError> {
@@ -739,7 +812,7 @@ fn ordered_session_keys(snapshot: &LifecycleSnapshot) -> Result<Vec<&str>, Stora
     Ok(ordered)
 }
 
-fn validate_snapshot(snapshot: &LifecycleSnapshot) -> Result<(), StorageError> {
+pub(super) fn validate_snapshot(snapshot: &LifecycleSnapshot) -> Result<(), StorageError> {
     if snapshot.schema_version != LIFECYCLE_SCHEMA_VERSION
         || snapshot.next_sequence == 0
         || snapshot.next_sequence > i64::MAX as u64

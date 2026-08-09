@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -7,7 +8,10 @@ fn isolated_command(temp: &tempfile::TempDir) -> Command {
     let config = temp.path().join("config");
     let state = temp.path().join("state");
     let project = temp.path().join("project");
-    std::fs::create_dir_all(&project).unwrap();
+    for directory in [temp.path(), &home, &config, &state, &project] {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command
         .current_dir(project)
@@ -30,6 +34,22 @@ fn cli_is_cbrain_while_public_namespaces_remain_coding_brain() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&config.stdout).contains("coding-brain/config.toml"));
+}
+
+#[test]
+fn storage_namespace_exposes_only_static_export_and_reset_actions() {
+    let temp = tempfile::tempdir().unwrap();
+    let help = isolated_command(&temp)
+        .args(["storage", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("export-audit"), "{help}");
+    assert!(help.contains("export-legacy"), "{help}");
+    assert!(help.contains("reset-review-state"), "{help}");
+    assert!(!help.contains("activate"), "{help}");
+    assert!(!help.contains("import"), "{help}");
 }
 
 #[test]

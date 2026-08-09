@@ -9,8 +9,10 @@ use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivityState,
     ProjectEvidence, SessionTarget, bounded_activity_identifier, lossless_redacted_activity_text,
 };
+#[cfg(test)]
+use coding_brain_core::lifecycle::test_support::LifecycleStore;
 use coding_brain_core::lifecycle::{
-    ApplyOutcome, LifecycleEvent, LifecycleStore, RecordedLifecycleEvent, coding_brain_state_root,
+    ApplyOutcome, LifecycleEvent, RecordedLifecycleEvent, coding_brain_state_root,
 };
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use coding_brain_core::project::ProjectIdentity;
@@ -22,7 +24,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::brain::UNSUPPORTED_PERMISSION_TOOL_REASON;
-use crate::brain::activity::{ActivityLog, ActivityStore};
+use crate::brain::activity::ActivityLog;
+#[cfg(test)]
+use crate::brain::activity::ActivityStore;
+use crate::brain::storage::{BrainDb, OpenRole, StorageDeadline, StoragePaths};
 #[cfg(test)]
 use crate::provider_hooks::normalized_outcome;
 use crate::provider_hooks::{ParsedLifecycleHook, parse_lifecycle};
@@ -82,6 +87,7 @@ fn write_diagnostic(stderr: &mut impl Write, diagnostic: impl fmt::Display) {
     let _ = writeln!(stderr, "cbrain lifecycle hook: {diagnostic}");
 }
 
+#[cfg(test)]
 pub(crate) fn run_with<R: Read, W: Write, E: Write>(
     stdin: R,
     _stdout: W,
@@ -143,6 +149,7 @@ enum Correlation {
     None,
 }
 
+#[cfg(test)]
 pub(crate) fn run_with_activity<R: Read, W: Write, E: Write>(
     stdin: R,
     _stdout: W,
@@ -161,6 +168,7 @@ pub(crate) fn run_with_activity<R: Read, W: Write, E: Write>(
     );
 }
 
+#[cfg(test)]
 fn run_provider_with_activity<R: Read, E: Write>(
     provider: AgentProvider,
     stdin: R,
@@ -184,6 +192,7 @@ fn run_provider_with_activity<R: Read, E: Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn run_provider_with_activity_and_live_process<R: Read, E: Write>(
     provider: AgentProvider,
     stdin: R,
@@ -287,6 +296,7 @@ fn run_provider_with_activity_and_live_process<R: Read, E: Write>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn persist_provider_hook(
     provider: AgentProvider,
     antigravity_event: Option<&str>,
@@ -308,6 +318,7 @@ pub(crate) fn persist_provider_hook(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn persist_provider_hook_with_live_process(
     provider: AgentProvider,
     antigravity_event: Option<&str>,
@@ -427,6 +438,7 @@ fn persist_recovery_event_in_order(
     Ok((recorded, true))
 }
 
+#[cfg(test)]
 fn append_observation(
     activity: &ActivityStore,
     lifecycle: &LifecycleEvent,
@@ -932,10 +944,6 @@ fn epoch_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn activity_store() -> Option<ActivityStore> {
-    current_paths().map(|paths| ActivityStore::at(paths.state_root().join("activity.jsonl")))
-}
-
 fn current_paths() -> Option<CodingBrainPaths> {
     let environment = PathEnvironment::new(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
@@ -946,27 +954,193 @@ fn current_paths() -> Option<CodingBrainPaths> {
 }
 
 pub(crate) fn run(provider: AgentProvider, antigravity_event: Option<&str>) {
-    let state_root = coding_brain_state_root();
-    let store = LifecycleStore::at(&state_root);
-    let session_links = SessionLinkStore::at(state_root.join("session-links.jsonl"));
-    let activity = activity_store();
     let stdin = std::io::stdin();
     let stderr = std::io::stderr();
-    run_provider_with_activity(
+    run_provider_with_sqlite(provider, stdin.lock(), stderr.lock(), antigravity_event);
+}
+
+fn run_provider_with_sqlite<R: Read, E: Write>(
+    provider: AgentProvider,
+    stdin: R,
+    mut stderr: E,
+    antigravity_event: Option<&str>,
+) {
+    let input = match read_bounded_hook_input(stdin) {
+        Ok(input) => input,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            return;
+        }
+    };
+    if provider == AgentProvider::Antigravity && antigravity_event == Some("PostInvocation") {
+        match parse_lifecycle(provider, antigravity_event, &input) {
+            Ok(parsed) if parsed.event.is_none() => return,
+            Ok(_) => {}
+            Err(error) => {
+                write_diagnostic(&mut stderr, error);
+                return;
+            }
+        }
+    }
+    let state_root = coding_brain_state_root();
+    let paths = StoragePaths::at(&state_root);
+    let mut database = match BrainDb::open_current(
+        &paths,
+        OpenRole::Hook,
+        StorageDeadline::after(std::time::Duration::from_millis(500)),
+    ) {
+        Ok(database) => database,
+        Err(error) => {
+            write_diagnostic(&mut stderr, format!("SQLite storage unavailable: {error}"));
+            return;
+        }
+    };
+    let links = SessionLinkStore::at(state_root.join("session-links.jsonl"));
+    match persist_provider_hook_sqlite(
         provider,
-        stdin.lock(),
-        stderr.lock(),
-        &store,
-        activity.as_ref(),
-        Some(&session_links),
         antigravity_event,
-    );
+        &input,
+        &mut database,
+        &links,
+        crate::provider_hooks::live_parent_process(provider),
+        crate::provider_hooks::revalidate_live_process,
+    ) {
+        Ok(_) => {}
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+        }
+    }
+}
+
+pub(crate) fn persist_provider_hook_sqlite(
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+    input: &[u8],
+    database: &mut BrainDb,
+    session_links: &SessionLinkStore,
+    live_process: Option<coding_brain_core::provider::LiveProcessIdentity>,
+    revalidate_live_process: impl Fn(&coding_brain_core::provider::LiveProcessIdentity) -> bool,
+) -> Result<RecordedProviderHook, String> {
+    let mut parsed =
+        parse_lifecycle(provider, antigravity_event, input).map_err(|error| error.to_string())?;
+    parsed.live_process = live_process;
+    let event_kind = parsed
+        .event
+        .clone()
+        .ok_or_else(|| "provider hook has no lifecycle transition".to_owned())?;
+    let event = LifecycleEvent::from_parts_with_turn_initial_step(
+        parsed.identity.clone(),
+        event_kind,
+        parsed.turn_initial_step,
+    )
+    .map_err(|error| error.to_string())?;
+    let (recorded, recovery_link_persisted) = persist_recovery_event_in_order(
+        requires_recovery_link(&event),
+        || {
+            database
+                .record_lifecycle(event.clone(), epoch_ms())
+                .map_err(|error| error.to_string())
+        },
+        || {
+            let Some(live_process) = parsed.live_process.clone() else {
+                return Ok(false);
+            };
+            if !revalidate_live_process(&live_process) {
+                return Ok(false);
+            }
+            let native_session_id = linked_native_session_id(&parsed.identity).to_string();
+            session_links
+                .append(session_identity_link(
+                    &parsed.identity,
+                    live_process.clone(),
+                ))
+                .map_err(|error| error.to_string())?;
+            let projection = session_links
+                .read_projection()
+                .map_err(|error| error.to_string())?;
+            let native =
+                coding_brain_core::provider::AgentSessionKey::native(provider, &native_session_id);
+            Ok(
+                projection.native_for(&live_process) == Some(native_session_id.as_str())
+                    && projection.live_for(&native) == Some(&live_process),
+            )
+        },
+    )?;
+    if recorded.outcome != ApplyOutcome::Applied {
+        return Ok(RecordedProviderHook {
+            parsed,
+            event,
+            outcome: recorded.outcome,
+            sequence: recorded.sequence,
+            recovery_link_persisted,
+        });
+    }
+    let activity_input = LifecycleActivityInput::from_parsed(&parsed, input);
+    let observation = observation_event(&event, &activity_input)?;
+    let mut events = vec![observation];
+    if event.name().as_str() == "PostToolUse" {
+        let identity = event.identity();
+        let related = match (identity.turn_id(), activity_input.normalized_tool_use_id()) {
+            (Some(turn_id), Some(tool_use_id)) => database.activity_for_permission_outcome(
+                identity.provider(),
+                identity.session_id(),
+                turn_id,
+                &tool_use_id,
+                64,
+                4 * 1024 * 1024,
+            ),
+            _ => Ok(Default::default()),
+        };
+        match related {
+            Ok(mut page) => {
+                if let Some(before) = page
+                    .events
+                    .iter()
+                    .map(|record| record.cursor.get())
+                    .max()
+                    .and_then(|cursor| cursor.checked_add(1))
+                    .and_then(|cursor| crate::brain::storage::ActivityCursor::try_from(cursor).ok())
+                {
+                    let anchor_page = database
+                        .read_activity_page(Some(before), 64, 4 * 1024 * 1024)
+                        .map_err(|error| error.to_string())?;
+                    page.events.extend(anchor_page.events);
+                }
+                page.events.sort_by_key(|record| record.cursor);
+                page.events.dedup_by_key(|record| record.cursor);
+                let log = ActivityLog::from_events(
+                    page.events.into_iter().map(|record| record.event).collect(),
+                );
+                match correlate_outcome(&log, &event, &activity_input) {
+                    Correlation::Outcome(outcome) => events.push(outcome),
+                    Correlation::Diagnostic { event, .. } => {
+                        events.push(event);
+                    }
+                    Correlation::None => {}
+                }
+            }
+            Err(error) => {
+                return Err(error.to_string());
+            }
+        }
+    }
+    database
+        .append_activity_batch(&events)
+        .map_err(|error| error.to_string())?;
+    Ok(RecordedProviderHook {
+        parsed,
+        event,
+        outcome: recorded.outcome,
+        sequence: recorded.sequence,
+        recovery_link_persisted,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::{Arc, Barrier};
 
@@ -976,8 +1150,7 @@ mod tests {
         bounded_redacted_activity_text,
     };
     use coding_brain_core::lifecycle::{
-        IgnoreReason, LifecycleEventKind, LifecycleIdentity, LifecycleStore, MAX_SESSIONS,
-        StoreCondition,
+        IgnoreReason, LifecycleEventKind, LifecycleIdentity, MAX_SESSIONS, StoreCondition,
     };
     use coding_brain_core::project::ProjectId;
     use fs2::FileExt;
@@ -1733,6 +1906,88 @@ mod tests {
         let projection = links.read_projection().unwrap();
         assert_eq!(projection.native_for(&live_process), Some("claimed-root"));
         assert_eq!(projection.live_for(&root_key), Some(&live_process));
+    }
+
+    #[test]
+    fn sqlite_root_stop_requires_an_exact_verified_recovery_link() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(temp.path());
+        let mut database = BrainDb::create_current(&paths).unwrap();
+        let links = SessionLinkStore::at(temp.path().join("session-links.jsonl"));
+        let live_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+            AgentProvider::Codex,
+            4200,
+            9002,
+            "pts/8",
+        )
+        .unwrap();
+
+        let recorded = persist_provider_hook_sqlite(
+            AgentProvider::Codex,
+            None,
+            &root_stop_payload(temp.path(), "claimed-root", "turn-a"),
+            &mut database,
+            &links,
+            Some(live_process.clone()),
+            |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(recorded.outcome, ApplyOutcome::Applied);
+        assert!(recorded.recovery_link_persisted);
+        let root_key = coding_brain_core::provider::AgentSessionKey::native(
+            AgentProvider::Codex,
+            "claimed-root",
+        );
+        let snapshot = database.read_lifecycle().unwrap();
+        assert_eq!(
+            snapshot.sessions[&root_key.storage_key()].latest_event,
+            Some(coding_brain_core::lifecycle::LifecycleEventName::Stop)
+        );
+        let projection = links.read_projection().unwrap();
+        assert_eq!(projection.native_for(&live_process), Some("claimed-root"));
+        assert_eq!(projection.live_for(&root_key), Some(&live_process));
+    }
+
+    #[test]
+    fn sqlite_root_stop_commits_lifecycle_but_aborts_recovery_when_link_is_unverified() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(temp.path());
+        let mut database = BrainDb::create_current(&paths).unwrap();
+        let link_path = temp.path().join("session-links.jsonl");
+        let links = SessionLinkStore::at(&link_path);
+        let live_process = coding_brain_core::provider::LiveProcessIdentity::try_new(
+            AgentProvider::Codex,
+            4200,
+            9002,
+            "pts/8",
+        )
+        .unwrap();
+
+        let error = persist_provider_hook_sqlite(
+            AgentProvider::Codex,
+            None,
+            &root_stop_payload(temp.path(), "claimed-root", "turn-a"),
+            &mut database,
+            &links,
+            Some(live_process),
+            |_| false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "exact recovery identity link unavailable");
+        let root_key = coding_brain_core::provider::AgentSessionKey::native(
+            AgentProvider::Codex,
+            "claimed-root",
+        );
+        let snapshot = database.read_lifecycle().unwrap();
+        assert_eq!(
+            snapshot.sessions[&root_key.storage_key()].latest_event,
+            Some(coding_brain_core::lifecycle::LifecycleEventName::Stop)
+        );
+        assert!(!link_path.exists());
     }
 
     #[test]

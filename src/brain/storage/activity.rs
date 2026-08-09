@@ -5,6 +5,7 @@ use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivitySnapshot,
     ActivityState, CorrectionDisposition, MAX_ACTIVITY_EVENT_BYTES, SnapshotLimits,
 };
+use coding_brain_core::provider::AgentProvider;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use super::{BrainDb, StorageDeadline, StorageError};
@@ -61,6 +62,13 @@ pub struct ActivityPage {
     pub serialized_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryReservationOutcome {
+    Reserved,
+    Duplicate,
+    Cooldown,
+}
+
 impl ActivityPage {
     /// Projects a caller-assembled window whose logical activity sequences are complete.
     ///
@@ -103,6 +111,181 @@ struct TerminalIdentity {
 }
 
 impl BrainDb {
+    pub fn append_recovery_activity_if_absent(
+        &mut self,
+        event: ActivityEvent,
+    ) -> Result<bool, StorageError> {
+        let diagnostic =
+            event.kind == ActivityKind::Diagnostic && event.state == ActivityState::Error;
+        let attention = event.kind == ActivityKind::Decision
+            && event.state == ActivityState::Abstained
+            && event.rule_id.as_deref() == Some("actionable_prompt_attention");
+        if !diagnostic && !attention {
+            return Err(StorageError::InvalidStorage("recovery activity is invalid"));
+        }
+        let activity_id = event.activity_id.clone();
+        let prepared = prepare_activity(event)?;
+        apply_deadline(&self.connection, self.deadline)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if transaction
+            .query_row(
+                "SELECT 1 FROM recovery_once WHERE activity_id = ?1",
+                [&activity_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let current = validated_high_water(&transaction)?;
+        let cursor = current.checked_add(1).ok_or(StorageError::InvalidStorage(
+            "activity cursor space is exhausted",
+        ))?;
+        transaction.execute(
+            "UPDATE schema_meta SET activity_high_water = ?1 WHERE singleton = 1",
+            [cursor],
+        )?;
+        insert_activity(&transaction, cursor, &prepared, None)?;
+        transaction.execute(
+            "INSERT INTO recovery_once (activity_id, source_cursor) VALUES (?1, ?2)",
+            params![activity_id, cursor],
+        )?;
+        commit_before_deadline(self.deadline, super::StorageOperation::Activity, || {
+            transaction.commit()
+        })?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_recovery(
+        &mut self,
+        attempt_key: &str,
+        session_key: &str,
+        provider: AgentProvider,
+        session_id: &str,
+        ephemeral: bool,
+        epoch_order: u64,
+        reserved_at_ms: u64,
+        cooldown_ms: u64,
+    ) -> Result<RecoveryReservationOutcome, StorageError> {
+        if attempt_key.is_empty()
+            || attempt_key.len() > 4_096
+            || session_key.is_empty()
+            || session_key.len() > 4_096
+            || session_id.is_empty()
+            || session_id.len() > 512
+            || epoch_order == 0
+            || epoch_order > i64::MAX as u64
+            || reserved_at_ms > i64::MAX as u64
+            || cooldown_ms > i64::MAX as u64
+        {
+            return Err(StorageError::InvalidStorage(
+                "recovery reservation is out of range",
+            ));
+        }
+        apply_deadline(&self.connection, self.deadline)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM recovery_reservations AS r
+             WHERE r.ephemeral = 0 AND NOT EXISTS (
+                 SELECT 1 FROM lifecycle_sessions AS l
+                 WHERE l.provider = r.provider AND l.session_id = r.session_id
+             )",
+            [],
+        )?;
+        let ephemeral_cutoff = reserved_at_ms.saturating_sub(24 * 60 * 60 * 1_000) as i64;
+        transaction.execute(
+            "DELETE FROM recovery_reservations
+             WHERE ephemeral = 1 AND reserved_at_ms < ?1",
+            [ephemeral_cutoff],
+        )?;
+        transaction.execute(
+            "DELETE FROM recovery_reservations
+             WHERE ephemeral = 1 AND session_key NOT IN (
+                 SELECT session_key FROM recovery_reservations
+                 WHERE ephemeral = 1 ORDER BY reserved_at_ms DESC LIMIT 255
+             )",
+            [],
+        )?;
+        if !ephemeral
+            && transaction
+                .query_row(
+                    "SELECT 1 FROM lifecycle_sessions WHERE provider = ?1 AND session_id = ?2",
+                    params![provider.as_str(), session_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_none()
+        {
+            return Err(StorageError::InvalidStorage(
+                "stable recovery session is absent",
+            ));
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT attempt_key, epoch_order, reserved_at_ms
+                 FROM recovery_reservations WHERE session_key = ?1",
+                [session_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((existing_attempt, existing_epoch, existing_at)) = existing {
+            if existing_attempt == attempt_key || existing_epoch >= epoch_order as i64 {
+                return Ok(RecoveryReservationOutcome::Duplicate);
+            }
+            let cutoff = reserved_at_ms.saturating_sub(cooldown_ms) as i64;
+            if existing_at > cutoff {
+                return Ok(RecoveryReservationOutcome::Cooldown);
+            }
+            transaction.execute(
+                "UPDATE recovery_reservations
+                 SET attempt_key = ?1, provider = ?2, session_id = ?3, ephemeral = ?4,
+                     epoch_order = ?5, reserved_at_ms = ?6
+                 WHERE session_key = ?7",
+                params![
+                    attempt_key,
+                    provider.as_str(),
+                    session_id,
+                    i64::from(ephemeral),
+                    epoch_order as i64,
+                    reserved_at_ms as i64,
+                    session_key,
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO recovery_reservations (
+                    session_key, attempt_key, provider, session_id, ephemeral,
+                    epoch_order, reserved_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    session_key,
+                    attempt_key,
+                    provider.as_str(),
+                    session_id,
+                    i64::from(ephemeral),
+                    epoch_order as i64,
+                    reserved_at_ms as i64,
+                ],
+            )?;
+        }
+        commit_before_deadline(self.deadline, super::StorageOperation::Activity, || {
+            transaction.commit()
+        })?;
+        Ok(RecoveryReservationOutcome::Reserved)
+    }
+
     pub fn append_activity(
         &mut self,
         event: ActivityEvent,
@@ -119,6 +302,15 @@ impl BrainDb {
         &mut self,
         events: &[ActivityEvent],
     ) -> Result<Vec<ActivityCursor>, StorageError> {
+        self.append_activity_batch_inner(events).map_err(|error| {
+            super::maintenance::map_storage_error(super::StorageOperation::Activity, false, error)
+        })
+    }
+
+    fn append_activity_batch_inner(
+        &mut self,
+        events: &[ActivityEvent],
+    ) -> Result<Vec<ActivityCursor>, StorageError> {
         let prepared = events
             .iter()
             .cloned()
@@ -132,6 +324,7 @@ impl BrainDb {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::maintenance::sqlite_fault("activity-body")?;
         let current = validated_high_water(&transaction)?;
         let count = i64::try_from(prepared.len())
             .map_err(|_| StorageError::InvalidStorage("activity batch is too large"))?;
@@ -157,7 +350,10 @@ impl BrainDb {
             insert_activity(&transaction, cursor, activity, None)?;
             cursors.push(ActivityCursor::try_from(cursor)?);
         }
-        commit_before_deadline(self.deadline, || transaction.commit())?;
+        commit_before_deadline(self.deadline, super::StorageOperation::Activity, || {
+            super::maintenance::sqlite_fault("activity-commit")?;
+            transaction.commit()
+        })?;
         Ok(cursors)
     }
 
@@ -234,13 +430,101 @@ impl BrainDb {
         )
     }
 
+    pub fn activity_for_permission_identity(
+        &self,
+        provider: AgentProvider,
+        session_id: &str,
+        turn_id: &str,
+        tool_use_id: Option<&str>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<ActivityPage, StorageError> {
+        validate_page_limits(max_rows, max_bytes)?;
+        apply_deadline(&self.connection, self.deadline)?;
+        let mut statement = self.connection.prepare(
+            "SELECT source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+                    terminal_provider, terminal_session_id, terminal_turn_id,
+                    terminal_tool_use_id, terminal_action, outcome, correction, event_payload
+             FROM activity_events INDEXED BY activity_events_permission_identity
+             WHERE terminal_provider = ?1 AND terminal_session_id = ?2
+               AND terminal_turn_id = ?3 AND terminal_tool_use_id IS ?4
+             ORDER BY source_cursor DESC LIMIT ?5",
+        )?;
+        let mut rows = statement.query(params![
+            provider.as_str(),
+            session_id,
+            turn_id,
+            tool_use_id,
+            sql_query_limit(max_rows)?
+        ])?;
+        materialize_page(
+            &self.connection,
+            &mut rows,
+            max_rows,
+            max_bytes,
+            self.deadline,
+        )
+    }
+
+    pub fn activity_for_permission_outcome(
+        &self,
+        provider: AgentProvider,
+        session_id: &str,
+        turn_id: &str,
+        tool_use_id: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<ActivityPage, StorageError> {
+        validate_page_limits(max_rows, max_bytes)?;
+        apply_deadline(&self.connection, self.deadline)?;
+        let mut statement = self.connection.prepare(
+            "SELECT source_cursor, activity_id, event_kind, event_state, recorded_at_ms,
+                    terminal_provider, terminal_session_id, terminal_turn_id,
+                    terminal_tool_use_id, terminal_action, outcome, correction, event_payload
+             FROM activity_events INDEXED BY activity_events_permission_identity
+             WHERE terminal_provider = ?1 AND terminal_session_id = ?2
+               AND terminal_turn_id = ?3
+               AND (terminal_tool_use_id = ?4 OR terminal_tool_use_id IS NULL)
+             ORDER BY source_cursor DESC LIMIT ?5",
+        )?;
+        let mut rows = statement.query(params![
+            provider.as_str(),
+            session_id,
+            turn_id,
+            tool_use_id,
+            sql_query_limit(max_rows)?
+        ])?;
+        materialize_page(
+            &self.connection,
+            &mut rows,
+            max_rows,
+            max_bytes,
+            self.deadline,
+        )
+    }
+
     pub fn activity_after_cursor(
         &self,
         after: Option<ActivityCursor>,
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<ActivityPage, StorageError> {
+        self.activity_bounded_after_locked(after, i64::MAX, max_rows, max_bytes)
+    }
+
+    pub(super) fn activity_bounded_after_locked(
+        &self,
+        after: Option<ActivityCursor>,
+        through: i64,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<ActivityPage, StorageError> {
         validate_page_limits(max_rows, max_bytes)?;
+        if through < 0 {
+            return Err(StorageError::InvalidStorage(
+                "activity page bounds are invalid",
+            ));
+        }
         apply_deadline(&self.connection, self.deadline)?;
         let after = after.map_or(0, cursor_i64);
         let mut statement = self.connection.prepare(
@@ -248,10 +532,10 @@ impl BrainDb {
                     terminal_provider, terminal_session_id, terminal_turn_id,
                     terminal_tool_use_id, terminal_action, outcome, correction, event_payload
              FROM activity_events INDEXED BY activity_events_cursor
-             WHERE source_cursor > ?1
-             ORDER BY source_cursor ASC LIMIT ?2",
+             WHERE source_cursor > ?1 AND source_cursor <= ?2
+             ORDER BY source_cursor ASC LIMIT ?3",
         )?;
-        let mut rows = statement.query(params![after, sql_query_limit(max_rows)?])?;
+        let mut rows = statement.query(params![after, through, sql_query_limit(max_rows)?])?;
         materialize_page(
             &self.connection,
             &mut rows,
@@ -275,16 +559,28 @@ impl BrainDb {
         &mut self,
         cursor: ActivityCursor,
     ) -> Result<usize, StorageError> {
+        self.delete_activity_before_inner(cursor).map_err(|error| {
+            super::maintenance::map_storage_error(super::StorageOperation::Activity, false, error)
+        })
+    }
+
+    fn delete_activity_before_inner(
+        &mut self,
+        cursor: ActivityCursor,
+    ) -> Result<usize, StorageError> {
         apply_deadline(&self.connection, self.deadline)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::maintenance::sqlite_fault("activity-delete-body")?;
         validated_high_water(&transaction)?;
         let deleted = transaction.execute(
             "DELETE FROM activity_events WHERE source_cursor < ?1",
             [cursor_i64(cursor)],
         )?;
-        commit_before_deadline(self.deadline, || transaction.commit())?;
+        commit_before_deadline(self.deadline, super::StorageOperation::Activity, || {
+            transaction.commit()
+        })?;
         Ok(deleted)
     }
 
@@ -572,12 +868,13 @@ pub(super) fn ensure_deadline(deadline: Option<StorageDeadline>) -> Result<(), S
 
 pub(super) fn commit_before_deadline<T>(
     deadline: Option<StorageDeadline>,
+    operation: super::StorageOperation,
     commit: impl FnOnce() -> rusqlite::Result<T>,
 ) -> Result<T, StorageError> {
     ensure_deadline(deadline)?;
     // The deadline gates entry to commit. Once SQLite reports commit success, that
     // durable result is authoritative even if the wall-clock deadline has crossed.
-    Ok(commit()?)
+    commit().map_err(|error| super::maintenance::map_sqlite_error(operation, true, error))
 }
 
 fn ensure_single_activity_kind(

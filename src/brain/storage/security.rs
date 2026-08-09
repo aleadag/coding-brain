@@ -1,6 +1,7 @@
+use sha2::{Digest, Sha256};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -30,6 +31,32 @@ pub(super) struct SecureDatabaseDirectory {
     state_root_path: PathBuf,
     descriptor: File,
     path: PathBuf,
+}
+
+pub(super) struct PrivateFileSnapshot {
+    pub(super) bytes: Vec<u8>,
+    pub(super) identity: PrivateFileIdentity,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PrivateFileIdentity(EntryMetadata);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClosedDatabaseIdentity {
+    pub(super) device: u64,
+    pub(super) inode: u64,
+    pub(super) size: u64,
+    pub(super) modified_seconds: i64,
+    pub(super) modified_nanoseconds: i64,
+    pub(super) digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PublicationPresence {
+    Neither,
+    Staging,
+    Canonical,
+    LinkedPair,
 }
 
 impl SecureDatabaseDirectory {
@@ -198,6 +225,25 @@ impl SecureDatabaseDirectory {
         Ok(())
     }
 
+    pub(super) fn private_file_len(&self, name: &CStr) -> Result<Option<u64>, SecurityError> {
+        let descriptor = match open_readonly_regular_at(&self.descriptor, name) {
+            Ok(descriptor) => descriptor,
+            Err(SecurityError::Missing) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let opened = EntryMetadata::from(&file.metadata()?);
+        let at_path = metadata_at(&self.descriptor, name)?;
+        validate_private_file(&opened)?;
+        validate_private_file(&at_path)?;
+        if opened.dev != at_path.dev || opened.ino != at_path.ino {
+            return Err(SecurityError::Invalid(
+                "private database file changed during inspection",
+            ));
+        }
+        Ok(Some(opened.size))
+    }
+
     pub(super) fn remove_database(&self, database_name: &CStr) -> Result<(), SecurityError> {
         self.validate_existing_sidecars(database_name)?;
         let database_exists = match metadata_at(&self.descriptor, database_name) {
@@ -228,6 +274,297 @@ impl SecureDatabaseDirectory {
         }
         unlink_if_present(&self.descriptor, database_name)?;
         self.descriptor.sync_all()?;
+        Ok(())
+    }
+
+    pub(super) fn publish_database(
+        &self,
+        staging_name: &CStr,
+        canonical_name: &CStr,
+    ) -> Result<(), SecurityError> {
+        self.validate_path_correspondence()?;
+        self.reject_untrusted_entries(staging_name, true)?;
+        self.reject_untrusted_entries(canonical_name, false)?;
+        let linked = unsafe {
+            libc::linkat(
+                self.descriptor.as_raw_fd(),
+                staging_name.as_ptr(),
+                self.descriptor.as_raw_fd(),
+                canonical_name.as_ptr(),
+                0,
+            )
+        };
+        if linked != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        #[cfg(feature = "fault-injection")]
+        if canonical_name == super::BRAIN_DATABASE_NAME {
+            super::migration::migration_fault("after-brain-link");
+        } else if canonical_name == super::REVIEW_DATABASE_NAME {
+            super::migration::migration_fault("after-review-link");
+        }
+        if unsafe { libc::unlinkat(self.descriptor.as_raw_fd(), staging_name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        self.descriptor.sync_all()?;
+        self.validate_after_open(canonical_name)?;
+        self.validate_path_correspondence()?;
+        Ok(())
+    }
+
+    pub(super) fn publication_presence(
+        &self,
+        staging_name: &CStr,
+        canonical_name: &CStr,
+    ) -> Result<PublicationPresence, SecurityError> {
+        let staging = optional_metadata_at(&self.descriptor, staging_name)?;
+        let canonical = optional_metadata_at(&self.descriptor, canonical_name)?;
+        match (staging, canonical) {
+            (None, None) => Ok(PublicationPresence::Neither),
+            (Some(staging), None) => {
+                validate_private_file(&staging)?;
+                Ok(PublicationPresence::Staging)
+            }
+            (None, Some(canonical)) => {
+                validate_private_file(&canonical)?;
+                Ok(PublicationPresence::Canonical)
+            }
+            (Some(staging), Some(canonical)) => {
+                validate_private_linked_pair(&staging, &canonical)?;
+                Ok(PublicationPresence::LinkedPair)
+            }
+        }
+    }
+
+    pub(super) fn private_file_present(&self, name: &CStr) -> Result<bool, SecurityError> {
+        let Some(metadata) = optional_metadata_at(&self.descriptor, name)? else {
+            return Ok(false);
+        };
+        validate_private_file(&metadata)?;
+        Ok(true)
+    }
+
+    pub(super) fn finish_linked_publication(
+        &self,
+        staging_name: &CStr,
+        canonical_name: &CStr,
+    ) -> Result<(), SecurityError> {
+        let staging = metadata_at(&self.descriptor, staging_name)?;
+        let canonical = metadata_at(&self.descriptor, canonical_name)?;
+        validate_private_linked_pair(&staging, &canonical)?;
+        for name in [staging_name, canonical_name] {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                if optional_metadata_at(&self.descriptor, &sidecar_name(name, suffix)?)?.is_some() {
+                    return Err(SecurityError::Invalid(
+                        "partial publication has a SQLite sidecar",
+                    ));
+                }
+            }
+        }
+        if unsafe { libc::unlinkat(self.descriptor.as_raw_fd(), staging_name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        self.descriptor.sync_all()?;
+        self.validate_database_without_sidecars(canonical_name)?;
+        self.validate_path_correspondence()?;
+        Ok(())
+    }
+
+    pub(super) fn validate_database_without_sidecars(
+        &self,
+        database_name: &CStr,
+    ) -> Result<(), SecurityError> {
+        self.reject_untrusted_entries(database_name, true)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let name = sidecar_name(database_name, suffix)?;
+            match metadata_at(&self.descriptor, &name) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => return Err(SecurityError::Invalid("staging SQLite sidecar remains")),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn sync_database(&self, database_name: &CStr) -> Result<(), SecurityError> {
+        let descriptor = open_regular_at(&self.descriptor, database_name)?;
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        file.sync_all()?;
+        self.descriptor.sync_all()?;
+        Ok(())
+    }
+
+    pub(super) fn closed_database_identity(
+        &self,
+        database_name: &CStr,
+    ) -> Result<ClosedDatabaseIdentity, SecurityError> {
+        self.closed_database_identity_with_links(database_name, 1)
+    }
+
+    #[allow(clippy::unnecessary_cast)] // libc stat fields vary in width across Unix targets.
+    pub(super) fn closed_database_identity_with_links(
+        &self,
+        database_name: &CStr,
+        expected_links: u64,
+    ) -> Result<ClosedDatabaseIdentity, SecurityError> {
+        if expected_links == 1 {
+            self.validate_database_without_sidecars(database_name)?;
+        }
+        let descriptor = open_readonly_regular_at(&self.descriptor, database_name)?;
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let opened = EntryMetadata::from(&file.metadata()?);
+        let at_path = metadata_at(&self.descriptor, database_name)?;
+        let valid = |metadata: &EntryMetadata| {
+            metadata.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+                && metadata.uid == unsafe { libc::geteuid() }
+                && metadata.mode & 0o777 == 0o600
+                && metadata.nlink == expected_links
+        };
+        if !valid(&opened) || !valid(&at_path) {
+            return Err(SecurityError::Invalid(
+                "closed database link identity is invalid",
+            ));
+        }
+        if opened != at_path {
+            return Err(SecurityError::Invalid(
+                "closed database changed during identity capture",
+            ));
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 32 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        let after = EntryMetadata::from(&file.metadata()?);
+        let after_path = metadata_at(&self.descriptor, database_name)?;
+        if after != opened || after_path != opened {
+            return Err(SecurityError::Invalid(
+                "closed database changed during identity capture",
+            ));
+        }
+        Ok(ClosedDatabaseIdentity {
+            device: opened.dev,
+            inode: opened.ino,
+            size: opened.size,
+            modified_seconds: opened.modified_seconds,
+            modified_nanoseconds: opened.modified_nanoseconds,
+            digest: format!("{:x}", digest.finalize()),
+        })
+    }
+
+    pub(super) fn read_private_file(
+        &self,
+        name: &CStr,
+        maximum: usize,
+    ) -> Result<PrivateFileSnapshot, SecurityError> {
+        let descriptor = open_readonly_regular_at(&self.descriptor, name)?;
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let before_opened = EntryMetadata::from(&file.metadata()?);
+        let before_path = metadata_at(&self.descriptor, name)?;
+        validate_private_file(&before_opened)?;
+        validate_private_file(&before_path)?;
+        if before_opened != before_path || before_opened.size > maximum as u64 {
+            return Err(SecurityError::Invalid(
+                "private state file changed during open",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(before_opened.size as usize);
+        (&mut file)
+            .take((maximum + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > maximum {
+            return Err(SecurityError::Invalid(
+                "private state file exceeds its size limit",
+            ));
+        }
+        let after_opened = EntryMetadata::from(&file.metadata()?);
+        let after_path = metadata_at(&self.descriptor, name)?;
+        if before_opened != after_opened || before_opened != after_path {
+            return Err(SecurityError::Invalid(
+                "private state file changed during read",
+            ));
+        }
+        self.validate_path_correspondence()?;
+        Ok(PrivateFileSnapshot {
+            bytes,
+            identity: PrivateFileIdentity(before_opened),
+        })
+    }
+
+    pub(super) fn write_new_private_file(
+        &self,
+        name: &CStr,
+        bytes: &[u8],
+    ) -> Result<PrivateFileIdentity, SecurityError> {
+        let mut file = self.create_database_file(name)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        self.descriptor.sync_all()?;
+        self.validate_path_correspondence()?;
+        Ok(PrivateFileIdentity(EntryMetadata::from(&file.metadata()?)))
+    }
+
+    pub(super) fn publish_private_replacement(
+        &self,
+        name: &CStr,
+        expected: PrivateFileIdentity,
+        temporary_name: &CStr,
+        replacement: PrivateFileIdentity,
+    ) -> Result<PrivateFileIdentity, SecurityError> {
+        let at_path = metadata_at(&self.descriptor, name)?;
+        if at_path != expected.0 {
+            return Err(SecurityError::Invalid(
+                "private state file changed before replacement",
+            ));
+        }
+        let temporary = metadata_at(&self.descriptor, temporary_name)?;
+        if temporary != replacement.0 {
+            return Err(SecurityError::Invalid(
+                "private state replacement changed before publish",
+            ));
+        }
+        if unsafe {
+            libc::renameat(
+                self.descriptor.as_raw_fd(),
+                temporary_name.as_ptr(),
+                self.descriptor.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        self.descriptor.sync_all()?;
+        let published = metadata_at(&self.descriptor, name)?;
+        if published != replacement.0 {
+            return Err(SecurityError::Invalid(
+                "private state replacement changed during publish",
+            ));
+        }
+        self.validate_path_correspondence()?;
+        Ok(replacement)
+    }
+
+    pub(super) fn remove_private_file(
+        &self,
+        name: &CStr,
+        expected: PrivateFileIdentity,
+    ) -> Result<(), SecurityError> {
+        let at_path = metadata_at(&self.descriptor, name)?;
+        if at_path != expected.0 {
+            return Err(SecurityError::Invalid(
+                "private state file changed before removal",
+            ));
+        }
+        if unsafe { libc::unlinkat(self.descriptor.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        self.descriptor.sync_all()?;
+        self.validate_path_correspondence()?;
         Ok(())
     }
 
@@ -288,6 +625,61 @@ fn open_regular_at(directory: &File, name: &CStr) -> Result<libc::c_int, Securit
             Err(error.into())
         }
     }
+}
+
+fn open_readonly_regular_at(directory: &File, name: &CStr) -> Result<libc::c_int, SecurityError> {
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor >= 0 {
+        Ok(descriptor)
+    } else {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ELOOP)) {
+            Err(SecurityError::Invalid("private state file is a symlink"))
+        } else {
+            Err(error.into())
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+pub(super) fn open_fault_capability(path: &Path) -> Result<File, SecurityError> {
+    let parent = path
+        .parent()
+        .ok_or(SecurityError::Invalid("fault capability has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or(SecurityError::Invalid("fault capability has no name"))?;
+    let traversal = state_root_for_traversal(parent);
+    let mut directory = open_directory(if traversal.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    })?;
+    for component in normal_components(&traversal)? {
+        validate_safe_ancestor_metadata(&EntryMetadata::from(&directory.metadata()?))?;
+        directory = open_directory_at(&directory, component)?;
+    }
+    validate_private_directory(&directory)?;
+    let c_name = CString::new(name.as_bytes())
+        .map_err(|_| SecurityError::Invalid("fault capability name is invalid"))?;
+    let before = metadata_at(&directory, &c_name)?;
+    validate_private_file(&before)?;
+    let descriptor = open_readonly_regular_at(&directory, &c_name)?;
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let opened = EntryMetadata::from(&file.metadata()?);
+    validate_private_file(&opened)?;
+    if before.dev != opened.dev || before.ino != opened.ino {
+        return Err(SecurityError::Invalid(
+            "fault capability changed during open",
+        ));
+    }
+    Ok(file)
 }
 
 fn validate_or_create_state_root(state_root: &Path, create: bool) -> Result<(), SecurityError> {
@@ -490,13 +882,43 @@ fn validate_private_file(metadata: &EntryMetadata) -> Result<(), SecurityError> 
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[allow(clippy::unnecessary_cast)] // libc stat fields vary in width across Unix targets.
+fn validate_private_linked_pair(
+    left: &EntryMetadata,
+    right: &EntryMetadata,
+) -> Result<(), SecurityError> {
+    let owner = unsafe { libc::geteuid() };
+    let private_regular = |metadata: &EntryMetadata| {
+        metadata.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+            && metadata.uid == owner
+            && metadata.mode & 0o777 == 0o600
+            && metadata.nlink == 2
+    };
+    if !private_regular(left)
+        || !private_regular(right)
+        || left.dev != right.dev
+        || left.ino != right.ino
+        || left.size != right.size
+        || left.modified_seconds != right.modified_seconds
+        || left.modified_nanoseconds != right.modified_nanoseconds
+    {
+        return Err(SecurityError::Invalid(
+            "partial publication is not one exact private inode",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct EntryMetadata {
     mode: u32,
     uid: u32,
     nlink: u64,
     dev: u64,
     ino: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
 }
 
 impl From<&fs::Metadata> for EntryMetadata {
@@ -507,6 +929,9 @@ impl From<&fs::Metadata> for EntryMetadata {
             nlink: metadata.nlink(),
             dev: metadata.dev(),
             ino: metadata.ino(),
+            size: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
         }
     }
 }
@@ -532,7 +957,21 @@ fn metadata_at(directory: &File, name: &CStr) -> io::Result<EntryMetadata> {
         nlink: stat.st_nlink as u64,
         dev: stat.st_dev as u64,
         ino: stat.st_ino as u64,
+        size: stat.st_size as u64,
+        modified_seconds: stat.st_mtime,
+        modified_nanoseconds: stat.st_mtime_nsec,
     })
+}
+
+fn optional_metadata_at(
+    directory: &File,
+    name: &CStr,
+) -> Result<Option<EntryMetadata>, SecurityError> {
+    match metadata_at(directory, name) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn unlink_if_present(directory: &File, name: &CStr) -> Result<(), SecurityError> {
@@ -620,6 +1059,9 @@ mod tests {
             nlink: 1,
             dev: 1,
             ino: 1,
+            size: 0,
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
         };
 
         assert!(validate_private_state_root_metadata(&metadata).is_err());
@@ -634,6 +1076,9 @@ mod tests {
             nlink: 1,
             dev: 1,
             ino: 1,
+            size: 0,
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
         };
 
         assert!(validate_safe_ancestor_metadata(&metadata).is_err());
@@ -648,6 +1093,9 @@ mod tests {
             nlink: 1,
             dev: 1,
             ino: 1,
+            size: 0,
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
         };
 
         assert!(validate_safe_ancestor_metadata(&metadata).is_err());

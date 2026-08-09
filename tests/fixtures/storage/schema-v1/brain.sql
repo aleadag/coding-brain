@@ -7,7 +7,36 @@ CREATE TABLE schema_meta (
     migration_generation INTEGER NOT NULL CHECK (migration_generation BETWEEN 0 AND 0x7fffffffffffffff),
     erasure_state TEXT NOT NULL CHECK (erasure_state IN ('complete', 'in_progress')),
     erasure_generation INTEGER NOT NULL CHECK (erasure_generation BETWEEN 0 AND 0x7fffffffffffffff),
-    activity_high_water INTEGER NOT NULL CHECK (activity_high_water BETWEEN 0 AND 0x7fffffffffffffff)
+    activity_high_water INTEGER NOT NULL CHECK (activity_high_water BETWEEN 0 AND 0x7fffffffffffffff),
+    maintenance_retention_boundary INTEGER CHECK (
+        maintenance_retention_boundary IS NULL
+        OR maintenance_retention_boundary BETWEEN 1 AND 0x7fffffffffffffff
+    ),
+    maintenance_scan_before INTEGER CHECK (
+        maintenance_scan_before IS NULL
+        OR maintenance_scan_before BETWEEN 1 AND 0x7fffffffffffffff
+    ),
+    maintenance_recent_remaining INTEGER NOT NULL DEFAULT 32 CHECK (
+        maintenance_recent_remaining BETWEEN 0 AND 32
+    ),
+    maintenance_overlap_activity_id TEXT CHECK (
+        maintenance_overlap_activity_id IS NULL
+        OR length(maintenance_overlap_activity_id) BETWEEN 1 AND 512
+    ),
+    maintenance_overlap_keep INTEGER NOT NULL DEFAULT 0 CHECK (
+        maintenance_overlap_keep IN (0, 1)
+    ),
+    CHECK (
+        (maintenance_retention_boundary IS NULL
+         AND maintenance_scan_before IS NULL
+         AND maintenance_overlap_activity_id IS NULL
+         AND maintenance_overlap_keep = 0)
+        OR
+        (maintenance_retention_boundary IS NOT NULL
+         AND maintenance_scan_before IS NOT NULL
+         AND maintenance_scan_before <= maintenance_retention_boundary)
+    ),
+    CHECK (maintenance_overlap_activity_id IS NOT NULL OR maintenance_overlap_keep = 0)
 ) STRICT;
 
 INSERT INTO schema_meta (
@@ -19,8 +48,13 @@ INSERT INTO schema_meta (
     migration_generation,
     erasure_state,
     erasure_generation,
-    activity_high_water
-) VALUES (1, 0x4342524e, 1, 1, 'complete', 0, 'complete', 0, 0);
+    activity_high_water,
+    maintenance_retention_boundary,
+    maintenance_scan_before,
+    maintenance_recent_remaining,
+    maintenance_overlap_activity_id,
+    maintenance_overlap_keep
+) VALUES (1, 0x4342524e, 1, 1, 'complete', 0, 'complete', 0, 0, NULL, NULL, 32, NULL, 0);
 
 CREATE TABLE permission_attempts (
     attempt_id TEXT PRIMARY KEY CHECK (length(attempt_id) BETWEEN 1 AND 512),
@@ -485,3 +519,22 @@ CREATE TABLE lifecycle_invocation_steps (
 
 CREATE INDEX lifecycle_invocation_steps_exact
 ON lifecycle_invocation_steps (provider, session_id, invocation_id, step);
+
+CREATE TABLE recovery_reservations (
+    session_key TEXT PRIMARY KEY CHECK (length(CAST(session_key AS BLOB)) BETWEEN 1 AND 4096),
+    attempt_key TEXT NOT NULL UNIQUE CHECK (length(CAST(attempt_key AS BLOB)) BETWEEN 1 AND 4096),
+    provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude', 'antigravity')),
+    session_id TEXT NOT NULL CHECK (length(CAST(session_id AS BLOB)) BETWEEN 1 AND 512),
+    ephemeral INTEGER NOT NULL CHECK (ephemeral IN (0, 1)),
+    epoch_order INTEGER NOT NULL CHECK (epoch_order BETWEEN 1 AND 0x7fffffffffffffff),
+    reserved_at_ms INTEGER NOT NULL CHECK (reserved_at_ms BETWEEN 0 AND 0x7fffffffffffffff)
+) STRICT;
+
+CREATE INDEX recovery_reservations_retention
+ON recovery_reservations (ephemeral, reserved_at_ms DESC);
+
+CREATE TABLE recovery_once (
+    activity_id TEXT PRIMARY KEY CHECK (length(CAST(activity_id AS BLOB)) BETWEEN 1 AND 512),
+    source_cursor INTEGER NOT NULL UNIQUE,
+    FOREIGN KEY (source_cursor) REFERENCES activity_events (source_cursor) ON DELETE CASCADE
+) STRICT;

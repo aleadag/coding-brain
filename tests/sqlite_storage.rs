@@ -13,8 +13,10 @@ use coding_brain::brain::decisions::{
 use coding_brain::brain::storage::{
     ActivityCursor, BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, DecisionIdentity,
     DecisionKind, DecisionPayload, HistoricalDeliveryState, HistoricalPermissionProvenance,
-    LearningErasePaths, OpenRole, REVIEW_APPLICATION_ID, REVIEW_SCHEMA_VERSION, ReviewDb,
-    ReviewEligibility, ReviewEligibleOccurrence, StorageDeadline, StorageError, StoragePaths,
+    LearningErasePaths, OpenRole, REVIEW_APPLICATION_ID, REVIEW_SCHEMA_VERSION,
+    RecoveryReservationOutcome, ReviewDb, ReviewEligibility, ReviewEligibleOccurrence,
+    StorageDeadline, StorageError, StorageFaultCategory, StorageOperation, StoragePaths,
+    WAL_AUTOCHECKPOINT_PAGES,
 };
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivityState,
@@ -390,6 +392,54 @@ fn activity_terminal_identity_keeps_opposite_actions_and_rejects_same_action_dup
             .duplicate_terminal_states,
         1
     );
+}
+
+#[test]
+fn permission_identity_lookup_does_not_scan_large_activity_history() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let mut target =
+        identified_activity_event("target", 1, ActivityState::Allowed, AgentProvider::Codex);
+    target.decision_id = Some("decision-target".into());
+    db.append_activity(target).unwrap();
+    let events = (0..4_097)
+        .map(|index| {
+            let mut event =
+                activity_event(&format!("filler-{index}"), 2 + index, ActivityState::Error);
+            event.kind = ActivityKind::Diagnostic;
+            event.tool = None;
+            event.normalized_command = None;
+            event.fingerprint = None;
+            event.rule_id = None;
+            event.confidence = None;
+            event.threshold = None;
+            event.decision_id = None;
+            event.reasoning = Some("x".repeat(4_096));
+            event
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .map(|event| serde_json::to_vec(event).unwrap().len())
+            .sum::<usize>()
+            > 16 * 1024 * 1024
+    );
+    db.append_activity_batch(&events).unwrap();
+
+    let page = db
+        .activity_for_permission_identity(
+            AgentProvider::Codex,
+            "session-target",
+            "turn-target",
+            Some("tool-target"),
+            8,
+            512 * 1024,
+        )
+        .unwrap();
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].event.activity_id, "target");
 }
 
 #[test]
@@ -841,13 +891,10 @@ fn activity_round_trip_preserves_opaque_paths_and_projects_incomplete_state() {
 }
 
 #[test]
-fn activity_sqlite_page_projects_like_the_legacy_log() {
-    use coding_brain::brain::activity::ActivityStore;
-
+fn activity_sqlite_page_projects_complete_activity_history() {
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     let mut db = BrainDb::create_current(&paths).unwrap();
-    let store = ActivityStore::at(root.path().join("activity.jsonl"));
     let observed = activity_event("sequence", 10, ActivityState::Observed);
     let denied = activity_event("sequence", 11, ActivityState::Denied);
     let delivered = activity_event("sequence", 12, ActivityState::Delivered);
@@ -858,37 +905,43 @@ fn activity_sqlite_page_projects_like_the_legacy_log() {
     correction.correction = Some(CorrectionDisposition::BrainRight);
     let older = activity_event("older-sequence", 1, ActivityState::Denied);
     let events = [older, observed, denied, delivered, outcome, correction];
-    for event in &events {
-        store.append(event.clone()).unwrap();
-    }
     db.append_activity_batch(&events).unwrap();
 
     let limits = SnapshotLimits::default();
-    let legacy = store.snapshot(limits).unwrap();
     let sqlite = db
         .activity_after_cursor(None, 100, 1024 * 1024)
         .unwrap()
         .project_complete_window(limits, 20);
-    assert_eq!(sqlite, legacy);
+    assert!(sqlite.attention.is_empty());
+    assert_eq!(sqlite.unresolved_count, 0);
+    assert!(sqlite.diagnostic_events.is_empty());
+    assert_eq!(sqlite.recent.len(), 2);
+    assert_eq!(sqlite.recent[0].activity_id, "sequence");
+    assert_eq!(sqlite.recent[0].outcome, Some(ActivityOutcome::Succeeded));
+    assert_eq!(
+        sqlite.recent[0].correction,
+        Some(CorrectionDisposition::BrainRight)
+    );
+    assert_eq!(sqlite.recent[1].activity_id, "older-sequence");
+    assert_eq!(sqlite.recent[1].state, ActivityState::Denied);
 }
 
 #[test]
 fn activity_projection_requires_a_complete_caller_assembled_window() {
-    use coding_brain::brain::activity::ActivityStore;
-
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     let mut db = BrainDb::create_current(&paths).unwrap();
-    let store = ActivityStore::at(root.path().join("activity.jsonl"));
     let events = [
         activity_event("boundary", 1, ActivityState::Observed),
         activity_event("boundary", 2, ActivityState::Denied),
         activity_event("boundary", 3, ActivityState::Delivered),
     ];
-    for event in &events {
-        store.append(event.clone()).unwrap();
-    }
     db.append_activity_batch(&events).unwrap();
+
+    let expected = db
+        .activity_after_cursor(None, 100, 128 * 1024)
+        .unwrap()
+        .project_complete_window(SnapshotLimits::default(), 4);
 
     let first = db.activity_after_cursor(None, 2, 128 * 1024).unwrap();
     let second = db
@@ -906,7 +959,7 @@ fn activity_projection_requires_a_complete_caller_assembled_window() {
 
     assert_eq!(
         assembled.project_complete_window(SnapshotLimits::default(), 4),
-        store.snapshot(SnapshotLimits::default()).unwrap()
+        expected
     );
 }
 
@@ -1056,6 +1109,192 @@ fn lifecycle_stop_round_trip_preserves_closed_current_continuity() {
     assert_eq!(
         state.recent_turns.front().map(String::as_str),
         Some("turn-1")
+    );
+}
+
+#[test]
+fn recovery_reservations_are_atomic_monotonic_and_bounded() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Codex,
+        "session-1".into(),
+        Some("turn-1".into()),
+        None,
+        "/work/project".into(),
+    )
+    .unwrap();
+    db.record_lifecycle(
+        LifecycleEvent::from_parts(identity, LifecycleEventKind::Stop).unwrap(),
+        100,
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.reserve_recovery(
+            "attempt-1",
+            "codex:session-1",
+            AgentProvider::Codex,
+            "session-1",
+            false,
+            1,
+            1_000,
+            10_000,
+        )
+        .unwrap(),
+        RecoveryReservationOutcome::Reserved
+    );
+    assert_eq!(
+        db.reserve_recovery(
+            "attempt-1",
+            "codex:session-1",
+            AgentProvider::Codex,
+            "session-1",
+            false,
+            1,
+            1_001,
+            10_000,
+        )
+        .unwrap(),
+        RecoveryReservationOutcome::Duplicate
+    );
+    assert_eq!(
+        db.reserve_recovery(
+            "attempt-2",
+            "codex:session-1",
+            AgentProvider::Codex,
+            "session-1",
+            false,
+            2,
+            10_999,
+            10_000,
+        )
+        .unwrap(),
+        RecoveryReservationOutcome::Cooldown
+    );
+    assert_eq!(
+        db.reserve_recovery(
+            "attempt-2",
+            "codex:session-1",
+            AgentProvider::Codex,
+            "session-1",
+            false,
+            2,
+            11_000,
+            10_000,
+        )
+        .unwrap(),
+        RecoveryReservationOutcome::Reserved
+    );
+    assert_eq!(
+        db.reserve_recovery(
+            "attempt-stale",
+            "codex:session-1",
+            AgentProvider::Codex,
+            "session-1",
+            false,
+            1,
+            30_000,
+            10_000,
+        )
+        .unwrap(),
+        RecoveryReservationOutcome::Duplicate
+    );
+
+    for index in 1..=300_u64 {
+        assert_eq!(
+            db.reserve_recovery(
+                &format!("process-attempt-{index}"),
+                &format!("live-session-{index}"),
+                AgentProvider::Codex,
+                &format!("live-session-{index}"),
+                true,
+                index,
+                40_000 + index,
+                10_000,
+            )
+            .unwrap(),
+            RecoveryReservationOutcome::Reserved
+        );
+    }
+    let connection = open_for_constraints(&paths.brain_db());
+    let ephemeral: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM recovery_reservations WHERE ephemeral = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        ephemeral <= 256,
+        "unbounded ephemeral reservations: {ephemeral}"
+    );
+}
+
+#[test]
+fn concurrent_recovery_reservation_has_one_winner() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut setup = BrainDb::create_current(&paths).unwrap();
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Codex,
+        "session-1".into(),
+        Some("turn-1".into()),
+        None,
+        "/work/project".into(),
+    )
+    .unwrap();
+    setup
+        .record_lifecycle(
+            LifecycleEvent::from_parts(identity, LifecycleEventKind::Stop).unwrap(),
+            100,
+        )
+        .unwrap();
+    drop(setup);
+    let barrier = Arc::new(Barrier::new(2));
+    let workers = (0..2)
+        .map(|_| {
+            let paths = paths.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut database = BrainDb::open_current(
+                    &paths,
+                    OpenRole::NonHook,
+                    StorageDeadline::after(Duration::from_secs(5)),
+                )
+                .unwrap();
+                barrier.wait();
+                database
+                    .reserve_recovery(
+                        "attempt-1",
+                        "codex:session-1",
+                        AgentProvider::Codex,
+                        "session-1",
+                        false,
+                        1,
+                        1_000,
+                        10_000,
+                    )
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    outcomes.sort_by_key(|outcome| match outcome {
+        RecoveryReservationOutcome::Reserved => 0,
+        RecoveryReservationOutcome::Duplicate => 1,
+        RecoveryReservationOutcome::Cooldown => 2,
+    });
+    assert_eq!(
+        outcomes,
+        [
+            RecoveryReservationOutcome::Reserved,
+            RecoveryReservationOutcome::Duplicate,
+        ]
     );
 }
 
@@ -1584,6 +1823,10 @@ fn fresh_brain_database_has_exact_security_pragmas() {
     assert_eq!(db.pragma_i64("foreign_keys").unwrap(), 1);
     assert_eq!(db.pragma_i64("trusted_schema").unwrap(), 0);
     assert_eq!(db.pragma_i64("secure_delete").unwrap(), 1);
+    assert_eq!(
+        db.pragma_i64("wal_autocheckpoint").unwrap(),
+        WAL_AUTOCHECKPOINT_PAGES
+    );
     assert!(db.defensive_mode().unwrap());
     assert_eq!(db.limit(Limit::SQLITE_LIMIT_ATTACHED).unwrap(), 0);
     assert_eq!(
@@ -1892,7 +2135,11 @@ fn current_open_fails_closed_when_sqlite_schema_is_corrupt() {
     assert!(
         matches!(
             error,
-            StorageError::InvalidStorage(_) | StorageError::Sqlite(_)
+            StorageError::InvalidStorage(_)
+                | StorageError::StorageFault {
+                    operation: StorageOperation::Open,
+                    category: StorageFaultCategory::Corrupt,
+                }
         ),
         "{error:?}"
     );
@@ -2155,6 +2402,62 @@ fn decision_storage_round_trips_complete_permission_and_observation_records() {
             .record,
         permission
     );
+}
+
+#[test]
+fn canonical_mark_updates_sqlite_payload_atomically() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut db = BrainDb::create_current(&paths).unwrap();
+    let cursor = db
+        .append_activity(decision_activity_event(
+            "observation",
+            "canonical-decision",
+            1,
+            ActivityState::Observed,
+            None,
+        ))
+        .unwrap();
+    let mut record = complete_decision("canonical-decision", AgentProvider::Codex);
+    record.override_reason = Some("original override".into());
+    db.insert_decision(
+        &DecisionIdentity::observation("canonical-decision", AgentProvider::Codex, 1),
+        &DecisionPayload::new(DecisionKind::Observation, cursor, record),
+    )
+    .unwrap();
+
+    db.mark_decision_canonical("canonical-decision", Some("operator evidence"))
+        .unwrap();
+
+    let marked = db
+        .decision_payload("canonical-decision")
+        .unwrap()
+        .unwrap()
+        .record;
+    assert_eq!(marked.canonical, Some(true));
+    assert_eq!(marked.override_reason.as_deref(), Some("original override"));
+    drop(db);
+    assert_eq!(
+        open_for_constraints(&paths.brain_db())
+            .query_row(
+                "SELECT note FROM decision_payloads WHERE decision_id = 'canonical-decision'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "operator evidence"
+    );
+    assert!(!root.path().join("brain/canonical.jsonl").exists());
+    let mut db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.mark_decision_canonical("missing", None),
+        Err(StorageError::InvalidStorage(_))
+    ));
 }
 
 #[test]

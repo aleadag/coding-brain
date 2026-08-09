@@ -10,10 +10,13 @@ use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use super::decisions::{DecisionRecord, project_slug, read_distillation_decisions};
+use super::decisions::{DecisionRecord, project_slug};
 use super::pref_store::{parse_preferences_json, preferences_to_json};
 use super::preferences::{DistilledPreferences, distill_preferences};
 use super::secure_state::{SecureStateDirectory, SecureStateError};
+use super::storage::{
+    BrainDb, LearningReadSession, OpenRole, StorageDeadline, StorageError, StoragePaths,
+};
 
 const SCHEMA_VERSION: u32 = 1;
 const DISTILL_INTERVAL: usize = 10;
@@ -55,7 +58,9 @@ pub enum DistillError {
     UnsupportedSchema(u32),
     MissingWatermarkDecision(String),
     NoStableDecisionId,
+    #[cfg(test)]
     AlreadyRunning,
+    Storage(StorageError),
     Injected(&'static str),
 }
 
@@ -71,7 +76,9 @@ impl fmt::Display for DistillError {
                 write!(formatter, "watermark decision {id} is absent")
             }
             Self::NoStableDecisionId => formatter.write_str("distillation batch has no stable ID"),
+            #[cfg(test)]
             Self::AlreadyRunning => formatter.write_str("distillation is already running"),
+            Self::Storage(error) => write!(formatter, "distillation storage failed: {error}"),
             Self::Injected(stage) => write!(formatter, "injected failure at {stage}"),
         }
     }
@@ -91,6 +98,12 @@ impl From<serde_json::Error> for DistillError {
     }
 }
 
+impl From<StorageError> for DistillError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailStage {
     AfterGenerationFile(usize),
@@ -105,14 +118,37 @@ struct GenerationManifest {
 }
 
 pub fn run_once(paths: &CodingBrainPaths) -> Result<DistillOutcome, DistillError> {
+    let storage_paths = StoragePaths::at(paths.state_root());
+    let database = BrainDb::open_current(
+        &storage_paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(std::time::Duration::from_secs(30)),
+    )?;
+    let read_session = database.learning_read_session()?;
     let Some(lock) = try_acquire_lock(paths)? else {
         return Ok(DistillOutcome::AlreadyRunning);
     };
-    let (cursor_decisions, learning_decisions) = read_distillation_decisions();
-    finish_locked(
-        &lock,
-        run_locked(paths, &cursor_decisions, &learning_decisions, None),
-    )
+    let decisions = read_sqlite_decisions(&read_session)?;
+    finish_locked(&lock, run_locked(paths, &decisions, &decisions, None))
+}
+
+fn read_sqlite_decisions(
+    session: &LearningReadSession<'_>,
+) -> Result<Vec<DecisionRecord>, StorageError> {
+    const PAGE_ROWS: usize = 1_024;
+    const PAGE_BYTES: usize = 16 * 1024 * 1024;
+
+    let mut after = None;
+    let mut decisions = Vec::new();
+    loop {
+        let page = session.page_after(after, PAGE_ROWS, PAGE_BYTES)?;
+        let next = page.next_cursor;
+        decisions.extend(page.into_records());
+        let Some(cursor) = next else {
+            return Ok(decisions);
+        };
+        after = Some(cursor);
+    }
 }
 
 pub fn current_paths() -> io::Result<CodingBrainPaths> {
@@ -281,6 +317,7 @@ fn record_trigger(paths: &CodingBrainPaths) -> io::Result<bool> {
     Ok(due)
 }
 
+#[cfg(test)]
 pub(crate) fn forget_preferences_with(
     paths: &CodingBrainPaths,
     erase_source: impl FnOnce() -> io::Result<()>,
@@ -303,6 +340,7 @@ pub(crate) fn forget_preferences_with(
     result.and(unlock)
 }
 
+#[cfg(test)]
 fn try_acquire_named_lock(root: &Path, name: &str) -> Result<Option<File>, DistillError> {
     let directory = SecureStateDirectory::open_or_create(root).map_err(secure_distill_error)?;
     let name = std::ffi::CString::new(name)
@@ -317,6 +355,7 @@ fn try_acquire_named_lock(root: &Path, name: &str) -> Result<Option<File>, Disti
     }
 }
 
+#[cfg(test)]
 pub(crate) fn erase_published_preferences_at_root(root: &Path) -> io::Result<()> {
     let directory = SecureStateDirectory::open_existing_strict(root).map_err(secure_io_error)?;
     directory
@@ -558,11 +597,18 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use fs2::FileExt;
 
     use super::*;
     use crate::brain::decisions::{DecisionRecord, DecisionType};
+    use crate::brain::storage::{DecisionIdentity, DecisionKind, DecisionPayload};
+    use coding_brain_core::brain_activity::{
+        ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, ProjectEvidence,
+    };
     use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
+    use coding_brain_core::project::ProjectId;
 
     fn paths(temp: &tempfile::TempDir) -> CodingBrainPaths {
         CodingBrainPaths::resolve(&PathEnvironment::new(
@@ -598,6 +644,62 @@ mod tests {
                 canonical: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn production_distillation_reads_sqlite_learning_records() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = paths(&temp);
+        let storage_paths = StoragePaths::at(paths.state_root());
+        let mut database = BrainDb::create_current(&storage_paths).unwrap();
+        let record = decisions(1).pop().unwrap();
+        let decision_id = record.decision_id.clone().unwrap();
+        let cursor = database
+            .append_activity(ActivityEvent {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                kind: ActivityKind::Decision,
+                activity_id: "distill-activity".into(),
+                recorded_at_ms: 1,
+                project: ProjectEvidence {
+                    project_id: ProjectId::Temporary("distill-project".into()),
+                    cwd: "/work/distill-project".into(),
+                    label: Some("distill-project".into()),
+                },
+                session: None,
+                state: ActivityState::Observed,
+                tool: Some("Bash".into()),
+                normalized_command: Some("cargo test".into()),
+                fingerprint: None,
+                rule_id: None,
+                confidence: None,
+                threshold: None,
+                reasoning: None,
+                decision_id: Some(decision_id.clone()),
+                outcome: None,
+                correction: None,
+                note: None,
+                supersedes: None,
+            })
+            .unwrap();
+        database
+            .insert_decision(
+                &DecisionIdentity::observation(
+                    decision_id.clone(),
+                    coding_brain_core::provider::AgentProvider::Codex,
+                    1,
+                ),
+                &DecisionPayload::new(DecisionKind::Observation, cursor, record),
+            )
+            .unwrap();
+        let session = database.learning_read_session().unwrap();
+
+        let loaded = read_sqlite_decisions(&session).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].decision_id.as_deref(), Some(decision_id.as_str()));
+        assert!(!paths.state_root().join("brain/decisions.jsonl").exists());
+        assert!(!paths.state_root().join("activity.jsonl").exists());
     }
 
     #[test]

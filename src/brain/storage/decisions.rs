@@ -1,4 +1,6 @@
-use std::fs::{self, File};
+#[cfg(debug_assertions)]
+use std::fs;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -207,6 +209,37 @@ impl BrainDb {
     ) -> Result<(), StorageError> {
         let _erasure_gate = acquire_shared_erasure_gate(&self.learning_root)?;
         self.ensure_learning_available()?;
+        self.insert_decision_without_legacy_gate(identity, payload)
+            .map_err(|error| {
+                super::maintenance::map_storage_error(
+                    super::StorageOperation::Decision,
+                    false,
+                    error,
+                )
+            })
+    }
+
+    pub(super) fn import_decision(
+        &mut self,
+        identity: &DecisionIdentity,
+        payload: &DecisionPayload,
+    ) -> Result<(), StorageError> {
+        self.ensure_learning_available()?;
+        self.insert_decision_without_legacy_gate(identity, payload)
+            .map_err(|error| {
+                super::maintenance::map_storage_error(
+                    super::StorageOperation::Decision,
+                    false,
+                    error,
+                )
+            })
+    }
+
+    fn insert_decision_without_legacy_gate(
+        &mut self,
+        identity: &DecisionIdentity,
+        payload: &DecisionPayload,
+    ) -> Result<(), StorageError> {
         validate_identity_payload(identity, payload)?;
         validate_source_activity(&self.connection, identity, payload)?;
         let serialized = serialize_record(&payload.record)?;
@@ -221,6 +254,7 @@ impl BrainDb {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::maintenance::sqlite_fault("decision-body")?;
         match identity {
             DecisionIdentity::Permission {
                 decision_id,
@@ -278,7 +312,14 @@ impl BrainDb {
             ],
         )?;
         decision_write_stage("before-commit")?;
-        super::activity::commit_before_deadline(self.deadline, || transaction.commit())
+        super::activity::commit_before_deadline(
+            self.deadline,
+            super::StorageOperation::Decision,
+            || {
+                super::maintenance::sqlite_fault("decision-commit")?;
+                transaction.commit()
+            },
+        )
     }
 
     pub fn decision_identity(
@@ -317,6 +358,78 @@ impl BrainDb {
         decision_id: &str,
     ) -> Result<Option<DecisionPayload>, StorageError> {
         let _erasure_gate = acquire_shared_erasure_gate(&self.learning_root)?;
+        self.decision_payload_without_legacy_gate(decision_id)
+    }
+
+    pub fn mark_decision_canonical(
+        &mut self,
+        decision_id: &str,
+        note: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let _erasure_gate = acquire_shared_erasure_gate(&self.learning_root)?;
+        self.mark_decision_canonical_inner(decision_id, note)
+            .map_err(|error| {
+                super::maintenance::map_storage_error(
+                    super::StorageOperation::Decision,
+                    false,
+                    error,
+                )
+            })
+    }
+
+    fn mark_decision_canonical_inner(
+        &mut self,
+        decision_id: &str,
+        note: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.ensure_learning_available()?;
+        validate_id(decision_id)?;
+        let existing = self
+            .decision_payload_without_legacy_gate(decision_id)?
+            .ok_or(StorageError::InvalidStorage("decision payload is absent"))?;
+        let mut record = existing.record;
+        record.canonical = Some(true);
+        let serialized = serialize_record(&record)?;
+        let projected_note = note
+            .map(|note| bounded_projection(Some(note)).expect("present note stays present"))
+            .or_else(|| bounded_projection(record.override_reason.as_deref()));
+
+        super::activity::apply_deadline(&self.connection, self.deadline)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::maintenance::sqlite_fault("decision-body")?;
+        let changed = transaction.execute(
+            "UPDATE decision_payloads
+             SET note = ?1, decision_record = ?2
+             WHERE decision_id = ?3",
+            params![projected_note, serialized, decision_id],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::InvalidStorage("decision payload is absent"));
+        }
+        decision_write_stage("before-commit")?;
+        super::activity::commit_before_deadline(
+            self.deadline,
+            super::StorageOperation::Decision,
+            || {
+                super::maintenance::sqlite_fault("decision-commit")?;
+                transaction.commit()
+            },
+        )
+    }
+
+    pub(super) fn migration_decision_payload(
+        &self,
+        decision_id: &str,
+    ) -> Result<Option<DecisionPayload>, StorageError> {
+        self.decision_payload_without_legacy_gate(decision_id)
+    }
+
+    fn decision_payload_without_legacy_gate(
+        &self,
+        decision_id: &str,
+    ) -> Result<Option<DecisionPayload>, StorageError> {
         self.ensure_learning_available()?;
         validate_id(decision_id)?;
         super::activity::apply_deadline(&self.connection, self.deadline)?;
@@ -388,14 +501,24 @@ impl BrainDb {
             .page_after(after, max_rows, max_bytes)
     }
 
-    fn learning_decisions_after_locked(
+    pub(super) fn learning_decisions_after_locked(
         &self,
         after: Option<ActivityCursor>,
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<LearningDecisionPage, StorageError> {
+        self.learning_decisions_bounded_after_locked(after, i64::MAX, max_rows, max_bytes)
+    }
+
+    pub(super) fn learning_decisions_bounded_after_locked(
+        &self,
+        after: Option<ActivityCursor>,
+        through_rowid: i64,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<LearningDecisionPage, StorageError> {
         self.ensure_learning_available()?;
-        if max_rows == 0 || max_bytes == 0 || max_rows > i64::MAX as usize {
+        if through_rowid < 0 || max_rows == 0 || max_bytes == 0 || max_rows > i64::MAX as usize {
             return Err(StorageError::InvalidStorage(
                 "decision read bounds are invalid",
             ));
@@ -426,10 +549,12 @@ impl BrainDb {
                           AND c.authority_action = i.authority_action)
                          OR h.decision_id IS NOT NULL)))
                AND p.source_cursor > ?1
-             ORDER BY p.source_cursor ASC, p.decision_id ASC LIMIT ?2",
+               AND p.rowid <= ?2
+             ORDER BY p.source_cursor ASC, p.decision_id ASC LIMIT ?3",
         )?;
         let mut rows = statement.query(params![
             after.map_or(0, |cursor| cursor.get() as i64),
+            through_rowid,
             row_limit
         ])?;
         let mut result = Vec::new();
@@ -724,7 +849,8 @@ fn materialize_payload(
     }
     if bounded_projection(record.command.as_deref()) != row.2
         || bounded_projection(Some(&record.brain_reasoning)) != row.3
-        || bounded_projection(record.override_reason.as_deref()) != row.4
+        || (record.canonical != Some(true)
+            && bounded_projection(record.override_reason.as_deref()) != row.4)
     {
         return Err(StorageError::InvalidStorage(
             "decision typed projection disagrees with payload",
@@ -1077,7 +1203,7 @@ impl ErasureLocks {
                     continue;
                 }
             };
-            for name in [c"decisions.jsonl", c"canonical.jsonl", c"preferences.json"] {
+            for name in super::legacy::LEGACY_LEARNING_FILES {
                 directory
                     .remove_regular_if_present(name)
                     .map_err(secure_storage_error)?;
@@ -1172,9 +1298,12 @@ impl Drop for ErasureLocks {
 }
 
 fn checkpoint_truncate(connection: &rusqlite::Connection) -> Result<(), StorageError> {
-    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
-        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|error| {
+            super::maintenance::map_sqlite_error(super::StorageOperation::Checkpoint, false, error)
         })?;
     if busy != 0 || log_frames != 0 || checkpointed_frames != 0 {
         return Err(StorageError::Busy);
@@ -1182,19 +1311,19 @@ fn checkpoint_truncate(connection: &rusqlite::Connection) -> Result<(), StorageE
     Ok(())
 }
 
-fn erasure_stage(brain_root: &Path, stage: &'static str) -> Result<(), StorageError> {
+fn erasure_stage(brain_root: &Path, _stage: &'static str) -> Result<(), StorageError> {
     #[cfg(debug_assertions)]
     {
-        if std::env::var("CODING_BRAIN_ERASURE_TEST_FAIL").as_deref() == Ok(stage) {
+        if std::env::var("CODING_BRAIN_ERASURE_TEST_FAIL").as_deref() == Ok(_stage) {
             return Err(StorageError::InvalidStorage("injected erasure failure"));
         }
-        if std::env::var("CODING_BRAIN_ERASURE_TEST_PAUSE").as_deref() == Ok(stage) {
+        if std::env::var("CODING_BRAIN_ERASURE_TEST_PAUSE").as_deref() == Ok(_stage) {
             let marker = std::env::var_os("CODING_BRAIN_ERASURE_TEST_MARKER")
                 .map(PathBuf::from)
                 .ok_or(StorageError::InvalidStorage(
                     "erasure test marker is absent",
                 ))?;
-            fs::write(marker, stage)?;
+            fs::write(marker, _stage)?;
             if let Some(release) = std::env::var_os("CODING_BRAIN_ERASURE_TEST_RELEASE") {
                 let release = PathBuf::from(release);
                 while !release.exists() {
@@ -1211,9 +1340,9 @@ fn erasure_stage(brain_root: &Path, stage: &'static str) -> Result<(), StorageEr
     Ok(())
 }
 
-fn decision_write_stage(stage: &'static str) -> Result<(), StorageError> {
+fn decision_write_stage(_stage: &'static str) -> Result<(), StorageError> {
     #[cfg(debug_assertions)]
-    if std::env::var("CODING_BRAIN_DECISION_WRITE_PAUSE").as_deref() == Ok(stage) {
+    if std::env::var("CODING_BRAIN_DECISION_WRITE_PAUSE").as_deref() == Ok(_stage) {
         let marker = std::env::var_os("CODING_BRAIN_DECISION_WRITE_MARKER")
             .map(PathBuf::from)
             .ok_or(StorageError::InvalidStorage(
@@ -1224,7 +1353,7 @@ fn decision_write_stage(stage: &'static str) -> Result<(), StorageError> {
             .ok_or(StorageError::InvalidStorage(
                 "decision write test release is absent",
             ))?;
-        fs::write(marker, stage)?;
+        fs::write(marker, _stage)?;
         while !release.exists() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

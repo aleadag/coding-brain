@@ -177,6 +177,16 @@ impl ReviewSurfaceState {
         self.last_archive.len()
     }
 
+    pub fn dispositions(&self) -> impl Iterator<Item = (ReviewKey, ReviewDisposition)> + '_ {
+        self.dispositions
+            .iter()
+            .map(|(key, disposition)| (*key, *disposition))
+    }
+
+    pub fn last_archive(&self) -> impl Iterator<Item = ReviewKey> + '_ {
+        self.last_archive.iter().copied()
+    }
+
     fn count(&self, disposition: ReviewDisposition) -> usize {
         self.dispositions
             .values()
@@ -206,6 +216,16 @@ impl ReviewDb {
         request: &ReviewMutationRequest,
         evidence: &ReviewEligibility,
     ) -> Result<ReviewMutationResult, StorageError> {
+        self.mutate_inner(request, evidence).map_err(|error| {
+            super::maintenance::map_storage_error(super::StorageOperation::Review, false, error)
+        })
+    }
+
+    fn mutate_inner(
+        &mut self,
+        request: &ReviewMutationRequest,
+        evidence: &ReviewEligibility,
+    ) -> Result<ReviewMutationResult, StorageError> {
         request
             .validate()
             .map_err(StorageError::InvalidReviewRequest)?;
@@ -220,6 +240,7 @@ impl ReviewDb {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::maintenance::sqlite_fault("review-body")?;
         let mut loaded = load_surface(&transaction, evidence, self.deadline)?;
         if loaded.state.surface_revision >= i64::MAX as u64 {
             return Err(StorageError::ReviewRevisionOverflow);
@@ -297,7 +318,14 @@ impl ReviewDb {
             self.deadline,
         )?;
         ensure_deadline(self.deadline)?;
-        transaction.commit()?;
+        super::activity::commit_before_deadline(
+            self.deadline,
+            super::StorageOperation::Review,
+            || {
+                super::maintenance::sqlite_fault("review-commit")?;
+                transaction.commit()
+            },
+        )?;
         Ok(result)
     }
 }

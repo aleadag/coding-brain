@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -5,6 +6,16 @@ use std::time::{Duration, Instant};
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn command(temp: &tempfile::TempDir) -> Command {
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    for directory in [
+        temp.path().join("config"),
+        temp.path().join("state"),
+        temp.path().join("state/coding-brain"),
+        temp.path().join("state/coding-brain/brain"),
+    ] {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
     command
         .current_dir(temp.path())
@@ -97,6 +108,26 @@ fn every_config_action_exits_without_entering_the_tui() {
     ] {
         assert_success(&run(&temp, args));
     }
+}
+
+#[test]
+fn storage_actions_are_static_cli_commands() {
+    let temp = tempfile::tempdir().unwrap();
+
+    for args in [
+        &["storage", "--help"][..],
+        &["storage", "export-audit", "--help"],
+        &["storage", "export-legacy", "--help"],
+        &["storage", "reset-review-state", "--help"],
+    ] {
+        assert_success(&run(&temp, args));
+    }
+    assert!(
+        !temp
+            .path()
+            .join("state/coding-brain/.star-prompted")
+            .exists()
+    );
 }
 
 #[test]

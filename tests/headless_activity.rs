@@ -1,8 +1,10 @@
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use coding_brain::brain::storage::{BrainDb, ReviewDb, StoragePaths};
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, ProjectEvidence,
     SessionTarget,
@@ -13,9 +15,9 @@ use coding_brain_core::provider::AgentProvider;
 #[test]
 fn headless_emits_activity_without_a_session_roster() {
     let home = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state = home.path().join("state");
     let activity_dir = state.join("coding-brain");
-    std::fs::create_dir_all(&activity_dir).unwrap();
     let event = ActivityEvent {
         schema_version: ACTIVITY_SCHEMA_VERSION,
         kind: ActivityKind::Decision,
@@ -51,11 +53,12 @@ fn headless_emits_activity_without_a_session_roster() {
         note: None,
         supersedes: None,
     };
-    std::fs::write(
-        activity_dir.join("activity.jsonl"),
-        format!("{}\n", serde_json::to_string(&event).unwrap()),
-    )
-    .unwrap();
+    let paths = StoragePaths::at(&activity_dir);
+    BrainDb::create_current(&paths)
+        .unwrap()
+        .append_activity(event)
+        .unwrap();
+    ReviewDb::create_current(&paths).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_cbrain"))
         .args(["--headless", "--json"])
         .env("HOME", home.path())
@@ -82,6 +85,17 @@ fn headless_emits_activity_without_a_session_roster() {
             panic!("headless produced no activity within five seconds: {error}");
         }
     };
+    if line.is_empty() {
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        panic!("headless exited before activity: status={status}, stderr={stderr}");
+    }
     child.kill().unwrap();
     child.wait().unwrap();
 
@@ -93,4 +107,5 @@ fn headless_emits_activity_without_a_session_roster() {
     assert!(output.get("session").is_none());
     assert!(output.get("terminal").is_none());
     assert!(output.get("normalized_command").is_none());
+    assert!(!activity_dir.join("activity.jsonl").exists());
 }

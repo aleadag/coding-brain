@@ -1,32 +1,49 @@
 #![allow(dead_code)] // Review projections and runtime mutations are wired in later tasks.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[cfg(test)]
 use std::ffi::{CStr, CString};
 use std::fmt;
+#[cfg(test)]
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(test)]
+use std::io::{Read, Write};
+#[cfg(test)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::thread;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use coding_brain_core::review_state::{
     MAX_REVIEW_KEYS, MAX_REVIEW_STATE_BYTES, ReviewDisposition, ReviewKey, ReviewMutation,
     ReviewMutationRequest, ReviewMutationResult, ReviewRequestError, ReviewSurface,
 };
+#[cfg(test)]
 use fs2::FileExt;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use super::secure_state::{SecureEntryMetadata, SecureStateDirectory, SecureStateError};
 
 const REVIEW_STATE_SCHEMA_VERSION: u32 = 1;
+#[cfg(test)]
 const STATE_NAME: &CStr = c"review-state.json";
+#[cfg(test)]
 const LOCK_NAME: &CStr = c"review-state.lock";
+#[cfg(test)]
 const LOCK_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(test)]
 const LOCK_RETRY: Duration = Duration::from_millis(5);
+#[cfg(test)]
 const TEMP_ATTEMPTS: usize = 128;
+#[cfg(test)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -86,6 +103,7 @@ impl From<serde_json::Error> for ReviewStateError {
     }
 }
 
+#[cfg(test)]
 impl From<SecureStateError> for ReviewStateError {
     fn from(error: SecureStateError) -> Self {
         match error {
@@ -118,6 +136,31 @@ impl Default for ReviewStateSnapshot {
 }
 
 impl ReviewStateSnapshot {
+    pub(crate) fn from_sqlite_surfaces(
+        surfaces: impl IntoIterator<Item = crate::brain::storage::ReviewSurfaceState>,
+    ) -> Result<Self, &'static str> {
+        let mut projected = BTreeMap::new();
+        for surface in surfaces {
+            let key = surface.surface();
+            let state = SurfaceState {
+                revision: surface.surface_revision(),
+                items: surface.dispositions().collect(),
+                last_archive: surface.last_archive().collect(),
+            };
+            if projected.insert(key, state).is_some() {
+                return Err("duplicate SQLite review surface");
+            }
+        }
+        if projected.len() != all_surfaces().count()
+            || all_surfaces().any(|surface| !projected.contains_key(&surface))
+        {
+            return Err("incomplete SQLite review surfaces");
+        }
+        Ok(Self {
+            surfaces: projected,
+        })
+    }
+
     pub(crate) fn surface_revision(&self, surface: ReviewSurface) -> u64 {
         self.surface(surface).revision
     }
@@ -142,6 +185,16 @@ impl ReviewStateSnapshot {
         disposition_count(&self.surface(surface).items, ReviewDisposition::Archived)
     }
 
+    pub(crate) fn items(
+        &self,
+        surface: ReviewSurface,
+    ) -> impl Iterator<Item = (&ReviewKey, ReviewDisposition)> {
+        self.surface(surface)
+            .items
+            .iter()
+            .map(|(key, disposition)| (key, *disposition))
+    }
+
     fn surface(&self, surface: ReviewSurface) -> &SurfaceState {
         self.surfaces
             .get(&surface)
@@ -149,10 +202,12 @@ impl ReviewStateSnapshot {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct ReviewStateStore {
     state_root: PathBuf,
 }
 
+#[cfg(test)]
 impl ReviewStateStore {
     pub(crate) fn at(state_root: &Path) -> Self {
         Self {
@@ -473,6 +528,7 @@ struct PersistedSurface {
     items: BTreeMap<ReviewKey, ReviewDisposition>,
 }
 
+#[cfg(test)]
 fn read_snapshot(
     directory: &SecureStateDirectory,
 ) -> Result<ReviewStateSnapshot, ReviewStateError> {
@@ -491,6 +547,7 @@ fn read_snapshot(
     Ok(snapshot)
 }
 
+#[cfg(test)]
 fn read_persisted(directory: &SecureStateDirectory) -> Result<PersistedState, ReviewStateError> {
     let Some(mut file) = open_exact_regular(directory, STATE_NAME, false)? else {
         return Ok(PersistedState::default());
@@ -567,6 +624,7 @@ fn validate_persisted(state: &PersistedState) -> Result<(), ReviewStateError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn open_exact_regular(
     directory: &SecureStateDirectory,
     name: &CStr,
@@ -575,6 +633,7 @@ fn open_exact_regular(
     open_exact_regular_with_missing_hook(directory, name, create, || {})
 }
 
+#[cfg(test)]
 fn open_exact_regular_with_missing_hook(
     directory: &SecureStateDirectory,
     name: &CStr,
@@ -598,6 +657,7 @@ fn open_exact_regular_with_missing_hook(
     }
 }
 
+#[cfg(test)]
 fn validate_exact_file_mode(metadata: &SecureEntryMetadata) -> Result<(), ReviewStateError> {
     if metadata.mode & 0o777 != 0o600 {
         return Err(ReviewStateError::InvalidStorage(
@@ -607,14 +667,17 @@ fn validate_exact_file_mode(metadata: &SecureEntryMetadata) -> Result<(), Review
     Ok(())
 }
 
+#[cfg(test)]
 struct LockGuard<'a>(&'a File);
 
+#[cfg(test)]
 impl Drop for LockGuard<'_> {
     fn drop(&mut self) {
         let _ = FileExt::unlock(self.0);
     }
 }
 
+#[cfg(test)]
 fn lock_exclusive<'a>(
     directory: &SecureStateDirectory,
     file: &'a File,
@@ -644,6 +707,7 @@ fn lock_exclusive<'a>(
     }
 }
 
+#[cfg(test)]
 fn create_temporary(directory: &SecureStateDirectory) -> Result<(CString, File), ReviewStateError> {
     let mut randomness = File::open("/dev/urandom")?;
     for _ in 0..TEMP_ATTEMPTS {
@@ -671,6 +735,7 @@ fn create_temporary(directory: &SecureStateDirectory) -> Result<(CString, File),
     ))
 }
 
+#[cfg(test)]
 fn persist<F, P, D>(
     directory: &SecureStateDirectory,
     lock: &File,

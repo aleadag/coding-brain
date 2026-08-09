@@ -27,6 +27,15 @@ event.
 The implementation plan and its eleven-branch stress test are recorded in the
 [Coding Brain implementation plan](https://github.com/aleadag/codexctl/blob/main/.internal/plans/2026-07-17-coding-brain-product-boundary.md).
 
+> **SQLite supersession:** ADR-0006 preserves this ADR's proposal, commitment,
+> delivery, and execution semantics, but supersedes the JSONL destination
+> stores, immutable permission-journal recovery protocol, and JSON review-state
+> implementation described below. Those sections document the pre-SQLite
+> v0.59.1 design and now survive only in migration, downgrade export, and test
+> compatibility readers. `brain.sqlite3` is the sole live authority,
+> `review.sqlite3` holds isolated operational review state, and ordinary
+> non-hook startup performs the supported storage migration automatically.
+
 ## Decision
 
 ### Separate proposal, commitment, delivery, and execution
@@ -166,5 +175,7 @@ manifest reset makes the user's intent reviewable in the repository.
   exchange for safe rollback after a failed publication.
 - Remote endpoints remain usable by explicit choice, but prompts and responses
   are bounded and visible transport warnings remain part of the product UI.
-- Purge and project-identity reset remain explicit operator actions; normal
-  startup does not migrate, rewrite, or delete legacy data.
+- Purge and project-identity reset remain explicit operator actions. Under
+  ADR-0006, ordinary non-hook startup may migrate supported pre-SQLite Coding
+  Brain state and freeze the migrated sources; hooks do not migrate, rewrite,
+  or delete legacy data.
