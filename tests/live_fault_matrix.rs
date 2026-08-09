@@ -241,16 +241,17 @@ impl FaultHarness {
     fn new(fault: MatrixFault) -> Self {
         let temp = tempfile::tempdir().unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let home = temp.path().join("home");
-        let config_base = temp.path().join("config");
-        let state_base = temp.path().join("state");
+        let temp_root = fs::canonicalize(temp.path()).unwrap();
+        let home = temp_root.join("home");
+        let config_base = temp_root.join("config");
+        let state_base = temp_root.join("state");
         let state_root = state_base.join("coding-brain");
         for directory in [&home, &config_base, &state_base, &state_root] {
             fs::create_dir_all(directory).unwrap();
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
         }
 
-        let fifo = temp.path().join("control.fifo");
+        let fifo = temp_root.join("control.fifo");
         let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
         let marker_reader = OpenOptions::new()
@@ -265,7 +266,7 @@ impl FaultHarness {
             .unwrap();
         let metadata = marker_writer.metadata().unwrap();
 
-        let capability = NamedTempFile::new_in(temp.path()).unwrap();
+        let capability = NamedTempFile::new_in(&temp_root).unwrap();
         let nonce = capability
             .path()
             .file_name()
@@ -495,8 +496,10 @@ impl FaultHarness {
         loop {
             let remaining = marker_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                self.kill_and_reap();
-                return Err(format!("marker deadline expired for {fault:?}"));
+                let output = self.kill_and_collect_output();
+                return Err(format!(
+                    "marker deadline expired for {fault:?}; child output: {output:?}"
+                ));
             }
             let timeout = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
             let mut descriptor = libc::pollfd {
@@ -585,10 +588,15 @@ impl FaultHarness {
     }
 
     fn kill_and_reap(&mut self) {
+        let _ = self.kill_and_collect_output();
+    }
+
+    fn kill_and_collect_output(&mut self) -> Option<Output> {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
-            let _ = child.wait();
+            return child.wait_with_output().ok();
         }
+        None
     }
 
     fn run_unarmed_hook(&mut self, provider: AgentProvider) -> Output {
@@ -1877,7 +1885,10 @@ fn assert_hung_child_without_marker_is_bounded_and_reaped() {
         )
         .unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert_eq!(error, "marker deadline expired for AdmissionWrite");
+    assert!(
+        error.starts_with("marker deadline expired for AdmissionWrite; child output:"),
+        "{error}"
+    );
     assert!(harness.child.is_none());
     let mut status = 0;
     assert_eq!(
