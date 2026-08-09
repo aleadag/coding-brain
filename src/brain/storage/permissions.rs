@@ -3297,10 +3297,10 @@ mod tests {
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         let started = std::time::Instant::now();
         fs::write(root.path().join("start-delivery"), b"start").unwrap();
-        let status = child.wait().unwrap();
+        wait_for(&root.path().join("busy-returned"));
         let elapsed = started.elapsed();
+        let status = child.wait().unwrap();
         assert!(status.success());
-        assert!(root.path().join("busy-returned").exists());
         assert!(
             elapsed < Duration::from_millis(1_250),
             "delivery busy wait reset the absolute deadline: {elapsed:?}"
