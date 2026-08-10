@@ -3750,7 +3750,7 @@ fn legacy_writer_guard_drains_a_contended_journal_entry() {
 
 #[test]
 fn legacy_writer_guard_reenumerates_after_locked_journal_rename_or_removal() {
-    for remove in [false, true] {
+    for (case, remove) in [("rename", false), ("removal", true)] {
         let root = private_tempdir();
         let journal = create_legacy_journal(root.path(), 0);
         let held = OpenOptions::new()
@@ -3772,7 +3772,7 @@ fn legacy_writer_guard_reenumerates_after_locked_journal_rename_or_removal() {
             FileExt::unlock(&directory).unwrap();
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(directory.try_lock_exclusive().is_err());
+        assert!(directory.try_lock_exclusive().is_err(), "{case}");
         if remove {
             fs::remove_file(&journal).unwrap();
         } else {
@@ -3783,7 +3783,8 @@ fn legacy_writer_guard_reenumerates_after_locked_journal_rename_or_removal() {
             .unwrap();
         }
         FileExt::unlock(&held).unwrap();
-        assert!(acquire.join().unwrap().is_ok());
+        let result = acquire.join().unwrap();
+        assert!(result.is_ok(), "{case}: {result:?}");
     }
 }
 
