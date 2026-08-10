@@ -4530,7 +4530,7 @@ impl<'database> ReplayAccounting<'database> {
             return Err(source_accounting_changed());
         }
         let source = match record.brain_source.as_str() {
-            "model" => "model",
+            "model" | "brain" => "model",
             "deterministic" => "deterministic_safety",
             "provider_policy" => "native_provider",
             _ => {
@@ -5262,7 +5262,7 @@ impl<'database, 'accounting> MigrationImport<'database, 'accounting> {
             }
         };
         let source = match record.brain_source.as_str() {
-            "model" => "model",
+            "model" | "brain" => "model",
             "deterministic" => "deterministic_safety",
             "provider_policy" => "native_provider",
             _ => {
