@@ -43,10 +43,11 @@ The complete gate has three required layers:
 
 1. **Portable package check.** `packages.default` keeps `doCheck` enabled and
    uses `cargoCheckHook` in the debug profile with one Rust test thread. It runs
-   the complete `coding-brain-core` and `coding-brain-tui` crate suites, plus the
-   root package's `release_workflow` and `release_metadata` contract targets.
-   This stable responsibility boundary replaces a per-test portability
-   allowlist.
+   `coding-brain-core` and `coding-brain-tui` crate suites, plus the root
+   package's `release_workflow` and `release_metadata` contract targets. On
+   Darwin Nix builders only, the hook excludes the exact loopback-webhook and
+   non-UTF-8-path tests whose required OS operations are rejected by the macOS
+   Nix sandbox. Linux Nix retains both tests.
 2. **Complete Rust suite.** The existing required `Test (ubuntu-latest)` and
    `Test (macos-latest)` jobs continue running
    `cargo test --all-targets -- --test-threads=1` with default features. No test
@@ -90,16 +91,18 @@ curl installation. The curl input prevents the webhook test from timing out
 before it can send its loopback request.
 
 The package check must not use a custom runtime feature, hidden CLI argument,
-ambient test-root override, owner-check exception, per-test portability
-allowlist, or `--unshare-user-try` fallback. Every root-package target remains
-covered by the complete Ubuntu/macOS Cargo jobs; installed root-binary behavior
-is additionally covered by the VM check.
+ambient test-root override, owner-check exception, or `--unshare-user-try`
+fallback. Its only per-test exclusions are the two exact Darwin-only filters
+for `helpers::tests::status_webhook_keeps_only_retained_session_fields` and
+`project::tests::git_root_preserves_non_utf8_path_bytes`. Every root-package
+target remains covered by the complete Ubuntu/macOS Cargo jobs; installed
+root-binary behavior is additionally covered by the VM check.
 
-The same portable package-check selection applies on Linux and Darwin. Only the
-`storage-security-vm` check is conditional, and it is exposed on
-`x86_64-linux` only. This gives `packages.default` one cross-platform check
-contract while the required Ubuntu/macOS Cargo matrix remains the complete
-root-package suite on both operating systems.
+Linux and Darwin share the same package-check responsibility boundary. Darwin
+adds only the two exact capability exclusions above; Linux runs them. The
+`storage-security-vm` check is conditional and exposed on `x86_64-linux` only.
+The required Ubuntu/macOS Cargo matrix remains the complete root-package suite
+on both operating systems and therefore retains both excluded tests on macOS.
 
 ## VM consumer test
 
@@ -196,7 +199,12 @@ Ubuntu-only step builds:
 The Ubuntu package build is the regression for a builder where nested user
 namespace creation is unavailable: the derivation contains no Bubblewrap
 invocation, so Cargo must start and the declared portable checks must complete.
-The macOS package leg proves the same Nix package contract builds on Darwin.
+The macOS package leg proves the package contract builds in the Darwin Nix
+sandbox with only the two approved capability-dependent exclusions. PR #87 run
+31368200386 established the boundary: ordinary `Test (macos-latest)` passed the
+complete suite, including the legacy-writer regression, while sandboxed `Nix
+(macos-latest)` failed at loopback bind with `EPERM` and invalid-byte directory
+creation with `EILSEQ` before reaching root integration tests.
 `nix flake check --all-systems --no-build` additionally evaluates all four
 standard flake systems, but does not create runtime evidence for architectures
 without runners. The VM check provides deterministic installed-package
@@ -222,8 +230,10 @@ Production code is unchanged. In particular:
 - default debug and release binaries gain no test controls.
 
 The package check has narrower environment-independent coverage than the full
-Cargo job, but no test is removed from the required repository gate. CI must
-require both the complete Cargo job and the Nix package/VM job before merge.
+Cargo job, and Darwin Nix has two narrower capability exclusions than Linux
+Nix, but no test is removed from the required repository gate. CI must require
+both the complete Cargo job and the Nix package/VM job before merge. The fix
+must not disable the macOS Nix sandbox or teach Rust tests to silently self-skip.
 
 ## Regression tests
 
@@ -232,7 +242,10 @@ Extend `tests/release_workflow.rs` to assert that:
 - `flake.nix` contains no Bubblewrap or nested-user-namespace Cargo wrapper;
 - the package retains debug checks and serialized test execution;
 - the package check runs both complete lower-layer crate suites and the two
-  named root release/package contract targets;
+  named root release/package contract targets, subject only to the two exact
+  Darwin-only capability exclusions;
+- the Darwin exclusions name only the loopback-webhook and non-UTF-8-path tests
+  and are absent from the Linux argument set;
 - the required CI test matrix still contains both `ubuntu-latest` and
   `macos-latest` and runs the exact serialized `cargo test --all-targets`
   command;
@@ -257,8 +270,9 @@ administration and requires separate authorization.
 3. The VM consumer check runs the installed default-feature binary, and no
    storage security logic changes.
 4. The package contains no Bubblewrap or equivalent namespace requirement.
-5. Package, Home Manager module, release contracts, local NixOS, Darwin Cargo,
-   and required VM checks pass.
+5. Package, Home Manager module, release contracts, local NixOS, complete
+   Darwin Cargo, Darwin Nix with the two exact exclusions, and required VM
+   checks pass.
 6. The linked downstream Home Manager build or an equivalent exact runner
    reproduction is green.
 
@@ -320,19 +334,22 @@ configuration documentation.
   validator rather than incidental Unix permission denial.
 - Named subtests and bounded metadata diagnostics distinguish infrastructure,
   fixture, and product failures without retries.
-- Linux and Darwin packages use the same portable check contract; only the VM
-  check is Linux-specific.
+- Linux and Darwin packages use the same responsibility boundary; Darwin Nix
+  alone excludes the two exact operations its sandbox rejects, while Linux Nix
+  and ordinary macOS Cargo retain them.
 - VM failures are fixed forward and never converted into skips or namespace
   fallbacks; a runner-budget failure reopens the design before merge.
 
 ### Changes Made
 
-- Replaced a per-test portability allowlist with a stable crate/contract split.
+- Replaced the broad per-test portability allowlist with a stable crate/contract
+  split, retaining only two evidence-backed Darwin-Nix capability exclusions.
 - Strengthened the VM from a positive consumer smoke test to explicit positive,
   foreign-owner, and replaceable-ancestor cases.
 - Removed the optional `passthru.tests` exposure.
 - Made software-emulated VM execution and time budgets explicit.
-- Unified Linux and Darwin package-check selection.
+- Unified Linux and Darwin package-check responsibility while documenting the
+  two exact Darwin-Nix capability exclusions.
 - Added exact CI authority, diagnostics, maintenance, and rollback requirements.
 
 ### Deferred / Parking Lot

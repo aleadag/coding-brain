@@ -4,18 +4,18 @@
 
 **Goal:** Make the default Nix package build succeed without nested user namespaces while preserving unchanged production storage validation, complete Ubuntu/macOS Cargo coverage, and an installed-package multi-user filesystem security check.
 
-**Architecture:** The package derivation removes its Bubblewrap Cargo wrapper and runs a stable portable selection: the complete `coding-brain-core` and `coding-brain-tui` suites through `cargoCheckHook`, followed by the root `release_workflow` and `release_metadata` contract targets. The existing Ubuntu/macOS Cargo matrix remains the complete source-suite authority, while an `x86_64-linux` NixOS VM check runs the installed default-feature package through one positive and two negative real-filesystem scenarios.
+**Architecture:** The package derivation removes its Bubblewrap Cargo wrapper and runs a stable portable selection: the `coding-brain-core` and `coding-brain-tui` suites through `cargoCheckHook`, followed by the root `release_workflow` and `release_metadata` contract targets. Darwin Nix excludes only two exact tests whose loopback and invalid-byte pathname operations its sandbox rejects; Linux Nix retains them. The existing Ubuntu/macOS Cargo matrix remains the complete source-suite authority, while an `x86_64-linux` NixOS VM check runs the installed default-feature package through one positive and two negative real-filesystem scenarios.
 
 **Tech Stack:** Rust 2024, Cargo workspaces, Nix flakes, `buildRustPackage`, `cargoCheckHook`, `pkgs.testers.runNixOSTest`, NixOS Python test driver, GitHub Actions, Beads.
 
-**Beads:** Epic `codexctl-5ymc2`; ordered tasks `codexctl-5ymc2.1` through `codexctl-5ymc2.4` map one-to-one to the four tasks below.
+**Beads:** Original epic `codexctl-5ymc2` and tasks `codexctl-5ymc2.1` through `codexctl-5ymc2.4` cover Tasks 1-4. Execution epic `codexctl-dzlb9.14.2`, discovered from brainstorming session `codexctl-dzlb9.14.1`, covers the Task 5 CI amendment.
 
 ## Global Constraints
 
 - Do not change `src/brain/storage/security.rs`, XDG path resolution, storage ownership rules, or any production runtime path.
 - Do not add a Cargo feature, hidden CLI argument, ambient test-root override, owner exception, Bubblewrap fallback, nested namespace, or extra workflow privilege.
 - Keep `checkType = "debug"`, `dontUseCargoParallelTests = true`, default build features, and normal `cargoCheckHook` execution.
-- Use the same portable package-check selection on Linux and Darwin; expose the VM only as `checks.x86_64-linux.storage-security-vm`.
+- Use the same package-check responsibility boundary on Linux and Darwin. Append exactly two test filters only when `pkgs.stdenv.isDarwin`; expose the VM only as `checks.x86_64-linux.storage-security-vm`.
 - Keep `cargo test --all-targets -- --test-threads=1` unchanged and required on both `ubuntu-latest` and `macos-latest`.
 - The VM must use the installed package, absolute XDG paths, real unprivileged users, `requiredFeatures.kvm = false`, `qemu.forceAccel = false`, a 15-minute test timeout, and no retries.
 - The GitHub Nix job is a required `ubuntu-latest`/`macos-latest` matrix, asserts `sandbox = true`, builds the current-system default package on both operating systems, runs the VM only on Ubuntu, prints build logs, and has a 30-minute timeout per matrix leg.
@@ -692,12 +692,136 @@ After an authorized push, wait for both Nix matrix legs and the Ubuntu/macOS Car
 
 ---
 
+### Task 5: Make the package check respect Darwin Nix sandbox capabilities
+
+**Files:**
+- Modify: `tests/release_workflow.rs:150-185`
+- Modify: `flake.nix:31-40`
+- Verify: `.github/workflows/ci.yml`
+
+**Interfaces:**
+- Consumes: the existing explicit `cargoTestFlags` package selection, Nixpkgs `pkgs.lib.optionals`, `pkgs.stdenv.isDarwin`, and the unchanged complete Ubuntu/macOS Cargo matrix.
+- Produces: two exact libtest filters appended only for Darwin Nix builds; Linux Nix retains both tests, and ordinary macOS Cargo remains their required runtime gate.
+
+**Acceptance Criteria:**
+- Darwin Nix skips only `helpers::tests::status_webhook_keeps_only_retained_session_fields` and `project::tests::git_root_preserves_non_utf8_path_bytes`.
+- The exclusions are encoded in `cargoTestFlags` with `pkgs.lib.optionals pkgs.stdenv.isDarwin`; they are not environment-variable self-skips in Rust.
+- Linux Nix still runs both named tests and its package build passes.
+- The ordinary `Test (macos-latest)` job retains the exact complete serialized Cargo command and passes both named tests.
+- The macOS Nix package build passes with sandboxing still asserted true.
+- Production Rust code, sandbox settings, dependencies, `flake.lock`, and the `fix/zha56` worktree are unchanged.
+
+- [ ] **Step 1: Add a failing release-contract assertion for the Darwin-only filters**
+
+Extend `nix_package_check_is_portable_and_bounded` in `tests/release_workflow.rs` after its existing required-contract loop:
+
+```rust
+    let darwin = flake
+        .split_once("++ pkgs.lib.optionals pkgs.stdenv.isDarwin [")
+        .expect("Nix package checks must isolate Darwin-only capability filters")
+        .1
+        .split_once("];")
+        .expect("Darwin-only capability filters must be a bounded list")
+        .0;
+    for required in [
+        "\"--\"",
+        "helpers::tests::status_webhook_keeps_only_retained_session_fields",
+        "project::tests::git_root_preserves_non_utf8_path_bytes",
+    ] {
+        assert_contract(darwin, required);
+    }
+    assert_eq!(
+        darwin.matches("\"--skip\"").count(),
+        2,
+        "Darwin Nix must skip only the two approved capability-dependent tests"
+    );
+```
+
+- [ ] **Step 2: Run the contract test and verify RED**
+
+Run:
+
+```bash
+nix develop path:. --command cargo test --test release_workflow nix_package_check_is_portable_and_bounded -- --exact
+```
+
+Expected: FAIL with `Nix package checks must isolate Darwin-only capability filters` because `cargoTestFlags` has no Darwin conditional yet.
+
+- [ ] **Step 3: Append the two exact Darwin-only libtest filters**
+
+Change the existing `cargoTestFlags` assignment in `flake.nix` to:
+
+```nix
+          cargoTestFlags = [
+            "-p"
+            "coding-brain-core"
+            "-p"
+            "coding-brain-tui"
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            "--"
+            "--skip"
+            "helpers::tests::status_webhook_keeps_only_retained_session_fields"
+            "--skip"
+            "project::tests::git_root_preserves_non_utf8_path_bytes"
+          ];
+```
+
+Do not modify either Rust test. The argument separator and filters remain absent from Linux because `lib.optionals false` contributes an empty list.
+
+- [ ] **Step 4: Run focused GREEN verification**
+
+Run:
+
+```bash
+nix develop path:. --command cargo test --test release_workflow nix_package_check_is_portable_and_bounded -- --exact
+nix flake check path:. --all-systems --no-build
+nix run path:.#formatter.x86_64-linux -- --check flake.nix
+```
+
+Expected: all three commands pass; all four default systems evaluate, and `flake.nix` is formatted.
+
+- [ ] **Step 5: Prove Linux Nix did not lose either test**
+
+Run:
+
+```bash
+nix build --no-link --print-build-logs path:.#packages.x86_64-linux.default
+```
+
+Expected: PASS, with package logs containing successful executions of both `status_webhook_keeps_only_retained_session_fields` and `git_root_preserves_non_utf8_path_bytes`. Absence of either name is a failed acceptance check.
+
+- [ ] **Step 6: Run the local regression gates**
+
+Run:
+
+```bash
+nix develop path:. --command cargo test --test release_workflow
+nix develop path:. --command cargo fmt --all -- --check
+nix develop path:. --command cargo clippy --all-targets -- -D warnings
+git diff --exit-code -- crates/coding-brain-core/src/helpers.rs crates/coding-brain-core/src/project.rs src/brain/storage/legacy.rs tests/storage_migration.rs Cargo.toml Cargo.lock flake.lock
+```
+
+Expected: all commands pass and the protected production, `zha56`, dependency, and lock files have no diff.
+
+- [ ] **Step 7: Commit, push, and inspect the exact replacement jobs only after authorization**
+
+After an authorized push, inspect PR #87:
+
+```bash
+gh pr checks 87
+```
+
+Expected: `Nix (macos-latest)`, `Nix (ubuntu-latest)`, and `Test (macos-latest)` pass. The macOS Cargo log must still show both exact tests passing; the macOS Nix log must show exactly those two tests filtered and no sandbox relaxation. Do not rerun or modify the separate `zha56` worktree.
+
+---
+
 ## Final Handoff Checklist
 
 - Report changed files and the exact purpose of each.
 - Report package-check evidence separately from complete Cargo-suite evidence.
 - Report VM positive/foreign-owner/replaceable-ancestor evidence separately.
-- Report Darwin as locally unverified unless a real Darwin job completed.
+- Report Darwin as locally unverified unless a real Darwin job completed; distinguish complete Cargo coverage from the two-filter Nix package check.
 - Report GitHub-hosted TCG as unverified until the new CI job completes within 30 minutes.
 - Report branch-protection state without mutating it.
 - Report commit, push, PR, and downstream rerun status explicitly.
@@ -727,6 +851,8 @@ After an authorized push, wait for both Nix matrix legs and the Ubuntu/macOS Car
   workspace crates do not silently enter the portable package boundary.
 - Use `path:.` for local pre-commit Nix verification so untracked new Nix files
   are tested without staging them; committed CI uses `.#`.
+- Keep both capability-dependent tests in Linux Nix and ordinary macOS Cargo;
+  append their exact `--skip` filters only to Darwin Nix `cargoTestFlags`.
 
 ### Changes Made
 
@@ -742,6 +868,8 @@ After an authorized push, wait for both Nix matrix legs and the Ubuntu/macOS Car
 - Added curl as a declared check-only input after the first unwrapped package
   build proved the retained webhook test otherwise times out before making its
   loopback request.
+- Added the PR #87 follow-up that retains both capability tests on Linux and in
+  ordinary macOS Cargo while filtering them only from Darwin Nix.
 
 ### Deferred / Parking Lot
 
@@ -755,5 +883,6 @@ After an authorized push, wait for both Nix matrix legs and the Ubuntu/macOS Car
 ### Confidence Assessment
 
 - Overall: High
-- Areas of concern: GitHub-hosted TCG duration and the first real Darwin Nix
-  package build remain execution-time acceptance gates.
+- Areas of concern: the replacement real Darwin Nix package build remains an
+  execution-time acceptance gate; source evaluation cannot prove Seatbelt
+  behavior.
