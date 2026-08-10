@@ -29,6 +29,7 @@ const MAX_NOTE_CHARS: usize = 512;
 const MAX_MANUAL_TEXT_BYTES: usize = 4_096;
 const BUSY_RETRYING_STATUS: &str = "Brain data busy; retrying";
 const BUSY_STALE_STATUS: &str = "Brain data busy; showing previous refresh";
+const STORAGE_UNAVAILABLE_STATUS_PREFIX: &str = "Brain: SQLite storage unavailable (";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrainTab {
@@ -232,6 +233,7 @@ impl BrainApp {
             self.pending_action_status = Some(status);
         }
         let mut source_error = None;
+        let mut storage_unavailable_status = None;
         let mut busy_status = None;
         let selected_attention_display_id = self
             .selected_display_id(ReviewSurface::Attention)
@@ -284,6 +286,12 @@ impl BrainApp {
             Err(BrainSourceError::Other(error)) => {
                 source_error = Some(format!("Brain: {}", bounded_status(&error)));
             }
+            Err(BrainSourceError::StorageUnavailable(category)) => {
+                storage_unavailable_status = Some(format!(
+                    "Brain: SQLite storage unavailable ({}); keeping the last coherent view",
+                    category.as_str()
+                ));
+            }
             Err(BrainSourceError::Busy) => {
                 busy_status = Some(if self.has_successful_refresh {
                     BUSY_STALE_STATUS
@@ -308,6 +316,14 @@ impl BrainApp {
             false
         } else if !recovery.is_empty() {
             self.status = Some(recovery.join(" · "));
+            false
+        } else if let Some(status) = storage_unavailable_status
+            && self.status.as_deref().is_none_or(|current| {
+                matches!(current, BUSY_RETRYING_STATUS | BUSY_STALE_STATUS)
+                    || current.starts_with(STORAGE_UNAVAILABLE_STATUS_PREFIX)
+            })
+        {
+            self.status = Some(status);
             false
         } else if let Some(status) = busy_status
             && self
@@ -2449,6 +2465,33 @@ mod tests {
     }
 
     #[test]
+    fn cold_start_corruption_reports_category_without_data() {
+        let app = scripted_app([Err(BrainSourceError::StorageUnavailable(
+            coding_brain_core::runtime::BrainStorageFaultCategory::Corrupt,
+        ))]);
+
+        assert_eq!(
+            app.status(),
+            Some("Brain: SQLite storage unavailable (corrupt); keeping the last coherent view")
+        );
+        assert!(app.snapshot().recent.is_empty());
+        assert!(app.review_queue().is_empty());
+    }
+
+    #[test]
+    fn cold_start_missing_storage_remains_other_not_corrupt() {
+        let app = scripted_app([Err(BrainSourceError::StorageUnavailable(
+            coding_brain_core::runtime::BrainStorageFaultCategory::Other,
+        ))]);
+
+        assert_eq!(
+            app.status(),
+            Some("Brain: SQLite storage unavailable (other); keeping the last coherent view")
+        );
+        assert!(app.snapshot().recent.is_empty());
+    }
+
+    #[test]
     fn busy_refresh_retains_all_views_then_recovers_atomically() {
         let mut app = scripted_app([
             Ok(refresh_fixture("old", 1, 1)),
@@ -2466,6 +2509,38 @@ mod tests {
         app.refresh();
         assert_refresh_fixture(&app, "new", 2, 2);
         assert_eq!(app.status(), None);
+    }
+
+    #[test]
+    fn corrupt_refresh_retains_complete_coherent_view_and_selection() {
+        let mut app = scripted_app([
+            Ok(refresh_fixture("old", 2, 2)),
+            Err(BrainSourceError::StorageUnavailable(
+                coding_brain_core::runtime::BrainStorageFaultCategory::Corrupt,
+            )),
+        ]);
+        assert!(app.has_successful_refresh);
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('j')));
+        let selected = app
+            .selected_display_id(ReviewSurface::Review)
+            .map(str::to_owned);
+        let expected_review_state = app.review_state.clone();
+        assert_eq!(selected.as_deref(), Some("old-1"));
+
+        app.refresh();
+
+        assert_refresh_fixture(&app, "old", 2, 2);
+        assert_eq!(
+            app.selected_display_id(ReviewSurface::Review),
+            selected.as_deref()
+        );
+        assert_eq!(app.review_state, expected_review_state);
+        assert!(app.has_successful_refresh);
+        assert_eq!(
+            app.status(),
+            Some("Brain: SQLite storage unavailable (corrupt); keeping the last coherent view")
+        );
     }
 
     #[test]
@@ -2519,9 +2594,42 @@ mod tests {
     }
 
     #[test]
+    fn completed_action_outranks_corrupt_refresh() {
+        let mut app = scripted_app([
+            Ok(refresh_fixture("old", 1, 1)),
+            Err(BrainSourceError::StorageUnavailable(
+                coding_brain_core::runtime::BrainStorageFaultCategory::Corrupt,
+            )),
+        ]);
+        app.status = Some("Sent allow".into());
+
+        app.refresh();
+
+        assert_refresh_fixture(&app, "old", 1, 1);
+        assert_eq!(app.status(), Some("Sent allow"));
+    }
+
+    #[test]
     fn recovery_warning_outranks_busy_information() {
         let source = Arc::new(ScriptedBrainSource {
             refreshes: std::sync::Mutex::new([Err(BrainSourceError::Busy)].into_iter().collect()),
+        });
+        let runtime = BrainRuntime::new(source, Arc::new(RecoveryWarningActions));
+        let app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
+
+        assert_eq!(app.status(), Some("Recovered interrupted activity"));
+    }
+
+    #[test]
+    fn recovery_warning_outranks_corrupt_refresh() {
+        let source = Arc::new(ScriptedBrainSource {
+            refreshes: std::sync::Mutex::new(
+                [Err(BrainSourceError::StorageUnavailable(
+                    coding_brain_core::runtime::BrainStorageFaultCategory::Corrupt,
+                ))]
+                .into_iter()
+                .collect(),
+            ),
         });
         let runtime = BrainRuntime::new(source, Arc::new(RecoveryWarningActions));
         let app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));

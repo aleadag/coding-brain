@@ -442,4 +442,26 @@ mod tests {
         assert!(mark_by_id("", None).is_err());
         assert!(mark_by_id("   ", None).is_err());
     }
+
+    #[test]
+    fn sqlite_review_reads_deterministic_historical_authority() {
+        let (root, paths) = crate::brain::storage::test_support::deterministic_historical_fixture(
+            "review-deterministic",
+        );
+        let decisions = sqlite_decisions(&paths).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].decision_id.as_deref(),
+            Some("review-deterministic")
+        );
+        drop(root);
+    }
+
+    #[test]
+    fn sqlite_review_reports_historical_invariant_as_corrupt() {
+        let error = sqlite_review_error(StorageError::InvalidStorage(
+            "historical permission decision anchor is invalid",
+        ));
+        assert_eq!(error, "SQLite decision storage unavailable (corrupt)");
+    }
 }

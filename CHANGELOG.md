@@ -6,6 +6,13 @@ All notable changes to Coding Brain are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Migrated deterministic safety decisions remain readable in Live, Review, and
+  learning views without becoming live permission authority. If SQLite becomes
+  unavailable, the TUI now reports the stable fault category while preserving
+  its last coherent view.
+
 ### Changed
 
 - Nix package checks now run the portable core, TUI, and release-contract test

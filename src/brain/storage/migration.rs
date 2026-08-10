@@ -21,7 +21,9 @@ use sha2::{Digest, Sha256};
 use super::legacy::PermissionTransactionJournal;
 use crate::brain::decisions::{DecisionRecord, DecisionType, HookDecisionRecord};
 
-use super::decisions::{DecisionIdentity, DecisionKind, DecisionPayload};
+use super::decisions::{
+    CanonicalHistoricalDecisionSource, DecisionIdentity, DecisionKind, DecisionPayload,
+};
 use super::legacy::{
     LegacyDecision, LegacyFingerprint, LegacyFreezeArtifact, LegacyImportSink, LegacySourceKind,
     LegacySourceSet, LegacyWriterGuard,
@@ -42,6 +44,38 @@ const FROZEN_MANIFEST_NAME: &CStr = c".brain.sqlite3.frozen-manifest.json";
 const MAX_FREEZE_RECORD_BYTES: usize = 16 * 1024;
 const MAX_FROZEN_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FREEZE_FILES: usize = 4_100;
+
+fn legacy_proposal_source(value: &str) -> Result<CanonicalHistoricalDecisionSource, StorageError> {
+    match value {
+        "model" | "brain" => Ok(CanonicalHistoricalDecisionSource::Model),
+        "deterministic" => Ok(CanonicalHistoricalDecisionSource::DeterministicSafety),
+        "provider_policy" => Ok(CanonicalHistoricalDecisionSource::NativeProvider),
+        _ => Err(StorageError::InvalidStorage(
+            "legacy proposal decision source is unsupported",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_proposal_sources_map_to_the_canonical_domain() {
+        for (legacy, canonical) in [
+            ("model", "model"),
+            ("brain", "model"),
+            ("deterministic", "deterministic_safety"),
+            ("provider_policy", "native_provider"),
+        ] {
+            assert_eq!(legacy_proposal_source(legacy).unwrap().as_str(), canonical);
+        }
+        assert!(matches!(
+            legacy_proposal_source("future_authority"),
+            Err(StorageError::InvalidStorage(_))
+        ));
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MigrationStatus {
@@ -4659,16 +4693,7 @@ impl<'database> ReplayAccounting<'database> {
         {
             return Err(source_accounting_changed());
         }
-        let source = match record.brain_source.as_str() {
-            "model" | "brain" => "model",
-            "deterministic" => "deterministic_safety",
-            "provider_policy" => "native_provider",
-            _ => {
-                return Err(StorageError::InvalidStorage(
-                    "legacy proposal decision source is unsupported",
-                ));
-            }
-        };
+        let source = legacy_proposal_source(&record.brain_source)?;
         let decided_at_ms =
             record
                 .resolved_at
@@ -4683,7 +4708,7 @@ impl<'database> ReplayAccounting<'database> {
             record.turn_id.clone(),
             session.tool_use_id.clone(),
             action,
-            source,
+            source.as_str(),
             decided_at_ms,
         );
         let payload = DecisionPayload::new(
@@ -5391,16 +5416,7 @@ impl<'database, 'accounting> MigrationImport<'database, 'accounting> {
                 return Ok(());
             }
         };
-        let source = match record.brain_source.as_str() {
-            "model" | "brain" => "model",
-            "deterministic" => "deterministic_safety",
-            "provider_policy" => "native_provider",
-            _ => {
-                return Err(StorageError::InvalidStorage(
-                    "legacy proposal decision source is unsupported",
-                ));
-            }
-        };
+        let source = legacy_proposal_source(&record.brain_source)?;
         let decided_at_ms =
             record
                 .resolved_at
@@ -5415,7 +5431,7 @@ impl<'database, 'accounting> MigrationImport<'database, 'accounting> {
             record.turn_id.clone(),
             session.tool_use_id.clone(),
             action,
-            source,
+            source.as_str(),
             decided_at_ms,
         );
         let payload = DecisionPayload::new(

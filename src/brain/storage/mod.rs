@@ -14,6 +14,9 @@ mod review;
 mod schema;
 mod security;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 #[cfg(feature = "fault-injection")]
 #[allow(unused_imports)]
 pub(crate) use fault_injection::{
