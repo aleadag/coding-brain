@@ -94,6 +94,58 @@ fn ci_runs_live_fault_matrix_with_isolated_release_artifacts() {
 }
 
 #[test]
+fn ci_requires_nix_package_checks_on_supported_hosts_and_vm_security_on_linux() {
+    let workflow = include_str!("../.github/workflows/ci.yml");
+    let cargo = job(workflow, "test", "nix");
+    let nix = job(workflow, "nix", "core-standalone");
+
+    for required in [
+        "name: Test (${{ matrix.os }})",
+        "runs-on: ${{ matrix.os }}",
+        "os: [ubuntu-latest, macos-latest]",
+        "cargo test --all-targets -- --test-threads=1",
+    ] {
+        assert_contract(cargo, required);
+    }
+
+    for required in [
+        "name: Nix (${{ matrix.os }})",
+        "runs-on: ${{ matrix.os }}",
+        "os: [ubuntu-latest, macos-latest]",
+        "timeout-minutes: 30",
+        "cachix/install-nix-action@v31",
+        "extra_nix_config: sandbox = true",
+        "name: Verify sandbox",
+        "nix config show sandbox",
+        "name: Evaluate all flake systems",
+        "nix flake check --all-systems --no-build",
+        "name: Build Nix package",
+        "nix build --no-link --print-build-logs .#",
+        "name: Test storage security in NixOS VM",
+        "nix build --no-link --print-build-logs .#checks.x86_64-linux.storage-security-vm",
+    ] {
+        assert_contract(nix, required);
+    }
+
+    for linux_only_step in [
+        "Evaluate all flake systems",
+        "Test storage security in NixOS VM",
+    ] {
+        assert_contract(named_step(nix, linux_only_step), "if: runner.os == 'Linux'");
+    }
+
+    for forbidden in [
+        "continue-on-error",
+        "retry",
+        "sudo",
+        "bwrap",
+        "unshare-user",
+    ] {
+        assert!(!nix.contains(forbidden), "Nix CI must not use {forbidden}");
+    }
+}
+
+#[test]
 #[should_panic(expected = "test job must not upload artifacts")]
 fn artifact_upload_guard_rejects_broad_test_job_uploads() {
     let test_job =
@@ -119,6 +171,108 @@ fn official_release_nix_and_package_paths_remain_feature_free() {
     assert!(
         !flake.contains("fault-injection"),
         "Nix build and package commands must remain feature-free"
+    );
+}
+
+#[test]
+fn nix_package_check_is_portable_and_bounded() {
+    let flake = include_str!("../flake.nix");
+
+    for forbidden in [
+        "bubblewrap",
+        "/bin/bwrap",
+        "--unshare-user",
+        "nixCheckCargo",
+        "CBRAIN_NIX_CHECK_UID",
+        "CBRAIN_NIX_CHECK_GID",
+        "--workspace",
+        "--exclude",
+    ] {
+        assert!(
+            !flake.contains(forbidden),
+            "Nix package checks must not require {forbidden}"
+        );
+    }
+
+    for required in [
+        "checkType = \"debug\";",
+        "dontUseCargoParallelTests = true;",
+        "cargoTestFlags = [",
+        "\"coding-brain-core\"",
+        "\"coding-brain-tui\"",
+        "nativeCheckInputs = [",
+        "pkgs.git",
+        "pkgs.curl",
+        "cargo test",
+        "--offline",
+        "--test release_workflow",
+        "--test release_metadata",
+        "--test-threads=1",
+    ] {
+        assert_contract(flake, required);
+    }
+
+    let darwin = flake
+        .split_once("++ pkgs.lib.optionals pkgs.stdenv.isDarwin [")
+        .expect("Nix package checks must isolate Darwin-only capability filters")
+        .1
+        .split_once("];")
+        .expect("Darwin-only capability filters must be a bounded list")
+        .0;
+    for required in [
+        "\"--\"",
+        "helpers::tests::status_webhook_keeps_only_retained_session_fields",
+        "project::tests::git_root_preserves_non_utf8_path_bytes",
+    ] {
+        assert_contract(darwin, required);
+    }
+    assert_eq!(
+        darwin.matches("\"--skip\"").count(),
+        2,
+        "Darwin Nix must skip only the two approved capability-dependent tests"
+    );
+}
+
+#[test]
+fn nix_exposes_a_bounded_storage_security_vm_check() {
+    let flake = include_str!("../flake.nix");
+    let home_manager = include_str!("../nix/tests/home-manager-module.nix");
+    let vm = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/nix/tests/storage-security-vm.nix"
+    ))
+    .expect("storage VM test module must exist");
+    let doctor_fixtures = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/nix/tests/home-manager-doctor-fixtures.nix"
+    ))
+    .expect("Home Manager doctor fixtures must exist");
+
+    for required in [
+        "storageSecurityVm = pkgs.testers.runNixOSTest",
+        "system == \"x86_64-linux\"",
+        "storage-security-vm = storageSecurityVm",
+        "requiredFeatures.kvm = false",
+        "qemu.forceAccel = false",
+        "globalTimeout = 15 * 60",
+        "--distill-once",
+        "--brain-review list",
+        "doctor --json",
+        "state directory ancestor is foreign-owned",
+        "state directory ancestor is replaceable by another user",
+        "home-manager-doctor-fixtures.nix",
+        "Home Manager provider hooks pass doctor",
+        "invalid Home Manager provider content fails doctor",
+    ] {
+        assert!(
+            flake.contains(required) || vm.contains(required) || doctor_fixtures.contains(required),
+            "missing storage VM contract: {required}"
+        );
+    }
+    assert!(!flake.contains("passthru.tests"));
+    assert!(
+        !home_manager.contains("cbrain doctor --json"),
+        "real cbrain storage checks must run in the NixOS VM, not a plain derivation"
     );
 }
 

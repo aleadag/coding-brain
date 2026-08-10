@@ -25,55 +25,39 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-        nixCheckEntrypoint =
-          if pkgs.stdenv.isLinux then
-            pkgs.writeShellScript "coding-brain-nix-check" ''
-              ${pkgs.coreutils}/bin/chmod 0755 /
-              ${pkgs.coreutils}/bin/chmod 1777 /tmp
-              exec "$CBRAIN_NIX_REAL_CARGO" "$@"
-            ''
-          else
-            null;
-        nixCheckCargo =
-          if pkgs.stdenv.isLinux then
-            pkgs.writeShellScriptBin "cargo" ''
-              exec ${pkgs.bubblewrap}/bin/bwrap \
-                --die-with-parent \
-                --unshare-user \
-                --uid "$CBRAIN_NIX_CHECK_UID" \
-                --gid "$CBRAIN_NIX_CHECK_GID" \
-                --tmpfs / \
-                --dir /nix \
-                --ro-bind /nix/store /nix/store \
-                --dir "$NIX_BUILD_TOP" \
-                --bind "$NIX_BUILD_TOP" "$NIX_BUILD_TOP" \
-                --dir /bin \
-                --ro-bind /bin /bin \
-                --proc /proc \
-                --dev /dev \
-                --dir /tmp \
-                --tmpfs /tmp \
-                --chdir "$PWD" \
-                ${nixCheckEntrypoint} "$@"
-            ''
-          else
-            null;
-      in
-      {
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+        package = pkgs.rustPlatform.buildRustPackage {
           pname = "coding-brain";
           version = cargoToml.package.version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           checkType = "debug";
           dontUseCargoParallelTests = true;
-          preCheck = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-            export CBRAIN_NIX_REAL_CARGO="$(command -v cargo)"
-            export CBRAIN_NIX_CHECK_UID="$(${pkgs.coreutils}/bin/id -u)"
-            export CBRAIN_NIX_CHECK_GID="$(${pkgs.coreutils}/bin/id -g)"
-            export PATH="${nixCheckCargo}/bin:$PATH"
+          cargoTestFlags = [
+            "-p"
+            "coding-brain-core"
+            "-p"
+            "coding-brain-tui"
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            "--"
+            "--skip"
+            "helpers::tests::status_webhook_keeps_only_retained_session_fields"
+            "--skip"
+            "project::tests::git_root_preserves_non_utf8_path_bytes"
+          ];
+          postCheck = ''
+            cargo test \
+              --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
+              --offline \
+              --test release_workflow \
+              --test release_metadata \
+              -- \
+              --test-threads=1
           '';
-          nativeCheckInputs = [ pkgs.git ];
+          nativeCheckInputs = [
+            pkgs.git
+            pkgs.curl
+          ];
 
           meta = with pkgs.lib; {
             description = "Local brain for supervising and learning from coding-agent activity.";
@@ -83,9 +67,30 @@
             platforms = platforms.unix;
           };
         };
+        doctorFixtures = import ./nix/tests/home-manager-doctor-fixtures.nix {
+          inherit
+            home-manager
+            package
+            pkgs
+            self
+            ;
+        };
+        storageSecurityVm = pkgs.testers.runNixOSTest (
+          import ./nix/tests/storage-security-vm.nix {
+            inherit doctorFixtures package;
+          }
+        );
+      in
+      {
+        packages.default = package;
 
-        checks.home-manager-module = import ./nix/tests/home-manager-module.nix {
-          inherit home-manager pkgs self;
+        checks = {
+          home-manager-module = import ./nix/tests/home-manager-module.nix {
+            inherit home-manager pkgs self;
+          };
+        }
+        // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          storage-security-vm = storageSecurityVm;
         };
 
         formatter = pkgs.nixfmt-rfc-style;

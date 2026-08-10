@@ -114,6 +114,30 @@ jobs:
             fi
           fi
 
+  nix:
+    name: Nix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: sandbox = true
+      - name: Verify sandbox
+        run: test "$(nix config show sandbox)" = true
+      - name: Evaluate all flake systems
+        if: runner.os == 'Linux'
+        run: nix flake check --all-systems --no-build
+      - name: Build Nix package
+        run: nix build --no-link --print-build-logs .#
+      - name: Test storage security in NixOS VM
+        if: runner.os == 'Linux'
+        run: nix build --no-link --print-build-logs .#checks.x86_64-linux.storage-security-vm
+
   # Workspace refactor (#279) — verify coding-brain-core builds and tests
   # standalone, without the binary crate. Guards the
   # coding-brain → coding-brain-core dependency direction at the workspace level.
