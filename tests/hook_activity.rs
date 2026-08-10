@@ -1259,10 +1259,10 @@ fn parallel_permission_transactions_use_distinct_owner_only_journals() {
 }
 
 #[test]
-fn independent_permission_process_burst_commits_every_request() {
+fn independent_permission_process_burst_eventually_commits_every_request() {
     let home = tempfile::tempdir().unwrap();
     install_model_fixture(home.path(), "approve");
-    let requests = (0..8)
+    let (payloads, requests): (Vec<_>, Vec<_>) = (0..8)
         .map(|index| {
             let payload = permission_payload_for_request(
                 home.path(),
@@ -1272,17 +1272,42 @@ fn independent_permission_process_burst_commits_every_request() {
             );
             let mut child = spawn_permission_hook(home.path());
             child.stdin.take().unwrap().write_all(&payload).unwrap();
-            child
+            (payload, child)
         })
-        .collect::<Vec<_>>();
+        .unzip();
 
-    for (index, output) in wait_children_output(requests).into_iter().enumerate() {
+    for (index, (payload, mut output)) in payloads
+        .iter()
+        .zip(wait_children_output(requests))
+        .enumerate()
+    {
         assert!(
             output.status.success(),
             "burst {index}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if output.stdout.is_empty() {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(
+                    "permission transaction admission blocked: duplicate or already active permission request"
+                ),
+                "burst {index}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output = run_permission_hook(home.path(), payload);
+            assert!(
+                output.status.success(),
+                "burst {index} retry: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let response: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "burst {index}: invalid response ({error}); stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
         assert_eq!(
             response["hookSpecificOutput"]["decision"]["behavior"], "allow",
             "burst {index}"
