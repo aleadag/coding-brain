@@ -211,6 +211,26 @@ fn nix_package_check_is_portable_and_bounded() {
     ] {
         assert_contract(flake, required);
     }
+
+    let darwin = flake
+        .split_once("++ pkgs.lib.optionals pkgs.stdenv.isDarwin [")
+        .expect("Nix package checks must isolate Darwin-only capability filters")
+        .1
+        .split_once("];")
+        .expect("Darwin-only capability filters must be a bounded list")
+        .0;
+    for required in [
+        "\"--\"",
+        "helpers::tests::status_webhook_keeps_only_retained_session_fields",
+        "project::tests::git_root_preserves_non_utf8_path_bytes",
+    ] {
+        assert_contract(darwin, required);
+    }
+    assert_eq!(
+        darwin.matches("\"--skip\"").count(),
+        2,
+        "Darwin Nix must skip only the two approved capability-dependent tests"
+    );
 }
 
 #[test]

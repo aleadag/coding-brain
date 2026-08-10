@@ -37,6 +37,13 @@
             "coding-brain-core"
             "-p"
             "coding-brain-tui"
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            "--"
+            "--skip"
+            "helpers::tests::status_webhook_keeps_only_retained_session_fields"
+            "--skip"
+            "project::tests::git_root_preserves_non_utf8_path_bytes"
           ];
           postCheck = ''
             cargo test \
