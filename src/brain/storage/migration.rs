@@ -170,6 +170,11 @@ impl MigrationCoordinator {
         state = recover_pending_state_transition(&self.paths, directory, state, true)?;
         state = recover_pending_review_result(&self.paths, directory, state, true)?;
         state = recover_pending_freeze_state(directory, state, true)?;
+        state = recover_pending_building_rebase(&self.paths, directory, state, true)?;
+        if state.manifest.status == MigrationStatus::Building {
+            validate_coordinator_metadata(&self.paths, directory, &state.manifest)?;
+            state = rebase_building_sources(&self.paths, directory, state)?;
+        }
         validate_state(&self.paths, directory, &state.manifest)?;
 
         if state.manifest.status == MigrationStatus::Complete {
@@ -3225,6 +3230,7 @@ fn inspect_in_directory(
     let state = recover_pending_state_transition(paths, directory, state, false)?;
     let state = recover_pending_review_result(paths, directory, state, false)?;
     let state = recover_pending_freeze_state(directory, state, false)?;
+    let state = recover_pending_building_rebase(paths, directory, state, false)?;
     validate_state(paths, directory, &state.manifest)?;
     if matches!(
         state.manifest.freeze_state,
@@ -3274,6 +3280,97 @@ fn create_initial_state(
     };
     let identity = directory.write_new_private_file(MIGRATION_STATE_NAME, &manifest.encoded()?)?;
     Ok(LoadedState { manifest, identity })
+}
+
+fn building_rebase_temp_name(generation: u64) -> Result<CString, StorageError> {
+    CString::new(format!(
+        ".brain.sqlite3.migration-state-{generation}-building-rebase.tmp"
+    ))
+    .map_err(|_| StorageError::InvalidStorage("migration state temporary name is invalid"))
+}
+
+fn recover_pending_building_rebase(
+    paths: &StoragePaths,
+    directory: &SecureDatabaseDirectory,
+    mut state: LoadedState,
+    publish: bool,
+) -> Result<LoadedState, StorageError> {
+    let temporary = building_rebase_temp_name(state.manifest.generation)?;
+    if !directory.private_file_present(&temporary)? {
+        return Ok(state);
+    }
+    if state.manifest.status != MigrationStatus::Building {
+        return Err(StorageError::InvalidStorage(
+            "building rebase temporary exists outside Building state",
+        ));
+    }
+    let snapshot = directory.read_private_file(&temporary, MAX_MIGRATION_STATE_BYTES)?;
+    let recovered = decode_state(&snapshot.bytes)?;
+    let mut expected = state.manifest.clone();
+    expected.fingerprint_digest = recovered.fingerprint_digest.clone();
+    expected.fingerprint_count = recovered.fingerprint_count;
+    expected.descriptors = recovered.descriptors.clone();
+    if recovered != expected {
+        return Err(StorageError::InvalidStorage(
+            "pending Building source rebase is not canonical",
+        ));
+    }
+    validate_building_source_advance(
+        &state.manifest,
+        &SourceFingerprintState {
+            digest: recovered.fingerprint_digest.clone(),
+            count: recovered.fingerprint_count,
+            descriptors: recovered.descriptors.clone(),
+        },
+    )?;
+    state.manifest.allowed_temporary = Some(temporary.to_string_lossy().into_owned());
+    validate_coordinator_metadata(paths, directory, &state.manifest)?;
+    if publish {
+        state.identity = directory.publish_private_replacement(
+            MIGRATION_STATE_NAME,
+            state.identity,
+            &temporary,
+            snapshot.identity,
+        )?;
+    }
+    state.manifest = recovered;
+    if !publish {
+        state.manifest.allowed_temporary = Some(temporary.to_string_lossy().into_owned());
+    }
+    Ok(state)
+}
+
+fn rebase_building_sources(
+    paths: &StoragePaths,
+    directory: &SecureDatabaseDirectory,
+    mut state: LoadedState,
+) -> Result<LoadedState, StorageError> {
+    let _guard = LegacyWriterGuard::acquire(
+        &paths.state_root,
+        StorageDeadline::after(Duration::from_secs(5)),
+    )?;
+    let sources = LegacySourceSet::at(&paths.state_root)?;
+    let fingerprints = brain_source_fingerprint_state(&sources)?;
+    if state.manifest.fingerprint_digest == fingerprints.digest
+        && state.manifest.fingerprint_count == fingerprints.count
+        && state.manifest.descriptors == fingerprints.descriptors
+    {
+        return Ok(state);
+    }
+    validate_building_source_advance(&state.manifest, &fingerprints)?;
+    state.manifest.fingerprint_digest = fingerprints.digest;
+    state.manifest.fingerprint_count = fingerprints.count;
+    state.manifest.descriptors = fingerprints.descriptors;
+    let temporary = building_rebase_temp_name(state.manifest.generation)?;
+    let replacement = directory.write_new_private_file(&temporary, &state.manifest.encoded()?)?;
+    migration_fault("after-building-rebase-state-temp-sync");
+    state.identity = directory.publish_private_replacement(
+        MIGRATION_STATE_NAME,
+        state.identity,
+        &temporary,
+        replacement,
+    )?;
+    Ok(state)
 }
 
 fn transition_state(
@@ -3986,6 +4083,39 @@ struct SourceFingerprintState {
     digest: String,
     count: u64,
     descriptors: Vec<PersistedFingerprint>,
+}
+
+fn validate_building_source_advance(
+    previous: &ValidatedState,
+    current: &SourceFingerprintState,
+) -> Result<(), StorageError> {
+    let append_only = current.count >= previous.fingerprint_count
+        && previous
+            .descriptors
+            .iter()
+            .zip(&current.descriptors)
+            .all(|(before, after)| {
+                if !before.present {
+                    return true;
+                }
+                if !after.present || before.device != after.device {
+                    return false;
+                }
+                match before.kind.as_str() {
+                    "decisions" | "activity" => {
+                        before.inode == after.inode && before.size <= after.size
+                    }
+                    "lifecycle" => before.size <= after.size,
+                    "permission_transactions" => before.inode == after.inode,
+                    _ => false,
+                }
+            });
+    if !append_only {
+        return Err(StorageError::InvalidStorage(
+            "legacy source change is not an append-only Building advance",
+        ));
+    }
+    Ok(())
 }
 
 fn brain_source_fingerprint_state(

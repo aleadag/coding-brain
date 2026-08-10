@@ -580,6 +580,151 @@ fn legacy_brain_proposal_building_and_verified_restarts_complete_safely() {
     }
 }
 
+#[cfg(feature = "fault-injection")]
+fn advance_legacy_sources(state_root: &std::path::Path, suffix: &str, index: u64) {
+    for relative in ["brain/decisions.jsonl", "activity.jsonl"] {
+        let path = state_root.join(relative);
+        let fixture_lines = if relative == "activity.jsonl" { 2 } else { 1 };
+        let appended = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .take(fixture_lines)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace("4vh58", suffix)
+            + "\n";
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(appended.as_bytes())
+            .unwrap();
+    }
+    let journal = fs::read_to_string(
+        state_root.join(
+            "brain/permission-transactions/permission-transaction-000000000000000000000000000000000000001-0000000001-00000000000000000001.json",
+        ),
+    )
+    .unwrap()
+    .replace("4vh58", suffix);
+    write_private(
+        &state_root.join(format!(
+            "brain/permission-transactions/permission-transaction-{index:039}-0000000001-{index:020}.json"
+        )),
+        journal.as_bytes(),
+    );
+    write_lifecycle_authorities(
+        state_root,
+        AgentProvider::Codex,
+        &format!("session-{suffix}"),
+        &format!("turn-{suffix}"),
+        "/fixture",
+        &[(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &format!("transaction-{suffix}"),
+            PermissionAction::Allow,
+        )],
+    );
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn building_restart_rebases_advanced_legacy_sources() {
+    let fixture = LegacyFixture::copy("permission-journal-4vh58");
+    assert!(!migration_child(fixture.state_root(), "building").success());
+    let stale_staging = staging_path(fixture.state_root());
+    let stale_inode = fs::metadata(&stale_staging).unwrap().ino();
+    let generation = migration_state(fixture.state_root())["generation"]
+        .as_u64()
+        .unwrap();
+
+    advance_legacy_sources(fixture.state_root(), "advanced", 2);
+    let decisions = fs::read(fixture.state_root().join("brain/decisions.jsonl")).unwrap();
+    let activity = fs::read(fixture.state_root().join("activity.jsonl")).unwrap();
+    let lifecycle = fs::read(fixture.state_root().join("hooks/lifecycle.json")).unwrap();
+
+    assert_eq!(
+        MigrationCoordinator::at(fixture.state_root())
+            .resume()
+            .unwrap(),
+        MigrationStatus::Complete
+    );
+    let state = migration_state(fixture.state_root());
+    assert_eq!(state["generation"], generation);
+    assert_eq!(state["accounting"]["sources"]["decisions"], 2);
+    assert_eq!(state["accounting"]["sources"]["activities"], 4);
+    assert_eq!(state["accounting"]["sources"]["journals"], 2);
+    assert_eq!(state["accounting"]["sources"]["lifecycle_snapshots"], 1);
+    assert_ne!(
+        fs::metadata(fixture.state_root().join("db/brain.sqlite3"))
+            .unwrap()
+            .ino(),
+        stale_inode
+    );
+    assert_eq!(
+        fs::read(fixture.state_root().join("brain/decisions.jsonl")).unwrap(),
+        decisions
+    );
+    assert_eq!(
+        fs::read(fixture.state_root().join("activity.jsonl")).unwrap(),
+        activity
+    );
+    assert_eq!(
+        fs::read(fixture.state_root().join("hooks/lifecycle.json")).unwrap(),
+        lifecycle
+    );
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn building_source_rebase_temp_recovers_after_more_legacy_growth() {
+    let fixture = LegacyFixture::copy("permission-journal-4vh58");
+    assert!(!migration_child(fixture.state_root(), "building").success());
+    advance_legacy_sources(fixture.state_root(), "advanced", 2);
+    assert!(
+        !migration_child(
+            fixture.state_root(),
+            "after-building-rebase-state-temp-sync",
+        )
+        .success()
+    );
+    advance_legacy_sources(fixture.state_root(), "subsequent", 3);
+
+    assert_eq!(
+        MigrationCoordinator::at(fixture.state_root())
+            .resume()
+            .unwrap(),
+        MigrationStatus::Complete
+    );
+    let state = migration_state(fixture.state_root());
+    assert_eq!(state["accounting"]["sources"]["decisions"], 3);
+    assert_eq!(state["accounting"]["sources"]["activities"], 6);
+    assert_eq!(state["accounting"]["sources"]["journals"], 3);
+    assert_eq!(state["accounting"]["sources"]["lifecycle_snapshots"], 1);
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn building_restart_rejects_append_only_source_substitution() {
+    let fixture = LegacyFixture::copy("permission-journal-4vh58");
+    assert!(!migration_child(fixture.state_root(), "building").success());
+    let decisions = fixture.state_root().join("brain/decisions.jsonl");
+    let replacement = fs::read_to_string(&decisions)
+        .unwrap()
+        .replace("4vh58", "substituted");
+    fs::rename(&decisions, fixture.state_root().join("decisions.saved")).unwrap();
+    write_private(&decisions, replacement.as_bytes());
+    let before = tree_snapshot(fixture.state_root());
+
+    assert!(matches!(
+        MigrationCoordinator::at(fixture.state_root()).resume(),
+        Err(StorageError::InvalidStorage(
+            "legacy source change is not an append-only Building advance"
+        ))
+    ));
+    assert_eq!(tree_snapshot(fixture.state_root()), before);
+}
+
 #[test]
 fn migration_freezes_manifest_and_completes_normal_run() {
     let fixture = LegacyFixture::copy("permission-journal-4vh58");
