@@ -40,6 +40,7 @@ pub(crate) enum FaultPosition {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum MigrationFaultStage {
     Building,
+    AfterBuildingRebaseStateTempSync,
     Verified,
     AfterVerifiedStateTempSync,
     AfterBrainLink,
@@ -116,6 +117,7 @@ impl MigrationFaultStage {
     pub(crate) fn from_label(label: &str) -> Option<Self> {
         Some(match label {
             "building" => Self::Building,
+            "after-building-rebase-state-temp-sync" => Self::AfterBuildingRebaseStateTempSync,
             "verified" => Self::Verified,
             "after-verified-state-temp-sync" => Self::AfterVerifiedStateTempSync,
             "after-brain-link" => Self::AfterBrainLink,
@@ -156,6 +158,7 @@ impl MigrationFaultStage {
     fn as_str(self) -> &'static str {
         match self {
             Self::Building => "building",
+            Self::AfterBuildingRebaseStateTempSync => "after-building-rebase-state-temp-sync",
             Self::Verified => "verified",
             Self::AfterVerifiedStateTempSync => "after-verified-state-temp-sync",
             Self::AfterBrainLink => "after-brain-link",
@@ -824,6 +827,7 @@ mod tests {
     fn migration_labels_are_closed_and_matrix_matches_only_publication() {
         for stage in [
             MigrationFaultStage::Building,
+            MigrationFaultStage::AfterBuildingRebaseStateTempSync,
             MigrationFaultStage::Verified,
             MigrationFaultStage::AfterVerifiedStateTempSync,
             MigrationFaultStage::AfterBrainLink,
