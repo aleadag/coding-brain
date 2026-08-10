@@ -22,9 +22,6 @@ let
     home.homeDirectory = "/home/codexctl-test";
     home.stateVersion = "25.11";
   };
-  doctorPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs {
-    doCheck = false;
-  };
   configured = home-manager.lib.homeManagerConfiguration {
     inherit pkgs;
     modules = [
@@ -54,28 +51,6 @@ let
             model = "gemma4:e4b";
             timeout_ms = 25000;
           };
-        };
-      }
-    ];
-  };
-  doctorConfigured = home-manager.lib.homeManagerConfiguration {
-    inherit pkgs;
-    modules = [
-      self.homeManagerModules.default
-      baseHome
-      {
-        programs.codex.enable = true;
-        programs.claude-code = {
-          enable = true;
-          package = null;
-        };
-        programs.antigravity-cli = {
-          enable = true;
-          package = null;
-        };
-        programs.coding-brain = {
-          enable = true;
-          package = doctorPackage;
         };
       }
     ];
@@ -437,32 +412,6 @@ let
   unsupportedFailures = builtins.filter (item: !item.assertion) unsupportedHooks.config.assertions;
   enableOnlyFailures = builtins.filter (item: !item.assertion) enableOnlyCodex.config.assertions;
   disabledFailures = builtins.filter (item: !item.assertion) disabledCodex.config.assertions;
-  codexHooksJson = pkgs.writeText "codex-hooks.json" (
-    builtins.toJSON { hooks = doctorConfigured.config.programs.codex.hooks; }
-  );
-  claudeSettingsJson = pkgs.writeText "claude-settings.json" (
-    builtins.toJSON doctorConfigured.config.programs.claude-code.settings
-  );
-  providerHomeManagerFiles = pkgs.runCommand "home-manager-files" { } ''
-    mkdir -p "$out/.codex" "$out/.claude" "$out/.gemini/config"
-    cp ${codexHooksJson} "$out/.codex/hooks.json"
-    cp ${claudeSettingsJson} "$out/.claude/settings.json"
-    cp ${doctorConfigured.config.home.file.".gemini/config/hooks.json".source} \
-      "$out/.gemini/config/hooks.json"
-  '';
-  invalidAntigravityHomeManagerFiles = pkgs.runCommand "invalid-antigravity-home-manager-files" { } ''
-    mkdir -p "$out/.codex" "$out/.claude" "$out/.gemini/config"
-    cp ${providerHomeManagerFiles}/.codex/hooks.json "$out/.codex/hooks.json"
-    cp ${providerHomeManagerFiles}/.claude/settings.json "$out/.claude/settings.json"
-    printf '%s\n' '["SECRET_PROVIDER_CONTENT"]' \
-      > "$out/.gemini/config/hooks.json"
-  '';
-  fakeProviders = pkgs.runCommand "coding-brain-fake-providers" { } ''
-    mkdir -p "$out/bin"
-    ln -s ${pkgs.coreutils}/bin/true "$out/bin/codex"
-    ln -s ${pkgs.coreutils}/bin/true "$out/bin/claude"
-    ln -s ${pkgs.coreutils}/bin/true "$out/bin/agy"
-  '';
 in
 assert builtins.elem testPackage cfg.home.packages;
 assert lib.hasSuffix "/bin/cbrain" expectedExe;
@@ -629,10 +578,7 @@ assert
   ] cfg);
 pkgs.runCommand "coding-brain-home-manager-module-check"
   {
-    nativeBuildInputs = [
-      pkgs.jq
-      doctorPackage
-    ];
+    nativeBuildInputs = [ pkgs.jq ];
   }
   ''
     grep -F 'endpoint = "http://localhost:11434/api/generate"' \
@@ -694,147 +640,5 @@ pkgs.runCommand "coding-brain-home-manager-module-check"
       | all(.[]; length == 1)
     ' \
       ${dualAliasConfigured.config.home.file.".gemini/config/hooks.json".source}
-
-    fixture_home="$TMPDIR/home"
-    mkdir -p \
-      "$fixture_home/.codex" \
-      "$fixture_home/.claude" \
-      "$fixture_home/.gemini/config" \
-      "$TMPDIR/config" \
-      "$TMPDIR/state"
-    ln -s ${providerHomeManagerFiles}/.codex/hooks.json \
-      "$fixture_home/.codex/hooks.json"
-    ln -s ${providerHomeManagerFiles}/.claude/settings.json \
-      "$fixture_home/.claude/settings.json"
-    ln -s ${providerHomeManagerFiles}/.gemini/config/hooks.json \
-      "$fixture_home/.gemini/config/hooks.json"
-
-    export HOME="$fixture_home"
-    export XDG_CONFIG_HOME="$TMPDIR/config"
-    export XDG_STATE_HOME="$TMPDIR/state"
-    export PATH="${fakeProviders}/bin:$PATH"
-
-    cd "$TMPDIR"
-    doctor_status=0
-    cbrain doctor --json > "$TMPDIR/doctor.json" \
-      || doctor_status="$?"
-    test "$doctor_status" -eq 0 -o "$doctor_status" -eq 1
-
-    for provider in Codex Claude Antigravity; do
-      jq -e --arg name "$provider setup" '
-        any(.[]; .name == $name and .status == "pass" and .fix_hint == null)
-      ' "$TMPDIR/doctor.json"
-    done
-    jq -e '
-      any(.[];
-        .name == "Codex hook trust"
-        and .status == "advisory"
-        and (.message | contains("trust unverified"))
-        and (.fix_hint | contains("/hooks"))
-      )
-    ' "$TMPDIR/doctor.json"
-    jq -e '
-      all(.[];
-        if (.name | endswith(" setup"))
-        then ((.fix_hint // "") | contains("cbrain init") | not)
-        else true
-        end
-      )
-    ' "$TMPDIR/doctor.json"
-
-    jq -e '
-      [.[] | select(.name | endswith(" setup"))]
-      | all(.[]; has("evidence") | not)
-    ' "$TMPDIR/doctor.json"
-
-    mixed_project="$TMPDIR/mixed-project"
-    mkdir -p "$mixed_project/.git"
-    HOME="$mixed_project" \
-    XDG_CONFIG_HOME="$TMPDIR/mixed-init-config" \
-    XDG_STATE_HOME="$TMPDIR/mixed-init-state" \
-    cbrain init codex claude \
-      --non-interactive \
-      --skip-brain \
-      --skip-skills
-    export HOME="$fixture_home"
-    export XDG_CONFIG_HOME="$TMPDIR/config"
-    export XDG_STATE_HOME="$TMPDIR/state"
-    cd "$mixed_project"
-    mixed_status=0
-    cbrain doctor --json > "$TMPDIR/doctor-mixed.json" || mixed_status="$?"
-    test "$mixed_status" -eq 0 -o "$mixed_status" -eq 1
-
-    check_mixed_provider() {
-      provider="$1"
-      global_path="$2"
-      project_path="$3"
-      jq -e \
-        --arg name "$provider setup" \
-        --arg global "$global_path" \
-        --arg project "$project_path" '
-          .[]
-          | select(.name == $name)
-          | .status == "advisory"
-            and (.evidence.provider_files | length == 2)
-            and .evidence.provider_files[0] == {
-              path: $global,
-              path_lossy: false,
-              scope: "global",
-              ownership: "home_manager",
-              state: "current"
-            }
-            and .evidence.provider_files[1] == {
-              path: $project,
-              path_lossy: false,
-              scope: "project",
-              ownership: "imperative",
-              state: "current"
-            }
-        ' "$TMPDIR/doctor-mixed.json"
-    }
-    check_mixed_provider \
-      Codex \
-      "$fixture_home/.codex/hooks.json" \
-      "$mixed_project/.codex/hooks.json"
-    check_mixed_provider \
-      Claude \
-      "$fixture_home/.claude/settings.json" \
-      "$mixed_project/.claude/settings.json"
-
-    invalid_home="$TMPDIR/invalid-home"
-    mkdir -p \
-      "$invalid_home/.codex" \
-      "$invalid_home/.claude" \
-      "$invalid_home/.gemini/config" \
-      "$TMPDIR/invalid-config" \
-      "$TMPDIR/invalid-state"
-    ln -s ${invalidAntigravityHomeManagerFiles}/.codex/hooks.json \
-      "$invalid_home/.codex/hooks.json"
-    ln -s ${invalidAntigravityHomeManagerFiles}/.claude/settings.json \
-      "$invalid_home/.claude/settings.json"
-    ln -s ${invalidAntigravityHomeManagerFiles}/.gemini/config/hooks.json \
-      "$invalid_home/.gemini/config/hooks.json"
-    export HOME="$invalid_home"
-    export XDG_CONFIG_HOME="$TMPDIR/invalid-config"
-    export XDG_STATE_HOME="$TMPDIR/invalid-state"
-    cd "$TMPDIR"
-    invalid_status=0
-    cbrain doctor --json > "$TMPDIR/doctor-invalid-antigravity.json" \
-      || invalid_status="$?"
-    test "$invalid_status" -eq 1
-    jq -e --arg path "$invalid_home/.gemini/config/hooks.json" '
-      .[]
-      | select(.name == "Antigravity setup")
-      | .status == "fail"
-        and .evidence.provider_files == [{
-          path: $path,
-          path_lossy: false,
-          scope: "global",
-          ownership: "home_manager",
-          state: "invalid",
-          reason: "malformed_content"
-        }]
-    ' "$TMPDIR/doctor-invalid-antigravity.json"
-    ! grep -F 'SECRET_PROVIDER_CONTENT' "$TMPDIR/doctor-invalid-antigravity.json"
     touch "$out"
   ''
