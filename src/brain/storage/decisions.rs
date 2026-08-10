@@ -42,6 +42,34 @@ impl DecisionKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CanonicalHistoricalDecisionSource {
+    Model,
+    DeterministicSafety,
+    NativeProvider,
+}
+
+impl CanonicalHistoricalDecisionSource {
+    pub(super) fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "model" => Ok(Self::Model),
+            "deterministic_safety" => Ok(Self::DeterministicSafety),
+            "native_provider" => Ok(Self::NativeProvider),
+            _ => Err(StorageError::InvalidStorage(
+                "historical permission decision source is invalid",
+            )),
+        }
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::DeterministicSafety => "deterministic_safety",
+            Self::NativeProvider => "native_provider",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecisionIdentity {
     Permission {

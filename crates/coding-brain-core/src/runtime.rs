@@ -734,9 +734,29 @@ fn validate_activity_row_identities(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrainStorageFaultCategory {
+    Full,
+    Io,
+    Corrupt,
+    Other,
+}
+
+impl BrainStorageFaultCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Io => "io",
+            Self::Corrupt => "corrupt",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrainSourceError {
     Busy,
+    StorageUnavailable(BrainStorageFaultCategory),
     Other(String),
 }
 
@@ -744,6 +764,13 @@ impl std::fmt::Display for BrainSourceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Busy => formatter.write_str("brain data is busy"),
+            Self::StorageUnavailable(category) => {
+                write!(
+                    formatter,
+                    "SQLite storage unavailable ({})",
+                    category.as_str()
+                )
+            }
             Self::Other(error) => formatter.write_str(error),
         }
     }
@@ -1473,6 +1500,18 @@ mod tests {
         ReviewTarget, SurfaceReviewProjection,
     };
     use crate::terminals::TerminalSessionAction;
+
+    #[test]
+    fn brain_storage_fault_categories_have_stable_labels() {
+        assert_eq!(BrainStorageFaultCategory::Full.as_str(), "full");
+        assert_eq!(BrainStorageFaultCategory::Io.as_str(), "io");
+        assert_eq!(BrainStorageFaultCategory::Corrupt.as_str(), "corrupt");
+        assert_eq!(BrainStorageFaultCategory::Other.as_str(), "other");
+        assert_eq!(
+            BrainSourceError::StorageUnavailable(BrainStorageFaultCategory::Corrupt).to_string(),
+            "SQLite storage unavailable (corrupt)"
+        );
+    }
 
     #[test]
     fn review_alignment_rejects_attention_mismatch() {

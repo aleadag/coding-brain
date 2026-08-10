@@ -1055,10 +1055,16 @@ pub(super) fn validated_historical_authority(
     let decided_at_ms = u64::try_from(decision.8).map_err(|_| {
         StorageError::InvalidStorage("historical permission decision timestamp is invalid")
     })?;
+    let decision_source = decision
+        .7
+        .as_deref()
+        .ok_or(StorageError::InvalidStorage(
+            "historical permission decision identity is incomplete",
+        ))
+        .and_then(super::decisions::CanonicalHistoricalDecisionSource::parse)?;
     if decision.0 != "permission"
         || decision.1.is_some()
         || decision.6.as_deref() != Some(raw.authority_action.as_str())
-        || decision.7.as_deref() != Some("model")
     {
         return Err(StorageError::InvalidStorage(
             "historical permission decision anchor is invalid",
@@ -1075,7 +1081,7 @@ pub(super) fn validated_historical_authority(
         ))?,
         decision.5,
         action,
-        "model",
+        decision_source.as_str(),
         decided_at_ms,
     );
     let high_water = super::activity::validated_high_water(connection)?;

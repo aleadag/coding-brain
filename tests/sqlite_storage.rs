@@ -3973,6 +3973,164 @@ fn insert_historical_authority(
         .unwrap();
 }
 
+fn insert_historical_authority_for_action(
+    connection: &Connection,
+    decision_id: &str,
+    terminal_source_cursor: i64,
+    action: PermissionAction,
+) {
+    let (action, state) = match action {
+        PermissionAction::Allow => ("allow", "allowed"),
+        PermissionAction::Deny => ("deny", "denied"),
+    };
+    connection
+        .execute(
+            "INSERT INTO historical_permission_authority (
+                decision_id, terminal_source_cursor, decision_kind, authority_action,
+                terminal_event_kind, terminal_event_state, terminal_action,
+                provenance_kind, transaction_id, request_key,
+                response_eligible, delivery_state
+             ) VALUES (?1, ?2, 'permission', ?3,
+                       'decision', ?4, ?3, 'proposal_terminal',
+                       NULL, NULL, 0, 'unknown')",
+            params![decision_id, terminal_source_cursor, action, state],
+        )
+        .unwrap();
+}
+
+fn historical_source_fixture(
+    decision_id: &str,
+    source: &str,
+    action: PermissionAction,
+    tool_use_id: Option<&str>,
+    high_water_before: i64,
+) -> (tempfile::TempDir, StoragePaths) {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(BrainDb::create_current(&paths).unwrap());
+    let connection = open_for_constraints(&paths.brain_db());
+    connection
+        .execute(
+            "UPDATE schema_meta SET activity_high_water = ?1 WHERE singleton = 1",
+            [high_water_before],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap();
+    let state = match action {
+        PermissionAction::Allow => ActivityState::Allowed,
+        PermissionAction::Deny => ActivityState::Denied,
+    };
+    let mut terminal = decision_activity_event(
+        "production-historical-activity",
+        decision_id,
+        1_786_178_933_696,
+        state,
+        Some(AgentProvider::Codex),
+    );
+    let session = terminal.session.as_mut().unwrap();
+    session.session_id = "production-redacted-session".into();
+    session.turn_id = Some("production-redacted-turn".into());
+    session.tool_use_id = tool_use_id.map(str::to_owned);
+    let cursor = db.append_activity(terminal).unwrap();
+
+    let mut record = complete_decision(decision_id, AgentProvider::Codex);
+    record.user_action = "hook_proposal".into();
+    record.brain_action = match action {
+        PermissionAction::Allow => "approve".into(),
+        PermissionAction::Deny => "deny".into(),
+    };
+    db.insert_decision(
+        &DecisionIdentity::permission(
+            decision_id,
+            AgentProvider::Codex,
+            "production-redacted-session",
+            "production-redacted-turn",
+            tool_use_id.map(str::to_owned),
+            action,
+            source,
+            1_786_178_933_000,
+        ),
+        &DecisionPayload::new(DecisionKind::Permission, cursor, record),
+    )
+    .unwrap();
+    drop(db);
+
+    let connection = open_for_constraints(&paths.brain_db());
+    insert_historical_authority_for_action(&connection, decision_id, cursor.get() as i64, action);
+    drop(connection);
+    (root, paths)
+}
+
+#[test]
+fn production_deterministic_historical_authority_is_readable() {
+    let (_root, paths) = historical_source_fixture(
+        "dec_1786178933696120619_4155783_0",
+        "deterministic_safety",
+        PermissionAction::Deny,
+        None,
+        1188,
+    );
+    let db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap();
+    let page = db
+        .learning_read_session()
+        .unwrap()
+        .page_after(None, 10, 1024 * 1024)
+        .unwrap();
+    assert_eq!(page.decisions[0].source_cursor.get(), 1189);
+    assert_eq!(
+        page.decisions[0].record.decision_id.as_deref(),
+        Some("dec_1786178933696120619_4155783_0")
+    );
+}
+
+#[test]
+fn every_canonical_historical_source_uses_the_same_validator() {
+    for (source, action, tool_use_id) in [
+        ("model", PermissionAction::Allow, Some("tool-model")),
+        (
+            "deterministic_safety",
+            PermissionAction::Allow,
+            Some("tool-deterministic"),
+        ),
+        (
+            "native_provider",
+            PermissionAction::Deny,
+            Some("tool-provider"),
+        ),
+    ] {
+        let (_root, paths) = historical_source_fixture(
+            &format!("historical-{source}"),
+            source,
+            action,
+            tool_use_id,
+            0,
+        );
+        let db = BrainDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert_eq!(
+            db.learning_decisions(10, 1024 * 1024).unwrap().len(),
+            1,
+            "{source}"
+        );
+    }
+}
+
 #[test]
 fn historical_permission_reads_are_bounded_and_learning_revalidates_the_full_tuple() {
     let root = private_tempdir();
@@ -4097,6 +4255,13 @@ fn historical_permission_corruption_fails_closed_for_audit_and_learning() {
         "provenance",
         "null-correlated-provenance",
         "proposal-with-correlation",
+        "unknown-source",
+        "provider",
+        "session",
+        "turn",
+        "tool-use",
+        "action",
+        "cursor",
     ] {
         let root = private_tempdir();
         let paths = StoragePaths::at(root.path());
@@ -4160,6 +4325,19 @@ fn historical_permission_corruption_fails_closed_for_audit_and_learning() {
                     "UPDATE historical_permission_authority
                      SET transaction_id = 'legacy-transaction',
                          request_key = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
+                }
+                "unknown-source" => {
+                    "UPDATE decision_identities SET decision_source = 'future_source'"
+                }
+                "provider" => "UPDATE decision_identities SET provider = 'claude'",
+                "session" => "UPDATE decision_identities SET session_id = 'other-session'",
+                "turn" => "UPDATE decision_identities SET turn_id = 'other-turn'",
+                "tool-use" => {
+                    "UPDATE decision_identities SET tool_use_id = 'other-tool-use'"
+                }
+                "action" => "UPDATE decision_identities SET authority_action = 'deny'",
+                "cursor" => {
+                    "UPDATE historical_permission_authority SET terminal_source_cursor = 2"
                 }
                 _ => unreachable!(),
             })

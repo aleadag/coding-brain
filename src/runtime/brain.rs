@@ -17,12 +17,13 @@ use coding_brain_core::review_state::{
     ReviewTarget, SurfaceReviewProjection, derive_review_key_set,
 };
 use coding_brain_core::runtime::{
-    BrainActions, BrainGateMode, BrainRefresh, BrainSource, BrainSourceError, CacheSummary,
-    CorrectionInput, CounterfactualSummary, DecisionSummary, EndpointHealth, LatencySummary,
-    ProviderScoreSummary, ReviewItemSummary, ReviewMutationError, RiskTierSummary,
-    ScorecardSummary, SessionActionAttempt, SessionActionAvailability, SessionActionCapability,
-    SessionActionFailure, SessionActionFailureCategory, SessionActionPreflightRequest,
-    SessionActionRequest, SessionActionTarget,
+    BrainActions, BrainGateMode, BrainRefresh, BrainSource, BrainSourceError,
+    BrainStorageFaultCategory, CacheSummary, CorrectionInput, CounterfactualSummary,
+    DecisionSummary, EndpointHealth, LatencySummary, ProviderScoreSummary, ReviewItemSummary,
+    ReviewMutationError, RiskTierSummary, ScorecardSummary, SessionActionAttempt,
+    SessionActionAvailability, SessionActionCapability, SessionActionFailure,
+    SessionActionFailureCategory, SessionActionPreflightRequest, SessionActionRequest,
+    SessionActionTarget,
 };
 use coding_brain_core::session::AgentSession;
 use coding_brain_core::session_links::SessionIdentityProjection;
@@ -236,14 +237,24 @@ fn review_state_source_error(error: brain::review_state::ReviewStateError) -> Br
 
 #[allow(dead_code)] // Task 8 selects SQLite; Task 10 freezes the safe runtime failure seam.
 fn sqlite_storage_source_error(error: &StorageError) -> BrainSourceError {
-    if matches!(error, StorageError::Busy) {
-        BrainSourceError::Busy
-    } else {
-        BrainSourceError::Other(format!(
-            "SQLite storage unavailable ({}); keeping the last coherent view",
-            error.fault_category().as_str()
-        ))
+    if error.fault_category() == crate::brain::storage::StorageFaultCategory::Busy {
+        return BrainSourceError::Busy;
     }
+    let category = match error.fault_category() {
+        crate::brain::storage::StorageFaultCategory::Full => BrainStorageFaultCategory::Full,
+        crate::brain::storage::StorageFaultCategory::Io => BrainStorageFaultCategory::Io,
+        crate::brain::storage::StorageFaultCategory::Corrupt => BrainStorageFaultCategory::Corrupt,
+        crate::brain::storage::StorageFaultCategory::Busy => unreachable!("handled above"),
+        crate::brain::storage::StorageFaultCategory::Other => BrainStorageFaultCategory::Other,
+    };
+    BrainSourceError::StorageUnavailable(category)
+}
+
+fn sqlite_storage_unavailable_message(category: BrainStorageFaultCategory) -> String {
+    format!(
+        "SQLite storage unavailable ({}); keeping the last coherent view",
+        category.as_str()
+    )
 }
 
 const SQLITE_RUNTIME_PAGE_ROWS: usize = 4_096;
@@ -609,8 +620,10 @@ fn review_mutation_error(error: brain::review_state::ReviewStateError) -> Review
 }
 
 fn sqlite_review_mutation_error(error: StorageError) -> ReviewMutationError {
+    if error.fault_category() == crate::brain::storage::StorageFaultCategory::Busy {
+        return ReviewMutationError::Busy;
+    }
     match error {
-        StorageError::Busy => ReviewMutationError::Busy,
         StorageError::CommitUncertain { .. } => ReviewMutationError::DurabilityUncertain,
         StorageError::InvalidReviewRequest(error) => ReviewMutationError::InvalidRequest(error),
         StorageError::StaleReviewRevision => ReviewMutationError::StaleRevision,
@@ -619,8 +632,11 @@ fn sqlite_review_mutation_error(error: StorageError) -> ReviewMutationError {
         StorageError::ReviewDispositionConflict => ReviewMutationError::DispositionConflict,
         StorageError::ReviewCapacityExceeded => ReviewMutationError::CapacityExceeded,
         other => ReviewMutationError::Other(match sqlite_storage_source_error(&other) {
-            BrainSourceError::Other(message) => message,
+            BrainSourceError::StorageUnavailable(category) => {
+                sqlite_storage_unavailable_message(category)
+            }
             BrainSourceError::Busy => "SQLite review storage is busy".into(),
+            BrainSourceError::Other(message) => message,
         }),
     }
 }
@@ -1385,6 +1401,9 @@ fn record_correction_at_state_root(
 fn sqlite_runtime_action_error(error: &StorageError) -> String {
     match sqlite_storage_source_error(error) {
         BrainSourceError::Busy => "SQLite storage is busy; no change was made".into(),
+        BrainSourceError::StorageUnavailable(category) => {
+            sqlite_storage_unavailable_message(category)
+        }
         BrainSourceError::Other(message) => message,
     }
 }
@@ -1446,6 +1465,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt;
 
+    use coding_brain_core::brain_activity::DeliveryState;
     use coding_brain_core::review_state::{
         ReviewDisposition, ReviewKey, ReviewKeySetError, ReviewMutation, ReviewMutationRequest,
         ReviewSurface,
@@ -1459,19 +1479,61 @@ mod tests {
     use crate::brain::review_state::ReviewStateSnapshot;
 
     #[test]
-    fn sqlite_storage_runtime_error_preserves_last_view_with_fixed_category() {
+    fn sqlite_storage_runtime_error_preserves_typed_category() {
         let error = StorageError::Io(std::io::Error::other("/private/operator/path token-secret"));
 
-        let BrainSourceError::Other(message) = sqlite_storage_source_error(&error) else {
-            panic!("storage I/O errors must remain an explicit runtime diagnostic");
-        };
-
         assert_eq!(
-            message,
-            "SQLite storage unavailable (io); keeping the last coherent view"
+            sqlite_storage_source_error(&error),
+            BrainSourceError::StorageUnavailable(
+                coding_brain_core::runtime::BrainStorageFaultCategory::Io
+            )
         );
-        assert!(!message.contains("private/operator"));
-        assert!(!message.contains("token-secret"));
+        assert_eq!(
+            sqlite_storage_source_error(&StorageError::InvalidStorage("invariant")),
+            BrainSourceError::StorageUnavailable(
+                coding_brain_core::runtime::BrainStorageFaultCategory::Corrupt
+            )
+        );
+        assert_eq!(
+            sqlite_storage_source_error(&StorageError::StorageFault {
+                operation: crate::brain::storage::StorageOperation::Read,
+                category: crate::brain::storage::StorageFaultCategory::Full,
+            }),
+            BrainSourceError::StorageUnavailable(
+                coding_brain_core::runtime::BrainStorageFaultCategory::Full
+            )
+        );
+        assert_eq!(
+            sqlite_storage_source_error(&StorageError::MigrationRequired),
+            BrainSourceError::StorageUnavailable(
+                coding_brain_core::runtime::BrainStorageFaultCategory::Other
+            )
+        );
+        assert_eq!(
+            sqlite_storage_source_error(&StorageError::StorageFault {
+                operation: crate::brain::storage::StorageOperation::Read,
+                category: crate::brain::storage::StorageFaultCategory::Busy,
+            }),
+            BrainSourceError::Busy
+        );
+    }
+
+    #[test]
+    fn sqlite_storage_categories_render_at_action_and_review_seams() {
+        let full = StorageError::StorageFault {
+            operation: crate::brain::storage::StorageOperation::Read,
+            category: crate::brain::storage::StorageFaultCategory::Full,
+        };
+        assert_eq!(
+            sqlite_runtime_action_error(&full),
+            "SQLite storage unavailable (full); keeping the last coherent view"
+        );
+        assert_eq!(
+            sqlite_review_mutation_error(StorageError::InvalidStorage("invariant")),
+            ReviewMutationError::Other(
+                "SQLite storage unavailable (corrupt); keeping the last coherent view".into()
+            )
+        );
     }
 
     #[test]
@@ -1529,6 +1591,22 @@ mod tests {
         ] {
             assert!(!temp.path().join(legacy).exists(), "created {legacy}");
         }
+    }
+
+    #[test]
+    fn sqlite_refresh_reads_deterministic_historical_authority() {
+        let (root, _paths) = crate::brain::storage::test_support::deterministic_historical_fixture(
+            "runtime-deterministic",
+        );
+        let refresh =
+            LiveBrainSource::refresh_from_sqlite_store(root.path(), SnapshotLimits::default())
+                .unwrap();
+        assert!(refresh.snapshot.recent.is_empty());
+        assert_eq!(refresh.snapshot.attention.len(), 1);
+        let attention = &refresh.snapshot.attention[0].activity;
+        assert_eq!(attention.activity_id, "activity-runtime-deterministic");
+        assert_eq!(attention.delivery, DeliveryState::Unknown);
+        drop(root);
     }
 
     #[test]
