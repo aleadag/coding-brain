@@ -1287,6 +1287,94 @@ struct JournalGuardEntry {
     identity: EntryIdentity,
 }
 
+#[derive(Debug)]
+enum JournalEntryOpen {
+    Stable(File),
+    Changed,
+}
+
+fn validate_journal_entry_identity(
+    identity: EntryIdentity,
+    expected: &JournalGuardEntry,
+) -> Result<(), StorageError> {
+    if expected.identity.mode & 0o777 == 0o400 {
+        validate_freeze_temp_identity(identity)?;
+        if identity.mode & 0o777 != 0o400 {
+            return Err(invalid("legacy freeze temporary has an unsafe mode"));
+        }
+        Ok(())
+    } else {
+        validate_regular_identity(identity)
+    }
+}
+
+fn open_journal_entry(
+    directory: &File,
+    expected: &JournalGuardEntry,
+) -> Result<JournalEntryOpen, StorageError> {
+    open_journal_entry_with(directory, expected, &mut || {})
+}
+
+fn open_journal_entry_with<F>(
+    directory: &File,
+    expected: &JournalGuardEntry,
+    after_open: &mut F,
+) -> Result<JournalEntryOpen, StorageError>
+where
+    F: FnMut(),
+{
+    let name = CString::new(expected.name.as_str())
+        .map_err(|_| invalid("legacy journal guard name contains NUL"))?;
+    let before = match metadata_at(directory, &name) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(JournalEntryOpen::Changed);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    validate_journal_entry_identity(before, expected)?;
+    if before != expected.identity {
+        return Ok(JournalEntryOpen::Changed);
+    }
+
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(JournalEntryOpen::Changed)
+        } else {
+            Err(invalid(
+                "legacy source is not a safe descriptor-anchored entry",
+            ))
+        };
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let opened = EntryIdentity::from_metadata(&file.metadata()?);
+    validate_journal_entry_identity(opened, expected)?;
+    if opened != expected.identity {
+        return Ok(JournalEntryOpen::Changed);
+    }
+    after_open();
+    let after = match metadata_at(directory, &name) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(JournalEntryOpen::Changed);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    validate_journal_entry_identity(after, expected)?;
+    if after != expected.identity {
+        return Ok(JournalEntryOpen::Changed);
+    }
+    Ok(JournalEntryOpen::Stable(file))
+}
+
 fn enumerate_journal_entries(
     directory: &File,
     deadline: StorageDeadline,
@@ -1343,12 +1431,10 @@ fn drain_journal_entry(
 ) -> Result<bool, StorageError> {
     loop {
         deadline.ensure_remaining()?;
-        let Some(file) = openat(directory, &expected.name, libc::O_RDONLY)? else {
-            return Ok(false);
+        let file = match open_journal_entry(directory, expected)? {
+            JournalEntryOpen::Stable(file) => file,
+            JournalEntryOpen::Changed => return Ok(false),
         };
-        if EntryIdentity::from_metadata(&file.metadata()?) != expected.identity {
-            return Ok(false);
-        }
         match file.try_lock_exclusive() {
             Ok(()) => {
                 let stable = validate_journal_entry_path(directory, expected, &file)?;
@@ -1373,12 +1459,11 @@ fn validate_journal_entry_path(
     file: &File,
 ) -> Result<bool, StorageError> {
     let opened = EntryIdentity::from_metadata(&file.metadata()?);
-    if expected.identity.mode & 0o777 == 0o400 {
-        validate_freeze_temp_identity(opened)?;
-    } else {
-        validate_regular_identity(opened)?;
+    if !journal_entry_path_matches(directory, expected)? {
+        return Ok(false);
     }
-    Ok(opened == expected.identity && journal_entry_path_matches(directory, expected)?)
+    validate_journal_entry_identity(opened, expected)?;
+    Ok(opened == expected.identity)
 }
 
 fn journal_entry_path_matches(
@@ -1389,11 +1474,7 @@ fn journal_entry_path_matches(
         .map_err(|_| invalid("legacy journal guard name contains NUL"))?;
     match metadata_at(directory, &name) {
         Ok(identity) => {
-            if expected.identity.mode & 0o777 == 0o400 {
-                validate_freeze_temp_identity(identity)?;
-            } else {
-                validate_regular_identity(identity)?;
-            }
+            validate_journal_entry_identity(identity, expected)?;
             Ok(identity == expected.identity)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -1976,6 +2057,233 @@ mod tests {
     fn private_directory(path: &Path) {
         fs::create_dir_all(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn guard_journal_name(index: u64) -> String {
+        format!(
+            "permission-transaction-{:039}-{:010}-{:020}.json",
+            index + 1,
+            1,
+            index + 1
+        )
+    }
+
+    fn guarded_journal_fixture() -> (tempfile::TempDir, File, JournalGuardEntry, PathBuf) {
+        guarded_journal_fixture_with(0o600, false)
+    }
+
+    fn guarded_frozen_journal_fixture() -> (tempfile::TempDir, File, JournalGuardEntry, PathBuf) {
+        guarded_journal_fixture_with(0o400, true)
+    }
+
+    fn guarded_journal_fixture_with(
+        mode: u32,
+        allow_frozen: bool,
+    ) -> (tempfile::TempDir, File, JournalGuardEntry, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory_path = root.path().join("brain/permission-transactions");
+        private_directory(directory_path.parent().unwrap());
+        private_directory(&directory_path);
+        let path = directory_path.join(guard_journal_name(0));
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(mode)
+            .open(&path)
+            .unwrap();
+        let directory = File::open(&directory_path).unwrap();
+        let expected = enumerate_journal_entries(
+            &directory,
+            StorageDeadline::after(Duration::from_secs(1)),
+            allow_frozen,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        (root, directory, expected, path)
+    }
+
+    #[test]
+    fn journal_open_classifies_safe_rename_as_changed() {
+        let (_root, directory, expected, path) = guarded_journal_fixture();
+        let renamed = path.parent().unwrap().join(guard_journal_name(1));
+        let result = open_journal_entry_with(&directory, &expected, &mut || {
+            fs::rename(&path, &renamed).unwrap();
+        });
+        assert!(
+            matches!(&result, Ok(JournalEntryOpen::Changed)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_open_classifies_removal_as_changed() {
+        let (_root, directory, expected, path) = guarded_journal_fixture();
+        let result = open_journal_entry_with(&directory, &expected, &mut || {
+            fs::remove_file(&path).unwrap();
+        });
+        assert!(
+            matches!(&result, Ok(JournalEntryOpen::Changed)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_open_rejects_symlink_replacement() {
+        let (root, directory, expected, path) = guarded_journal_fixture();
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        let result = open_journal_entry_with(&directory, &expected, &mut || {
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+        });
+        assert!(
+            matches!(&result, Err(StorageError::InvalidStorage(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_open_classifies_safe_same_name_replacement_as_changed() {
+        let (_root, directory, expected, path) = guarded_journal_fixture();
+        let displaced = path.with_extension("displaced");
+        let result = open_journal_entry_with(&directory, &expected, &mut || {
+            fs::rename(&path, &displaced).unwrap();
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+        });
+        assert!(
+            matches!(&result, Ok(JournalEntryOpen::Changed)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_open_rejects_wrong_mode_after_open() {
+        let (_root, directory, expected, path) = guarded_journal_fixture();
+        let result = open_journal_entry_with(&directory, &expected, &mut || {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        });
+        assert!(
+            matches!(&result, Err(StorageError::InvalidStorage(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_open_rejects_wrong_mode_after_open_for_frozen_journal() {
+        let (_root, directory, expected, path) = guarded_frozen_journal_fixture();
+        let result = open_journal_entry_with(&directory, &expected, &mut || {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        });
+        assert!(
+            matches!(&result, Err(StorageError::InvalidStorage(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_open_classifies_safe_same_name_frozen_replacement_as_changed() {
+        let (_root, directory, expected, path) = guarded_frozen_journal_fixture();
+        let displaced = path.with_extension("displaced");
+        let result = open_journal_entry_with(&directory, &expected, &mut || {
+            fs::rename(&path, &displaced).unwrap();
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o400)
+                .open(&path)
+                .unwrap();
+        });
+        assert!(
+            matches!(&result, Ok(JournalEntryOpen::Changed)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_path_validation_rejects_wrong_mode_for_frozen_journal() {
+        let (_root, directory, expected, path) = guarded_frozen_journal_fixture();
+        let file = File::open(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let result = validate_journal_entry_path(&directory, &expected, &file);
+
+        assert!(
+            matches!(&result, Err(StorageError::InvalidStorage(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_path_validation_classifies_removal_as_changed() {
+        let (_root, directory, expected, path) = guarded_journal_fixture();
+        let file = File::open(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let result = validate_journal_entry_path(&directory, &expected, &file);
+
+        assert!(matches!(result, Ok(false)), "{result:?}");
+    }
+
+    #[test]
+    fn journal_path_matcher_rejects_wrong_mode_for_frozen_journal() {
+        let (_root, directory, expected, path) = guarded_frozen_journal_fixture();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let result = journal_entry_path_matches(&directory, &expected);
+
+        assert!(
+            matches!(&result, Err(StorageError::InvalidStorage(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_identity_rejects_wrong_owner() {
+        let (_root, _directory, expected, _path) = guarded_journal_fixture();
+        let identity = EntryIdentity {
+            owner: expected.identity.owner ^ 1,
+            ..expected.identity
+        };
+
+        assert!(matches!(
+            validate_journal_entry_identity(identity, &expected),
+            Err(StorageError::InvalidStorage(_))
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn journal_identity_rejects_unsupported_type() {
+        let (_root, _directory, expected, _path) = guarded_journal_fixture();
+        let identity = EntryIdentity {
+            mode: (expected.identity.mode & !(libc::S_IFMT as u32)) | libc::S_IFIFO as u32,
+            ..expected.identity
+        };
+
+        assert!(matches!(
+            validate_journal_entry_identity(identity, &expected),
+            Err(StorageError::InvalidStorage(_))
+        ));
+    }
+
+    #[test]
+    fn journal_open_rejects_extra_link_after_open() {
+        let (root, directory, expected, path) = guarded_journal_fixture();
+        let result = open_journal_entry_with(&directory, &expected, &mut || {
+            fs::hard_link(&path, root.path().join("alias")).unwrap();
+        });
+        assert!(
+            matches!(&result, Err(StorageError::InvalidStorage(_))),
+            "{result:?}"
+        );
     }
 
     #[test]
