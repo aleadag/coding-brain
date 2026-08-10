@@ -13,14 +13,16 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use coding_brain::brain::storage::{
-    BrainDb, FrozenSourceManifest, LEGACY_EXPORT_PROFILE, LegacyFreezeArtifact, LegacySourceKind,
-    LegacySourceSet, LegacyWriterGuard, MigrationCoordinator, MigrationStatus, OpenRole,
-    StorageDeadline, StorageError, StoragePaths,
+    BrainDb, DecisionIdentity, FrozenSourceManifest, HistoricalDeliveryState,
+    LEGACY_EXPORT_PROFILE, LegacyFreezeArtifact, LegacySourceKind, LegacySourceSet,
+    LegacyWriterGuard, MigrationCoordinator, MigrationStatus, OpenRole, PermissionAdmission,
+    PermissionState, StorageDeadline, StorageError, StoragePaths,
 };
 use coding_brain_core::lifecycle::{
     LifecycleEvent, LifecycleEventKind, LifecycleIdentity, LifecycleSnapshot, PermissionAction,
     PermissionAuthority,
 };
+use coding_brain_core::project::ProjectId;
 use coding_brain_core::provider::AgentProvider;
 use coding_brain_core::review_state::{ReviewKey, ReviewSurface};
 use fs2::FileExt;
@@ -442,6 +444,140 @@ fn migration_reconciles_4vh58_without_response_authority() {
         .unwrap(),
         1
     );
+}
+
+#[test]
+fn legacy_brain_proposals_import_as_model_historical_non_authority() {
+    let fixture = LegacyFixture::copy("legacy-brain-proposals");
+    assert_eq!(
+        MigrationCoordinator::at(fixture.state_root())
+            .run_non_hook()
+            .unwrap(),
+        MigrationStatus::Complete
+    );
+
+    let connection =
+        rusqlite::Connection::open(fixture.state_root().join("db/brain.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM permission_attempts),
+                        (SELECT count(*) FROM permission_commits)",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+        (0, 0)
+    );
+    drop(connection);
+
+    let paths = StoragePaths::at(fixture.state_root());
+    let mut db = BrainDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(2)),
+    )
+    .unwrap();
+    for (decision_id, action) in [
+        ("legacy-brain-allow", PermissionAction::Allow),
+        ("legacy-brain-deny", PermissionAction::Deny),
+    ] {
+        let identity = db.decision_identity(decision_id).unwrap().unwrap();
+        assert!(matches!(
+            identity,
+            DecisionIdentity::Permission {
+                authority_action,
+                ref decision_source,
+                ..
+            } if authority_action == action && decision_source == "model"
+        ));
+        assert_eq!(
+            db.decision_payload(decision_id)
+                .unwrap()
+                .unwrap()
+                .record
+                .brain_action,
+            match action {
+                PermissionAction::Allow => "approve",
+                PermissionAction::Deny => "deny",
+            }
+        );
+    }
+    let source_records =
+        fs::read_to_string(fixture.state_root().join("brain/decisions.jsonl")).unwrap();
+    assert!(source_records.lines().all(|line| {
+        serde_json::from_str::<serde_json::Value>(line).unwrap()["brain_source"] == "brain"
+    }));
+
+    let historical = db
+        .historical_permission_authority_after(None, 10, 1024 * 1024)
+        .unwrap();
+    assert_eq!(historical.authorities.len(), 2);
+    assert!(historical.authorities.iter().all(|row| {
+        !row.response_eligible && row.delivery_state == HistoricalDeliveryState::Unknown
+    }));
+
+    let live_identity = LifecycleIdentity::try_new(
+        AgentProvider::Antigravity,
+        "legacy-brain-session".into(),
+        Some("step-5".into()),
+        None,
+        "/fixture".into(),
+    )
+    .unwrap();
+    let admission = PermissionAdmission::new(
+        live_identity,
+        "a".repeat(64),
+        ProjectId::Temporary("fixture".into()),
+        "Bash",
+        Some("live-tool-use".into()),
+        "live-activity",
+        3000,
+        3001,
+    );
+    let guard = db.admit_permission(admission).unwrap().unwrap();
+    assert_eq!(
+        db.permission_state(guard.attempt_id()).unwrap(),
+        PermissionState::Absent
+    );
+    assert_eq!(db.permission_decision(guard.attempt_id()).unwrap(), None);
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn legacy_brain_proposal_building_and_verified_restarts_complete_safely() {
+    for fault in ["building", "verified"] {
+        let fixture = LegacyFixture::copy("legacy-brain-proposals");
+        let decisions_before =
+            fs::read(fixture.state_root().join("brain/decisions.jsonl")).unwrap();
+        let activity_before = fs::read(fixture.state_root().join("activity.jsonl")).unwrap();
+
+        assert!(!migration_child(fixture.state_root(), fault).success());
+        let state_before = migration_state(fixture.state_root());
+        let generation = state_before["generation"].as_u64().unwrap();
+        assert_eq!(state_before["status"], fault);
+        assert!(!fixture.state_root().join("db/brain.sqlite3").exists());
+        if fault == "building" {
+            assert!(staging_path(fixture.state_root()).exists());
+        }
+
+        let coordinator = MigrationCoordinator::at(fixture.state_root());
+        assert_eq!(coordinator.resume().unwrap(), MigrationStatus::Complete);
+        assert_eq!(
+            migration_state(fixture.state_root())["generation"],
+            generation
+        );
+        assert_eq!(
+            fs::read(fixture.state_root().join("brain/decisions.jsonl")).unwrap(),
+            decisions_before
+        );
+        assert_eq!(
+            fs::read(fixture.state_root().join("activity.jsonl")).unwrap(),
+            activity_before
+        );
+        assert!(fixture.state_root().join("db/brain.sqlite3").exists());
+        assert_eq!(coordinator.resume().unwrap(), MigrationStatus::Complete);
+    }
 }
 
 #[test]
@@ -1294,6 +1430,97 @@ fn rewrite_json_lines(
         output.push('\n');
     }
     write_private(path, output.as_bytes());
+}
+
+fn remove_json_lines(path: &std::path::Path, mut remove: impl FnMut(&serde_json::Value) -> bool) {
+    let input = fs::read_to_string(path).unwrap();
+    let mut output = String::new();
+    for line in input.lines() {
+        let value = serde_json::from_str(line).unwrap();
+        if !remove(&value) {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    write_private(path, output.as_bytes());
+}
+
+#[test]
+fn legacy_brain_source_alias_does_not_promote_incomplete_proposals() {
+    for case in ["missing-terminal", "session-mismatch", "abstain"] {
+        let fixture = LegacyFixture::copy("legacy-brain-proposals");
+        match case {
+            "missing-terminal" => {
+                remove_json_lines(&fixture.state_root().join("activity.jsonl"), |value| {
+                    value["decision_id"] == "legacy-brain-allow"
+                })
+            }
+            "session-mismatch" => rewrite_json_lines(
+                &fixture.state_root().join("brain/decisions.jsonl"),
+                |index, value| {
+                    if index == 0 {
+                        value["session_id"] = serde_json::Value::from("other-session");
+                    }
+                },
+            ),
+            "abstain" => rewrite_json_lines(
+                &fixture.state_root().join("brain/decisions.jsonl"),
+                |index, value| {
+                    if index == 0 {
+                        value["brain_action"] = serde_json::Value::from("abstain");
+                    }
+                },
+            ),
+            _ => unreachable!(),
+        }
+
+        assert_eq!(
+            MigrationCoordinator::at(fixture.state_root())
+                .run_non_hook()
+                .unwrap(),
+            MigrationStatus::Complete,
+            "{case}"
+        );
+        let db = BrainDb::open_current(
+            &StoragePaths::at(fixture.state_root()),
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(2)),
+        )
+        .unwrap();
+        assert_eq!(db.decision_identity("legacy-brain-allow").unwrap(), None);
+        assert!(
+            db.historical_permission_authority_after(None, 10, 1024 * 1024)
+                .unwrap()
+                .authorities
+                .iter()
+                .all(|row| row.decision_id != "legacy-brain-allow"),
+            "{case}"
+        );
+        assert_eq!(
+            migration_state(fixture.state_root())["accounting"]["skips"]["incomplete_proposals"],
+            1,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn legacy_migration_rejects_unknown_exact_proposal_source() {
+    let fixture = LegacyFixture::copy("legacy-brain-proposals");
+    rewrite_json_lines(
+        &fixture.state_root().join("brain/decisions.jsonl"),
+        |index, value| {
+            if index == 0 {
+                value["brain_source"] = serde_json::Value::from("future_source");
+            }
+        },
+    );
+    assert!(matches!(
+        MigrationCoordinator::at(fixture.state_root()).run_non_hook(),
+        Err(StorageError::InvalidStorage(
+            "legacy proposal decision source is unsupported"
+        ))
+    ));
 }
 
 fn duplicate_permission_evidence(state_root: &std::path::Path) {
