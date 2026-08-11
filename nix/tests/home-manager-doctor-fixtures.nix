@@ -39,19 +39,21 @@ let
   claudeSettingsJson = pkgs.writeText "claude-settings.json" (
     builtins.toJSON configured.config.programs.claude-code.settings
   );
+  invalidAntigravityHooksJson = pkgs.writeText "invalid-antigravity-hooks.json" ''
+    ["SECRET_PROVIDER_CONTENT"]
+  '';
   providerHomeManagerFiles = pkgs.runCommand "home-manager-files" { } ''
     mkdir -p "$out/.codex" "$out/.claude" "$out/.gemini/config"
-    cp ${codexHooksJson} "$out/.codex/hooks.json"
-    cp ${claudeSettingsJson} "$out/.claude/settings.json"
-    cp ${configured.config.home.file.".gemini/config/hooks.json".source} \
+    ln -s ${codexHooksJson} "$out/.codex/hooks.json"
+    ln -s ${claudeSettingsJson} "$out/.claude/settings.json"
+    ln -s ${configured.config.home.file.".gemini/config/hooks.json".source} \
       "$out/.gemini/config/hooks.json"
   '';
   invalidProviderHomeManagerFiles = pkgs.runCommand "invalid-antigravity-home-manager-files" { } ''
     mkdir -p "$out/.codex" "$out/.claude" "$out/.gemini/config"
-    cp ${providerHomeManagerFiles}/.codex/hooks.json "$out/.codex/hooks.json"
-    cp ${providerHomeManagerFiles}/.claude/settings.json "$out/.claude/settings.json"
-    printf '%s\n' '["SECRET_PROVIDER_CONTENT"]' \
-      > "$out/.gemini/config/hooks.json"
+    ln -s ${codexHooksJson} "$out/.codex/hooks.json"
+    ln -s ${claudeSettingsJson} "$out/.claude/settings.json"
+    ln -s ${invalidAntigravityHooksJson} "$out/.gemini/config/hooks.json"
   '';
   fakeProviders = pkgs.runCommand "coding-brain-fake-providers" { } ''
     mkdir -p "$out/bin"

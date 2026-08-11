@@ -118,6 +118,13 @@
 
     with subtest("Home Manager provider hooks pass doctor"):
         state = f"{home}/.local/state"
+        for relative in [
+            ".codex/hooks.json",
+            ".claude/settings.json",
+            ".gemini/config/hooks.json",
+        ]:
+            machine.succeed(f"test -L {provider_files}/{relative}")
+            machine.succeed(f"test -f $(readlink -f {provider_files}/{relative})")
         install_provider_files(home, provider_files)
         status, stdout, stderr = run_cbrain("doctor-home-manager", state, "doctor --json")
         assert status in [0, 1], f"doctor failed: stdout={stdout!r} stderr={stderr!r}"
@@ -181,6 +188,40 @@
                 },
             ], setup
 
+        blocked_project = f"{home}/blocked-codex-project"
+        machine.succeed(
+            "install -d -o cbrain-test -g cbrain-test -m 0700 "
+            f"{blocked_project} {blocked_project}/.git"
+        )
+        machine.succeed(
+            f"runuser -u cbrain-test -- touch {blocked_project}/.codex"
+        )
+        status, stdout, stderr = run_cbrain_at(
+            "doctor-blocked-codex-project",
+            blocked_project,
+            home,
+            config,
+            state,
+            "doctor --json",
+        )
+        assert status == 1, f"doctor status={status}: stdout={stdout!r} stderr={stderr!r}"
+        checks = json.loads(stdout)
+        codex = named_check(checks, "Codex setup")
+        assert codex["status"] == "fail", codex
+        assert codex["evidence"]["provider_files"][0]["ownership"] == "home_manager", codex
+        project_file = next(
+            item for item in codex["evidence"]["provider_files"]
+            if item["scope"] == "project"
+        )
+        assert project_file == {
+            "path": f"{blocked_project}/.codex/hooks.json",
+            "path_lossy": False,
+            "scope": "project",
+            "ownership": "unsupported",
+            "state": "invalid",
+            "reason": "unsupported_topology",
+        }, codex
+
     with subtest("invalid Home Manager provider content fails doctor"):
         invalid_home = f"{home}/invalid-home"
         invalid_config = f"{invalid_home}/.config"
@@ -188,6 +229,10 @@
         machine.succeed(
             "install -d -o cbrain-test -g cbrain-test -m 0700 "
             f"{invalid_home} {invalid_config} {invalid_state}"
+        )
+        machine.succeed(f"test -L {invalid_provider_files}/.gemini/config/hooks.json")
+        machine.succeed(
+            f"test -f $(readlink -f {invalid_provider_files}/.gemini/config/hooks.json)"
         )
         install_provider_files(invalid_home, invalid_provider_files)
         status, stdout, stderr = run_cbrain_at(
