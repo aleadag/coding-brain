@@ -629,13 +629,38 @@ pub(crate) fn run_bounded_process_until(
     deadline: std::time::Instant,
     output: &mut OutputBudget,
 ) -> Result<Vec<u8>, BoundedProcessError> {
+    run_bounded_process_until_with(
+        command,
+        deadline,
+        output,
+        bounded_child_reaper(),
+        #[cfg(test)]
+        ProcessFault::None,
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ProcessFault {
+    None,
+    StdoutDescriptor,
+}
+
+#[cfg(unix)]
+fn run_bounded_process_until_with(
+    command: &mut std::process::Command,
+    deadline: std::time::Instant,
+    output: &mut OutputBudget,
+    child_reaper: Option<&std::sync::mpsc::SyncSender<std::process::Child>>,
+    #[cfg(test)] fault: ProcessFault,
+) -> Result<Vec<u8>, BoundedProcessError> {
     use std::io::ErrorKind;
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use std::time::Instant;
 
-    let child_reaper = bounded_child_reaper().ok_or(BoundedProcessError::Cleanup)?;
+    let child_reaper = child_reaper.ok_or(BoundedProcessError::Cleanup)?;
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     unsafe {
         command.pre_exec(|| {
@@ -654,6 +679,11 @@ pub(crate) fn run_bounded_process_until(
             return Err(BoundedProcessError::Io);
         }
     };
+    #[cfg(test)]
+    if matches!(fault, ProcessFault::StdoutDescriptor) {
+        terminate_process_group(child, child_reaper);
+        return Err(BoundedProcessError::Io);
+    }
     let descriptor = stdout.as_raw_fd();
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
@@ -1109,6 +1139,61 @@ mod tests {
         assert_eq!(
             run_bounded_process_until(&mut command, Instant::now(), &mut output),
             Err(BoundedProcessError::Timeout)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_process_private_seam_reports_typed_setup_and_child_failures() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut cleanup = Command::new("/bin/true");
+        assert_eq!(
+            run_bounded_process_until_with(
+                &mut cleanup,
+                deadline,
+                &mut OutputBudget::new(32),
+                None,
+                ProcessFault::None,
+            ),
+            Err(BoundedProcessError::Cleanup)
+        );
+        let mut spawn = Command::new("/definitely/missing/cbrain-child");
+        assert_eq!(
+            run_bounded_process_until_with(
+                &mut spawn,
+                deadline,
+                &mut OutputBudget::new(32),
+                bounded_child_reaper(),
+                ProcessFault::None,
+            ),
+            Err(BoundedProcessError::Spawn)
+        );
+        let mut status = Command::new("/bin/sh");
+        status.args(["-c", "exit 7"]);
+        assert_eq!(
+            run_bounded_process_until_with(
+                &mut status,
+                deadline,
+                &mut OutputBudget::new(32),
+                bounded_child_reaper(),
+                ProcessFault::None,
+            ),
+            Err(BoundedProcessError::ExitStatus)
+        );
+        let mut io = Command::new("/bin/sh");
+        io.args(["-c", "printf x"]);
+        assert_eq!(
+            run_bounded_process_until_with(
+                &mut io,
+                deadline,
+                &mut OutputBudget::new(32),
+                bounded_child_reaper(),
+                ProcessFault::StdoutDescriptor,
+            ),
+            Err(BoundedProcessError::Io)
         );
     }
 
