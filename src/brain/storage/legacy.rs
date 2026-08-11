@@ -1355,12 +1355,8 @@ where
         };
     }
     let file = unsafe { File::from_raw_fd(descriptor) };
-    let opened = EntryIdentity::from_metadata(&file.metadata()?);
-    validate_journal_entry_identity(opened, expected)?;
-    if opened != expected.identity {
-        return Ok(JournalEntryOpen::Changed);
-    }
     after_open();
+    let opened = EntryIdentity::from_metadata(&file.metadata()?);
     let after = match metadata_at(directory, &name) {
         Ok(identity) => identity,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1370,6 +1366,10 @@ where
     };
     validate_journal_entry_identity(after, expected)?;
     if after != expected.identity {
+        return Ok(JournalEntryOpen::Changed);
+    }
+    validate_journal_entry_identity(opened, expected)?;
+    if opened != expected.identity {
         return Ok(JournalEntryOpen::Changed);
     }
     Ok(JournalEntryOpen::Stable(file))
