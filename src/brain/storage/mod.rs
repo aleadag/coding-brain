@@ -11,6 +11,7 @@ mod maintenance;
 mod migration;
 mod permissions;
 mod review;
+mod runtime_cache;
 mod schema;
 mod security;
 
@@ -70,6 +71,12 @@ pub use permissions::{
 };
 #[allow(unused_imports)]
 pub use review::{ReviewEligibility, ReviewEligibleOccurrence, ReviewSurfaceState};
+#[allow(unused_imports)]
+pub use runtime_cache::{
+    CacheDeadline, CacheProvenance, CacheRootKey, CacheRow, MAX_RUNTIME_CACHE_ROWS,
+    RUNTIME_CACHE_APPLICATION_ID, RUNTIME_CACHE_SCHEMA_VERSION, RuntimeCacheBypass,
+    RuntimeCacheReader, RuntimeCacheWriter,
+};
 
 pub const BRAIN_APPLICATION_ID: i32 = 0x4342_524e;
 pub const BRAIN_SCHEMA_VERSION: i32 = 1;
@@ -78,6 +85,7 @@ pub const REVIEW_SCHEMA_VERSION: i32 = 1;
 
 const BRAIN_DATABASE_NAME: &CStr = c"brain.sqlite3";
 const REVIEW_DATABASE_NAME: &CStr = c"review.sqlite3";
+const RUNTIME_CACHE_DATABASE_NAME: &CStr = c"runtime-cache-v1.sqlite3";
 const REVIEW_RESET_GATE_NAME: &CStr = c"review-reset.lock";
 const MIGRATION_LOCK_NAME: &CStr = c"migration.lock";
 
@@ -107,6 +115,11 @@ impl StoragePaths {
     pub fn review_db(&self) -> PathBuf {
         self.db_dir
             .join(OsStr::from_bytes(REVIEW_DATABASE_NAME.to_bytes()))
+    }
+
+    pub fn runtime_cache_v1(&self) -> PathBuf {
+        self.db_dir
+            .join(OsStr::from_bytes(RUNTIME_CACHE_DATABASE_NAME.to_bytes()))
     }
 
     fn brain_learning_root(&self) -> PathBuf {
