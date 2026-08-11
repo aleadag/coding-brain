@@ -3277,9 +3277,7 @@ mod tests {
                 StoreLeafFixture::NonUtf8 => {
                     let mut target = store.as_os_str().as_bytes().to_vec();
                     target.extend_from_slice(b"/\xff-codex-hooks");
-                    let target = PathBuf::from(std::ffi::OsString::from_vec(target));
-                    std::fs::write(&target, b"{}").unwrap();
-                    target
+                    PathBuf::from(std::ffi::OsString::from_vec(target))
                 }
                 StoreLeafFixture::CurrentDirectory => {
                     let target = store.join("11111111111111111111111111111111-codex-hooks");
