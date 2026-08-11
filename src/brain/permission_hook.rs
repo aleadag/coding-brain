@@ -5084,8 +5084,8 @@ mod tests {
         std::thread::scope(|scope| {
             let mut workers = Vec::new();
             for payload in payloads {
-                let ready_tx = ready_tx.clone();
-                let (release_tx, release_rx) = mpsc::sync_channel(0);
+                let mut ready_tx = Some(ready_tx.clone());
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
                 let (result_tx, result_rx) = mpsc::sync_channel(0);
                 let handle = scope.spawn(move || {
                     let mut stdout = Vec::new();
@@ -5099,25 +5099,35 @@ mod tests {
                         lifecycle,
                         Some(activity),
                         |_, _| {
-                            ready_tx.send(()).unwrap();
-                            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            ready_tx.take().unwrap().send(()).unwrap();
+                            release_rx.recv().unwrap();
                             Ok(suggestion(RuleAction::Approve, 0.9))
                         },
                     );
+                    drop(ready_tx);
                     result_tx.send((stdout, stderr)).unwrap();
                 });
                 workers.push((release_tx, result_rx, handle));
             }
             drop(ready_tx);
-            for _ in payloads {
-                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let rendezvous = payloads.iter().try_for_each(|_| ready_rx.recv());
+            if rendezvous.is_err() {
+                for (release, _, _) in &workers {
+                    let _ = release.try_send(());
+                }
             }
             let mut results = Vec::with_capacity(workers.len());
             for (release, result, handle) in workers {
-                release.send(()).unwrap();
-                results.push(result.recv_timeout(Duration::from_secs(5)).unwrap());
+                if rendezvous.is_ok() {
+                    release.send(()).unwrap();
+                }
+                results.push(result.recv().unwrap());
                 handle.join().unwrap();
             }
+            assert!(
+                rendezvous.is_ok(),
+                "permission worker finished before reaching the model gate"
+            );
             results
         })
     }
