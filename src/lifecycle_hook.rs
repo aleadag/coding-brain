@@ -1026,7 +1026,7 @@ fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
     antigravity_event: Option<&str>,
     budget: HookBudget,
 ) {
-    let timing = HookTiming::new(provider, HookEventClass::Other, &budget);
+    let mut timing = HookTiming::new(provider, HookEventClass::Other, &budget);
     let input = match read_bounded_hook_input_until(&mut stdin, budget.deadline()) {
         Ok(input) => input,
         Err(error) => {
@@ -1054,20 +1054,6 @@ fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
         }
     }
     let state_root = coding_brain_state_root();
-    let paths = StoragePaths::at(&state_root);
-    let mut database = match BrainDb::open_current(
-        &paths,
-        OpenRole::Hook,
-        StorageDeadline::after(budget.allowance(std::time::Duration::from_millis(500))),
-    ) {
-        Ok(database) => database,
-        Err(error) => {
-            write_diagnostic(&mut stderr, format!("SQLite storage unavailable: {error}"));
-            timing.finish(HookStage::Storage, HookOutcome::StorageUnavailable);
-            return;
-        }
-    };
-    let links = SessionLinkStore::at(state_root.join("session-links.jsonl"));
     let mut parent_output = crate::provider_hooks::OutputBudget::new(4 * 1024);
     let live_process = budget
         .optional_child_deadline(
@@ -1077,6 +1063,20 @@ fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
         .and_then(|deadline| {
             crate::provider_hooks::live_parent_process_until(provider, deadline, &mut parent_output)
         });
+    let paths = StoragePaths::at(&state_root);
+    let mut database = match BrainDb::open_current(
+        &paths,
+        OpenRole::Hook,
+        StorageDeadline::after(std::time::Duration::from_millis(500)),
+    ) {
+        Ok(database) => database,
+        Err(error) => {
+            write_diagnostic(&mut stderr, format!("SQLite storage unavailable: {error}"));
+            timing.finish(HookStage::Storage, HookOutcome::StorageUnavailable);
+            return;
+        }
+    };
+    let links = SessionLinkStore::at(state_root.join("session-links.jsonl"));
     match persist_provider_hook_sqlite(
         provider,
         antigravity_event,
@@ -1086,7 +1086,12 @@ fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
         live_process,
         crate::provider_hooks::revalidate_live_process,
     ) {
-        Ok(_) => timing.finish(HookStage::Lifecycle, HookOutcome::Success),
+        Ok(recorded) => {
+            timing.set_event(HookEventClass::from_lifecycle_name(
+                recorded.event.name().as_str(),
+            ));
+            timing.finish(HookStage::Lifecycle, HookOutcome::Success);
+        }
         Err(error) => {
             write_diagnostic(&mut stderr, error);
             timing.finish(HookStage::Lifecycle, HookOutcome::Error);
@@ -1756,17 +1761,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bounded_reader_until_times_out_while_writer_remains_open() {
+    fn bounded_reader_until_times_out_after_partial_input_with_open_writer() {
         use std::io::Write;
         use std::os::unix::net::UnixStream;
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
-        writer.write_all(b"ready").unwrap();
+        writer.write_all(b"partial-input").unwrap();
         assert_eq!(
-            read_bounded_hook_input_until(&mut reader, Instant::now()),
+            read_bounded_hook_input_until(&mut reader, Instant::now() + Duration::from_millis(20)),
             Err(HookInputError::Timeout)
         );
+        writer.write_all(b"still-open").unwrap();
     }
 
     #[test]

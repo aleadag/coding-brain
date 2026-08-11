@@ -38,9 +38,10 @@ impl HookBudget<SystemClock> {
 
 impl<C: MonotonicClock> HookBudget<C> {
     pub(crate) fn with_clock(clock: C, budget: Duration) -> Self {
+        let started = clock.now();
         Self {
-            started: clock.now(),
-            deadline: clock.now() + budget,
+            started,
+            deadline: started + budget,
             clock,
         }
     }
@@ -54,8 +55,9 @@ impl<C: MonotonicClock> HookBudget<C> {
     }
 
     pub(crate) fn child_deadline(&self, cap: Duration) -> Option<Instant> {
-        let allowance = self.allowance(cap);
-        (!allowance.is_zero()).then(|| self.clock.now() + allowance)
+        let now = self.clock.now();
+        let allowance = self.deadline.saturating_duration_since(now).min(cap);
+        (!allowance.is_zero()).then_some(now + allowance)
     }
 
     pub(crate) fn optional_child_deadline(
@@ -63,8 +65,13 @@ impl<C: MonotonicClock> HookBudget<C> {
         cap: Duration,
         reserve: Duration,
     ) -> Option<Instant> {
-        let allowance = self.remaining().saturating_sub(reserve).min(cap);
-        (!allowance.is_zero()).then(|| self.clock.now() + allowance)
+        let now = self.clock.now();
+        let allowance = self
+            .deadline
+            .saturating_duration_since(now)
+            .saturating_sub(reserve)
+            .min(cap);
+        (!allowance.is_zero()).then_some(now + allowance)
     }
 
     pub(crate) fn deadline(&self) -> Instant {
@@ -88,6 +95,18 @@ pub(crate) enum HookEventClass {
 }
 
 impl HookEventClass {
+    pub(crate) fn from_lifecycle_name(name: &str) -> Self {
+        match name {
+            "UserPromptSubmit" => Self::UserPromptSubmit,
+            "PreToolUse" => Self::PreToolUse,
+            "PostToolUse" => Self::PostToolUse,
+            "Stop" => Self::Stop,
+            "SubagentStart" => Self::SubagentStart,
+            "SubagentStop" => Self::SubagentStop,
+            _ => Self::Other,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::UserPromptSubmit => "user_prompt_submit",
@@ -215,6 +234,10 @@ impl HookTiming {
         }
     }
 
+    pub(crate) fn set_event(&mut self, event: HookEventClass) {
+        self.event = event;
+    }
+
     pub(crate) fn finish(&self, stage: HookStage, outcome: HookOutcome) {
         if std::env::var_os("CBRAIN_HOOK_TIMING").as_deref() != Some("1".as_ref()) {
             return;
@@ -298,6 +321,18 @@ mod tests {
         assert_eq!(
             budget.optional_child_deadline(Duration::from_millis(250), Duration::from_millis(500)),
             None
+        );
+    }
+
+    #[test]
+    fn lifecycle_event_names_stay_closed() {
+        assert_eq!(
+            HookEventClass::from_lifecycle_name("PreToolUse"),
+            HookEventClass::PreToolUse
+        );
+        assert_eq!(
+            HookEventClass::from_lifecycle_name("untrusted-event"),
+            HookEventClass::Other
         );
     }
 }

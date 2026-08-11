@@ -477,17 +477,36 @@ fn read_parent_process(pid: u32) -> Option<ParentProcessEvidence> {
 #[cfg(target_os = "linux")]
 fn read_parent_process_until(
     pid: u32,
-    _deadline: std::time::Instant,
-    _output: &mut OutputBudget,
+    deadline: std::time::Instant,
+    output: &mut OutputBudget,
 ) -> Option<ParentProcessEvidence> {
-    read_parent_process(pid)
+    let output = std::cell::RefCell::new(output);
+    read_linux_parent_process(
+        pid,
+        |path| {
+            read_bounded_file_until(
+                path,
+                MAX_PARENT_RECORD_BYTES,
+                deadline,
+                &mut output.borrow_mut(),
+            )
+        },
+        |path| {
+            read_bounded_link_until(
+                path,
+                MAX_PARENT_RECORD_BYTES,
+                deadline,
+                &mut output.borrow_mut(),
+            )
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]
 fn read_linux_parent_process(
     pid: u32,
     read_stat: impl FnOnce(&Path) -> Option<Vec<u8>>,
-    read_link: impl Fn(&Path) -> Option<PathBuf>,
+    mut read_link: impl FnMut(&Path) -> Option<PathBuf>,
 ) -> Option<ParentProcessEvidence> {
     let proc_dir = PathBuf::from(format!("/proc/{pid}"));
     let stat = read_stat(&proc_dir.join("stat"))?;
@@ -782,6 +801,63 @@ fn read_bounded_file(path: &Path, limit: usize) -> Option<Vec<u8>> {
     (bytes.len() <= limit).then_some(bytes)
 }
 
+#[cfg(target_os = "linux")]
+fn read_bounded_file_until(
+    path: &Path,
+    limit: usize,
+    deadline: std::time::Instant,
+    output: &mut OutputBudget,
+) -> Option<Vec<u8>> {
+    use std::io::ErrorKind;
+
+    if std::time::Instant::now() >= deadline || output.remaining == 0 {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    loop {
+        if std::time::Instant::now() >= deadline || bytes.len() >= limit || output.remaining == 0 {
+            return None;
+        }
+        let mut chunk = [0_u8; 1024];
+        let wanted = chunk
+            .len()
+            .min(limit + 1 - bytes.len())
+            .min(output.remaining);
+        match file.read(&mut chunk[..wanted]) {
+            Ok(0) => return Some(bytes),
+            Ok(read) => {
+                output.remaining -= read;
+                bytes.extend_from_slice(&chunk[..read]);
+                if bytes.len() > limit || std::time::Instant::now() >= deadline {
+                    return None;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_link_until(
+    path: &Path,
+    limit: usize,
+    deadline: std::time::Instant,
+    output: &mut OutputBudget,
+) -> Option<PathBuf> {
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let link = std::fs::read_link(path).ok()?;
+    let bytes = link.as_os_str().as_encoded_bytes().len();
+    if bytes > limit || bytes > output.remaining || std::time::Instant::now() >= deadline {
+        return None;
+    }
+    output.remaining -= bytes;
+    Some(link)
+}
+
 #[cfg(all(unix, not(target_os = "linux")))]
 fn stable_start_identity(value: &str) -> Option<u64> {
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1033,6 +1109,31 @@ mod tests {
         assert_eq!(
             run_bounded_process_until(&mut command, Instant::now(), &mut output),
             Err(BoundedProcessError::Timeout)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_proc_reads_respect_deadline_and_shared_output_budget() {
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("record");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut output = OutputBudget::new(4);
+        assert_eq!(
+            read_bounded_file_until(
+                &path,
+                MAX_PARENT_RECORD_BYTES,
+                Instant::now() + Duration::from_secs(1),
+                &mut output,
+            ),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(output.remaining(), 1);
+        assert_eq!(
+            read_bounded_file_until(&path, MAX_PARENT_RECORD_BYTES, Instant::now(), &mut output),
+            None
         );
     }
 

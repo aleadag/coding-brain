@@ -34,3 +34,19 @@ Commit: pending (created after this report is staged)
 - The plan's combined Cargo filter command is not valid Cargo syntax because Cargo accepts one filter. I ran the three focused filters separately.
 - Plain `git diff --check` reports every rustfmt-indented changed line due to this worktree's global `core.whitespace=indent-with-non-tab` setting. The source tree itself uses spaces; the scoped trailing-whitespace check above passed.
 - An initial compile error showed that the binary and library each compile their own module tree. Declaring `lifecycle_timing` in both `main.rs` and `lib.rs` resolved that without changing behavior.
+
+## Review correction pass
+
+- Deferred `StorageDeadline` construction until after optional parent discovery. Parent discovery receives only the child deadline that preserves 500 ms; authoritative SQLite open now receives a fresh full 500 ms reserve.
+- Linux `/proc` reads now check the stored absolute deadline before and after each accepted read, and debit stat/link bytes from the shared `OutputBudget`.
+- Successful persisted hooks update `HookTiming` from the closed lifecycle event mapping; `other` remains the fallback when the event is not established.
+- The stdin timeout test now writes partial input and holds the writer open through the deadline. The timeout occurs before `run_provider_with_sqlite` derives state paths or opens Brain storage, so this input-only fixture cannot touch cache or Brain state.
+- Added focused coverage for closed event mapping and Linux deadline/output accounting. Existing typed output-limit and timeout coverage remains in place.
+- `Spawn` and `ExitStatus` remain directly producible from commands, but the current public process API has no truthful deterministic injection point for post-spawn stdout I/O failure or unavailable reaper setup (`Cleanup`). I did not fabricate those outcomes; a separate seam would be needed if their deterministic coverage is required.
+
+Correction verification:
+
+- `nix develop path:. --command cargo test -p coding-brain bounded_reader_until -- --nocapture` — passed.
+- `nix develop path:. --command cargo test -p coding-brain bounded_proc_reads -- --nocapture` — passed.
+- `nix develop path:. --command cargo fmt` — passed.
+- `nix develop path:. --command cargo clippy -p coding-brain --all-targets -- -D warnings` — passed.
