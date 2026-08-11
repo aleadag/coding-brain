@@ -479,7 +479,7 @@ mod tests {
         SessionLinkStore,
     };
 
-    use super::LiveSessionNavigation;
+    use super::{LiveSessionNavigation, run_bounded_query};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1034,11 +1034,10 @@ mod tests {
         let _lock = test_lock();
         for body in ["(sleep 10) &\nexit 0\n", "sleep 10\n"] {
             let fixture = FixtureAgentDeck::script(body);
-            let navigator = LiveSessionNavigation::new(fixture.path().to_path_buf());
             let started = Instant::now();
 
             assert_eq!(
-                navigator.resolve(&target("deck-1", "/work/project")),
+                run_bounded_query(fixture.path()),
                 Err(NavigationError::TimedOut)
             );
             assert!(started.elapsed() < Duration::from_secs(3));
