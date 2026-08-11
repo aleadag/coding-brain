@@ -65,6 +65,7 @@ impl LegacyFixture {
                 .join(name),
             &state_root,
         );
+        let state_root = fs::canonicalize(state_root).unwrap();
         Self {
             _root: root,
             state_root,
