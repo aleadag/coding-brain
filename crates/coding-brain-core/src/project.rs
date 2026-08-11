@@ -27,6 +27,34 @@ pub struct ProjectIdentity {
     id: ProjectId,
 }
 
+pub trait ProjectCommandRunner {
+    fn output(&mut self, cwd: &Path, args: &[&str]) -> Result<Vec<u8>, ProjectCommandError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectCommandError {
+    Spawn,
+    Io,
+    Timeout,
+    OutputLimit,
+    ExitStatus,
+    Cleanup,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectProvenance {
+    Manifest,
+    NetworkRemote,
+    Temporary,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProjectResolution {
+    root: PathBuf,
+    identity: ProjectIdentity,
+    provenance: ProjectProvenance,
+}
+
 #[derive(Debug)]
 pub enum ProjectError {
     Io(io::Error),
@@ -58,17 +86,37 @@ impl From<io::Error> for ProjectError {
 
 impl ProjectIdentity {
     pub fn load(cwd: &Path, paths: &CodingBrainPaths) -> Result<Self, ProjectError> {
-        let root = project_root(cwd);
+        let mut runner = SystemProjectCommandRunner;
+        Self::resolve_with(cwd, paths, &mut runner).map(|resolution| resolution.identity)
+    }
+
+    pub fn resolve_with(
+        cwd: &Path,
+        paths: &CodingBrainPaths,
+        runner: &mut impl ProjectCommandRunner,
+    ) -> Result<ProjectResolution, ProjectError> {
+        let root = fs::canonicalize(project_root_with(cwd, runner))?;
         let manifest_path = manifest_path(&root, paths);
         match fs::read_to_string(&manifest_path) {
-            Ok(contents) => ProjectManifest::parse(&contents),
+            Ok(contents) => Ok(ProjectResolution {
+                root,
+                identity: ProjectManifest::parse(&contents)?,
+                provenance: ProjectProvenance::Manifest,
+            }),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if let Some(id) = git_remote_project_id(&root) {
-                    return Ok(Self { id });
+                if let Some(id) = git_remote_project_id_with(&root, runner) {
+                    return Ok(ProjectResolution {
+                        root,
+                        identity: Self { id },
+                        provenance: ProjectProvenance::NetworkRemote,
+                    });
                 }
-                let canonical = fs::canonicalize(&root)?;
-                Ok(Self {
-                    id: ProjectId::Temporary(temporary_id(&canonical)),
+                Ok(ProjectResolution {
+                    identity: Self {
+                        id: ProjectId::Temporary(temporary_id(&root)),
+                    },
+                    root,
+                    provenance: ProjectProvenance::Temporary,
                 })
             }
             Err(error) => Err(error.into()),
@@ -81,6 +129,20 @@ impl ProjectIdentity {
 
     pub fn is_durable(&self) -> bool {
         matches!(self.id, ProjectId::Stable(_))
+    }
+}
+
+impl ProjectResolution {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn identity(&self) -> &ProjectIdentity {
+        &self.identity
+    }
+
+    pub fn provenance(&self) -> ProjectProvenance {
+        self.provenance
     }
 }
 
@@ -153,8 +215,21 @@ fn git_root(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+fn git_root_with(cwd: &Path, runner: &mut impl ProjectCommandRunner) -> Option<PathBuf> {
+    let root = git_path_output_with(cwd, &["rev-parse", "--show-toplevel"], runner)?;
+    if root.is_absolute() {
+        Some(root)
+    } else {
+        fs::canonicalize(cwd.join(root)).ok()
+    }
+}
+
 fn project_root(cwd: &Path) -> PathBuf {
     git_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+fn project_root_with(cwd: &Path, runner: &mut impl ProjectCommandRunner) -> PathBuf {
+    git_root_with(cwd, runner).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 fn temporary_id(path: &Path) -> String {
@@ -171,16 +246,33 @@ fn temporary_id(path: &Path) -> String {
 const GIT_REMOTE_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x2c54e35b_775d_4bc5_83df_40d4d2fde58e);
 
-fn git_path_output(cwd: &Path, args: &[&str]) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+struct SystemProjectCommandRunner;
+
+impl ProjectCommandRunner for SystemProjectCommandRunner {
+    fn output(&mut self, cwd: &Path, args: &[&str]) -> Result<Vec<u8>, ProjectCommandError> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .map_err(|_| ProjectCommandError::Spawn)?;
+        if !output.status.success() {
+            return Err(ProjectCommandError::ExitStatus);
+        }
+        Ok(output.stdout)
     }
-    let mut value = output.stdout;
+}
+
+fn git_path_output(cwd: &Path, args: &[&str]) -> Option<PathBuf> {
+    let mut runner = SystemProjectCommandRunner;
+    git_path_output_with(cwd, args, &mut runner)
+}
+
+fn git_path_output_with(
+    cwd: &Path,
+    args: &[&str],
+    runner: &mut impl ProjectCommandRunner,
+) -> Option<PathBuf> {
+    let mut value = runner.output(cwd, args).ok()?;
     if value.last() == Some(&b'\n') {
         value.pop();
         #[cfg(windows)]
@@ -203,16 +295,12 @@ fn git_path_output(cwd: &Path, args: &[&str]) -> Option<PathBuf> {
     }
 }
 
-fn git_text_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(output.stdout).ok()?;
+fn git_text_output_with(
+    cwd: &Path,
+    args: &[&str],
+    runner: &mut impl ProjectCommandRunner,
+) -> Option<String> {
+    let value = String::from_utf8(runner.output(cwd, args).ok()?).ok()?;
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
 }
@@ -318,9 +406,16 @@ fn canonical_remote(remote: &str) -> Option<String> {
     None
 }
 
-fn git_remote_project_id(git_root: &Path) -> Option<ProjectId> {
-    let remote = git_text_output(git_root, &["remote", "get-url", "origin"])?;
-    let canonical = canonical_remote(&remote)?;
+fn git_remote_project_id_with(
+    git_root: &Path,
+    runner: &mut impl ProjectCommandRunner,
+) -> Option<ProjectId> {
+    let remote = git_text_output_with(git_root, &["remote", "get-url", "origin"], runner)?;
+    git_remote_project_id_from_remote(&remote)
+}
+
+fn git_remote_project_id_from_remote(remote: &str) -> Option<ProjectId> {
+    let canonical = canonical_remote(remote)?;
     let fingerprint = format!("git-remote:v1:{canonical}");
     Some(ProjectId::Stable(
         uuid::Uuid::new_v5(&GIT_REMOTE_NAMESPACE, fingerprint.as_bytes()).to_string(),
@@ -374,6 +469,120 @@ mod tests {
     fn fixture_paths(home: &Path) -> CodingBrainPaths {
         CodingBrainPaths::resolve(&PathEnvironment::new(None, None, Some(home.to_path_buf())))
             .unwrap()
+    }
+
+    type FixtureResponse = (Vec<String>, Result<Vec<u8>, ProjectCommandError>);
+
+    struct FixtureRunner {
+        responses: Vec<FixtureResponse>,
+        calls: usize,
+    }
+
+    impl FixtureRunner {
+        fn new(
+            responses: impl IntoIterator<
+                Item = (Vec<&'static str>, Result<Vec<u8>, ProjectCommandError>),
+            >,
+        ) -> Self {
+            Self {
+                responses: responses
+                    .into_iter()
+                    .map(|(args, result)| (args.into_iter().map(str::to_owned).collect(), result))
+                    .collect(),
+                calls: 0,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls
+        }
+    }
+
+    impl ProjectCommandRunner for FixtureRunner {
+        fn output(&mut self, _cwd: &Path, args: &[&str]) -> Result<Vec<u8>, ProjectCommandError> {
+            self.calls += 1;
+            let (expected, result) = self
+                .responses
+                .get_mut(self.calls - 1)
+                .unwrap_or_else(|| panic!("unexpected command {args:?}"));
+            assert_eq!(expected, args);
+            result.clone()
+        }
+    }
+
+    #[test]
+    fn injected_runner_reports_provenance_and_never_retries_after_failure() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().to_path_buf();
+        let root_output = format!("{}\n", root.display());
+        let paths = fixture_paths(fixture.path());
+        let mut runner = FixtureRunner::new([
+            (
+                vec!["rev-parse", "--show-toplevel"],
+                Ok(root_output.into_bytes()),
+            ),
+            (
+                vec!["remote", "get-url", "origin"],
+                Err(ProjectCommandError::Timeout),
+            ),
+        ]);
+
+        let resolved = ProjectIdentity::resolve_with(fixture.path(), &paths, &mut runner).unwrap();
+
+        assert_eq!(resolved.root(), root);
+        assert_eq!(resolved.provenance(), ProjectProvenance::Temporary);
+        assert_eq!(runner.calls(), 2);
+    }
+
+    #[test]
+    fn injected_runner_reports_manifest_provenance_without_remote_lookup() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().to_path_buf();
+        let paths = fixture_paths(fixture.path());
+        fs::create_dir_all(root.join(".coding-brain")).unwrap();
+        fs::write(
+            root.join(".coding-brain/project.toml"),
+            format!(
+                "schema_version = {PROJECT_SCHEMA_VERSION}\nproject_id = \"{}\"\n",
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .unwrap();
+        let mut runner = FixtureRunner::new([(
+            vec!["rev-parse", "--show-toplevel"],
+            Ok(format!("{}\n", root.display()).into_bytes()),
+        )]);
+
+        let resolved = ProjectIdentity::resolve_with(&root, &paths, &mut runner).unwrap();
+
+        assert_eq!(resolved.root(), root);
+        assert_eq!(resolved.provenance(), ProjectProvenance::Manifest);
+        assert!(resolved.identity().is_durable());
+        assert_eq!(runner.calls(), 1);
+    }
+
+    #[test]
+    fn injected_runner_reports_network_remote_provenance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().to_path_buf();
+        let paths = fixture_paths(fixture.path());
+        let mut runner = FixtureRunner::new([
+            (
+                vec!["rev-parse", "--show-toplevel"],
+                Ok(format!("{}\n", root.display()).into_bytes()),
+            ),
+            (
+                vec!["remote", "get-url", "origin"],
+                Ok(b"https://user:secret@example.com/Owner/Repo.git\n".to_vec()),
+            ),
+        ]);
+
+        let resolved = ProjectIdentity::resolve_with(&root, &paths, &mut runner).unwrap();
+
+        assert_eq!(resolved.root(), root);
+        assert_eq!(resolved.provenance(), ProjectProvenance::NetworkRemote);
+        assert!(resolved.identity().is_durable());
+        assert_eq!(runner.calls(), 2);
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
