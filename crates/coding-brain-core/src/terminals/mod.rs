@@ -3739,11 +3739,7 @@ mod tests {
 
     #[test]
     fn bounded_command_runner_rejects_oversized_output() {
-        let error = run_bounded(Command::new("sh").args([
-            "-c",
-            "i=0; while [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done",
-        ]))
-        .unwrap_err();
+        let error = run_bounded(Command::new("sh").args(["-c", "printf '%70000s' x"])).unwrap_err();
         assert!(error.contains("exceeded 64 KiB"));
     }
 
@@ -3814,7 +3810,7 @@ mod tests {
         let pid_file = directory.path().join("oversize-child.pid");
         let error = run_bounded(Command::new("sh").args([
             "-c",
-            "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s' \"$child\" > \"$1\"; i=0; while [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done",
+            "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s' \"$child\" > \"$1\"; printf '%70000s' x",
             "sh",
             pid_file.to_str().unwrap(),
         ]))
