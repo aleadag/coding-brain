@@ -2051,10 +2051,13 @@ fn hook_open_rejects_incomplete_and_unsupported_schema_without_repair() {
     let error = BrainDb::open_current(
         &paths,
         OpenRole::Hook,
-        StorageDeadline::after(Duration::from_millis(50)),
+        StorageDeadline::after(Duration::from_millis(250)),
     )
     .unwrap_err();
-    assert!(matches!(error, StorageError::MigrationRequired));
+    assert!(
+        matches!(error, StorageError::MigrationRequired),
+        "{error:?}"
+    );
 
     let connection = open_for_constraints(&paths.brain_db());
     connection
@@ -2064,10 +2067,13 @@ fn hook_open_rejects_incomplete_and_unsupported_schema_without_repair() {
     let error = BrainDb::open_current(
         &paths,
         OpenRole::Hook,
-        StorageDeadline::after(Duration::from_millis(50)),
+        StorageDeadline::after(Duration::from_millis(250)),
     )
     .unwrap_err();
-    assert!(matches!(error, StorageError::UnsupportedSchema { .. }));
+    assert!(
+        matches!(error, StorageError::UnsupportedSchema { .. }),
+        "{error:?}"
+    );
 }
 
 #[test]

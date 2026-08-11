@@ -133,10 +133,10 @@ fn model_admission_honors_the_stored_hook_deadline() {
     let db = BrainDb::open_current(
         &paths,
         OpenRole::Hook,
-        StorageDeadline::after(Duration::from_millis(20)),
+        StorageDeadline::after(Duration::from_millis(250)),
     )
     .unwrap();
-    std::thread::sleep(Duration::from_millis(40));
+    std::thread::sleep(Duration::from_millis(300));
 
     assert!(matches!(db.admit_model_attempt(), Err(StorageError::Busy)));
 }

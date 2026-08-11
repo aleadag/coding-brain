@@ -37,7 +37,7 @@ use coding_brain_core::review_state::ReviewRequestError;
 use fs2::FileExt;
 use rusqlite::config::DbConfig;
 use rusqlite::limits::Limit;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
 
 use security::{SecureDatabaseDirectory, SecurityError};
 
@@ -702,6 +702,35 @@ struct ReviewResetGuard {
     directory: SecureDatabaseDirectory,
 }
 
+struct ReviewMigrationGuard {
+    _state_root_lock: File,
+    gate: Option<File>,
+    directory: SecureDatabaseDirectory,
+}
+
+impl ReviewMigrationGuard {
+    fn acquire_gate(&mut self) -> Result<(), StorageError> {
+        let gate = self
+            .directory
+            .open_lock_file(REVIEW_RESET_GATE_NAME, true)?;
+        lock_review_reset_file(&gate, true)?;
+        self.directory
+            .sync_lock_file(REVIEW_RESET_GATE_NAME, &gate)?;
+        self.gate = Some(gate);
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), StorageError> {
+        let gate = self.gate.as_ref().ok_or(StorageError::InvalidStorage(
+            "review reset gate is not held",
+        ))?;
+        self.directory
+            .validate_lock_file(REVIEW_RESET_GATE_NAME, gate)?;
+        self.directory.validate_path_correspondence()?;
+        Ok(())
+    }
+}
+
 impl fmt::Debug for ReviewDb {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ReviewDb(..)")
@@ -737,79 +766,6 @@ impl ReviewDb {
         let reset_guard = acquire_review_reset_guard(paths, false, false)?;
         deadline.ensure_remaining()?;
         Self::open_current_after_guard(reset_guard, deadline)
-    }
-
-    pub(super) fn open_frozen_for_export(
-        paths: &StoragePaths,
-        deadline: StorageDeadline,
-    ) -> Result<Self, StorageError> {
-        deadline.ensure_remaining()?;
-        let reset_guard = acquire_review_reset_guard(paths, true, false)?;
-        deadline.ensure_remaining()?;
-        reset_guard.directory.validate_path_correspondence()?;
-        let before = reset_guard
-            .directory
-            .closed_database_identity(REVIEW_DATABASE_NAME)?;
-        let connection = Connection::open_with_flags(
-            reset_guard
-                .directory
-                .path()
-                .join(OsStr::from_bytes(REVIEW_DATABASE_NAME.to_bytes())),
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW
-                | OpenFlags::SQLITE_OPEN_EXRESCODE,
-        )?;
-        deadline.apply(&connection)?;
-        schema::configure_connection(&connection, Some(deadline))?;
-        let application_id = connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
-        let schema_version = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let journal_mode: String =
-            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-        let integrity: String =
-            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-        let foreign_key_error = connection
-            .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
-            .optional()?;
-        deadline.ensure_remaining()?;
-        schema::verify_frozen_schema(&connection, DatabaseKind::Review, deadline)?;
-        let valid_meta_rows = connection.query_row(
-            "SELECT count(*) FROM review_meta
-             WHERE surface IN ('attention', 'review', 'diagnostics', 'recent')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        deadline.ensure_remaining()?;
-        if application_id != REVIEW_APPLICATION_ID
-            || schema_version != REVIEW_SCHEMA_VERSION
-            || journal_mode != "delete"
-        {
-            return Err(StorageError::UnsupportedSchema {
-                application_id,
-                schema_version,
-            });
-        }
-        if integrity != "ok" || foreign_key_error.is_some() || valid_meta_rows != 4 {
-            return Err(StorageError::InvalidStorage(
-                "frozen review database validation failed",
-            ));
-        }
-        reset_guard
-            .directory
-            .validate_after_open(REVIEW_DATABASE_NAME)?;
-        reset_guard.directory.validate_path_correspondence()?;
-        let after = reset_guard
-            .directory
-            .closed_database_identity(REVIEW_DATABASE_NAME)?;
-        if before != after {
-            return Err(StorageError::InvalidStorage(
-                "frozen review database changed during validation",
-            ));
-        }
-        Ok(Self {
-            connection,
-            _reset_guard: reset_guard,
-            deadline: Some(deadline),
-        })
     }
 
     fn open_current_after_guard(
@@ -876,6 +832,29 @@ fn acquire_review_reset_guard(
     directory.validate_path_correspondence()?;
     Ok(ReviewResetGuard {
         _gate: gate,
+        directory,
+    })
+}
+
+fn acquire_review_reset_guard_for_migration(
+    paths: &StoragePaths,
+) -> Result<ReviewMigrationGuard, StorageError> {
+    let directory = SecureDatabaseDirectory::prepare(&paths.state_root, true)?;
+    let mut guard = acquire_review_reset_root_for_migration(&directory)?;
+    guard.acquire_gate()?;
+    Ok(guard)
+}
+
+fn acquire_review_reset_root_for_migration(
+    directory: &SecureDatabaseDirectory,
+) -> Result<ReviewMigrationGuard, StorageError> {
+    let directory = directory.try_clone()?;
+    let state_root_lock = directory.open_state_root_lock()?;
+    lock_review_reset_file(&state_root_lock, true)?;
+    directory.validate_path_correspondence()?;
+    Ok(ReviewMigrationGuard {
+        _state_root_lock: state_root_lock,
+        gate: None,
         directory,
     })
 }
@@ -1019,6 +998,30 @@ mod tests {
                 open_guard,
                 StorageDeadline::after(Duration::from_millis(250)),
             ),
+            Err(StorageError::InvalidStorage(_))
+        ));
+    }
+
+    #[test]
+    fn review_migration_guard_final_validation_rejects_gate_identity_change() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(root.path());
+        let guard = acquire_review_reset_guard_for_migration(&paths).unwrap();
+        let gate = paths.db_dir().join("review-reset.lock");
+        fs::remove_file(&gate).unwrap();
+        let replacement = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&gate)
+            .unwrap();
+        replacement
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .unwrap();
+        replacement.sync_all().unwrap();
+
+        assert!(matches!(
+            guard.validate(),
             Err(StorageError::InvalidStorage(_))
         ));
     }

@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt as UnixFileExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use super::super::secure_state::state_root_for_traversal;
@@ -60,6 +60,15 @@ pub(super) enum PublicationPresence {
 }
 
 impl SecureDatabaseDirectory {
+    pub(super) fn try_clone(&self) -> Result<Self, SecurityError> {
+        Ok(Self {
+            state_root_descriptor: self.state_root_descriptor.try_clone()?,
+            state_root_path: self.state_root_path.clone(),
+            descriptor: self.descriptor.try_clone()?,
+            path: self.path.clone(),
+        })
+    }
+
     pub(super) fn prepare(state_root: &Path, create: bool) -> Result<Self, SecurityError> {
         validate_or_create_state_root(state_root, create)?;
         let state_root_path = state_root_for_traversal(state_root).into_owned();
@@ -85,6 +94,18 @@ impl SecureDatabaseDirectory {
 
     pub(super) fn state_root_descriptor(&self) -> &File {
         &self.state_root_descriptor
+    }
+
+    pub(super) fn open_state_root_lock(&self) -> Result<File, SecurityError> {
+        let current = open_existing_directory(&self.state_root_path)?;
+        let retained = EntryMetadata::from(&self.state_root_descriptor.metadata()?);
+        let reopened = EntryMetadata::from(&current.metadata()?);
+        if retained.dev != reopened.dev || retained.ino != reopened.ino {
+            return Err(SecurityError::Invalid(
+                "database state root changed after anchor acquisition",
+            ));
+        }
+        Ok(current)
     }
 
     pub(super) fn validate_path_correspondence(&self) -> Result<(), SecurityError> {
@@ -208,6 +229,16 @@ impl SecureDatabaseDirectory {
                 "database lock changed after locking",
             ));
         }
+        Ok(())
+    }
+
+    pub(super) fn sync_lock_file(&self, name: &CStr, file: &File) -> Result<(), SecurityError> {
+        self.validate_lock_file(name, file)?;
+        self.validate_path_correspondence()?;
+        file.sync_all()?;
+        self.descriptor.sync_all()?;
+        self.validate_lock_file(name, file)?;
+        self.validate_path_correspondence()?;
         Ok(())
     }
 
@@ -344,6 +375,25 @@ impl SecureDatabaseDirectory {
         Ok(true)
     }
 
+    pub(super) fn private_file_device_inode(
+        &self,
+        name: &CStr,
+    ) -> Result<(u64, u64), SecurityError> {
+        let descriptor = open_readonly_regular_at(&self.descriptor, name)?;
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let opened = EntryMetadata::from(&file.metadata()?);
+        let at_path = metadata_at(&self.descriptor, name)?;
+        validate_private_file(&opened)?;
+        validate_private_file(&at_path)?;
+        if opened != at_path {
+            return Err(SecurityError::Invalid(
+                "private file changed during identity capture",
+            ));
+        }
+        self.validate_path_correspondence()?;
+        Ok((opened.dev, opened.ino))
+    }
+
     pub(super) fn finish_linked_publication(
         &self,
         staging_name: &CStr,
@@ -391,6 +441,239 @@ impl SecureDatabaseDirectory {
         let file = unsafe { File::from_raw_fd(descriptor) };
         file.sync_all()?;
         self.descriptor.sync_all()?;
+        Ok(())
+    }
+
+    pub(super) fn database_journal_mode(
+        &self,
+        database_name: &CStr,
+    ) -> Result<&'static str, SecurityError> {
+        self.validate_database_without_sidecars(database_name)?;
+        let descriptor = open_readonly_regular_at(&self.descriptor, database_name)?;
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let opened = EntryMetadata::from(&file.metadata()?);
+        let at_path = metadata_at(&self.descriptor, database_name)?;
+        validate_private_file(&opened)?;
+        validate_private_file(&at_path)?;
+        if opened.dev != at_path.dev || opened.ino != at_path.ino {
+            return Err(SecurityError::Invalid(
+                "database changed during journal-mode inspection",
+            ));
+        }
+        let mut header = [0_u8; 20];
+        file.read_exact(&mut header)?;
+        let after = EntryMetadata::from(&file.metadata()?);
+        if opened.dev != after.dev
+            || opened.ino != after.ino
+            || opened.size != after.size
+            || opened.modified_seconds != after.modified_seconds
+            || opened.modified_nanoseconds != after.modified_nanoseconds
+            || &header[..16] != b"SQLite format 3\0"
+        {
+            return Err(SecurityError::Invalid(
+                "database changed during journal-mode inspection",
+            ));
+        }
+        self.validate_path_correspondence()?;
+        match (header[18], header[19]) {
+            (1, 1) => Ok("delete"),
+            (2, 2) => Ok("wal"),
+            _ => Err(SecurityError::Invalid(
+                "database has an unsupported journal mode",
+            )),
+        }
+    }
+
+    pub(super) fn normalize_database_header_to_wal(
+        &self,
+        database_name: &CStr,
+    ) -> Result<(), SecurityError> {
+        self.validate_database_without_sidecars(database_name)?;
+        let descriptor = open_regular_at(&self.descriptor, database_name)?;
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let opened = EntryMetadata::from(&file.metadata()?);
+        self.normalize_database_header_to_wal_file(database_name, &file, opened)
+    }
+
+    pub(super) fn copy_database_to_bound_file(
+        &self,
+        source_name: &CStr,
+        temporary_name: &CStr,
+        temporary_device: u64,
+        temporary_inode: u64,
+    ) -> Result<(), SecurityError> {
+        self.validate_database_without_sidecars(source_name)?;
+        let source_descriptor = open_readonly_regular_at(&self.descriptor, source_name)?;
+        let mut source = unsafe { File::from_raw_fd(source_descriptor) };
+        let source_before = EntryMetadata::from(&source.metadata()?);
+        let source_path = metadata_at(&self.descriptor, source_name)?;
+        validate_private_file(&source_before)?;
+        if source_before != source_path {
+            return Err(SecurityError::Invalid(
+                "database changed before normalization copy",
+            ));
+        }
+
+        let temporary_descriptor = open_regular_at(&self.descriptor, temporary_name)?;
+        let mut temporary = unsafe { File::from_raw_fd(temporary_descriptor) };
+        let temporary_before = EntryMetadata::from(&temporary.metadata()?);
+        let temporary_path = metadata_at(&self.descriptor, temporary_name)?;
+        validate_private_file(&temporary_before)?;
+        if temporary_before != temporary_path
+            || temporary_before.dev != temporary_device
+            || temporary_before.ino != temporary_inode
+        {
+            return Err(SecurityError::Invalid(
+                "normalization temporary changed before copy",
+            ));
+        }
+
+        temporary.set_len(0)?;
+        io::copy(&mut source, &mut temporary)?;
+        temporary.sync_all()?;
+        self.descriptor.sync_all()?;
+        let source_after = EntryMetadata::from(&source.metadata()?);
+        let source_after_path = metadata_at(&self.descriptor, source_name)?;
+        let temporary_after = EntryMetadata::from(&temporary.metadata()?);
+        let temporary_after_path = metadata_at(&self.descriptor, temporary_name)?;
+        if source_after != source_before
+            || source_after_path != source_before
+            || temporary_after != temporary_after_path
+            || temporary_after.dev != temporary_device
+            || temporary_after.ino != temporary_inode
+        {
+            return Err(SecurityError::Invalid(
+                "database changed during normalization copy",
+            ));
+        }
+        self.validate_path_correspondence()?;
+        Ok(())
+    }
+
+    pub(super) fn publish_database_replacement(
+        &self,
+        canonical_name: &CStr,
+        expected: &ClosedDatabaseIdentity,
+        temporary_name: &CStr,
+        replacement: &ClosedDatabaseIdentity,
+    ) -> Result<(), SecurityError> {
+        self.publish_database_replacement_with_hook(
+            canonical_name,
+            expected,
+            temporary_name,
+            replacement,
+            || {},
+        )
+    }
+
+    fn publish_database_replacement_with_hook(
+        &self,
+        canonical_name: &CStr,
+        expected: &ClosedDatabaseIdentity,
+        temporary_name: &CStr,
+        replacement: &ClosedDatabaseIdentity,
+        before_exchange: impl FnOnce(),
+    ) -> Result<(), SecurityError> {
+        if &self.closed_database_identity(canonical_name)? != expected {
+            return Err(SecurityError::Invalid(
+                "database changed before normalized replacement",
+            ));
+        }
+        if &self.closed_database_identity(temporary_name)? != replacement {
+            return Err(SecurityError::Invalid(
+                "normalization temporary changed before publish",
+            ));
+        }
+        before_exchange();
+        exchange_files_at(&self.descriptor, temporary_name, canonical_name)?;
+        self.descriptor.sync_all()?;
+        let published = self.closed_database_identity(canonical_name)?;
+        let displaced = self.closed_database_identity(temporary_name)?;
+        if &published != replacement || &displaced != expected {
+            exchange_files_at(&self.descriptor, temporary_name, canonical_name)?;
+            self.descriptor.sync_all()?;
+            if self.closed_database_identity(canonical_name)? != displaced
+                || self.closed_database_identity(temporary_name)? != published
+            {
+                return Err(SecurityError::Invalid(
+                    "normalized database replacement could not be restored",
+                ));
+            }
+            return Err(SecurityError::Invalid(
+                "database changed during normalized replacement",
+            ));
+        }
+        self.validate_path_correspondence()?;
+        Ok(())
+    }
+
+    pub(super) fn remove_closed_database_file(
+        &self,
+        name: &CStr,
+        expected: &ClosedDatabaseIdentity,
+    ) -> Result<(), SecurityError> {
+        if &self.closed_database_identity(name)? != expected {
+            return Err(SecurityError::Invalid(
+                "database changed before exact removal",
+            ));
+        }
+        if unsafe { libc::unlinkat(self.descriptor.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        self.descriptor.sync_all()?;
+        self.validate_path_correspondence()?;
+        Ok(())
+    }
+
+    fn normalize_database_header_to_wal_file(
+        &self,
+        database_name: &CStr,
+        file: &File,
+        opened: EntryMetadata,
+    ) -> Result<(), SecurityError> {
+        let at_path = metadata_at(&self.descriptor, database_name)?;
+        validate_private_file(&opened)?;
+        validate_private_file(&at_path)?;
+        if opened != at_path {
+            return Err(SecurityError::Invalid(
+                "database changed before WAL normalization",
+            ));
+        }
+        let mut header = [0_u8; 20];
+        UnixFileExt::read_exact_at(file, &mut header, 0)?;
+        if &header[..16] != b"SQLite format 3\0" {
+            return Err(SecurityError::Invalid(
+                "database header is invalid before WAL normalization",
+            ));
+        }
+        match (header[18], header[19]) {
+            (1, 1) => UnixFileExt::write_all_at(file, &[2, 2], 18)?,
+            (2, 2) => {}
+            _ => {
+                return Err(SecurityError::Invalid(
+                    "database has an unsupported journal mode",
+                ));
+            }
+        }
+        file.sync_all()?;
+        self.descriptor.sync_all()?;
+
+        let after = EntryMetadata::from(&file.metadata()?);
+        let after_path = metadata_at(&self.descriptor, database_name)?;
+        let mut normalized = [0_u8; 20];
+        UnixFileExt::read_exact_at(file, &mut normalized, 0)?;
+        if after.dev != opened.dev
+            || after.ino != opened.ino
+            || after.size != opened.size
+            || after_path != after
+            || &normalized[..16] != b"SQLite format 3\0"
+            || normalized[18..20] != [2, 2]
+        {
+            return Err(SecurityError::Invalid(
+                "database changed during WAL normalization",
+            ));
+        }
+        self.validate_path_correspondence()?;
         Ok(())
     }
 
@@ -936,6 +1219,51 @@ impl From<&fs::Metadata> for EntryMetadata {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn exchange_files_at(directory: &File, left: &CStr, right: &CStr) -> io::Result<()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory.as_raw_fd(),
+            left.as_ptr(),
+            directory.as_raw_fd(),
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn exchange_files_at(directory: &File, left: &CStr, right: &CStr) -> io::Result<()> {
+    let result = unsafe {
+        libc::renameatx_np(
+            directory.as_raw_fd(),
+            left.as_ptr(),
+            directory.as_raw_fd(),
+            right.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn exchange_files_at(_directory: &File, _left: &CStr, _right: &CStr) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic database exchange is unsupported",
+    ))
+}
+
 #[allow(clippy::unnecessary_cast)]
 fn metadata_at(directory: &File, name: &CStr) -> io::Result<EntryMetadata> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -1051,6 +1379,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wal_header_normalization_rejects_path_replacement_without_touching_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = SecureDatabaseDirectory::prepare(root.path(), true).unwrap();
+        let name = c"review.sqlite3";
+        let mut original = b"SQLite format 3\0".to_vec();
+        original.extend_from_slice(&[4, 0, 1, 1]);
+        original.resize(512, 0);
+        let mut file = directory.create_database_file(name).unwrap();
+        file.write_all(&original).unwrap();
+        file.sync_all().unwrap();
+        let opened = EntryMetadata::from(&file.metadata().unwrap());
+
+        let path = directory.path().join("review.sqlite3");
+        fs::rename(&path, directory.path().join("retained-original")).unwrap();
+        let replacement = b"replacement-evidence";
+        fs::write(&path, replacement).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            directory
+                .normalize_database_header_to_wal_file(name, &file, opened)
+                .is_err()
+        );
+        assert_eq!(fs::read(path).unwrap(), replacement);
+    }
+
+    #[test]
+    fn normalized_exchange_rejects_substituted_canonical_without_changing_either_file() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = SecureDatabaseDirectory::prepare(root.path(), true).unwrap();
+        let canonical = c"review.sqlite3";
+        let temporary = c".review.sqlite3.normalization-1.tmp";
+        let mut original = directory.create_database_file(canonical).unwrap();
+        original.write_all(b"original").unwrap();
+        original.sync_all().unwrap();
+        let expected = directory.closed_database_identity(canonical).unwrap();
+        let mut normalized = directory.create_database_file(temporary).unwrap();
+        normalized.write_all(b"normalized").unwrap();
+        normalized.sync_all().unwrap();
+        let replacement = directory.closed_database_identity(temporary).unwrap();
+
+        let temporary_before = directory.closed_database_identity(temporary).unwrap();
+        let substituted_identity = std::cell::RefCell::new(None);
+
+        assert!(
+            directory
+                .publish_database_replacement_with_hook(
+                    canonical,
+                    &expected,
+                    temporary,
+                    &replacement,
+                    || {
+                        let retained = directory.path().join("retained-original");
+                        fs::rename(directory.path().join("review.sqlite3"), retained).unwrap();
+                        let mut substituted = directory.create_database_file(canonical).unwrap();
+                        substituted.write_all(b"substituted").unwrap();
+                        substituted.sync_all().unwrap();
+                        *substituted_identity.borrow_mut() =
+                            Some(directory.closed_database_identity(canonical).unwrap());
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(
+            directory.closed_database_identity(canonical).unwrap(),
+            substituted_identity.into_inner().unwrap()
+        );
+        assert_eq!(
+            directory.closed_database_identity(temporary).unwrap(),
+            temporary_before
+        );
+        assert_eq!(
+            fs::read(directory.path().join("review.sqlite3")).unwrap(),
+            b"substituted"
+        );
+        assert_eq!(
+            fs::read(directory.path().join(".review.sqlite3.normalization-1.tmp")).unwrap(),
+            b"normalized"
+        );
+    }
+
+    #[test]
     #[allow(clippy::unnecessary_cast)] // libc mode constants vary in width across Unix targets.
     fn private_state_root_metadata_rejects_foreign_owner() {
         let metadata = EntryMetadata {
@@ -1065,6 +1477,23 @@ mod tests {
         };
 
         assert!(validate_private_state_root_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)] // libc mode constants vary in width across Unix targets.
+    fn private_file_metadata_rejects_foreign_owner() {
+        let metadata = EntryMetadata {
+            mode: libc::S_IFREG as u32 | 0o600,
+            uid: unsafe { libc::geteuid() }.wrapping_add(1),
+            nlink: 1,
+            dev: 1,
+            ino: 1,
+            size: 0,
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
+        };
+
+        assert!(validate_private_file(&metadata).is_err());
     }
 
     #[test]

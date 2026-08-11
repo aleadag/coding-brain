@@ -8,6 +8,9 @@ All notable changes to Coding Brain are documented here.
 
 ### Fixed
 
+- SQLite migration now creates and safely recovers the Review reset gate before
+  reporting healthy Review storage. Doctor validates both Brain and Review, so
+  an unusable migrated Review database is reported before the TUI opens it.
 - Migrated deterministic safety decisions remain readable in Live, Review, and
   learning views without becoming live permission authority. If SQLite becomes
   unavailable, the TUI now reports the stable fault category while preserving

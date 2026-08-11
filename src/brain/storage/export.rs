@@ -723,8 +723,11 @@ fn legacy_review_bytes(paths: &StoragePaths) -> Result<Option<Vec<u8>>, StorageE
     {
         return Ok(None);
     }
-    let review =
-        ReviewDb::open_frozen_for_export(paths, StorageDeadline::after(Duration::from_secs(5)))?;
+    let review = ReviewDb::open_current(
+        paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(5)),
+    )?;
     let transaction = review.connection.unchecked_transaction()?;
     let mut surfaces = Map::new();
     let mut meta = transaction.prepare(
