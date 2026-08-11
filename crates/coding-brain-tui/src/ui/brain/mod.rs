@@ -268,12 +268,12 @@ fn lifecycle_footer(actions: &str, existing: &str, projection: &SurfaceReviewPro
 pub(super) fn review_prefix(target: &ReviewTarget, unseen_label: &str) -> &'static str {
     if target.new_member_keys.is_empty() {
         if unseen_label == "unseen" {
-            "seen     "
+            "  "
         } else {
             "reviewed "
         }
     } else if unseen_label == "unseen" {
-        "unseen   "
+        "● "
     } else {
         "NEW      "
     }
@@ -385,7 +385,7 @@ mod tests {
             "missing mixed Attention count:\n{live}"
         );
         assert!(
-            live.contains("Recent (2 unseen)"),
+            live.contains("Recent (1 unseen)"),
             "missing Recent unseen count:\n{live}"
         );
 
@@ -430,11 +430,77 @@ mod tests {
 
         let text = render_text_at(&app, 140, 38);
 
-        assert!(text.contains("Recent (2 unseen)"), "{text}");
+        assert!(text.contains("Recent (1 unseen)"), "{text}");
         assert!(text.contains("a seen  A seen all"), "{text}");
         for forbidden in ["d archive", "D archive reviewed", "u undo"] {
             assert!(!text.contains(forbidden), "found {forbidden}:\n{text}");
         }
+    }
+
+    #[test]
+    fn recent_rows_use_compact_aligned_seen_and_unseen_prefixes() {
+        let mut app = lifecycle_render_app(1);
+        let theme = *app.theme();
+        let projection = app.review_projection(ReviewSurface::Recent);
+        let unseen_prefix = review_prefix(&projection.items[0], "unseen");
+        let seen_prefix = review_prefix(&projection.items[1], "unseen");
+
+        assert_eq!(unseen_prefix, "● ");
+        assert_eq!(seen_prefix, "  ");
+        assert_eq!(UnicodeWidthStr::width(unseen_prefix), 2);
+        assert_eq!(UnicodeWidthStr::width(seen_prefix), 2);
+
+        app.handle_key(key(KeyCode::Char('J')));
+        for width in [41, 119, 120, 140] {
+            let text = render_text_at(&app, width, 38);
+            assert!(
+                text.contains("> ●"),
+                "missing unseen marker at {width}:\n{text}"
+            );
+            assert!(
+                text.contains("Recent (1 unseen)"),
+                "missing Recent count at {width}:\n{text}"
+            );
+        }
+
+        let unseen_buffer = render_buffer_at(&app, 140, 38);
+        let unseen_text = buffer_text(&unseen_buffer);
+        let unseen_content = content_column(
+            &unseen_text,
+            "ALLOW      project  Codex  recent-new-1",
+            "recent-new-1",
+        );
+        let seen_row = unseen_text
+            .lines()
+            .position(|line| line.contains("recent-new-2"))
+            .unwrap();
+        let seen_content = content_column(
+            &unseen_text,
+            "ALLOW      project  Codex  recent-new-2",
+            "recent-new-2",
+        );
+        assert_eq!(unseen_content, seen_content);
+        assert_eq!(
+            unseen_buffer[(seen_content as u16, seen_row as u16)].fg,
+            theme.text_muted
+        );
+
+        app.handle_key(key(KeyCode::Char('j')));
+        let seen_selected = render_text_at(&app, 140, 38);
+        let selected_line = seen_selected
+            .lines()
+            .find(|line| line.contains("ALLOW      project  Codex  recent-new-2"))
+            .unwrap();
+        assert!(selected_line.contains(">   "), "{seen_selected}");
+        assert!(!selected_line.contains('●'), "{seen_selected}");
+        assert_eq!(
+            unseen_content,
+            content_column(
+                &seen_selected,
+                "ALLOW      project  Codex  recent-new-2",
+                "recent-new-2",
+            )
+        );
     }
 
     #[test]
@@ -447,7 +513,7 @@ mod tests {
                 "missing mixed count at {width}:\n{text}"
             );
             assert!(
-                text.contains("Recent (2 unseen)"),
+                text.contains("Recent (1 unseen)"),
                 "missing Recent title at {width}:\n{text}"
             );
             assert!(
@@ -598,7 +664,7 @@ mod tests {
             &[
                 "Needs Attention",
                 "+1 more unresolved",
-                "Recent (2 unseen)",
+                "Recent (1 unseen)",
                 "Evidence",
                 "> NEW",
             ],
@@ -621,12 +687,7 @@ mod tests {
                 "q quit",
             ],
             &["d archive", "D archive reviewed", "u undo"],
-            &[
-                "Needs Attention",
-                "Recent (2 unseen)",
-                "Evidence",
-                "> unseen",
-            ],
+            &["Needs Attention", "Recent (1 unseen)", "Evidence", "> ●"],
         );
 
         app.handle_key(key(KeyCode::Tab));
@@ -1722,9 +1783,9 @@ mod tests {
             ),
             recent: lifecycle_projection(
                 ReviewSurface::Recent,
-                vec![("recent-new-1".into(), 1, 0), ("recent-new-2".into(), 1, 0)],
-                2,
-                0,
+                vec![("recent-new-1".into(), 1, 0), ("recent-new-2".into(), 0, 1)],
+                1,
+                1,
                 0,
             ),
         };
