@@ -184,3 +184,43 @@ existing rename, safe replacement, symlink, mode, owner, link-count, and file-
 type cases. The existing post-lock removal test remains in place. Production
 lock order, retry interval, absolute deadline, enumeration bounds, generic
 `openat` behavior, and public APIs remain unchanged.
+
+## Stress Test Results: Descriptor-open Recurrence
+
+### Resolved Decisions
+
+- An opened descriptor may be discarded without validation only after pathname
+  inspection establishes disappearance or a different, independently validated
+  safe identity; its contents are never read, locked, or trusted.
+- A `Stable` result still requires the full device, inode, type, mode, owner,
+  and link-count identity to match the enumerated entry.
+- Namespace churn after the post-open lookup remains covered by the existing
+  successful-lock and contended-lock pathname validations. Another lookup in
+  the open helper would only move the race boundary.
+- The deterministic callback moves immediately after `openat`. Removal there
+  must reproduce the hosted `nlink=0` error before the classification change,
+  while the final regression asserts the `Changed` behavior rather than error
+  text.
+- The existing absolute deadline, retry interval, enumeration bounds, generic
+  secure-open helper, lock order, and public APIs remain unchanged.
+- Local Linux verification establishes candidate behavior only. Repeated
+  focused and full serialized macOS jobs remain the platform acceptance gate.
+
+### Changes Made
+
+- Clarified that an unread descriptor can be discarded after confirmed
+  namespace churn without weakening the matching-path validation boundary.
+- Required both downstream lock outcomes to retain pathname revalidation.
+- Bound implementation to current `origin/main`; the already-upstream original
+  zha56 patch must not be duplicated when the local branch is rebased.
+
+### Deferred / Parking Lot
+
+- Publishing a branch and triggering hosted macOS CI remain separately
+  authorized external actions after local implementation and review.
+
+### Confidence Assessment
+
+- Overall: High
+- Remaining concern: only hosted macOS scheduling can confirm that the original
+  nondeterministic integration failure no longer recurs.
