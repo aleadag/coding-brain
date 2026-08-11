@@ -2413,25 +2413,9 @@ mod tests {
             snapshot_calls: AtomicUsize::new(0),
             error: "source failed".into(),
         });
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let actions = Arc::new(SlowBrainActions {
-            error: None,
-            calls: AtomicUsize::new(0),
-            preflight_calls: AtomicUsize::new(0),
-            completed,
-            delay: Duration::from_millis(50),
-            preflight_delay: Duration::ZERO,
-            preflight_capabilities: vec![
-                SessionActionCapability::Allow,
-                SessionActionCapability::Deny,
-                SessionActionCapability::Continue,
-                SessionActionCapability::ManualText,
-            ],
-        });
-        let runtime = BrainRuntime::new(source, actions);
+        let runtime = BrainRuntime::new(source, Arc::new(MockBrainRuntime::default()));
         let mut app = BrainApp::new(runtime, Theme::from_mode(ThemeMode::Dark));
-        dispatch_allow(&mut app);
-        std::thread::sleep(Duration::from_millis(100));
+        queue_delivery_result(&mut app, "allow");
 
         app.refresh();
         assert_eq!(app.status(), Some("Sent allow"));
@@ -2639,10 +2623,8 @@ mod tests {
 
     #[test]
     fn navigation_completion_does_not_overwrite_completed_action_outcome() {
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (mut app, _) = slow_fixture_app(Duration::from_millis(50), completed);
-        dispatch_allow(&mut app);
-        std::thread::sleep(Duration::from_millis(100));
+        let (mut app, _) = fixture_app(false);
+        queue_delivery_result(&mut app, "allow");
 
         app.complete_navigation(Ok(NavigationOutcome::Attached));
         assert_eq!(app.status(), Some("Sent allow"));
@@ -3585,6 +3567,20 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender
             .send(SessionActionWorkerResult::Preflight(Ok(availability)))
+            .unwrap();
+        app.session_action_worker.receiver = Some(receiver);
+    }
+
+    fn queue_delivery_result(app: &mut BrainApp, label: &'static str) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(SessionActionWorkerResult::Delivery {
+                kind: SessionActionKind {
+                    label,
+                    manual_bytes: None,
+                },
+                result: Ok(()),
+            })
             .unwrap();
         app.session_action_worker.receiver = Some(receiver);
     }
