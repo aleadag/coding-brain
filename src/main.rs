@@ -17,13 +17,14 @@ mod doctor;
 mod executable;
 mod init;
 mod lifecycle_hook;
+mod lifecycle_timing;
 mod provider_hooks;
 mod runtime;
 
 use std::io;
 #[cfg(feature = "fault-injection")]
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
@@ -377,6 +378,7 @@ fn select_mode(cli: &Cli) -> RunMode {
 }
 
 fn main() -> io::Result<()> {
+    let started = Instant::now();
     let cli = Cli::parse();
     #[cfg(feature = "fault-injection")]
     if fault_activation_requested(&cli) {
@@ -401,7 +403,7 @@ fn main() -> io::Result<()> {
     let is_internal_hook =
         cli.permission_hook || cli.lifecycle_hook || cli.recovery_hook || cli.distill_once;
     let is_storage_command = matches!(cli.command, Some(Command::Storage { .. }));
-    let result = run_main(cli);
+    let result = run_main(cli, started);
     if result.is_ok() && !is_internal_hook && !is_storage_command {
         maybe_print_star_prompt();
     }
@@ -582,11 +584,12 @@ fn early_config_action(cli: &Cli) -> Option<&ConfigAction> {
     }
 }
 
-fn run_main(cli: Cli) -> io::Result<()> {
+fn run_main(cli: Cli, started: Instant) -> io::Result<()> {
     if cli.lifecycle_hook {
         lifecycle_hook::run(
             cli.provider.map(Into::into).unwrap_or_default(),
             cli.antigravity_hook_event.as_deref(),
+            lifecycle_timing::HookBudget::from_start(started),
         );
         return Ok(());
     }

@@ -372,12 +372,34 @@ struct ParentProcessEvidence {
 }
 
 pub(crate) fn live_parent_process(provider: AgentProvider) -> Option<LiveProcessIdentity> {
+    #[cfg(unix)]
+    {
+        let mut output = OutputBudget::new(MAX_PARENT_RECORD_BYTES);
+        live_parent_process_until(
+            provider,
+            std::time::Instant::now() + PARENT_PROCESS_TIMEOUT,
+            &mut output,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = provider;
+        None
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn live_parent_process_until(
+    provider: AgentProvider,
+    deadline: std::time::Instant,
+    output: &mut OutputBudget,
+) -> Option<LiveProcessIdentity> {
     let mut pid = parent_pid()?;
     for _ in 0..MAX_PARENT_DEPTH {
         if pid == 0 {
             break;
         }
-        let parent = read_parent_process(pid)?;
+        let parent = read_parent_process_until(pid, deadline, output)?;
         if let Some(live_process) = select_live_process(provider, std::slice::from_ref(&parent)) {
             return Some(live_process);
         }
@@ -453,6 +475,15 @@ fn read_parent_process(pid: u32) -> Option<ParentProcessEvidence> {
 }
 
 #[cfg(target_os = "linux")]
+fn read_parent_process_until(
+    pid: u32,
+    _deadline: std::time::Instant,
+    _output: &mut OutputBudget,
+) -> Option<ParentProcessEvidence> {
+    read_parent_process(pid)
+}
+
+#[cfg(target_os = "linux")]
 fn read_linux_parent_process(
     pid: u32,
     read_stat: impl FnOnce(&Path) -> Option<Vec<u8>>,
@@ -493,6 +524,20 @@ fn proc_executable_name(path: Option<PathBuf>) -> Option<String> {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn read_parent_process(pid: u32) -> Option<ParentProcessEvidence> {
+    let mut output = OutputBudget::new(MAX_PARENT_RECORD_BYTES);
+    read_parent_process_until(
+        pid,
+        std::time::Instant::now() + PARENT_PROCESS_TIMEOUT,
+        &mut output,
+    )
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn read_parent_process_until(
+    pid: u32,
+    deadline: std::time::Instant,
+    output_budget: &mut OutputBudget,
+) -> Option<ParentProcessEvidence> {
     use std::process::{Command, Stdio};
 
     let mut command = Command::new("/bin/ps");
@@ -501,11 +546,7 @@ fn read_parent_process(pid: u32) -> Option<ParentProcessEvidence> {
         .env_clear()
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let output = run_bounded_process(
-        &mut command,
-        PARENT_PROCESS_TIMEOUT,
-        MAX_PARENT_RECORD_BYTES,
-    )?;
+    let output = run_bounded_process_until(&mut command, deadline, output_budget).ok()?;
     let fields = std::str::from_utf8(&output)
         .ok()?
         .split_whitespace()
@@ -527,18 +568,55 @@ fn read_parent_process(pid: u32) -> Option<ParentProcessEvidence> {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BoundedProcessError {
+    Spawn,
+    Io,
+    Timeout,
+    OutputLimit,
+    ExitStatus,
+    Cleanup,
+}
+
+pub(crate) struct OutputBudget {
+    remaining: usize,
+}
+
+impl OutputBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self { remaining: limit }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining
+    }
+}
+
+#[cfg(unix)]
 pub(crate) fn run_bounded_process(
     command: &mut std::process::Command,
     timeout: std::time::Duration,
     output_limit: usize,
 ) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut output = OutputBudget::new(output_limit);
+    run_bounded_process_until(command, deadline, &mut output).ok()
+}
+
+#[cfg(unix)]
+pub(crate) fn run_bounded_process_until(
+    command: &mut std::process::Command,
+    deadline: std::time::Instant,
+    output: &mut OutputBudget,
+) -> Result<Vec<u8>, BoundedProcessError> {
     use std::io::ErrorKind;
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use std::time::Instant;
 
-    let child_reaper = bounded_child_reaper()?;
+    let child_reaper = bounded_child_reaper().ok_or(BoundedProcessError::Cleanup)?;
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     unsafe {
         command.pre_exec(|| {
@@ -549,12 +627,12 @@ pub(crate) fn run_bounded_process(
             }
         });
     }
-    let mut child = command.spawn().ok()?;
+    let mut child = command.spawn().map_err(|_| BoundedProcessError::Spawn)?;
     let mut stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
             terminate_process_group(child, child_reaper);
-            return None;
+            return Err(BoundedProcessError::Io);
         }
     };
     let descriptor = stdout.as_raw_fd();
@@ -562,11 +640,10 @@ pub(crate) fn run_bounded_process(
     if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
     {
         terminate_process_group(child, child_reaper);
-        return None;
+        return Err(BoundedProcessError::Io);
     }
 
-    let started = Instant::now();
-    let mut output = Vec::new();
+    let mut bytes = Vec::new();
     let mut eof = false;
     loop {
         let mut chunk = [0_u8; 1024];
@@ -577,34 +654,60 @@ pub(crate) fn run_bounded_process(
                     break;
                 }
                 Ok(read) => {
-                    output.extend_from_slice(&chunk[..read]);
-                    if output.len() > output_limit {
+                    let accepted = read.min(output.remaining);
+                    bytes.extend_from_slice(&chunk[..accepted]);
+                    output.remaining -= accepted;
+                    if accepted != read {
                         terminate_process_group(child, child_reaper);
-                        return None;
+                        return Err(BoundedProcessError::OutputLimit);
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => {
                     terminate_process_group(child, child_reaper);
-                    return None;
+                    return Err(BoundedProcessError::Io);
                 }
             }
         }
 
         match child.try_wait() {
-            Ok(Some(status)) if eof => return status.success().then_some(output),
+            Ok(Some(status)) if eof => {
+                return status
+                    .success()
+                    .then_some(bytes)
+                    .ok_or(BoundedProcessError::ExitStatus);
+            }
             Ok(_) => {}
             Err(_) => {
                 terminate_process_group(child, child_reaper);
-                return None;
+                return Err(BoundedProcessError::Io);
             }
         }
-        if started.elapsed() >= timeout {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             terminate_process_group(child, child_reaper);
-            return None;
+            return Err(BoundedProcessError::Timeout);
         }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let timeout_ms = i32::try_from(remaining.as_millis().saturating_add(1)).unwrap_or(i32::MAX);
+        let mut pollfd = libc::pollfd {
+            fd: descriptor,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } {
+            -1 if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted => continue,
+            -1 => {
+                terminate_process_group(child, child_reaper);
+                return Err(BoundedProcessError::Io);
+            }
+            0 => {
+                terminate_process_group(child, child_reaper);
+                return Err(BoundedProcessError::Timeout);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -895,6 +998,41 @@ mod tests {
         assert_eq!(
             run_bounded_process(&mut command, Duration::from_millis(100), 4),
             None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_process_until_reports_typed_output_limit() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 12345"]);
+        let mut output = OutputBudget::new(4);
+        assert_eq!(
+            run_bounded_process_until(
+                &mut command,
+                Instant::now() + Duration::from_millis(100),
+                &mut output,
+            ),
+            Err(BoundedProcessError::OutputLimit)
+        );
+        assert_eq!(output.remaining(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_process_until_reports_timeout_and_reaps_the_group() {
+        use std::process::Command;
+        use std::time::Instant;
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf ready; exec tail -f /dev/null"]);
+        let mut output = OutputBudget::new(1024);
+        assert_eq!(
+            run_bounded_process_until(&mut command, Instant::now(), &mut output),
+            Err(BoundedProcessError::Timeout)
         );
     }
 

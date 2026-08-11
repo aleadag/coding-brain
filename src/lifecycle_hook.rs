@@ -28,6 +28,7 @@ use crate::brain::activity::ActivityLog;
 #[cfg(test)]
 use crate::brain::activity::ActivityStore;
 use crate::brain::storage::{BrainDb, OpenRole, StorageDeadline, StoragePaths};
+use crate::lifecycle_timing::{HookBudget, HookEventClass, HookOutcome, HookStage, HookTiming};
 #[cfg(test)]
 use crate::provider_hooks::normalized_outcome;
 use crate::provider_hooks::{ParsedLifecycleHook, parse_lifecycle};
@@ -48,6 +49,7 @@ pub(crate) struct RecordedProviderHook {
 pub(crate) enum HookInputError {
     Read,
     TooLarge,
+    Timeout,
 }
 
 impl fmt::Display for HookInputError {
@@ -55,6 +57,7 @@ impl fmt::Display for HookInputError {
         match self {
             Self::Read => f.write_str("could not read stdin"),
             Self::TooLarge => f.write_str("input exceeds 65536 bytes"),
+            Self::Timeout => f.write_str("input timed out"),
         }
     }
 }
@@ -70,6 +73,57 @@ pub(crate) fn read_bounded_hook_input(mut reader: impl Read) -> Result<Vec<u8>, 
         Err(HookInputError::TooLarge)
     } else {
         Ok(input)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn read_bounded_hook_input_until(
+    reader: &mut (impl Read + std::os::fd::AsFd),
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, HookInputError> {
+    use std::io::ErrorKind;
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let descriptor = reader.as_fd().as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(HookInputError::Read);
+    }
+
+    let mut input = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(HookInputError::Timeout);
+        }
+        let timeout_ms = i32::try_from(remaining.as_millis().saturating_add(1)).unwrap_or(i32::MAX);
+        let mut pollfd = libc::pollfd {
+            fd: descriptor,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } {
+            -1 if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted => continue,
+            -1 => return Err(HookInputError::Read),
+            0 => return Err(HookInputError::Timeout),
+            _ => {}
+        }
+
+        let mut chunk = [0_u8; 4096];
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(input),
+            Ok(read) => {
+                let accepted = read.min(MAX_HOOK_INPUT_BYTES.saturating_sub(input.len()));
+                input.extend_from_slice(&chunk[..accepted]);
+                if accepted != read {
+                    return Err(HookInputError::TooLarge);
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(HookInputError::Read),
+        }
     }
 }
 
@@ -953,22 +1007,38 @@ fn current_paths() -> Option<CodingBrainPaths> {
     CodingBrainPaths::resolve(&environment).ok()
 }
 
-pub(crate) fn run(provider: AgentProvider, antigravity_event: Option<&str>) {
+pub(crate) fn run(provider: AgentProvider, antigravity_event: Option<&str>, budget: HookBudget) {
     let stdin = std::io::stdin();
     let stderr = std::io::stderr();
-    run_provider_with_sqlite(provider, stdin.lock(), stderr.lock(), antigravity_event);
+    run_provider_with_sqlite(
+        provider,
+        stdin.lock(),
+        stderr.lock(),
+        antigravity_event,
+        budget,
+    );
 }
 
-fn run_provider_with_sqlite<R: Read, E: Write>(
+fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
     provider: AgentProvider,
-    stdin: R,
+    mut stdin: R,
     mut stderr: E,
     antigravity_event: Option<&str>,
+    budget: HookBudget,
 ) {
-    let input = match read_bounded_hook_input(stdin) {
+    let timing = HookTiming::new(provider, HookEventClass::Other, &budget);
+    let input = match read_bounded_hook_input_until(&mut stdin, budget.deadline()) {
         Ok(input) => input,
         Err(error) => {
             write_diagnostic(&mut stderr, error);
+            timing.finish(
+                HookStage::Input,
+                match error {
+                    HookInputError::Timeout => HookOutcome::Timeout,
+                    HookInputError::TooLarge => HookOutcome::InputTooLarge,
+                    HookInputError::Read => HookOutcome::InputRead,
+                },
+            );
             return;
         }
     };
@@ -978,6 +1048,7 @@ fn run_provider_with_sqlite<R: Read, E: Write>(
             Ok(_) => {}
             Err(error) => {
                 write_diagnostic(&mut stderr, error);
+                timing.finish(HookStage::Parse, HookOutcome::Rejected);
                 return;
             }
         }
@@ -987,27 +1058,38 @@ fn run_provider_with_sqlite<R: Read, E: Write>(
     let mut database = match BrainDb::open_current(
         &paths,
         OpenRole::Hook,
-        StorageDeadline::after(std::time::Duration::from_millis(500)),
+        StorageDeadline::after(budget.allowance(std::time::Duration::from_millis(500))),
     ) {
         Ok(database) => database,
         Err(error) => {
             write_diagnostic(&mut stderr, format!("SQLite storage unavailable: {error}"));
+            timing.finish(HookStage::Storage, HookOutcome::StorageUnavailable);
             return;
         }
     };
     let links = SessionLinkStore::at(state_root.join("session-links.jsonl"));
+    let mut parent_output = crate::provider_hooks::OutputBudget::new(4 * 1024);
+    let live_process = budget
+        .optional_child_deadline(
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(500),
+        )
+        .and_then(|deadline| {
+            crate::provider_hooks::live_parent_process_until(provider, deadline, &mut parent_output)
+        });
     match persist_provider_hook_sqlite(
         provider,
         antigravity_event,
         &input,
         &mut database,
         &links,
-        crate::provider_hooks::live_parent_process(provider),
+        live_process,
         crate::provider_hooks::revalidate_live_process,
     ) {
-        Ok(_) => {}
+        Ok(_) => timing.finish(HookStage::Lifecycle, HookOutcome::Success),
         Err(error) => {
             write_diagnostic(&mut stderr, error);
+            timing.finish(HookStage::Lifecycle, HookOutcome::Error);
         }
     }
 }
@@ -1670,6 +1752,21 @@ mod tests {
             read_bounded_hook_input(Cursor::new(&oversized)),
             Err(HookInputError::TooLarge)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_until_times_out_while_writer_remains_open() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::time::Instant;
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_all(b"ready").unwrap();
+        assert_eq!(
+            read_bounded_hook_input_until(&mut reader, Instant::now()),
+            Err(HookInputError::Timeout)
+        );
     }
 
     #[test]

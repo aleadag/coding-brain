@@ -20,5 +20,6 @@ pub mod doctor;
 mod executable;
 pub mod init;
 mod lifecycle_hook;
+mod lifecycle_timing;
 mod provider_hooks;
 pub mod runtime;
