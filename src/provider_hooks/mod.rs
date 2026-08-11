@@ -1197,6 +1197,67 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_process_timeout_kills_ready_child_and_blocked_descendant() {
+        use std::io::Read;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (mut ready_reader, ready_writer) = UnixStream::pair().unwrap();
+        ready_reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let blocked_reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let _blocked_writer = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
+        let blocked_fd = blocked_reader.as_raw_fd();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ready_writer = ready_writer;
+            let ready_fd = _ready_writer.as_raw_fd();
+            let mut command = Command::new("/bin/sh");
+            command.args([
+                "-c",
+                "cat <&4 >/dev/null & child=$!; printf '%s %s\\n' \"$$\" \"$child\" >&3; wait",
+            ]);
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(ready_fd, 3) < 0 || libc::dup2(blocked_fd, 4) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut output = OutputBudget::new(1024);
+            sender
+                .send(run_bounded_process_until(
+                    &mut command,
+                    Instant::now() + Duration::from_millis(100),
+                    &mut output,
+                ))
+                .unwrap();
+        });
+        let mut pids = String::new();
+        ready_reader.read_to_string(&mut pids).unwrap();
+        let pids = pids
+            .split_whitespace()
+            .map(str::parse::<i32>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(pids.len(), 2);
+        assert_eq!(receiver.recv().unwrap(), Err(BoundedProcessError::Timeout));
+        for pid in pids {
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_proc_reads_respect_deadline_and_shared_output_budget() {

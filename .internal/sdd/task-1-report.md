@@ -50,3 +50,7 @@ Correction verification:
 - `nix develop path:. --command cargo test -p coding-brain bounded_proc_reads -- --nocapture` — passed.
 - `nix develop path:. --command cargo fmt` — passed.
 - `nix develop path:. --command cargo clippy -p coding-brain --all-targets -- -D warnings` — passed.
+
+Final correction commit `ef2dca41` adds a private resolved-reaper seam and cfg(test)-only stdout descriptor fault. It deterministically covers `Cleanup`, `Spawn`, `ExitStatus`, and post-spawn `Io` without changing the public process API.
+
+Final process-group proof uses an inherited readiness socket and a descendant blocked on an inherited pipe; it waits for the parent/descendant PID handshake, observes the bounded timeout, and asserts both PIDs return `ESRCH` after group termination.
