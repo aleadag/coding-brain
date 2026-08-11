@@ -5258,21 +5258,23 @@ mod tests {
         }
         assert_eq!(payloads.len(), 15);
         let start = Arc::new(Barrier::new(payloads.len()));
-        let (ready_tx, ready_rx) = mpsc::channel();
+        enum WorkerEvent {
+            ReachedModel,
+            Finished { stdout: Vec<u8>, stderr: Vec<u8> },
+        }
+        let (event_tx, event_rx) = mpsc::channel();
 
         let results = std::thread::scope(|scope| {
             let mut workers = Vec::new();
             for payload in &payloads {
                 let start = Arc::clone(&start);
-                let ready_tx = ready_tx.clone();
-                let (release_tx, release_rx) = mpsc::sync_channel(0);
-                let (result_tx, result_rx) = mpsc::channel();
+                let event_tx = event_tx.clone();
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
                 let lifecycle = &lifecycle;
                 let activity = &activity;
                 let config = &config;
                 workers.push((
                     release_tx,
-                    result_rx,
                     scope.spawn(move || {
                         start.wait();
                         let mut stdout = Vec::new();
@@ -5286,29 +5288,88 @@ mod tests {
                             lifecycle,
                             Some(activity),
                             |_, _| {
-                                ready_tx.send(()).unwrap();
+                                event_tx.send(WorkerEvent::ReachedModel).unwrap();
                                 release_rx.recv().unwrap();
                                 Ok(suggestion(RuleAction::Approve, 0.9))
                             },
                         );
-                        result_tx.send((stdout, stderr)).unwrap();
+                        event_tx
+                            .send(WorkerEvent::Finished { stdout, stderr })
+                            .unwrap();
                     }),
                 ));
             }
-            drop(ready_tx);
-            for _ in &payloads {
-                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(event_tx);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut reached_model = 0;
+            let mut results = Vec::with_capacity(payloads.len());
+            let mut failure = None;
+            while reached_model < payloads.len() {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match event_rx.recv_timeout(remaining) {
+                    Ok(WorkerEvent::ReachedModel) => reached_model += 1,
+                    Ok(WorkerEvent::Finished { stdout, stderr }) => {
+                        failure = Some(format!(
+                            "permission worker finished before the model gate: {}",
+                            String::from_utf8_lossy(&stderr)
+                        ));
+                        results.push((stdout, stderr));
+                        break;
+                    }
+                    Err(error) => {
+                        failure = Some(format!(
+                            "only {reached_model} of {} permission workers reached the model gate: {error}",
+                            payloads.len()
+                        ));
+                        break;
+                    }
+                }
             }
             let initial_lock_acquisitions = initial_lock_acquisitions.load(Ordering::SeqCst);
-            let results = workers
-                .into_iter()
-                .map(|(release, result_rx, handle)| {
+            if failure.is_none() {
+                for (release, _) in &workers {
                     release.send(()).unwrap();
-                    let result = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    handle.join().unwrap();
-                    result
-                })
-                .collect::<Vec<_>>();
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    match event_rx.recv_timeout(remaining) {
+                        Ok(WorkerEvent::Finished { stdout, stderr }) => {
+                            results.push((stdout, stderr));
+                        }
+                        Ok(WorkerEvent::ReachedModel) => {
+                            failure = Some("permission worker reached the model gate twice".into());
+                            break;
+                        }
+                        Err(error) => {
+                            failure = Some(format!(
+                                "only {} of {} permission workers finished before the deadline: {error}",
+                                results.len(),
+                                payloads.len()
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+            if failure.is_some() {
+                for (release, _) in &workers {
+                    let _ = release.try_send(());
+                }
+                while results.len() < payloads.len() {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    match event_rx.recv_timeout(remaining) {
+                        Ok(WorkerEvent::ReachedModel) => {}
+                        Ok(WorkerEvent::Finished { stdout, stderr }) => {
+                            results.push((stdout, stderr));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            for (_, handle) in workers {
+                if handle.join().is_err() {
+                    failure.get_or_insert_with(|| "permission worker panicked".into());
+                }
+            }
+            assert!(failure.is_none(), "{}", failure.unwrap_or_default());
             (initial_lock_acquisitions, results)
         });
         let (initial_lock_acquisitions, results) = results;
