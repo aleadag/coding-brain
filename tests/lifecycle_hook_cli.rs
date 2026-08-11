@@ -47,6 +47,17 @@ fn secure_home(home: &std::path::Path) {
     }
 }
 
+fn command_for_home(home: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
+    command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .current_dir(home);
+    command
+}
+
 fn prepare_current_storage(home: &std::path::Path) {
     secure_home(home);
     MigrationCoordinator::at(&home.join(".local/state/coding-brain"))
@@ -102,7 +113,7 @@ fn run_provider_hook_with_event(
             serde_json::to_vec(&value).unwrap()
         })
         .unwrap_or_else(|_| input.to_vec());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cbrain"));
+    let mut command = command_for_home(home);
     command.arg("--lifecycle-hook");
     if let Some(provider) = provider {
         command.args(["--provider", provider]);
@@ -111,8 +122,6 @@ fn run_provider_hook_with_event(
         command.args(["--antigravity-hook-event", event]);
     }
     let mut child = command
-        .env("HOME", home)
-        .current_dir(home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -611,21 +620,14 @@ fn provider_hook_rejects_oversized_missing_and_unknown_input_without_activity() 
 
 fn run_cli(home: &std::path::Path, args: &[&str]) -> Output {
     secure_home(home);
-    Command::new(env!("CARGO_BIN_EXE_cbrain"))
-        .args(args)
-        .env("HOME", home)
-        .current_dir(home)
-        .output()
-        .unwrap()
+    command_for_home(home).args(args).output().unwrap()
 }
 
 fn run_init_check(home: &std::path::Path) -> Output {
     secure_home(home);
-    Command::new(env!("CARGO_BIN_EXE_cbrain"))
+    command_for_home(home)
         .args(["init", "--check"])
-        .env("HOME", home)
         .env("PATH", "")
-        .current_dir(home)
         .output()
         .unwrap()
 }
@@ -1276,11 +1278,9 @@ fn run_permission_hook_without_prepare(home: &std::path::Path, input: &[u8]) -> 
         paths.extend(std::env::split_paths(&existing));
     }
     let path = std::env::join_paths(paths).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cbrain"))
+    let mut child = command_for_home(home)
         .arg("--permission-hook")
-        .env("HOME", home)
         .env("PATH", path)
-        .current_dir(home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -519,6 +519,13 @@ fn is_first_run() -> bool {
         return false;
     };
     let marker = init::marker::default_path();
+    is_first_run_with_paths(Some(&home), &marker)
+}
+
+fn is_first_run_with_paths(home: Option<&std::path::Path>, marker: &std::path::Path) -> bool {
+    let Some(home) = home else {
+        return false;
+    };
     let settings = home.join(".codex").join("hooks.json");
     let onboarded = marker.exists();
     let hooked = std::fs::read_to_string(&settings)
@@ -1290,35 +1297,16 @@ mod first_run_tests {
     use super::*;
     use std::fs;
 
-    struct HomeEnvGuard(Option<std::ffi::OsString>);
-
-    impl Drop for HomeEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: each guard is created while HOME_ENV_LOCK is held.
-            unsafe {
-                match self.0.take() {
-                    Some(home) => std::env::set_var("HOME", home),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
-    fn set_home(p: &std::path::Path) {
-        // SAFETY: tests are serialized via HOME_ENV_LOCK; nothing else
-        // here races on env reads inside the lock window.
-        unsafe { std::env::set_var("HOME", p) };
-    }
-
     #[test]
     fn first_run_when_neither_marker_nor_hooks_present() {
-        let _g = config::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        let _home = HomeEnvGuard(std::env::var_os("HOME"));
-        set_home(tmp.path());
-        assert!(is_first_run(), "fresh home should be first-run");
+        assert!(
+            is_first_run_with_paths(
+                Some(tmp.path()),
+                &tmp.path().join("state/coding-brain/onboarding.json"),
+            ),
+            "fresh home should be first-run"
+        );
     }
 
     #[test]
@@ -1333,29 +1321,18 @@ mod first_run_tests {
 
     #[test]
     fn not_first_run_when_onboarding_marker_present() {
-        let _g = config::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join(".local/state/coding-brain")).unwrap();
-        fs::write(
-            tmp.path().join(".local/state/coding-brain/onboarding.json"),
-            "{}",
-        )
-        .unwrap();
-        let _home = HomeEnvGuard(std::env::var_os("HOME"));
-        set_home(tmp.path());
+        let marker = tmp.path().join("state/coding-brain/onboarding.json");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, "{}").unwrap();
         assert!(
-            !is_first_run(),
+            !is_first_run_with_paths(Some(tmp.path()), &marker),
             "onboarding marker present should suppress first-run"
         );
     }
 
     #[test]
     fn not_first_run_when_settings_mentions_coding_brain() {
-        let _g = config::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join(".codex")).unwrap();
         fs::write(
@@ -1363,25 +1340,20 @@ mod first_run_tests {
             r#"{"hooks":{"PostToolUse":[{"hooks":[{"command":"cbrain --lifecycle-hook"}]}]}}"#,
         )
         .unwrap();
-        let _home = HomeEnvGuard(std::env::var_os("HOME"));
-        set_home(tmp.path());
         assert!(
-            !is_first_run(),
+            !is_first_run_with_paths(
+                Some(tmp.path()),
+                &tmp.path().join("state/coding-brain/onboarding.json"),
+            ),
             "hook install should suppress first-run even without onboarding marker"
         );
     }
 
     #[test]
     fn not_first_run_when_home_missing() {
-        let _g = config::HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let _home = HomeEnvGuard(std::env::var_os("HOME"));
-        // SAFETY: serialized via HOME_ENV_LOCK; nothing else reads HOME inside
-        // this critical section.
-        unsafe { std::env::remove_var("HOME") };
+        let tmp = tempfile::tempdir().unwrap();
         assert!(
-            !is_first_run(),
+            !is_first_run_with_paths(None, &tmp.path().join("onboarding.json")),
             "no HOME should be treated as not-first-run (no nudge possible)"
         );
     }

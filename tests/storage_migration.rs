@@ -4,6 +4,7 @@ use std::io::Read;
 use std::io::Write;
 #[cfg(feature = "fault-injection")]
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -86,6 +87,113 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) {
     fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn review_rows(path: &std::path::Path) -> Vec<(String, String, i64, String, i64)> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut uri = b"file:".to_vec();
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(*byte);
+        } else {
+            uri.extend_from_slice(&[b'%', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]]);
+        }
+    }
+    uri.extend_from_slice(b"?immutable=1");
+    let connection = rusqlite::Connection::open_with_flags(
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(uri)),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .unwrap();
+    connection
+        .prepare(
+            "SELECT surface, group_id, source_cursor, disposition, revision
+             FROM review_marks
+             ORDER BY surface, group_id, source_cursor",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn ensure_test_review_gate(paths: &StoragePaths) {
+    let gate = paths.db_dir().join("review-reset.lock");
+    if !gate.exists() {
+        write_private(&gate, b"");
+    }
+}
+
+fn convert_completed_review_to_legacy_delete(state_root: &std::path::Path) -> String {
+    let paths = StoragePaths::at(state_root);
+    let connection = rusqlite::Connection::open_with_flags(
+        paths.review_db(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .unwrap();
+    let checkpoint = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(checkpoint, (0, 0, 0));
+    assert_eq!(
+        connection
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "delete"
+    );
+    drop(connection);
+
+    let database = fs::read(paths.review_db()).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&database));
+    let metadata = fs::metadata(paths.review_db()).unwrap();
+    let state_path = state_root.join("db/.brain.sqlite3.migration-state.json");
+    let mut state = migration_state(state_root);
+    let artifact = &mut state["review_result"]["artifact"];
+    artifact["device"] = metadata.dev().into();
+    artifact["inode"] = metadata.ino().into();
+    artifact["size"] = metadata.len().into();
+    artifact["modified_seconds"] = metadata.mtime().into();
+    artifact["modified_nanoseconds"] = metadata.mtime_nsec().into();
+    artifact["digest"] = digest.clone().into();
+    write_private(&state_path, &serde_json::to_vec(&state).unwrap());
+    digest
+}
+
+fn sqlite_header_is_wal(path: &std::path::Path) -> bool {
+    let bytes = fs::read(path).unwrap();
+    bytes.get(18..20) == Some([2, 2].as_slice())
+}
+
+#[cfg(feature = "fault-injection")]
+fn review_artifact(path: &std::path::Path) -> serde_json::Value {
+    let bytes = fs::read(path).unwrap();
+    let metadata = fs::metadata(path).unwrap();
+    serde_json::json!({
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "size": metadata.len(),
+        "modified_seconds": metadata.mtime(),
+        "modified_nanoseconds": metadata.mtime_nsec(),
+        "digest": format!("{:x}", Sha256::digest(bytes)),
+    })
 }
 
 fn remove_fixture_journal(state_root: &std::path::Path) {
@@ -242,6 +350,22 @@ fn tree_snapshot(root: &std::path::Path) -> Vec<TreeEntry> {
     let mut entries = Vec::new();
     visit(root, root, &mut entries);
     entries
+}
+
+#[cfg(feature = "fault-injection")]
+fn review_gate_tree_snapshot(root: &std::path::Path) -> Vec<TreeEntry> {
+    tree_snapshot(root)
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.path.as_os_str().as_encoded_bytes(),
+                b"db/brain.sqlite3"
+                    | b"db/review.sqlite3"
+                    | b"db/review-reset.lock"
+                    | b"review-gate-evidence"
+            )
+        })
+        .collect()
 }
 
 #[cfg(feature = "fault-injection")]
@@ -685,7 +809,12 @@ fn legacy_brain_proposal_building_and_verified_restarts_complete_safely() {
             activity_before
         );
         assert!(fixture.state_root().join("db/brain.sqlite3").exists());
-        assert_eq!(coordinator.resume().unwrap(), MigrationStatus::Complete);
+        assert_eq!(
+            coordinator
+                .resume()
+                .unwrap_or_else(|error| panic!("resume after {fault} failed: {error:?}")),
+            MigrationStatus::Complete
+        );
     }
 }
 
@@ -1279,6 +1408,425 @@ fn missing_review_source_publishes_an_empty_current_review_database() {
         migration_state(fixture.state_root())["review_result"]["status"],
         "published"
     );
+}
+
+#[test]
+fn review_publication_creates_the_runtime_reset_gate() {
+    let fixture = LegacyFixture::copy("permission-journal-4vh58");
+    let coordinator = MigrationCoordinator::at(fixture.state_root());
+
+    assert_eq!(
+        coordinator.run_non_hook().unwrap(),
+        MigrationStatus::Complete
+    );
+    let paths = StoragePaths::at(fixture.state_root());
+    let gate = paths.db_dir().join("review-reset.lock");
+    let metadata = fs::metadata(&gate).unwrap();
+    assert_eq!(metadata.mode() & 0o777, 0o600);
+    assert_eq!(metadata.nlink(), 1);
+    drop(
+        coding_brain::brain::storage::ReviewDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(1)),
+        )
+        .unwrap(),
+    );
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn review_gate_sync_faults_resume_without_reset() {
+    for fault in ["after-review-gate-sync", "after-complete-review-gate-sync"] {
+        let fixture = LegacyFixture::copy("permission-journal-4vh58");
+        if fault == "after-complete-review-gate-sync" {
+            MigrationCoordinator::at(fixture.state_root())
+                .run_non_hook()
+                .unwrap();
+            fs::remove_file(fixture.state_root().join("db/review-reset.lock")).unwrap();
+        }
+
+        assert!(
+            !migration_child(fixture.state_root(), fault).success(),
+            "{fault}"
+        );
+        assert_eq!(
+            MigrationCoordinator::at(fixture.state_root())
+                .resume()
+                .unwrap(),
+            MigrationStatus::Complete,
+            "{fault}",
+        );
+        assert!(fixture.state_root().join("db/review-reset.lock").is_file());
+    }
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn unsafe_review_gate_entries_are_preserved_and_rejected() {
+    for unsafe_kind in ["symlink", "hardlink", "mode", "fifo"] {
+        let fixture = LegacyFixture::copy("permission-journal-4vh58");
+        let coordinator = MigrationCoordinator::at(fixture.state_root());
+        assert_eq!(
+            coordinator.run_non_hook().unwrap(),
+            MigrationStatus::Complete
+        );
+        let paths = StoragePaths::at(fixture.state_root());
+        let gate = paths.db_dir().join("review-reset.lock");
+        let evidence = fixture.state_root().join("review-gate-evidence");
+        match unsafe_kind {
+            "symlink" => {
+                write_private(&evidence, b"outside");
+                fs::remove_file(&gate).unwrap();
+                symlink(&evidence, &gate).unwrap();
+            }
+            "hardlink" => {
+                fs::hard_link(&gate, &evidence).unwrap();
+            }
+            "mode" => {
+                fs::set_permissions(&gate, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            "fifo" => {
+                fs::remove_file(&gate).unwrap();
+                let gate = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(gate.as_ptr(), 0o600) }, 0);
+            }
+            _ => unreachable!(),
+        }
+        let brain_identity = {
+            let metadata = fs::metadata(paths.brain_db()).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let review_identity = {
+            let metadata = fs::metadata(paths.review_db()).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let gate_identity = {
+            let metadata = fs::symlink_metadata(&gate).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let before = review_gate_tree_snapshot(fixture.state_root());
+
+        assert!(matches!(
+            coordinator.resume(),
+            Err(StorageError::InvalidStorage(_))
+        ));
+        assert_eq!(
+            review_gate_tree_snapshot(fixture.state_root()),
+            before,
+            "{unsafe_kind}"
+        );
+        let brain_after = fs::metadata(paths.brain_db()).unwrap();
+        let review_after = fs::metadata(paths.review_db()).unwrap();
+        let gate_after = fs::symlink_metadata(&gate).unwrap();
+        assert_eq!(
+            (brain_after.dev(), brain_after.ino()),
+            brain_identity,
+            "{unsafe_kind}"
+        );
+        assert_eq!(
+            (review_after.dev(), review_after.ino()),
+            review_identity,
+            "{unsafe_kind}"
+        );
+        assert_eq!(
+            (gate_after.dev(), gate_after.ino()),
+            gate_identity,
+            "{unsafe_kind}"
+        );
+    }
+}
+
+#[test]
+fn complete_published_review_repairs_only_a_missing_gate() {
+    let fixture = LegacyFixture::copy("permission-journal-4vh58");
+    let coordinator = MigrationCoordinator::at(fixture.state_root());
+    assert_eq!(
+        coordinator.run_non_hook().unwrap(),
+        MigrationStatus::Complete
+    );
+    let paths = StoragePaths::at(fixture.state_root());
+    let legacy_artifact = convert_completed_review_to_legacy_delete(fixture.state_root());
+    let brain_before = fs::read(paths.brain_db()).unwrap();
+    let rows_before = review_rows(&paths.review_db());
+    let gate = paths.db_dir().join("review-reset.lock");
+    if gate.exists() {
+        fs::remove_file(&gate).unwrap();
+    }
+    assert!(!gate.exists());
+
+    assert_eq!(coordinator.resume().unwrap(), MigrationStatus::Complete);
+    assert_eq!(fs::read(paths.brain_db()).unwrap(), brain_before);
+    assert_eq!(review_rows(&paths.review_db()), rows_before);
+    assert!(sqlite_header_is_wal(&paths.review_db()));
+    assert_ne!(
+        migration_state(fixture.state_root())["review_result"]["artifact"]["digest"],
+        legacy_artifact
+    );
+    assert!(paths.db_dir().join("review-reset.lock").is_file());
+    drop(
+        coding_brain::brain::storage::ReviewDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(1)),
+        )
+        .unwrap(),
+    );
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn complete_review_normalization_fault_reconciles_the_published_artifact() {
+    for fault in [
+        "after-complete-review-normalization-reserving",
+        "after-complete-review-normalization-preparing",
+        "after-complete-review-normalization-ready",
+        "after-complete-review-normalization-published",
+        "after-review-result-state-temp-sync",
+        "after-complete-review-normalization-cleanup",
+    ] {
+        let fixture = LegacyFixture::copy("permission-journal-4vh58");
+        let coordinator = MigrationCoordinator::at(fixture.state_root());
+        assert_eq!(
+            coordinator.run_non_hook().unwrap(),
+            MigrationStatus::Complete
+        );
+        let paths = StoragePaths::at(fixture.state_root());
+        let brain_before = fs::read(paths.brain_db()).unwrap();
+        let rows_before = review_rows(&paths.review_db());
+        let legacy_artifact = convert_completed_review_to_legacy_delete(fixture.state_root());
+        let old_manifest =
+            migration_state(fixture.state_root())["review_result"]["artifact"].clone();
+        let generation = migration_state(fixture.state_root())["generation"]
+            .as_u64()
+            .unwrap();
+        let intent_path = paths.db_dir().join(format!(
+            ".brain.sqlite3.review-normalization-{generation}.json"
+        ));
+        let temporary = paths
+            .db_dir()
+            .join(format!(".review.sqlite3.normalization-{generation}.tmp"));
+
+        assert!(!migration_child(fixture.state_root(), fault).success());
+        assert_eq!(fs::read(paths.brain_db()).unwrap(), brain_before);
+        let intent: serde_json::Value =
+            serde_json::from_slice(&fs::read(&intent_path).unwrap()).unwrap();
+        let status = intent["phase"]["status"].as_str().unwrap();
+        match fault {
+            "after-complete-review-normalization-reserving" => {
+                assert_eq!(status, "reserving");
+                assert!(!temporary.exists());
+                assert_eq!(review_artifact(&paths.review_db()), old_manifest);
+                assert_eq!(
+                    migration_state(fixture.state_root())["review_result"]["artifact"],
+                    old_manifest
+                );
+            }
+            "after-complete-review-normalization-preparing" => {
+                assert_eq!(status, "preparing");
+                let metadata = fs::metadata(&temporary).unwrap();
+                assert_eq!(intent["phase"]["device"], metadata.dev());
+                assert_eq!(intent["phase"]["inode"], metadata.ino());
+                assert_eq!(review_artifact(&paths.review_db()), old_manifest);
+            }
+            "after-complete-review-normalization-ready" => {
+                assert_eq!(status, "ready");
+                assert_eq!(review_artifact(&paths.review_db()), old_manifest);
+                assert_eq!(review_artifact(&temporary), intent["phase"]["artifact"]);
+            }
+            "after-complete-review-normalization-published"
+            | "after-review-result-state-temp-sync" => {
+                assert_eq!(status, "published");
+                assert_eq!(
+                    review_artifact(&paths.review_db()),
+                    intent["phase"]["artifact"]
+                );
+                assert_eq!(review_artifact(&temporary), old_manifest);
+                assert_eq!(
+                    migration_state(fixture.state_root())["review_result"]["artifact"],
+                    old_manifest
+                );
+                if fault == "after-review-result-state-temp-sync" {
+                    let result_temp = paths
+                        .db_dir()
+                        .join(format!(".brain.sqlite3.review-result-{generation}.tmp"));
+                    let result: serde_json::Value =
+                        serde_json::from_slice(&fs::read(result_temp).unwrap()).unwrap();
+                    assert_eq!(
+                        result["review_result"]["artifact"],
+                        intent["phase"]["artifact"]
+                    );
+                }
+            }
+            "after-complete-review-normalization-cleanup" => {
+                assert_eq!(status, "published");
+                assert!(!temporary.exists());
+                assert_eq!(
+                    review_artifact(&paths.review_db()),
+                    intent["phase"]["artifact"]
+                );
+                assert_eq!(
+                    migration_state(fixture.state_root())["review_result"]["artifact"],
+                    intent["phase"]["artifact"]
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            coordinator
+                .resume()
+                .unwrap_or_else(|error| panic!("resume after {fault} failed: {error:?}")),
+            MigrationStatus::Complete
+        );
+        assert!(sqlite_header_is_wal(&paths.review_db()));
+        assert_eq!(review_rows(&paths.review_db()), rows_before);
+        assert_ne!(
+            migration_state(fixture.state_root())["review_result"]["artifact"]["digest"],
+            legacy_artifact
+        );
+        assert_eq!(fs::read(paths.brain_db()).unwrap(), brain_before);
+        assert_eq!(
+            migration_state(fixture.state_root())["review_result"]["artifact"],
+            review_artifact(&paths.review_db())
+        );
+        assert!(
+            fs::read_dir(paths.db_dir()).unwrap().all(|entry| {
+                let name = entry.unwrap().file_name();
+                !name.to_string_lossy().contains("normalization-")
+            }),
+            "normalization state remained after {fault}"
+        );
+        drop(
+            coding_brain::brain::storage::ReviewDb::open_current(
+                &paths,
+                OpenRole::NonHook,
+                StorageDeadline::after(Duration::from_secs(1)),
+            )
+            .unwrap(),
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn complete_review_normalization_rejects_an_unknown_intent_field_without_mutation() {
+    let fixture = LegacyFixture::copy("permission-journal-4vh58");
+    let coordinator = MigrationCoordinator::at(fixture.state_root());
+    assert_eq!(
+        coordinator.run_non_hook().unwrap(),
+        MigrationStatus::Complete
+    );
+    let paths = StoragePaths::at(fixture.state_root());
+    convert_completed_review_to_legacy_delete(fixture.state_root());
+    let brain_before = fs::read(paths.brain_db()).unwrap();
+    let review_before = fs::read(paths.review_db()).unwrap();
+
+    assert!(
+        !migration_child(
+            fixture.state_root(),
+            "after-complete-review-normalization-reserving"
+        )
+        .success()
+    );
+    let generation = migration_state(fixture.state_root())["generation"]
+        .as_u64()
+        .unwrap();
+    let intent_path = paths.db_dir().join(format!(
+        ".brain.sqlite3.review-normalization-{generation}.json"
+    ));
+    let mut intent: serde_json::Value =
+        serde_json::from_slice(&fs::read(&intent_path).unwrap()).unwrap();
+    intent["temporary_name"] = "brain.sqlite3".into();
+    write_private(&intent_path, &serde_json::to_vec(&intent).unwrap());
+
+    assert!(matches!(
+        coordinator.resume(),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert_eq!(fs::read(paths.brain_db()).unwrap(), brain_before);
+    assert_eq!(fs::read(paths.review_db()).unwrap(), review_before);
+}
+
+#[test]
+fn complete_review_rejects_valid_wal_inode_substitution_with_existing_gate() {
+    complete_review_rejects_valid_wal_inode_substitution(false);
+}
+
+#[test]
+fn complete_review_rejects_valid_wal_inode_substitution_with_missing_gate() {
+    complete_review_rejects_valid_wal_inode_substitution(true);
+}
+
+fn complete_review_rejects_valid_wal_inode_substitution(remove_gate: bool) {
+    let fixture = LegacyFixture::copy("permission-journal-4vh58");
+    let coordinator = MigrationCoordinator::at(fixture.state_root());
+    assert_eq!(
+        coordinator.run_non_hook().unwrap(),
+        MigrationStatus::Complete
+    );
+    let paths = StoragePaths::at(fixture.state_root());
+    let brain_before = fs::read(paths.brain_db()).unwrap();
+    let review_before = fs::read(paths.review_db()).unwrap();
+    let original_inode = fs::metadata(paths.review_db()).unwrap().ino();
+    let replacement = paths.db_dir().join("review-substitution.sqlite3");
+    fs::copy(paths.review_db(), &replacement).unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::rename(&replacement, paths.review_db()).unwrap();
+    assert_ne!(
+        fs::metadata(paths.review_db()).unwrap().ino(),
+        original_inode
+    );
+    if remove_gate {
+        fs::remove_file(paths.db_dir().join("review-reset.lock")).unwrap();
+    }
+    let substituted_before = fs::read(paths.review_db()).unwrap();
+
+    assert!(matches!(
+        coordinator.resume(),
+        Err(StorageError::InvalidStorage(_))
+    ));
+    assert_eq!(fs::read(paths.brain_db()).unwrap(), brain_before);
+    assert_eq!(fs::read(paths.review_db()).unwrap(), substituted_before);
+    assert_eq!(substituted_before, review_before);
+}
+
+#[test]
+fn complete_review_validation_allows_a_healthy_live_holder() {
+    let fixture = LegacyFixture::copy("permission-journal-4vh58");
+    let coordinator = MigrationCoordinator::at(fixture.state_root());
+    coordinator.run_non_hook().unwrap();
+    let paths = StoragePaths::at(fixture.state_root());
+    ensure_test_review_gate(&paths);
+    let held = coding_brain::brain::storage::ReviewDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap();
+
+    assert_eq!(coordinator.resume().unwrap(), MigrationStatus::Complete);
+    drop(held);
+}
+
+#[test]
+fn complete_review_gate_repair_waits_for_unlinked_old_inode_holder() {
+    let fixture = LegacyFixture::copy("permission-journal-4vh58");
+    let coordinator = MigrationCoordinator::at(fixture.state_root());
+    coordinator.run_non_hook().unwrap();
+    let paths = StoragePaths::at(fixture.state_root());
+    ensure_test_review_gate(&paths);
+    let held = coding_brain::brain::storage::ReviewDb::open_current(
+        &paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )
+    .unwrap();
+    fs::remove_file(paths.db_dir().join("review-reset.lock")).unwrap();
+
+    assert!(matches!(coordinator.resume(), Err(StorageError::Busy)));
+    assert!(!paths.db_dir().join("review-reset.lock").exists());
+    drop(held);
+    assert_eq!(coordinator.resume().unwrap(), MigrationStatus::Complete);
 }
 
 #[test]
@@ -2838,7 +3386,7 @@ fn hook_open_is_typed_prompt_and_immutable_across_migration_states() {
         BrainDb::open_current(
             &StoragePaths::at(missing.path()),
             OpenRole::Hook,
-            StorageDeadline::after(Duration::from_millis(100)),
+            StorageDeadline::after(Duration::from_millis(250)),
         ),
         Err(StorageError::MigrationRequired)
     ));
@@ -2864,7 +3412,7 @@ fn hook_open_is_typed_prompt_and_immutable_across_migration_states() {
             BrainDb::open_current(
                 &StoragePaths::at(fixture.state_root()),
                 OpenRole::Hook,
-                StorageDeadline::after(Duration::from_millis(100)),
+                StorageDeadline::after(Duration::from_millis(250)),
             ),
             Err(StorageError::MigrationActive)
         ));
@@ -2893,7 +3441,7 @@ fn hook_open_accepts_completed_migration_without_mutating_coordinator() {
         BrainDb::open_current(
             &StoragePaths::at(root.path()),
             OpenRole::Hook,
-            StorageDeadline::after(Duration::from_millis(100)),
+            StorageDeadline::after(Duration::from_millis(250)),
         )
         .unwrap(),
     );
@@ -2914,7 +3462,7 @@ fn completed_migration_accepts_restart_after_live_database_write() {
     let mut database = BrainDb::open_current(
         &paths,
         OpenRole::Hook,
-        StorageDeadline::after(Duration::from_millis(100)),
+        StorageDeadline::after(Duration::from_millis(250)),
     )
     .unwrap();
     let identity = LifecycleIdentity::try_new(
@@ -4044,18 +4592,35 @@ fn legacy_writer_guard_reenumerates_after_locked_journal_rename_or_removal() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn legacy_writer_guard_fd_bound_process_helper() {
+    let Some(root) = std::env::var_os("CODING_BRAIN_LEGACY_WRITER_FD_CHILD_ROOT") else {
+        return;
+    };
+    let descriptors_before = fs::read_dir("/proc/self/fd").unwrap().count();
+    let guard = LegacyWriterGuard::acquire(
+        std::path::Path::new(&root),
+        StorageDeadline::after(Duration::from_secs(3)),
+    )
+    .unwrap();
+    let descriptors_held = fs::read_dir("/proc/self/fd").unwrap().count();
+    assert!(descriptors_held <= descriptors_before + 12);
+    drop(guard);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn legacy_writer_guard_drains_more_than_300_journals_with_bounded_file_descriptors() {
     let root = private_tempdir();
     for index in 0..350 {
         create_legacy_journal(root.path(), index);
     }
-    let descriptors_before = fs::read_dir("/proc/self/fd").unwrap().count();
-    let guard =
-        LegacyWriterGuard::acquire(root.path(), StorageDeadline::after(Duration::from_secs(3)))
-            .unwrap();
-    let descriptors_held = fs::read_dir("/proc/self/fd").unwrap().count();
-    assert!(descriptors_held <= descriptors_before + 12);
-    drop(guard);
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("legacy_writer_guard_fd_bound_process_helper")
+        .env("CODING_BRAIN_LEGACY_WRITER_FD_CHILD_ROOT", root.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[test]

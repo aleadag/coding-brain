@@ -50,8 +50,15 @@ pub(crate) enum MigrationFaultStage {
     ReviewBuilding,
     ReviewVerified,
     AfterReviewStagingSync,
+    AfterReviewGateSync,
     AfterReviewLink,
     AfterReviewPublication,
+    AfterCompleteReviewNormalizationReserving,
+    AfterCompleteReviewNormalizationPreparing,
+    AfterCompleteReviewNormalizationReady,
+    AfterCompleteReviewNormalizationPublished,
+    AfterCompleteReviewNormalizationCleanup,
+    AfterCompleteReviewGateSync,
     AfterReviewResultStateTempSync,
     BeforeFreezeGuard,
     AfterFreezeBuildingStateSync,
@@ -127,8 +134,25 @@ impl MigrationFaultStage {
             "review-building" => Self::ReviewBuilding,
             "review-verified" => Self::ReviewVerified,
             "after-review-staging-sync" => Self::AfterReviewStagingSync,
+            "after-review-gate-sync" => Self::AfterReviewGateSync,
             "after-review-link" => Self::AfterReviewLink,
             "after-review-publication" => Self::AfterReviewPublication,
+            "after-complete-review-normalization-reserving" => {
+                Self::AfterCompleteReviewNormalizationReserving
+            }
+            "after-complete-review-normalization-preparing" => {
+                Self::AfterCompleteReviewNormalizationPreparing
+            }
+            "after-complete-review-normalization-ready" => {
+                Self::AfterCompleteReviewNormalizationReady
+            }
+            "after-complete-review-normalization-published" => {
+                Self::AfterCompleteReviewNormalizationPublished
+            }
+            "after-complete-review-normalization-cleanup" => {
+                Self::AfterCompleteReviewNormalizationCleanup
+            }
+            "after-complete-review-gate-sync" => Self::AfterCompleteReviewGateSync,
             "after-review-result-state-temp-sync" => Self::AfterReviewResultStateTempSync,
             "before-freeze-guard" => Self::BeforeFreezeGuard,
             "after-freeze-building-state-sync" => Self::AfterFreezeBuildingStateSync,
@@ -168,8 +192,25 @@ impl MigrationFaultStage {
             Self::ReviewBuilding => "review-building",
             Self::ReviewVerified => "review-verified",
             Self::AfterReviewStagingSync => "after-review-staging-sync",
+            Self::AfterReviewGateSync => "after-review-gate-sync",
             Self::AfterReviewLink => "after-review-link",
             Self::AfterReviewPublication => "after-review-publication",
+            Self::AfterCompleteReviewNormalizationReserving => {
+                "after-complete-review-normalization-reserving"
+            }
+            Self::AfterCompleteReviewNormalizationPreparing => {
+                "after-complete-review-normalization-preparing"
+            }
+            Self::AfterCompleteReviewNormalizationReady => {
+                "after-complete-review-normalization-ready"
+            }
+            Self::AfterCompleteReviewNormalizationPublished => {
+                "after-complete-review-normalization-published"
+            }
+            Self::AfterCompleteReviewNormalizationCleanup => {
+                "after-complete-review-normalization-cleanup"
+            }
+            Self::AfterCompleteReviewGateSync => "after-complete-review-gate-sync",
             Self::AfterReviewResultStateTempSync => "after-review-result-state-temp-sync",
             Self::BeforeFreezeGuard => "before-freeze-guard",
             Self::AfterFreezeBuildingStateSync => "after-freeze-building-state-sync",
@@ -837,8 +878,15 @@ mod tests {
             MigrationFaultStage::ReviewBuilding,
             MigrationFaultStage::ReviewVerified,
             MigrationFaultStage::AfterReviewStagingSync,
+            MigrationFaultStage::AfterReviewGateSync,
             MigrationFaultStage::AfterReviewLink,
             MigrationFaultStage::AfterReviewPublication,
+            MigrationFaultStage::AfterCompleteReviewNormalizationReserving,
+            MigrationFaultStage::AfterCompleteReviewNormalizationPreparing,
+            MigrationFaultStage::AfterCompleteReviewNormalizationReady,
+            MigrationFaultStage::AfterCompleteReviewNormalizationPublished,
+            MigrationFaultStage::AfterCompleteReviewNormalizationCleanup,
+            MigrationFaultStage::AfterCompleteReviewGateSync,
             MigrationFaultStage::AfterReviewResultStateTempSync,
             MigrationFaultStage::BeforeFreezeGuard,
             MigrationFaultStage::AfterFreezeBuildingStateSync,

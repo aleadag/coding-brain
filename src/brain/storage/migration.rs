@@ -34,7 +34,8 @@ use super::security::{
 };
 use super::{
     BRAIN_DATABASE_NAME, BrainDb, MIGRATION_LOCK_NAME, OpenRole, REVIEW_DATABASE_NAME,
-    StorageDeadline, StorageError, StoragePaths,
+    REVIEW_RESET_GATE_NAME, ReviewDb, StorageDeadline, StorageError, StoragePaths,
+    acquire_review_reset_guard_for_migration, acquire_review_reset_root_for_migration,
 };
 
 static MIGRATION_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -213,7 +214,8 @@ impl MigrationCoordinator {
 
         if state.manifest.status == MigrationStatus::Complete {
             validate_frozen_manifest_for_state(&self.paths, &state.manifest)?;
-            return Ok(MigrationStatus::Complete);
+            state = repair_complete_review_gate(&self.paths, directory, state)?;
+            return Ok(state.manifest.status);
         }
         if state.manifest.status == MigrationStatus::LegacyFrozen {
             validate_frozen_manifest_for_state(&self.paths, &state.manifest)?;
@@ -384,7 +386,7 @@ fn migrate_review(
         state.manifest.review_result,
         ReviewMigrationResult::Verified { .. }
     ) {
-        return publish_verified_review(directory, state);
+        return publish_verified_review(paths, directory, state);
     }
     if let ReviewMigrationResult::Building {
         fingerprint,
@@ -435,7 +437,7 @@ fn migrate_review(
         ReviewMigrationResult::Verified { .. }
     ) {
         migration_fault("review-verified");
-        publish_verified_review(directory, state)
+        publish_verified_review(paths, directory, state)
     } else {
         Ok(state)
     }
@@ -2061,7 +2063,7 @@ fn resume_review_build(
         ReviewMigrationResult::Verified { .. }
     ) {
         migration_fault("review-verified");
-        publish_verified_review(directory, state)
+        publish_verified_review(paths, directory, state)
     } else {
         Ok(state)
     }
@@ -2169,6 +2171,7 @@ fn open_owned_review_staging(
 }
 
 fn publish_verified_review(
+    paths: &StoragePaths,
     directory: &SecureDatabaseDirectory,
     mut state: LoadedState,
 ) -> Result<LoadedState, StorageError> {
@@ -2184,48 +2187,52 @@ fn publish_verified_review(
     };
     let staging = CString::new(staging_name.as_bytes())
         .map_err(|_| StorageError::InvalidStorage("review staging name is invalid"))?;
-    let actual = match directory.publication_presence(&staging, REVIEW_DATABASE_NAME)? {
+    let presence = directory.publication_presence(&staging, REVIEW_DATABASE_NAME)?;
+    validate_verified_review_presence(
+        directory,
+        &staging,
+        presence,
+        &artifact,
+        &row_digest,
+        row_count,
+    )?;
+
+    let guard = acquire_review_reset_guard_for_migration(paths)?;
+    migration_fault("after-review-gate-sync");
+    guard.validate()?;
+    let locked_presence = directory.publication_presence(&staging, REVIEW_DATABASE_NAME)?;
+    if locked_presence != presence {
+        return Err(StorageError::InvalidStorage(
+            "verified review publication presence changed",
+        ));
+    }
+    validate_verified_review_presence(
+        directory,
+        &staging,
+        locked_presence,
+        &artifact,
+        &row_digest,
+        row_count,
+    )?;
+    match locked_presence {
         PublicationPresence::Staging => {
-            let actual = verify_closed_review(directory, &staging, 1, &row_digest, row_count)?;
-            if actual != artifact {
-                return Err(StorageError::InvalidStorage(
-                    "verified review staging identity changed",
-                ));
-            }
             directory.publish_database(&staging, REVIEW_DATABASE_NAME)?;
-            directory.closed_database_identity(REVIEW_DATABASE_NAME)?
         }
         PublicationPresence::LinkedPair => {
-            let actual = verify_closed_review(directory, &staging, 2, &row_digest, row_count)?;
-            if actual != artifact {
-                return Err(StorageError::InvalidStorage(
-                    "verified linked review identity changed",
-                ));
-            }
             directory.finish_linked_publication(&staging, REVIEW_DATABASE_NAME)?;
-            directory.closed_database_identity(REVIEW_DATABASE_NAME)?
         }
-        PublicationPresence::Canonical => {
-            let actual =
-                verify_closed_review(directory, REVIEW_DATABASE_NAME, 1, &row_digest, row_count)?;
-            ClosedDatabaseIdentity {
-                device: actual.device,
-                inode: actual.inode,
-                size: actual.size,
-                modified_seconds: actual.modified_seconds,
-                modified_nanoseconds: actual.modified_nanoseconds,
-                digest: actual.digest,
-            }
-        }
+        PublicationPresence::Canonical => {}
         PublicationPresence::Neither => {
             return Err(StorageError::InvalidStorage(
                 "verified review database disappeared",
             ));
         }
-    };
-    if ReviewArtifact::from(actual) != artifact {
+    }
+    let artifact =
+        verify_closed_review(directory, REVIEW_DATABASE_NAME, 1, &row_digest, row_count)?;
+    if review_journal_mode(directory)? != "wal" {
         return Err(StorageError::InvalidStorage(
-            "published review database identity changed",
+            "published review database is not in WAL mode",
         ));
     }
     state.manifest.review_result = ReviewMigrationResult::Published {
@@ -2236,7 +2243,80 @@ fn publish_verified_review(
         row_count,
     };
     migration_fault("after-review-publication");
-    replace_review_result(directory, state)
+    state = replace_review_result(directory, state)?;
+    guard.validate()?;
+    Ok(state)
+}
+
+fn validate_verified_review_presence(
+    directory: &SecureDatabaseDirectory,
+    staging: &CStr,
+    presence: PublicationPresence,
+    artifact: &ReviewArtifact,
+    row_digest: &str,
+    row_count: u64,
+) -> Result<(), StorageError> {
+    let (name, links) = match presence {
+        PublicationPresence::Staging => (staging, 1),
+        PublicationPresence::LinkedPair => (staging, 2),
+        PublicationPresence::Canonical => (REVIEW_DATABASE_NAME, 1),
+        PublicationPresence::Neither => {
+            return Err(StorageError::InvalidStorage(
+                "verified review database disappeared",
+            ));
+        }
+    };
+    let actual = verify_closed_review(directory, name, links, row_digest, row_count)?;
+    if &actual == artifact {
+        return Ok(());
+    }
+    if presence == PublicationPresence::Canonical
+        && actual.device == artifact.device
+        && actual.inode == artifact.inode
+        && review_journal_mode(directory)? == "wal"
+    {
+        return Ok(());
+    }
+    Err(StorageError::InvalidStorage(
+        "verified review database identity changed",
+    ))
+}
+
+fn review_journal_mode(directory: &SecureDatabaseDirectory) -> Result<String, StorageError> {
+    Ok(directory
+        .database_journal_mode(REVIEW_DATABASE_NAME)?
+        .to_owned())
+}
+
+fn normalize_review_database_to_wal(
+    directory: &SecureDatabaseDirectory,
+    database_name: &CStr,
+    expected_row_digest: &str,
+    expected_row_count: u64,
+) -> Result<ReviewArtifact, StorageError> {
+    verify_closed_review(
+        directory,
+        database_name,
+        1,
+        expected_row_digest,
+        expected_row_count,
+    )?;
+    if directory.database_journal_mode(database_name)? == "delete" {
+        directory.normalize_database_header_to_wal(database_name)?;
+    }
+    let artifact = verify_closed_review(
+        directory,
+        database_name,
+        1,
+        expected_row_digest,
+        expected_row_count,
+    )?;
+    if directory.database_journal_mode(database_name)? != "wal" {
+        return Err(StorageError::InvalidStorage(
+            "published review database is not in WAL mode",
+        ));
+    }
+    Ok(artifact)
 }
 
 fn review_row_digest(connection: &Connection) -> Result<(String, u64), StorageError> {
@@ -2308,8 +2388,9 @@ fn inspect_closed_review(
     let before = directory.closed_database_identity_with_links(name, links)?;
     let path = directory.path().join(OsStr::from_bytes(name.to_bytes()));
     let connection = Connection::open_with_flags(
-        path,
+        immutable_sqlite_uri(&path),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
             | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
             | rusqlite::OpenFlags::SQLITE_OPEN_EXRESCODE,
     )?;
@@ -2343,6 +2424,20 @@ fn inspect_closed_review(
         ));
     }
     Ok((after, row_digest, row_count))
+}
+
+fn immutable_sqlite_uri(path: &Path) -> PathBuf {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut uri = b"file:".to_vec();
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(*byte);
+        } else {
+            uri.extend_from_slice(&[b'%', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]]);
+        }
+    }
+    uri.extend_from_slice(b"?immutable=1");
+    PathBuf::from(std::ffi::OsString::from_vec(uri))
 }
 
 fn import_review_snapshot(
@@ -2522,11 +2617,10 @@ fn close_review_staging(
             "review staging WAL checkpoint is incomplete",
         ));
     }
-    let journal_mode: String =
-        connection.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
-    if journal_mode != "delete" {
+    let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if journal_mode != "wal" {
         return Err(StorageError::InvalidStorage(
-            "review staging journal mode did not close cleanly",
+            "review staging journal mode is not WAL",
         ));
     }
     connection
@@ -2745,6 +2839,28 @@ fn valid_review_result_transition(
         )
         | (ReviewMigrationResult::Verified { .. }, ReviewMigrationResult::Published { .. }) => true,
         (
+            ReviewMigrationResult::Published {
+                fingerprint,
+                staging_name,
+                artifact,
+                row_digest,
+                row_count,
+            },
+            ReviewMigrationResult::Published {
+                fingerprint: next_fingerprint,
+                staging_name: next_staging_name,
+                artifact: next_artifact,
+                row_digest: next_row_digest,
+                row_count: next_row_count,
+            },
+        ) => {
+            fingerprint == next_fingerprint
+                && staging_name == next_staging_name
+                && row_digest == next_row_digest
+                && row_count == next_row_count
+                && artifact != next_artifact
+        }
+        (
             ReviewMigrationResult::Published { .. },
             ReviewMigrationResult::Degraded { reason, .. },
         ) => reason == "source_race",
@@ -2759,6 +2875,11 @@ fn validate_review_transition_evidence(
     to: &ReviewMigrationResult,
     generation: u64,
 ) -> Result<(), StorageError> {
+    if let (ReviewMigrationResult::Published { .. }, ReviewMigrationResult::Published { .. }) =
+        (from, to)
+    {
+        return validate_normalized_review_transition_evidence(directory, from, to, generation);
+    }
     let sources = LegacySourceSet::at(&paths.state_root)?;
     let current_fingerprint = review_source_fingerprint(&sources)?;
     let staging = review_staging_name(generation)?;
@@ -2835,21 +2956,23 @@ fn validate_review_transition_evidence(
         (
             ReviewMigrationResult::Verified {
                 fingerprint,
+                staging_name,
                 artifact,
                 row_digest,
                 row_count,
-                ..
             },
             ReviewMigrationResult::Published {
                 fingerprint: recovered_fingerprint,
+                staging_name: recovered_staging_name,
                 artifact: recovered_artifact,
                 row_digest: recovered_digest,
                 row_count: recovered_count,
-                ..
             },
         ) => {
             if fingerprint != recovered_fingerprint
-                || artifact != recovered_artifact
+                || staging_name != recovered_staging_name
+                || artifact.device != recovered_artifact.device
+                || artifact.inode != recovered_artifact.inode
                 || row_digest != recovered_digest
                 || row_count != recovered_count
                 || &current_fingerprint != fingerprint
@@ -2866,6 +2989,9 @@ fn validate_review_transition_evidence(
                     "published review transition identity changed",
                 ));
             }
+        }
+        (ReviewMigrationResult::Published { .. }, ReviewMigrationResult::Published { .. }) => {
+            return validate_normalized_review_transition_evidence(directory, from, to, generation);
         }
         (
             ReviewMigrationResult::Published {
@@ -2902,6 +3028,81 @@ fn validate_review_transition_evidence(
                 "pending review result transition is invalid",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_normalized_review_transition_evidence(
+    directory: &SecureDatabaseDirectory,
+    from: &ReviewMigrationResult,
+    to: &ReviewMigrationResult,
+    generation: u64,
+) -> Result<(), StorageError> {
+    let (
+        ReviewMigrationResult::Published {
+            fingerprint,
+            staging_name,
+            artifact,
+            row_digest,
+            row_count,
+        },
+        ReviewMigrationResult::Published {
+            fingerprint: recovered_fingerprint,
+            staging_name: recovered_staging_name,
+            artifact: recovered_artifact,
+            row_digest: recovered_digest,
+            row_count: recovered_count,
+        },
+    ) = (from, to)
+    else {
+        return Err(StorageError::InvalidStorage(
+            "normalized review transition is invalid",
+        ));
+    };
+    let intent = load_review_normalization_intent(directory, generation)?
+        .ok_or(StorageError::InvalidStorage(
+            "normalized review transition has no intent",
+        ))?
+        .0;
+    let ReviewNormalizationPhase::Published {
+        artifact: intent_artifact,
+    } = &intent.phase
+    else {
+        return Err(StorageError::InvalidStorage(
+            "normalized review transition intent is incomplete",
+        ));
+    };
+    validate_review_normalization_intent(&intent, generation, row_digest, *row_count)?;
+    if intent.source_artifact != *artifact
+        || intent_artifact != recovered_artifact
+        || fingerprint != recovered_fingerprint
+        || staging_name != recovered_staging_name
+        || row_digest != recovered_digest
+        || row_count != recovered_count
+    {
+        return Err(StorageError::InvalidStorage(
+            "normalized review transition evidence changed",
+        ));
+    }
+    let actual = verify_closed_review(
+        directory,
+        REVIEW_DATABASE_NAME,
+        1,
+        recovered_digest,
+        *recovered_count,
+    )?;
+    if actual != *recovered_artifact || review_journal_mode(directory)? != "wal" {
+        return Err(StorageError::InvalidStorage(
+            "normalized review transition identity changed",
+        ));
+    }
+    let displaced = ReviewArtifact::from(
+        directory.closed_database_identity(&review_normalization_temporary_name(generation)?)?,
+    );
+    if displaced != *artifact {
+        return Err(StorageError::InvalidStorage(
+            "normalized review transition displaced identity changed",
+        ));
     }
     Ok(())
 }
@@ -3054,6 +3255,35 @@ struct ReviewArtifact {
     modified_seconds: i64,
     modified_nanoseconds: i64,
     digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewNormalizationIntent {
+    schema_version: u32,
+    generation: u64,
+    source_artifact: ReviewArtifact,
+    row_digest: String,
+    row_count: u64,
+    phase: ReviewNormalizationPhase,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ReviewNormalizationPhase {
+    Reserving,
+    Preparing {
+        device: u64,
+        inode: u64,
+    },
+    Ready {
+        device: u64,
+        inode: u64,
+        artifact: ReviewArtifact,
+    },
+    Published {
+        artifact: ReviewArtifact,
+    },
 }
 
 impl From<ClosedDatabaseIdentity> for ReviewArtifact {
@@ -3821,6 +4051,7 @@ fn validate_state(
         )?);
         return Ok(());
     }
+    validate_published_review_result(directory, state)?;
     if matches!(state.freeze_state, FreezeState::Pending) {
         validate_source_fingerprints(paths, state)?;
     }
@@ -3894,6 +4125,514 @@ fn validate_state(
             "migration accounting has no database",
         )),
     }
+}
+
+fn validate_published_review_result(
+    directory: &SecureDatabaseDirectory,
+    state: &ValidatedState,
+) -> Result<(), StorageError> {
+    let ReviewMigrationResult::Published {
+        artifact,
+        row_digest,
+        row_count,
+        ..
+    } = &state.review_result
+    else {
+        return Ok(());
+    };
+    let actual = verify_closed_review(directory, REVIEW_DATABASE_NAME, 1, row_digest, *row_count)?;
+    if &actual != artifact {
+        return Err(StorageError::InvalidStorage(
+            "published review database identity changed",
+        ));
+    }
+    Ok(())
+}
+
+fn repair_complete_review_gate(
+    paths: &StoragePaths,
+    directory: &SecureDatabaseDirectory,
+    mut state: LoadedState,
+) -> Result<LoadedState, StorageError> {
+    let ReviewMigrationResult::Published {
+        fingerprint,
+        staging_name,
+        artifact,
+        row_digest,
+        row_count,
+    } = state.manifest.review_result.clone()
+    else {
+        return Ok(state);
+    };
+    let pending_intent = load_review_normalization_intent(directory, state.manifest.generation)?;
+    let gate_present = directory.private_file_present(REVIEW_RESET_GATE_NAME)?;
+    if gate_present && pending_intent.is_none() {
+        validate_published_review_inode(directory, &artifact)?;
+        match ReviewDb::open_current(
+            paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(1)),
+        ) {
+            Ok(review) => {
+                drop(review);
+                return Ok(state);
+            }
+            Err(StorageError::UnsupportedSchema { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut guard = acquire_review_reset_root_for_migration(directory)?;
+    let mut pending_intent =
+        load_review_normalization_intent(directory, state.manifest.generation)?;
+    if pending_intent.is_none() && review_journal_mode(directory)? == "wal" {
+        validate_published_review_inode(directory, &artifact)?;
+        validate_closed_runtime_review(directory)?;
+    } else if pending_intent.is_none() {
+        validate_published_review_result(directory, &state.manifest)?;
+    }
+    guard.acquire_gate()?;
+    migration_fault("after-complete-review-gate-sync");
+    if pending_intent.is_none() && review_journal_mode(directory)? == "wal" {
+        validate_published_review_inode(directory, &artifact)?;
+        validate_closed_runtime_review(directory)?;
+    } else {
+        if pending_intent.is_none() {
+            validate_published_review_result(directory, &state.manifest)?;
+            let intent = ReviewNormalizationIntent {
+                schema_version: 1,
+                generation: state.manifest.generation,
+                source_artifact: artifact.clone(),
+                row_digest: row_digest.clone(),
+                row_count,
+                phase: ReviewNormalizationPhase::Reserving,
+            };
+            pending_intent = Some((
+                intent.clone(),
+                write_review_normalization_intent(directory, &intent)?,
+            ));
+            migration_fault("after-complete-review-normalization-reserving");
+        }
+        let (normalized, source_artifact, intent_identity) = reconcile_review_normalization(
+            directory,
+            state.manifest.generation,
+            pending_intent.expect("normalization intent was established"),
+            &artifact,
+            &row_digest,
+            row_count,
+        )?;
+        if artifact != normalized {
+            state.manifest.review_result = ReviewMigrationResult::Published {
+                fingerprint,
+                staging_name,
+                artifact: normalized,
+                row_digest,
+                row_count,
+            };
+            state = replace_review_result(directory, state)?;
+        }
+        let temporary = review_normalization_temporary_name(state.manifest.generation)?;
+        if directory.private_file_present(&temporary)? {
+            directory.remove_closed_database_file(
+                &temporary,
+                &closed_review_identity(&source_artifact),
+            )?;
+        }
+        migration_fault("after-complete-review-normalization-cleanup");
+        directory.remove_private_file(
+            &review_normalization_intent_name(state.manifest.generation)?,
+            intent_identity,
+        )?;
+    }
+    guard.validate()?;
+    drop(guard);
+    drop(ReviewDb::open_current(
+        paths,
+        OpenRole::NonHook,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )?);
+    Ok(state)
+}
+
+fn validate_published_review_inode(
+    directory: &SecureDatabaseDirectory,
+    artifact: &ReviewArtifact,
+) -> Result<(), StorageError> {
+    let (device, inode) = directory.private_file_device_inode(REVIEW_DATABASE_NAME)?;
+    if device != artifact.device || inode != artifact.inode {
+        return Err(StorageError::InvalidStorage(
+            "published review database identity changed",
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile_review_normalization(
+    directory: &SecureDatabaseDirectory,
+    generation: u64,
+    (mut intent, mut intent_identity): (ReviewNormalizationIntent, PrivateFileIdentity),
+    manifest_artifact: &ReviewArtifact,
+    row_digest: &str,
+    row_count: u64,
+) -> Result<(ReviewArtifact, ReviewArtifact, PrivateFileIdentity), StorageError> {
+    validate_review_normalization_intent(&intent, generation, row_digest, row_count)?;
+    let temporary = review_normalization_temporary_name(generation)?;
+    loop {
+        match intent.phase.clone() {
+            ReviewNormalizationPhase::Reserving => {
+                validate_review_normalization_source(
+                    directory,
+                    &intent,
+                    manifest_artifact,
+                    row_digest,
+                    row_count,
+                )?;
+                let (device, inode) = if directory.private_file_present(&temporary)? {
+                    directory.private_file_device_inode(&temporary)?
+                } else {
+                    let file = directory.create_database_file(&temporary)?;
+                    let metadata = file.metadata()?;
+                    (metadata.dev(), metadata.ino())
+                };
+                intent.phase = ReviewNormalizationPhase::Preparing { device, inode };
+                intent_identity = replace_review_normalization_intent(
+                    directory,
+                    generation,
+                    intent_identity,
+                    &intent,
+                )?;
+                migration_fault("after-complete-review-normalization-preparing");
+            }
+            ReviewNormalizationPhase::Preparing { device, inode } => {
+                validate_review_normalization_source(
+                    directory,
+                    &intent,
+                    manifest_artifact,
+                    row_digest,
+                    row_count,
+                )?;
+                if directory.private_file_device_inode(&temporary)? != (device, inode) {
+                    return Err(StorageError::InvalidStorage(
+                        "review normalization temporary identity changed",
+                    ));
+                }
+                directory.copy_database_to_bound_file(
+                    REVIEW_DATABASE_NAME,
+                    &temporary,
+                    device,
+                    inode,
+                )?;
+                let normalized =
+                    normalize_review_database_to_wal(directory, &temporary, row_digest, row_count)?;
+                intent.phase = ReviewNormalizationPhase::Ready {
+                    device,
+                    inode,
+                    artifact: normalized,
+                };
+                intent_identity = replace_review_normalization_intent(
+                    directory,
+                    generation,
+                    intent_identity,
+                    &intent,
+                )?;
+                migration_fault("after-complete-review-normalization-ready");
+            }
+            ReviewNormalizationPhase::Ready {
+                artifact: normalized,
+                ..
+            } => {
+                validate_review_normalization_source(
+                    directory,
+                    &intent,
+                    manifest_artifact,
+                    row_digest,
+                    row_count,
+                )?;
+                let canonical =
+                    ReviewArtifact::from(directory.closed_database_identity(REVIEW_DATABASE_NAME)?);
+                if canonical == intent.source_artifact {
+                    directory.publish_database_replacement(
+                        REVIEW_DATABASE_NAME,
+                        &closed_review_identity(&intent.source_artifact),
+                        &temporary,
+                        &closed_review_identity(&normalized),
+                    )?;
+                } else if canonical == normalized {
+                    let displaced =
+                        ReviewArtifact::from(directory.closed_database_identity(&temporary)?);
+                    if displaced != intent.source_artifact {
+                        return Err(StorageError::InvalidStorage(
+                            "review displaced canonical identity changed",
+                        ));
+                    }
+                } else {
+                    return Err(StorageError::InvalidStorage(
+                        "review canonical changed before normalized publish",
+                    ));
+                }
+                intent.phase = ReviewNormalizationPhase::Published {
+                    artifact: normalized,
+                };
+                intent_identity = replace_review_normalization_intent(
+                    directory,
+                    generation,
+                    intent_identity,
+                    &intent,
+                )?;
+                migration_fault("after-complete-review-normalization-published");
+            }
+            ReviewNormalizationPhase::Published {
+                artifact: normalized,
+            } => {
+                let actual = verify_closed_review(
+                    directory,
+                    REVIEW_DATABASE_NAME,
+                    1,
+                    row_digest,
+                    row_count,
+                )?;
+                if actual != normalized {
+                    return Err(StorageError::InvalidStorage(
+                        "normalized review canonical identity changed",
+                    ));
+                }
+                if directory.private_file_present(&temporary)? {
+                    let displaced =
+                        ReviewArtifact::from(directory.closed_database_identity(&temporary)?);
+                    if displaced != intent.source_artifact {
+                        return Err(StorageError::InvalidStorage(
+                            "review displaced canonical identity changed",
+                        ));
+                    }
+                } else if manifest_artifact != &normalized {
+                    return Err(StorageError::InvalidStorage(
+                        "review displaced canonical disappeared before manifest update",
+                    ));
+                }
+                return Ok((normalized, intent.source_artifact, intent_identity));
+            }
+        }
+    }
+}
+
+fn validate_review_normalization_source(
+    directory: &SecureDatabaseDirectory,
+    intent: &ReviewNormalizationIntent,
+    manifest_artifact: &ReviewArtifact,
+    row_digest: &str,
+    row_count: u64,
+) -> Result<(), StorageError> {
+    let normalized = match &intent.phase {
+        ReviewNormalizationPhase::Ready { artifact, .. }
+        | ReviewNormalizationPhase::Published { artifact } => Some(artifact),
+        _ => None,
+    };
+    if manifest_artifact != &intent.source_artifact
+        && normalized.is_none_or(|artifact| manifest_artifact != artifact)
+    {
+        return Err(StorageError::InvalidStorage(
+            "review normalization source does not match published state",
+        ));
+    }
+    let actual = verify_closed_review(directory, REVIEW_DATABASE_NAME, 1, row_digest, row_count)?;
+    if actual != intent.source_artifact && normalized.is_none_or(|artifact| &actual != artifact) {
+        return Err(StorageError::InvalidStorage(
+            "review normalization source identity changed",
+        ));
+    }
+    Ok(())
+}
+
+fn closed_review_identity(artifact: &ReviewArtifact) -> ClosedDatabaseIdentity {
+    ClosedDatabaseIdentity {
+        device: artifact.device,
+        inode: artifact.inode,
+        size: artifact.size,
+        modified_seconds: artifact.modified_seconds,
+        modified_nanoseconds: artifact.modified_nanoseconds,
+        digest: artifact.digest.clone(),
+    }
+}
+
+fn review_normalization_intent_name(generation: u64) -> Result<CString, StorageError> {
+    CString::new(format!(
+        ".brain.sqlite3.review-normalization-{generation}.json"
+    ))
+    .map_err(|_| StorageError::InvalidStorage("review normalization intent name is invalid"))
+}
+
+fn review_normalization_intent_update_name(generation: u64) -> Result<CString, StorageError> {
+    CString::new(format!(
+        ".brain.sqlite3.review-normalization-{generation}.update"
+    ))
+    .map_err(|_| StorageError::InvalidStorage("review normalization update name is invalid"))
+}
+
+fn review_normalization_temporary_name(generation: u64) -> Result<CString, StorageError> {
+    CString::new(format!(".review.sqlite3.normalization-{generation}.tmp"))
+        .map_err(|_| StorageError::InvalidStorage("review normalization temp name is invalid"))
+}
+
+fn load_review_normalization_intent(
+    directory: &SecureDatabaseDirectory,
+    generation: u64,
+) -> Result<Option<(ReviewNormalizationIntent, PrivateFileIdentity)>, StorageError> {
+    let name = review_normalization_intent_name(generation)?;
+    let update_name = review_normalization_intent_update_name(generation)?;
+    let update_present = directory.private_file_present(&update_name)?;
+    if !directory.private_file_present(&name)? {
+        if update_present {
+            return Err(StorageError::InvalidStorage(
+                "review normalization update has no intent",
+            ));
+        }
+        return Ok(None);
+    }
+    let snapshot = directory.read_private_file(&name, MAX_MIGRATION_STATE_BYTES)?;
+    let mut intent: ReviewNormalizationIntent = serde_json::from_slice(&snapshot.bytes)
+        .map_err(|_| StorageError::InvalidStorage("review normalization intent is invalid"))?;
+    let mut identity = snapshot.identity;
+    if update_present {
+        let update = directory.read_private_file(&update_name, MAX_MIGRATION_STATE_BYTES)?;
+        let next: ReviewNormalizationIntent = serde_json::from_slice(&update.bytes)
+            .map_err(|_| StorageError::InvalidStorage("review normalization update is invalid"))?;
+        validate_review_normalization_transition(&intent, &next)?;
+        identity = directory.publish_private_replacement(
+            &name,
+            identity,
+            &update_name,
+            update.identity,
+        )?;
+        intent = next;
+    }
+    Ok(Some((intent, identity)))
+}
+
+fn write_review_normalization_intent(
+    directory: &SecureDatabaseDirectory,
+    intent: &ReviewNormalizationIntent,
+) -> Result<PrivateFileIdentity, StorageError> {
+    let bytes = serde_json::to_vec(intent)
+        .map_err(|_| StorageError::InvalidStorage("review normalization intent is invalid"))?;
+    Ok(directory.write_new_private_file(
+        &review_normalization_intent_name(intent.generation)?,
+        &bytes,
+    )?)
+}
+
+fn replace_review_normalization_intent(
+    directory: &SecureDatabaseDirectory,
+    generation: u64,
+    expected: PrivateFileIdentity,
+    intent: &ReviewNormalizationIntent,
+) -> Result<PrivateFileIdentity, StorageError> {
+    let bytes = serde_json::to_vec(intent)
+        .map_err(|_| StorageError::InvalidStorage("review normalization intent is invalid"))?;
+    let update_name = review_normalization_intent_update_name(generation)?;
+    let replacement = directory.write_new_private_file(&update_name, &bytes)?;
+    Ok(directory.publish_private_replacement(
+        &review_normalization_intent_name(generation)?,
+        expected,
+        &update_name,
+        replacement,
+    )?)
+}
+
+fn validate_review_normalization_transition(
+    current: &ReviewNormalizationIntent,
+    next: &ReviewNormalizationIntent,
+) -> Result<(), StorageError> {
+    let valid_phase = match (&current.phase, &next.phase) {
+        (ReviewNormalizationPhase::Reserving, ReviewNormalizationPhase::Preparing { .. }) => true,
+        (
+            ReviewNormalizationPhase::Preparing { device, inode },
+            ReviewNormalizationPhase::Ready {
+                device: next_device,
+                inode: next_inode,
+                ..
+            },
+        ) => device == next_device && inode == next_inode,
+        (
+            ReviewNormalizationPhase::Ready { artifact, .. },
+            ReviewNormalizationPhase::Published {
+                artifact: next_artifact,
+            },
+        ) => artifact == next_artifact,
+        _ => false,
+    };
+    if current.schema_version != next.schema_version
+        || current.generation != next.generation
+        || current.source_artifact != next.source_artifact
+        || current.row_digest != next.row_digest
+        || current.row_count != next.row_count
+        || !valid_phase
+    {
+        return Err(StorageError::InvalidStorage(
+            "review normalization update is not the next phase",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_review_normalization_intent(
+    intent: &ReviewNormalizationIntent,
+    generation: u64,
+    row_digest: &str,
+    row_count: u64,
+) -> Result<(), StorageError> {
+    if intent.schema_version != 1
+        || intent.generation != generation
+        || intent.row_digest != row_digest
+        || intent.row_count != row_count
+    {
+        return Err(StorageError::InvalidStorage(
+            "review normalization intent does not match published state",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_closed_runtime_review(directory: &SecureDatabaseDirectory) -> Result<(), StorageError> {
+    let before = directory.closed_database_identity(REVIEW_DATABASE_NAME)?;
+    let path = directory
+        .path()
+        .join(OsStr::from_bytes(REVIEW_DATABASE_NAME.to_bytes()));
+    let connection = Connection::open_with_flags(
+        immutable_sqlite_uri(&path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | rusqlite::OpenFlags::SQLITE_OPEN_EXRESCODE,
+    )?;
+    let application_id: i32 =
+        connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    let user_version: i32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    let foreign_key_error = connection
+        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+        .optional()?;
+    super::schema::verify_frozen_schema(
+        &connection,
+        super::DatabaseKind::Review,
+        StorageDeadline::after(Duration::from_secs(1)),
+    )?;
+    if application_id != super::REVIEW_APPLICATION_ID
+        || user_version != super::REVIEW_SCHEMA_VERSION
+        || integrity != "ok"
+        || foreign_key_error.is_some()
+    {
+        return Err(StorageError::InvalidStorage(
+            "published review database is not runtime-valid",
+        ));
+    }
+    drop(connection);
+    let after = directory.closed_database_identity(REVIEW_DATABASE_NAME)?;
+    if before != after || review_journal_mode(directory)? != "wal" {
+        return Err(StorageError::InvalidStorage(
+            "published review database changed during runtime validation",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_source_fingerprints(
@@ -3987,11 +4726,17 @@ fn validate_managed_entries(
         let brain_namespace = bytes.starts_with(b".brain.sqlite3.migrate-")
             || bytes.starts_with(b".brain.sqlite3.migration-");
         let review_result_namespace = bytes.starts_with(b".brain.sqlite3.review-result-");
+        let review_normalization_namespace =
+            bytes.starts_with(b".brain.sqlite3.review-normalization-");
+        let review_normalization_database_namespace =
+            bytes.starts_with(b".review.sqlite3.normalization-");
         let review_staging_namespace = bytes.starts_with(b".review.sqlite3.migration-");
         let freeze_namespace = bytes.starts_with(b".brain.sqlite3.freeze-")
             || bytes.starts_with(b".brain.sqlite3.frozen-manifest");
         let managed = brain_namespace
             || review_result_namespace
+            || review_normalization_namespace
+            || review_normalization_database_namespace
             || review_staging_namespace
             || freeze_namespace;
         if !managed || bytes == MIGRATION_STATE_NAME.to_bytes() {
@@ -4015,6 +4760,14 @@ fn validate_managed_entries(
         let review_staging_bytes = review_staging.to_bytes();
         let review_owned = !matches!(&state.review_result, ReviewMigrationResult::Pending);
         let allowed_review_staging = review_owned && bytes == review_staging_bytes;
+        let allowed_review_normalization = state.status == MigrationStatus::Complete
+            && matches!(
+                &state.review_result,
+                ReviewMigrationResult::Published { .. }
+            )
+            && (bytes == review_normalization_intent_name(state.generation)?.to_bytes()
+                || bytes == review_normalization_intent_update_name(state.generation)?.to_bytes()
+                || bytes == review_normalization_temporary_name(state.generation)?.to_bytes());
         let allowed_review_building_sidecar =
             matches!(&state.review_result, ReviewMigrationResult::Building { .. })
                 && [
@@ -4040,6 +4793,7 @@ fn validate_managed_entries(
             && !allowed_building_sidecar
             && !allowed_state_temporary
             && !allowed_review_staging
+            && !allowed_review_normalization
             && !allowed_review_building_sidecar
             && !allowed_progress
             && !allowed_manifest
@@ -4099,6 +4853,12 @@ fn reject_unmanaged_migration_entries(
                 || name
                     .as_bytes()
                     .starts_with(b".brain.sqlite3.review-result-")
+                || name
+                    .as_bytes()
+                    .starts_with(b".brain.sqlite3.review-normalization-")
+                || name
+                    .as_bytes()
+                    .starts_with(b".review.sqlite3.normalization-")
                 || name.as_bytes().starts_with(b".review.sqlite3.migration-")
                 || name.as_bytes().starts_with(b".brain.sqlite3.freeze-")
                 || name

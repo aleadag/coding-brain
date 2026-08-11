@@ -33,7 +33,7 @@ use crate::brain::permission_transaction::{
 };
 use crate::brain::storage::{
     BrainDb, IntegrityHealth, MigrationCoordinator, MigrationHealth, MigrationStatus, OpenRole,
-    StorageDeadline, StorageError, StorageHealth, StoragePaths, WalHealth,
+    ReviewDb, StorageDeadline, StorageError, StorageHealth, StoragePaths, WalHealth,
 };
 
 use coding_brain_core::provider::AgentProvider;
@@ -268,10 +268,45 @@ fn permission_transaction_recovery_check(
     })
 }
 
+#[derive(Clone, Copy)]
+enum SqliteStorageStage {
+    Migration,
+    Brain,
+    Review,
+}
+
+impl SqliteStorageStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Migration => "migration",
+            Self::Brain => "Brain",
+            Self::Review => "Review",
+        }
+    }
+
+    fn redacted_path(self) -> &'static str {
+        match self {
+            Self::Migration => "$XDG_STATE_HOME/coding-brain/db",
+            Self::Brain => "$XDG_STATE_HOME/coding-brain/db/brain.sqlite3",
+            Self::Review => "$XDG_STATE_HOME/coding-brain/db/review.sqlite3",
+        }
+    }
+}
+
+struct SqliteStorageCheckFailure {
+    stage: SqliteStorageStage,
+    error: StorageError,
+}
+
 fn sqlite_storage_check_at(state_root: &Path) -> Check {
     let migration = match MigrationCoordinator::at(state_root).inspect() {
         Ok(status) => status,
-        Err(error) => return sqlite_storage_check_from_result(Err(error)),
+        Err(error) => {
+            return sqlite_storage_check_from_result(Err(SqliteStorageCheckFailure {
+                stage: SqliteStorageStage::Migration,
+                error,
+            }));
+        }
     };
     if migration != MigrationStatus::Complete {
         return Check {
@@ -297,16 +332,29 @@ fn sqlite_storage_check_at(state_root: &Path) -> Check {
         };
     }
     let paths = StoragePaths::at(state_root);
-    let result = BrainDb::open_current(
-        &paths,
-        OpenRole::NonHook,
-        StorageDeadline::after(Duration::from_millis(250)),
-    )
-    .and_then(|database| database.health());
-    sqlite_storage_check_from_result(result)
+    let deadline = StorageDeadline::after(Duration::from_millis(250));
+    let health = BrainDb::open_current(&paths, OpenRole::NonHook, deadline)
+        .and_then(|database| database.health())
+        .map_err(|error| SqliteStorageCheckFailure {
+            stage: SqliteStorageStage::Brain,
+            error,
+        });
+    let health = match health {
+        Ok(health) => health,
+        Err(error) => return sqlite_storage_check_from_result(Err(error)),
+    };
+    if let Err(error) = ReviewDb::open_current(&paths, OpenRole::NonHook, deadline) {
+        return sqlite_storage_check_from_result(Err(SqliteStorageCheckFailure {
+            stage: SqliteStorageStage::Review,
+            error,
+        }));
+    }
+    sqlite_storage_check_from_result(Ok(health))
 }
 
-fn sqlite_storage_check_from_result(result: Result<StorageHealth, StorageError>) -> Check {
+fn sqlite_storage_check_from_result(
+    result: Result<StorageHealth, SqliteStorageCheckFailure>,
+) -> Check {
     match result {
         Ok(health) => {
             let (status, message, fix_hint) = match health.wal {
@@ -362,12 +410,13 @@ fn sqlite_storage_check_from_result(result: Result<StorageHealth, StorageError>)
                 }),
             }
         }
-        Err(error) => {
-            let category = error.fault_category().as_str();
+        Err(failure) => {
+            let category = failure.error.fault_category().as_str();
+            let stage = failure.stage.label();
             Check {
                 name: "SQLite storage".into(),
                 status: CheckStatus::Fail,
-                message: format!("SQLite storage check failed ({category})"),
+                message: format!("SQLite {stage} storage check failed ({category})"),
                 fix_hint: Some(
                     "Inspect storage capacity, ownership, and integrity; then rerun `cbrain doctor`."
                         .into(),
@@ -375,7 +424,7 @@ fn sqlite_storage_check_from_result(result: Result<StorageHealth, StorageError>)
                 evidence: Some(CheckEvidence {
                     provider_files: Vec::new(),
                     storage: Some(StorageEvidence {
-                        database_path: "$XDG_STATE_HOME/coding-brain/db/brain.sqlite3".into(),
+                        database_path: failure.stage.redacted_path().into(),
                         schema_version: None,
                         sqlite_version: rusqlite::version().into(),
                         migration_status: "unknown".into(),
@@ -1903,6 +1952,7 @@ mod tests {
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let paths = crate::brain::storage::StoragePaths::at(root.path());
         drop(crate::brain::storage::BrainDb::create_current(&paths).unwrap());
+        drop(crate::brain::storage::ReviewDb::create_current(&paths).unwrap());
 
         let check = sqlite_storage_check_at(root.path());
         let json = serde_json::to_string(&check).unwrap();
@@ -1920,16 +1970,44 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_storage_doctor_identifies_an_unusable_review_database() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(root.path());
+        drop(BrainDb::create_current(&paths).unwrap());
+        drop(crate::brain::storage::ReviewDb::create_current(&paths).unwrap());
+        std::fs::remove_file(paths.db_dir().join("review-reset.lock")).unwrap();
+
+        let check = sqlite_storage_check_at(root.path());
+        let json = serde_json::to_string(&check).unwrap();
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("Review"));
+        assert!(json.contains("$XDG_STATE_HOME/coding-brain/db/review.sqlite3"));
+        assert!(!json.contains(&root.path().display().to_string()));
+    }
+
+    #[test]
     fn sqlite_storage_doctor_uses_fixed_error_categories() {
-        let check = sqlite_storage_check_from_result(Err(StorageError::Io(io::Error::other(
-            "/private/operator/path: token-secret",
-        ))));
+        let check = sqlite_storage_check_from_result(Err(SqliteStorageCheckFailure {
+            stage: SqliteStorageStage::Brain,
+            error: StorageError::Io(io::Error::other("/private/operator/path: token-secret")),
+        }));
         let json = serde_json::to_string(&check).unwrap();
 
         assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("Brain"));
         assert!(json.contains("\"error_category\":\"io\""));
         assert!(!json.contains("private/operator"));
         assert!(!json.contains("token-secret"));
+
+        let migration = sqlite_storage_check_from_result(Err(SqliteStorageCheckFailure {
+            stage: SqliteStorageStage::Migration,
+            error: StorageError::Io(io::Error::other("/private/migration/path")),
+        }));
+        let json = serde_json::to_string(&migration).unwrap();
+        assert!(migration.message.contains("migration"));
+        assert!(json.contains("$XDG_STATE_HOME/coding-brain/db"));
+        assert!(!json.contains("private/migration"));
     }
 
     #[test]

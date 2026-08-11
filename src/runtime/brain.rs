@@ -1478,6 +1478,35 @@ mod tests {
     use super::*;
     use crate::brain::review_state::ReviewStateSnapshot;
 
+    fn copy_legacy_storage_fixture(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+            std::fs::create_dir_all(destination).unwrap();
+            std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o700)).unwrap();
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let target = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), &target).unwrap();
+                    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state_root = root.path().join("state/coding-brain");
+        copy_tree(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/storage")
+                .join(name),
+            &state_root,
+        );
+        (root, state_root)
+    }
+
     #[test]
     fn sqlite_storage_runtime_error_preserves_typed_category() {
         let error = StorageError::Io(std::io::Error::other("/private/operator/path token-secret"));
@@ -1591,6 +1620,42 @@ mod tests {
         ] {
             assert!(!temp.path().join(legacy).exists(), "created {legacy}");
         }
+    }
+
+    #[test]
+    fn migrated_sqlite_refresh_uses_repaired_review_gate() {
+        let (_root, state_root) = copy_legacy_storage_fixture("permission-journal-4vh58");
+        let coordinator = crate::brain::storage::MigrationCoordinator::at(&state_root);
+        assert_eq!(
+            coordinator.run_non_hook().unwrap(),
+            crate::brain::storage::MigrationStatus::Complete
+        );
+        let paths = StoragePaths::at(&state_root);
+        let gate = paths.db_dir().join("review-reset.lock");
+        if gate.exists() {
+            std::fs::remove_file(&gate).unwrap();
+        }
+        assert!(!gate.exists());
+
+        assert!(matches!(
+            LiveBrainSource::refresh_from_sqlite_store(&state_root, SnapshotLimits::default()),
+            Err(BrainSourceError::StorageUnavailable(_)),
+        ));
+        assert_eq!(
+            coordinator.resume().unwrap(),
+            crate::brain::storage::MigrationStatus::Complete
+        );
+        LiveBrainSource::refresh_from_sqlite_store(&state_root, SnapshotLimits::default()).unwrap();
+
+        let held = ReviewDb::open_current(
+            &paths,
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert!(matches!(ReviewDb::reset(&paths), Err(StorageError::Busy)));
+        drop(held);
+        ReviewDb::reset(&paths).unwrap();
     }
 
     #[test]
