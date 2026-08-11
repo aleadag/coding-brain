@@ -41,13 +41,13 @@ represent these expected concurrent outcomes as `Changed`:
 existing re-enumeration loop and the original `StorageDeadline`. A stable entry
 continues through the existing exclusive-lock and path-validation checks.
 
-The helper will validate every identity it observes before comparing it with
-the enumerated identity: the pre-open path, opened descriptor, and post-open
-path. Only disappearance or a mismatch among otherwise safe owner-only,
-single-link regular files may return `Changed`. An unsafe name, symlink,
-unsupported type, invalid owner, invalid mode, extra hard link, unexpected I/O
-failure, or deadline expiry remains an error. The generic `openat` helper and
-every non-journal caller remain unchanged.
+The helper will validate the pre-open and post-open path identities before
+comparing them with the enumerated identity. It will validate the opened
+descriptor before returning `Stable`, but may discard it unread when pathname
+validation has already established disappearance or safe identity churn. An
+unsafe name, symlink, unsupported type, invalid owner, invalid mode, extra hard
+link, unexpected I/O failure, or deadline expiry remains an error. The generic
+`openat` helper and every non-journal caller remain unchanged.
 
 ## Deterministic Regression
 
@@ -57,11 +57,12 @@ observed TDD red evidence.
 
 Next, extract the journal open sequence behind a private callback seam without
 changing its current error classification, and verify the existing tests before
-and after that refactor. The seam runs after descriptor open and validation but
-before the post-open path lookup; production passes a no-op. Unit tests then
-use it to rename, remove, and safely replace the journal at that exact point.
-Those tests must fail with the current post-open `NotFound` or identity-change
-error before the implementation classifies the race as `Changed`.
+and after that refactor. The seam runs immediately after descriptor open and
+before descriptor metadata or the post-open path lookup; production passes a
+no-op. Unit tests then use it to rename, remove, and safely replace the journal
+at that exact point. Those tests must fail with the current post-open
+`InvalidStorage`, `NotFound`, or identity-change error before the implementation
+classifies the race as `Changed`.
 
 The deterministic coverage will also replace the path with a symlink at the
 same seam and assert that the unsafe replacement remains an error. These tests
@@ -108,14 +109,15 @@ state, or any non-journal legacy source behavior.
 
 - Use an explicit private `Stable(File)` or `Changed` result; do not overload
   `Option` or inspect error text.
-- Return `Changed` only for disappearance or identity mismatch among entries
-  that pass the existing journal safety validation.
+- Return `Changed` only for pathname disappearance or safe identity churn;
+  discard an opened descriptor unread in that case, and validate it before any
+  `Stable` result.
 - Keep the helper journal-specific and retain the generic fail-closed `openat`
   behavior for static sources and freeze artifacts.
 - Preserve the single absolute deadline and existing enumeration bounds; do
   not add retry counts, sleeps, or longer timeouts.
-- Treat the failed macOS job as the original red test, then use a behavior-
-  preserving extraction at the post-open lookup to create the deterministic
+- Treat the failed macOS jobs as the observed red tests, then use a behavior-
+  preserving extraction immediately after `openat` to create the deterministic
   red-green regression.
 
 ### Changes Made
@@ -123,9 +125,8 @@ state, or any non-journal legacy source behavior.
 - Made the open result and validation order explicit.
 - Added an unsafe-replacement regression to the rename/removal matrix.
 - Replaced the proposed compile-failure TDD step with a behavior-based sequence.
-- Corrected the deterministic seam to the post-open lookup and kept the hidden
-  historical `StorageError` unspecified until a diagnostic assertion captures
-  it.
+- Corrected the deterministic seam to the interval immediately after `openat`;
+  the recurrence diagnostic now fixes the expected red error exactly.
 
 ### Deferred / Parking Lot
 
@@ -151,3 +152,35 @@ with the existing fail-closed matcher, and only validate the held descriptor
 when the pathname still matches. A missing pathname or safe identity change
 returns `Changed`; an unsafe replacement still returns `InvalidStorage`. This
 does not change lock order, deadlines, enumeration bounds, or generic opens.
+
+## Hosted macOS Recurrence: Removal Before Descriptor Validation
+
+A later full serialized macOS run at commit `764471c2` reproduced the removal
+failure after both accepted PR #88 macOS runs had passed. The remaining race is
+inside `open_journal_entry_with`: `openat` has returned a descriptor, but the
+writer removes the journal before `file.metadata()` snapshots that descriptor.
+On macOS the snapshot then has zero links, and the helper rejects it before its
+test callback or pathname revalidation can classify the disappearance as
+expected namespace churn.
+
+Move the existing test callback to immediately after the descriptor is wrapped
+as a `File`, before descriptor metadata is read. This supersedes the original
+callback position after descriptor validation. A deterministic removal at the
+new boundary must first reproduce the exact error:
+`InvalidStorage("legacy guard file is not an owner-only single-link regular file")`.
+
+The production correction will snapshot the opened descriptor without
+validating it, then classify and validate the pathname. A missing pathname or a
+safe identity mismatch returns `Changed` and discards the unread descriptor. If
+the pathname still matches the enumerated identity, the helper validates the
+descriptor and requires it to match before returning `Stable`. Unsafe pathname
+identities and unexpected I/O remain errors. Discarding an unvalidated
+descriptor after confirmed namespace churn does not consume its contents or
+broaden trust in it; `O_NOFOLLOW`, the safe pre-open identity check, and the
+fail-closed matching-path case remain intact.
+
+Regression coverage must include removal at the new callback boundary and the
+existing rename, safe replacement, symlink, mode, owner, link-count, and file-
+type cases. The existing post-lock removal test remains in place. Production
+lock order, retry interval, absolute deadline, enumeration bounds, generic
+`openat` behavior, and public APIs remain unchanged.
