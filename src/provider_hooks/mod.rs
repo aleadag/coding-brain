@@ -1254,7 +1254,10 @@ mod tests {
         assert_eq!(receiver.recv().unwrap(), Err(BoundedProcessError::Timeout));
         for pid in pids {
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
         }
     }
 

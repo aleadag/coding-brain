@@ -54,3 +54,11 @@ Correction verification:
 Final correction commit `ef2dca41` adds a private resolved-reaper seam and cfg(test)-only stdout descriptor fault. It deterministically covers `Cleanup`, `Spawn`, `ExitStatus`, and post-spawn `Io` without changing the public process API.
 
 Final process-group proof uses an inherited readiness socket and a descendant blocked on an inherited pipe; it waits for the parent/descendant PID handshake, observes the bounded timeout, and asserts both PIDs return `ESRCH` after group termination.
+
+Post-`336656a5` verification:
+
+- `nix develop path:. --command cargo fmt --check` initially found one rustfmt line wrap in the new test; `nix develop path:. --command cargo fmt` applied it, and the final commit records that mechanical correction.
+- `nix develop path:. --command cargo clippy -p coding-brain --all-targets -- -D warnings` — passed.
+- `nix develop path:. --command cargo test -p coding-brain bounded_process -- --nocapture` — passed.
+
+Task 1 commit list: `3d5b60f7`, `7ae473d6`, `ef2dca41`, `336656a5`.
