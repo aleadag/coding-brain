@@ -4130,7 +4130,10 @@ fn antigravity_post_invocation_preserves_bounded_permission_authority_until_stop
     );
     assert!(stop.status.success());
     assert!(
-        String::from_utf8_lossy(&stop.stderr).contains("exact recovery identity link unavailable")
+        stop.stderr.is_empty()
+            || stop.stderr == b"cbrain lifecycle hook: exact recovery identity link unavailable\n",
+        "unexpected Stop diagnostic: {}",
+        String::from_utf8_lossy(&stop.stderr)
     );
 
     let after_stop = run_provider_permission_hook(
