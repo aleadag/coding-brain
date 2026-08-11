@@ -18,6 +18,12 @@
 - Keep the generic secure-open helper and all non-journal legacy-source behavior unchanged.
 - Do not commit, push, publish a PR, rerun hosted CI, or close `codexctl-zha56` without the authorization required by repository policy.
 
+## Existing Beads
+
+- Reuse epic `codexctl-g73cj`; do not create a duplicate execution epic.
+- Claim local implementation task `codexctl-0t6ma` for Task 1.
+- Leave hosted acceptance task `codexctl-ncvn8` blocked by Task 1 until publication is separately authorized.
+
 ---
 
 ### Task 1: Close the descriptor-open removal interval
@@ -45,6 +51,7 @@
 Before changing source, obtain explicit authority for any documentation checkpoint needed to make the worktree clean. Then run:
 
 ```bash
+git rev-parse HEAD
 git fetch origin main
 git rebase origin/main
 git status --short --branch
@@ -52,7 +59,7 @@ git cherry origin/main HEAD
 git diff origin/main -- src/brain/storage/legacy.rs tests/storage_migration.rs
 ```
 
-Expected: Git skips the patch-equivalent original zha56 commit, replays only unique documentation commits, status is clean, and there is no source/test diff from `origin/main`.
+Record the pre-rebase SHA as the restore point. Expected: Git skips the patch-equivalent original zha56 commit, replays only unique documentation commits, status is clean, and there is no source/test diff from `origin/main`. If rebase reports an unexpected source conflict or does not automatically skip the original patch, run `git rebase --abort`, preserve the output, and stop for review rather than resolving it speculatively.
 
 Run the unchanged focused baseline:
 
@@ -86,6 +93,8 @@ nix develop path:. --command cargo test journal_open_classifies_removal_as_chang
 ```
 
 Expected: FAIL with `Err(InvalidStorage("legacy guard file is not an owner-only single-link regular file"))`. This is the deterministic RED matching macOS job `93744653412`.
+
+Before continuing, retain evidence that the command exited nonzero, only `journal_open_classifies_removal_as_changed` failed, and its diagnostic exactly matched the recurrent error. A different failure returns the task to root-cause investigation.
 
 - [ ] **Step 3: Classify the pathname before trusting the descriptor**
 
@@ -173,6 +182,8 @@ rg -n 'LEGACY_WRITER_LOCK_ORDER|LEGACY_LOCK_RETRY|open_journal_entry_with|valida
 
 Expected: the implementation diff only moves the private callback and reorders journal-specific validation; the integration test, generic secure-open helper, constants, downstream path checks, and public APIs are unchanged.
 
+Confirm both unchanged unexpected-I/O arms still propagate errors directly. Do not introduce an additional callback or abstraction solely to inject an error into these unchanged branches.
+
 Update `codexctl-zha56` notes with the exact RED result, focused counts, and local gate results. Request separate authorization before creating an implementation commit; the proposed atomic message is:
 
 ```text
@@ -217,3 +228,32 @@ Expected: both macOS attempts PASS the exact deterministic removal test, the wri
 - [ ] **Step 4: Close only on complete acceptance**
 
 Record both macOS attempts and all local evidence in `codexctl-zha56`. Close it only if every acceptance criterion is satisfied; otherwise leave it open with the exact remaining failure or authorization gate.
+
+## Stress Test Results: Descriptor-open Recurrence Plan
+
+### Resolved Decisions
+
+- Rebase only from a clean tree, record the pre-rebase SHA, and abort on any unexpected source conflict or duplicate original patch.
+- Treat the callback move as RED only when the focused command fails solely with the exact recurrent zero-link `InvalidStorage` diagnostic.
+- Preserve the exact pathname-first, descriptor-before-`Stable` validation order and forbid broader helper refactoring.
+- Cover unsafe identities with the existing executable matrix; preserve unexpected-I/O handling as an unchanged diff-review invariant.
+- Retain every local gate and separate unrelated intermittent failures with exact evidence rather than skips or weakened checks.
+- Stop after local Task 1 evidence until implementation commit, push, PR, hosted CI, and Bead closure are separately authorized.
+- Roll back only the narrow source edit with an explicit patch; abort failed rebases and return failed hypotheses to systematic debugging.
+- Reuse existing epic `codexctl-g73cj` and tasks `codexctl-0t6ma` and `codexctl-ncvn8` instead of creating duplicate tracker records.
+
+### Changes Made
+
+- Added explicit rebase abort and restore-point instructions.
+- Made the deterministic RED evidence requirements exact.
+- Added the unchanged unexpected-I/O review invariant.
+- Bound execution to the existing Beads hierarchy.
+
+### Deferred / Parking Lot
+
+- Publication and hosted macOS acceptance remain blocked pending explicit authorization after the local candidate is reviewed.
+
+### Confidence Assessment
+
+- Overall: High
+- Remaining concern: the local plan can prove classification and safety, but only repeated hosted macOS jobs can accept the original scheduling-sensitive failure mode.
