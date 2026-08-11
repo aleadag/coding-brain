@@ -3452,7 +3452,7 @@ fn hook_open_accepts_completed_migration_without_mutating_coordinator() {
 }
 
 #[test]
-fn completed_migration_accepts_restart_after_live_database_write() {
+fn completed_migration_accepts_restart_while_live_database_is_held() {
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
     let coordinator = MigrationCoordinator::at(root.path());
@@ -3480,12 +3480,18 @@ fn completed_migration_accepts_restart_after_live_database_write() {
             1,
         )
         .unwrap();
-    drop(database);
+    assert!(
+        fs::metadata(paths.db_dir().join("brain.sqlite3-wal"))
+            .unwrap()
+            .len()
+            > 0
+    );
 
     assert_eq!(
         coordinator.run_non_hook().unwrap(),
         MigrationStatus::Complete
     );
+    drop(database);
 }
 
 #[test]

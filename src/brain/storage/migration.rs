@@ -4831,9 +4831,7 @@ fn validate_managed_entries(
     }
     if matches!(
         state.status,
-        MigrationStatus::BrainPublishedIncomplete
-            | MigrationStatus::LegacyFrozen
-            | MigrationStatus::Complete
+        MigrationStatus::BrainPublishedIncomplete | MigrationStatus::LegacyFrozen
     ) || (state.status == MigrationStatus::Verified
         && presence == PublicationPresence::Canonical)
     {
