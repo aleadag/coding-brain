@@ -419,6 +419,34 @@ fn invalid_inspected_file(
     InspectedProviderFile::Invalid { ownership, reason }
 }
 
+fn clean_store_relative_target(target: &Path, nix_store_root: &Path) -> Option<PathBuf> {
+    let raw_target = target.to_str()?;
+    if !raw_target.starts_with('/')
+        || raw_target[1..]
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return None;
+    }
+    let relative = target.strip_prefix(nix_store_root).ok()?.to_path_buf();
+    (!relative.as_os_str().is_empty()
+        && relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_))))
+    .then_some(relative)
+}
+
+fn is_normal_store_object_path(relative: &Path) -> bool {
+    relative
+        .components()
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(component) => component.to_str(),
+            _ => None,
+        })
+        .is_some_and(|component| !component.starts_with('.') && component.contains('-'))
+}
+
 fn home_manager_parent_topology_is_supported(
     nix_store_root: &Path,
     relative_parent: &Path,
@@ -443,6 +471,37 @@ fn home_manager_parent_topology_is_supported(
     Ok(())
 }
 
+fn home_manager_read_target(
+    target: &Path,
+    nix_store_root: &Path,
+) -> Result<PathBuf, ProviderHookDiagnosticReason> {
+    let metadata =
+        fs::symlink_metadata(target).map_err(|_| ProviderHookDiagnosticReason::Unreadable)?;
+    if metadata.file_type().is_file() {
+        return Ok(target.to_path_buf());
+    }
+    if !metadata.file_type().is_symlink() {
+        return Err(ProviderHookDiagnosticReason::UnsupportedTopology);
+    }
+
+    let inner_target =
+        fs::read_link(target).map_err(|_| ProviderHookDiagnosticReason::Unreadable)?;
+    let relative = clean_store_relative_target(&inner_target, nix_store_root)
+        .filter(|relative| is_normal_store_object_path(relative))
+        .ok_or(ProviderHookDiagnosticReason::UnsupportedTopology)?;
+    let relative_parent = relative
+        .parent()
+        .ok_or(ProviderHookDiagnosticReason::UnsupportedTopology)?;
+    home_manager_parent_topology_is_supported(nix_store_root, relative_parent)?;
+
+    let inner_metadata = fs::symlink_metadata(&inner_target)
+        .map_err(|_| ProviderHookDiagnosticReason::Unreadable)?;
+    if inner_metadata.file_type().is_symlink() || !inner_metadata.file_type().is_file() {
+        return Err(ProviderHookDiagnosticReason::UnsupportedTopology);
+    }
+    Ok(inner_target)
+}
+
 fn read_provider_file_for_inspection(
     path: &Path,
     provider: AgentProvider,
@@ -453,6 +512,14 @@ fn read_provider_file_for_inspection(
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return InspectedProviderFile::Missing;
+        }
+        Err(error)
+            if scope == HookScope::Project && error.kind() == io::ErrorKind::NotADirectory =>
+        {
+            return invalid_inspected_file(
+                ProviderHookOwnership::Unsupported,
+                ProviderHookDiagnosticReason::UnsupportedTopology,
+            );
         }
         Err(_) => {
             return invalid_inspected_file(
@@ -536,22 +603,13 @@ fn read_provider_file_for_inspection(
         return invalid_inspected_file(ProviderHookOwnership::Unsupported, reason);
     }
 
-    let target_metadata = match fs::symlink_metadata(&target) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            return invalid_inspected_file(
-                ProviderHookOwnership::HomeManager,
-                ProviderHookDiagnosticReason::Unreadable,
-            );
+    let read_target = match home_manager_read_target(&target, nix_store_root) {
+        Ok(target) => target,
+        Err(reason) => {
+            return invalid_inspected_file(ProviderHookOwnership::HomeManager, reason);
         }
     };
-    if target_metadata.file_type().is_symlink() || !target_metadata.file_type().is_file() {
-        return invalid_inspected_file(
-            ProviderHookOwnership::HomeManager,
-            ProviderHookDiagnosticReason::UnsupportedTopology,
-        );
-    }
-    let mut file = match File::open(&target) {
+    let mut file = match File::open(&read_target) {
         Ok(file) => file,
         Err(_) => {
             return invalid_inspected_file(
@@ -2705,6 +2763,39 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_home_manager_provider_store_leaf(
+        store: &Path,
+        home: &Path,
+        project: &Path,
+        provider: AgentProvider,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let generation = store.join("0123456789abcdefghijklmnopqrstuv-home-manager-files");
+        let leaf = match provider {
+            AgentProvider::Codex => generation.join(".codex/hooks.json"),
+            AgentProvider::Claude => generation.join(".claude/settings.json"),
+            AgentProvider::Antigravity => generation.join(".gemini/config/hooks.json"),
+        };
+        let source = match provider {
+            AgentProvider::Codex => store.join("11111111111111111111111111111111-codex-hooks"),
+            AgentProvider::Claude => store
+                .join("22222222222222222222222222222222-claude-settings")
+                .join("settings.json"),
+            AgentProvider::Antigravity => {
+                store.join("33333333333333333333333333333333-antigravity-hooks.json")
+            }
+        };
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, bytes).unwrap();
+        std::fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&source, &leaf).unwrap();
+        let home_link = provider_path(provider, HookScope::Global, home, project);
+        std::fs::create_dir_all(home_link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&leaf, &home_link).unwrap();
+        source
+    }
+
+    #[cfg(unix)]
     fn exact_provider_bytes(home: &Path, project: &Path, provider: AgentProvider) -> Vec<u8> {
         let mut plans =
             stage_provider_hooks_at(&[provider], HookScope::Global, home, project).unwrap();
@@ -2955,6 +3046,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn provider_inspection_accepts_home_manager_store_leaf_links_for_all_providers() {
+        for provider in [
+            AgentProvider::Codex,
+            AgentProvider::Claude,
+            AgentProvider::Antigravity,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            std::fs::create_dir_all(&project).unwrap();
+            let bytes = exact_provider_bytes(&home, &project, provider);
+            write_home_manager_provider_store_leaf(&store, &home, &project, provider, &bytes);
+
+            let inspection =
+                inspect_provider_hooks_at_with_store(provider, &home, &project, &store);
+
+            assert_eq!(inspection.state, ProviderHookState::Current, "{provider:?}");
+            assert_eq!(
+                inspection.ownership,
+                ProviderHookOwnership::HomeManager,
+                "{provider:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn provider_inspection_classifies_home_manager_definition_failures() {
         let provider = AgentProvider::Claude;
         let cases = [
@@ -3054,6 +3173,193 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn provider_inspection_reports_non_directory_global_ancestor_as_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(home.join(".codex"), b"").unwrap();
+
+        let inspection = inspect_provider_hooks_at(AgentProvider::Codex, &home, &project);
+        let global_file = inspection
+            .files
+            .iter()
+            .find(|file| file.scope == HookScope::Global)
+            .unwrap();
+
+        assert_eq!(inspection.state, ProviderHookState::Invalid);
+        assert_eq!(inspection.ownership, ProviderHookOwnership::Unsupported);
+        assert_eq!(
+            global_file.reason,
+            Some(ProviderHookDiagnosticReason::Unreadable)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_reports_non_directory_project_ancestor_as_unsupported_topology() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::write(project.join(".codex"), b"").unwrap();
+
+        let inspection = inspect_provider_hooks_at(AgentProvider::Codex, &home, &project);
+        let project_file = inspection
+            .files
+            .iter()
+            .find(|file| file.scope == HookScope::Project)
+            .unwrap();
+
+        assert_eq!(inspection.state, ProviderHookState::Invalid);
+        assert_eq!(inspection.ownership, ProviderHookOwnership::Unsupported);
+        assert_eq!(
+            project_file.reason,
+            Some(ProviderHookDiagnosticReason::UnsupportedTopology)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_rejects_unsafe_home_manager_store_leaf_targets() {
+        #[derive(Debug, Clone, Copy)]
+        enum StoreLeafFixture {
+            Relative,
+            NonStore,
+            StoreInternal,
+            NonUtf8,
+            CurrentDirectory,
+            ParentDirectory,
+            RepeatedSeparator,
+            Broken,
+            Directory,
+            MultiHop,
+            SymlinkedParent,
+        }
+
+        for fixture in [
+            StoreLeafFixture::Relative,
+            StoreLeafFixture::NonStore,
+            StoreLeafFixture::StoreInternal,
+            StoreLeafFixture::NonUtf8,
+            StoreLeafFixture::CurrentDirectory,
+            StoreLeafFixture::ParentDirectory,
+            StoreLeafFixture::RepeatedSeparator,
+            StoreLeafFixture::Broken,
+            StoreLeafFixture::Directory,
+            StoreLeafFixture::MultiHop,
+            StoreLeafFixture::SymlinkedParent,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            let generation = store.join("0123456789abcdefghijklmnopqrstuv-home-manager-files");
+            let leaf = generation.join(".codex/hooks.json");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+
+            let target = match fixture {
+                StoreLeafFixture::Relative => PathBuf::from("relative-target"),
+                StoreLeafFixture::NonStore => {
+                    let target = temp.path().join("outside/hooks.json");
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(&target, b"{}").unwrap();
+                    target
+                }
+                StoreLeafFixture::StoreInternal => {
+                    let target = store.join(".links/codex-hooks");
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(&target, b"{}").unwrap();
+                    target
+                }
+                StoreLeafFixture::NonUtf8 => {
+                    let mut target = store.as_os_str().as_bytes().to_vec();
+                    target.extend_from_slice(b"/\xff-codex-hooks");
+                    PathBuf::from(std::ffi::OsString::from_vec(target))
+                }
+                StoreLeafFixture::CurrentDirectory => {
+                    let target = store.join("11111111111111111111111111111111-codex-hooks");
+                    std::fs::write(&target, b"{}").unwrap();
+                    PathBuf::from(format!(
+                        "{}/./11111111111111111111111111111111-codex-hooks",
+                        store.display()
+                    ))
+                }
+                StoreLeafFixture::ParentDirectory => {
+                    let target = store.join("22222222222222222222222222222222-codex-hooks");
+                    std::fs::create_dir_all(store.join("11111111111111111111111111111111-unused"))
+                        .unwrap();
+                    std::fs::write(&target, b"{}").unwrap();
+                    PathBuf::from(format!(
+                        "{}/11111111111111111111111111111111-unused/../22222222222222222222222222222222-codex-hooks",
+                        store.display()
+                    ))
+                }
+                StoreLeafFixture::RepeatedSeparator => {
+                    let target = store.join("11111111111111111111111111111111-codex-hooks");
+                    std::fs::write(&target, b"{}").unwrap();
+                    PathBuf::from(format!(
+                        "{}//11111111111111111111111111111111-codex-hooks",
+                        store.display()
+                    ))
+                }
+                StoreLeafFixture::Broken => {
+                    store.join("11111111111111111111111111111111-broken-codex-hooks")
+                }
+                StoreLeafFixture::Directory => {
+                    let target = store.join("11111111111111111111111111111111-codex-hooks");
+                    std::fs::create_dir_all(&target).unwrap();
+                    target
+                }
+                StoreLeafFixture::MultiHop => {
+                    let target = store.join("11111111111111111111111111111111-codex-hooks");
+                    let final_target = store.join("22222222222222222222222222222222-codex-hooks");
+                    std::fs::write(&final_target, b"{}").unwrap();
+                    std::os::unix::fs::symlink(final_target, &target).unwrap();
+                    target
+                }
+                StoreLeafFixture::SymlinkedParent => {
+                    let store_object = store.join("11111111111111111111111111111111-codex-hooks");
+                    let parent = store_object.join("config");
+                    let outside = temp.path().join("outside-config");
+                    std::fs::create_dir_all(&store_object).unwrap();
+                    std::fs::create_dir_all(&outside).unwrap();
+                    std::fs::write(outside.join("hooks.json"), b"{}").unwrap();
+                    std::os::unix::fs::symlink(outside, &parent).unwrap();
+                    parent.join("hooks.json")
+                }
+            };
+            std::os::unix::fs::symlink(target, &leaf).unwrap();
+            let global = provider_path(AgentProvider::Codex, HookScope::Global, &home, &project);
+            std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&leaf, &global).unwrap();
+
+            let inspection =
+                inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store);
+            let global_file = inspection
+                .files
+                .iter()
+                .find(|file| file.scope == HookScope::Global)
+                .unwrap();
+            let reason = match fixture {
+                StoreLeafFixture::Broken => ProviderHookDiagnosticReason::Unreadable,
+                _ => ProviderHookDiagnosticReason::UnsupportedTopology,
+            };
+
+            assert_eq!(inspection.state, ProviderHookState::Invalid, "{fixture:?}");
+            assert_eq!(
+                inspection.ownership,
+                ProviderHookOwnership::HomeManager,
+                "{fixture:?}"
+            );
+            assert_eq!(global_file.reason, Some(reason), "{fixture:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn provider_inspection_rejects_unsupported_symlinks_and_targets() {
         #[derive(Debug, Clone, Copy)]
         enum Fixture {
@@ -3064,9 +3370,6 @@ mod tests {
             NonUtf8,
             NonStore,
             WrongSuffix,
-            NestedSymlink,
-            Directory,
-            Broken,
             ProjectLocal,
         }
 
@@ -3078,9 +3381,6 @@ mod tests {
             Fixture::NonUtf8,
             Fixture::NonStore,
             Fixture::WrongSuffix,
-            Fixture::NestedSymlink,
-            Fixture::Directory,
-            Fixture::Broken,
             Fixture::ProjectLocal,
         ] {
             let temp = tempfile::tempdir().unwrap();
@@ -3157,21 +3457,6 @@ mod tests {
                     std::fs::write(&target, b"{}").unwrap();
                     (global, target, ProviderHookOwnership::Unsupported)
                 }
-                Fixture::NestedSymlink => {
-                    let target = temp.path().join("actual.json");
-                    std::fs::write(&target, b"{}").unwrap();
-                    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
-                    std::os::unix::fs::symlink(target, &expected).unwrap();
-                    (global, expected, ProviderHookOwnership::HomeManager)
-                }
-                Fixture::Directory => {
-                    std::fs::create_dir_all(&expected).unwrap();
-                    (global, expected, ProviderHookOwnership::HomeManager)
-                }
-                Fixture::Broken => {
-                    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
-                    (global, expected, ProviderHookOwnership::HomeManager)
-                }
                 Fixture::ProjectLocal => {
                     std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
                     std::fs::write(&expected, b"{}").unwrap();
@@ -3183,19 +3468,6 @@ mod tests {
 
             let inspection =
                 inspect_provider_hooks_at_with_store(AgentProvider::Codex, &home, &project, &store);
-            let expected_reason = match fixture {
-                Fixture::Broken => ProviderHookDiagnosticReason::Unreadable,
-                Fixture::NestedSymlink
-                | Fixture::Directory
-                | Fixture::ProjectLocal
-                | Fixture::Relative
-                | Fixture::Parent
-                | Fixture::CurrentDirectory
-                | Fixture::NonUtf8
-                | Fixture::NonStore
-                | Fixture::WrongSuffix
-                | Fixture::RepeatedSeparator => ProviderHookDiagnosticReason::UnsupportedTopology,
-            };
             assert_eq!(inspection.state, ProviderHookState::Invalid, "{fixture:?}");
             assert_eq!(inspection.ownership, ownership, "{fixture:?}");
             let file = inspection
@@ -3203,7 +3475,11 @@ mod tests {
                 .iter()
                 .find(|file| file.state == ProviderHookFileState::Invalid)
                 .unwrap();
-            assert_eq!(file.reason, Some(expected_reason), "{fixture:?}");
+            assert_eq!(
+                file.reason,
+                Some(ProviderHookDiagnosticReason::UnsupportedTopology),
+                "{fixture:?}"
+            );
         }
     }
 

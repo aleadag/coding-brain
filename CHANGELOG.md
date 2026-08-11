@@ -8,6 +8,9 @@ All notable changes to Coding Brain are documented here.
 
 ### Fixed
 
+- Doctor now recognizes Home Manager provider files whose generation leaves
+  link to immutable Nix-store sources, while unsupported project paths and
+  imperative init or removal remain fail-closed.
 - SQLite migration now creates and safely recovers the Review reset gate before
   reporting healthy Review storage. Doctor validates both Brain and Review, so
   an unusable migrated Review database is reported before the TUI opens it.
