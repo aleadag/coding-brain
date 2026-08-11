@@ -68,16 +68,38 @@ impl CacheDeadline {
     }
 
     fn apply(self, connection: &Connection) -> Result<(), RuntimeCacheBypass> {
+        self.apply_with_busy_policy(connection, BusyPolicy::Deadline)
+    }
+
+    fn apply_with_busy_policy(
+        self,
+        connection: &Connection,
+        busy_policy: BusyPolicy,
+    ) -> Result<(), RuntimeCacheBypass> {
         self.ensure_remaining()?;
-        CACHE_BUSY_DEADLINE.with(|deadline| deadline.set(Some(self.0)));
-        connection
-            .busy_handler(Some(retry_cache_busy_until_deadline))
-            .map_err(map_sqlite_error)?;
+        match busy_policy {
+            BusyPolicy::Deadline => {
+                CACHE_BUSY_DEADLINE.with(|deadline| deadline.set(Some(self.0)));
+                connection
+                    .busy_handler(Some(retry_cache_busy_until_deadline))
+                    .map_err(map_sqlite_error)?;
+            }
+            BusyPolicy::Immediate => {
+                CACHE_BUSY_DEADLINE.with(|deadline| deadline.set(None));
+                connection.busy_handler(None).map_err(map_sqlite_error)?;
+            }
+        }
         let deadline = self.0;
         connection
             .progress_handler(1_000, Some(move || Instant::now() >= deadline))
             .map_err(map_sqlite_error)
     }
+}
+
+#[derive(Clone, Copy)]
+enum BusyPolicy {
+    Deadline,
+    Immediate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,7 +290,7 @@ impl RuntimeCacheReader {
         )
         .map_err(map_sqlite_error)?;
         configure_reader(&connection, deadline)?;
-        verify_cache(&connection, deadline)?;
+        verify_cache(&connection, deadline, BusyPolicy::Immediate)?;
         directory
             .validate_after_open(RUNTIME_CACHE_DATABASE_NAME)
             .map_err(map_security_error)?;
@@ -354,10 +376,6 @@ impl RuntimeCacheReader {
             refresh_order,
         )
     }
-
-    pub fn connection(&self) -> &Connection {
-        &self.connection
-    }
 }
 
 pub struct RuntimeCacheWriter {
@@ -409,11 +427,11 @@ impl RuntimeCacheWriter {
                 | OpenFlags::SQLITE_OPEN_EXRESCODE,
         )
         .map_err(map_sqlite_error)?;
-        configure_writer(&connection, deadline)?;
+        configure_writer(&connection, deadline, created)?;
         if created {
             initialize_cache(&connection, deadline)?;
         } else {
-            verify_cache(&connection, deadline)?;
+            verify_cache(&connection, deadline, BusyPolicy::Immediate)?;
         }
         directory
             .validate_after_open(RUNTIME_CACHE_DATABASE_NAME)
@@ -482,17 +500,13 @@ impl RuntimeCacheWriter {
         transaction.commit().map_err(map_sqlite_error)?;
         self.deadline.ensure_remaining()
     }
-
-    pub fn connection(&self) -> &Connection {
-        &self.connection
-    }
 }
 
 fn configure_reader(
     connection: &Connection,
     deadline: CacheDeadline,
 ) -> Result<(), RuntimeCacheBypass> {
-    configure_common(connection, deadline)?;
+    configure_common(connection, deadline, BusyPolicy::Immediate)?;
     connection
         .execute_batch("PRAGMA query_only = ON;")
         .map_err(map_sqlite_error)?;
@@ -502,8 +516,14 @@ fn configure_reader(
 fn configure_writer(
     connection: &Connection,
     deadline: CacheDeadline,
+    created: bool,
 ) -> Result<(), RuntimeCacheBypass> {
-    configure_common(connection, deadline)?;
+    let busy_policy = if created {
+        BusyPolicy::Deadline
+    } else {
+        BusyPolicy::Immediate
+    };
+    configure_common(connection, deadline, busy_policy)?;
     connection
         .execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")
         .map_err(map_sqlite_error)?;
@@ -513,8 +533,9 @@ fn configure_writer(
 fn configure_common(
     connection: &Connection,
     deadline: CacheDeadline,
+    busy_policy: BusyPolicy,
 ) -> Result<(), RuntimeCacheBypass> {
-    deadline.apply(connection)?;
+    deadline.apply_with_busy_policy(connection, busy_policy)?;
     connection
         .load_extension_disable()
         .map_err(map_sqlite_error)?;
@@ -572,14 +593,15 @@ fn initialize_cache(
         .map_err(map_sqlite_error)?;
     result?;
     deadline.ensure_remaining()?;
-    verify_cache(connection, deadline)
+    verify_cache(connection, deadline, BusyPolicy::Deadline)
 }
 
 fn verify_cache(
     connection: &Connection,
     deadline: CacheDeadline,
+    busy_policy: BusyPolicy,
 ) -> Result<(), RuntimeCacheBypass> {
-    deadline.apply(connection)?;
+    deadline.apply_with_busy_policy(connection, busy_policy)?;
     let application_id = connection
         .query_row("PRAGMA application_id", [], |row| row.get::<_, i32>(0))
         .map_err(map_sqlite_error)?;
@@ -714,5 +736,40 @@ fn map_sqlite_error(error: rusqlite::Error) -> RuntimeCacheBypass {
             RuntimeCacheBypass::Deadline
         }
         _ => RuntimeCacheBypass::Corrupt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn reader_connection_is_query_only() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(root.path());
+        drop(
+            RuntimeCacheWriter::create_or_open_after_activity(
+                &paths,
+                CacheDeadline::after(Duration::from_millis(250)),
+            )
+            .unwrap(),
+        );
+
+        let reader = RuntimeCacheReader::open_existing_read_only(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .connection
+                .query_row("PRAGMA query_only", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            1
+        );
     }
 }

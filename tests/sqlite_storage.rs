@@ -6149,28 +6149,29 @@ fn runtime_cache_table_names(connection: &Connection) -> Vec<String> {
 fn runtime_cache_creates_exact_v1_without_changing_authoritative_schemas() {
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
-    let cache = RuntimeCacheWriter::create_or_open_after_activity(
-        &paths,
-        CacheDeadline::after(Duration::from_millis(250)),
-    )
-    .unwrap();
+    drop(
+        RuntimeCacheWriter::create_or_open_after_activity(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap(),
+    );
+    let cache = open_for_constraints(&paths.runtime_cache_v1());
 
     assert_eq!(
         cache
-            .connection()
             .query_row("PRAGMA application_id", [], |row| row.get::<_, i32>(0))
             .unwrap(),
         RUNTIME_CACHE_APPLICATION_ID
     );
     assert_eq!(
         cache
-            .connection()
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
             .unwrap(),
         RUNTIME_CACHE_SCHEMA_VERSION
     );
     assert_eq!(
-        runtime_cache_table_names(cache.connection()),
+        runtime_cache_table_names(&cache),
         ["project_identity_cache"]
     );
     assert_eq!(BRAIN_SCHEMA_VERSION, 1);
@@ -6225,13 +6226,6 @@ fn runtime_cache_hit_is_query_only_and_creates_no_sidecars() {
     .unwrap();
     assert_eq!(reader.candidate_roots().unwrap(), [row.root().clone()]);
     assert_eq!(reader.load_selected_row(row.root()).unwrap(), row);
-    assert_eq!(
-        reader
-            .connection()
-            .query_row("PRAGMA query_only", [], |row| row.get::<_, i32>(0))
-            .unwrap(),
-        1
-    );
     drop(reader);
 
     let after = fs::read_dir(paths.db_dir())
@@ -6296,17 +6290,19 @@ fn runtime_cache_rejects_invalid_uuid_provenance_and_evidence_before_use() {
     ] {
         let root = private_tempdir();
         let paths = StoragePaths::at(root.path());
-        let writer = RuntimeCacheWriter::create_or_open_after_activity(
-            &paths,
-            CacheDeadline::after(Duration::from_millis(250)),
-        )
-        .unwrap();
-        writer
-            .connection()
+        drop(
+            RuntimeCacheWriter::create_or_open_after_activity(
+                &paths,
+                CacheDeadline::after(Duration::from_millis(250)),
+            )
+            .unwrap(),
+        );
+        let connection = open_for_constraints(&paths.runtime_cache_v1());
+        connection
             .execute_batch("PRAGMA ignore_check_constraints = ON;")
             .unwrap();
-        writer.connection().execute(insert, []).unwrap();
-        drop(writer);
+        connection.execute(insert, []).unwrap();
+        drop(connection);
 
         let result = RuntimeCacheReader::open_existing_read_only(
             &paths,
@@ -6328,23 +6324,24 @@ fn runtime_cache_rejects_invalid_uuid_provenance_and_evidence_before_use() {
 fn runtime_cache_rejects_oversized_evidence_before_materializing_it() {
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
-    let writer = RuntimeCacheWriter::create_or_open_after_activity(
-        &paths,
-        CacheDeadline::after(Duration::from_millis(250)),
-    )
-    .unwrap();
-    writer
-        .connection()
+    drop(
+        RuntimeCacheWriter::create_or_open_after_activity(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap(),
+    );
+    let connection = open_for_constraints(&paths.runtime_cache_v1());
+    connection
         .execute_batch("PRAGMA ignore_check_constraints = ON;")
         .unwrap();
-    writer
-        .connection()
+    connection
         .execute(
             "INSERT INTO project_identity_cache VALUES (?1, ?2, 1, zeroblob(65537), 1, 1)",
             params![b"/bad".as_slice(), "123e4567-e89b-12d3-a456-426614174000"],
         )
         .unwrap();
-    drop(writer);
+    drop(connection);
 
     let reader = RuntimeCacheReader::open_existing_read_only(
         &paths,
@@ -6431,6 +6428,46 @@ fn runtime_cache_lock_contention_respects_its_short_deadline() {
 }
 
 #[test]
+fn runtime_cache_first_open_loser_does_not_wait_for_winner_initialization() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let (winner_ready_tx, winner_ready_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_winner_tx, release_winner_rx) = std::sync::mpsc::sync_channel(0);
+
+    thread::scope(|scope| {
+        let winner_paths = &paths;
+        scope.spawn(move || {
+            drop(
+                RuntimeCacheWriter::create_or_open_after_activity(
+                    winner_paths,
+                    CacheDeadline::after(Duration::from_millis(250)),
+                )
+                .unwrap(),
+            );
+            let winner = open_for_constraints(&winner_paths.runtime_cache_v1());
+            winner.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+            winner_ready_tx.send(()).unwrap();
+            release_winner_rx.recv().unwrap();
+            winner.execute_batch("ROLLBACK;").unwrap();
+        });
+        winner_ready_rx.recv().unwrap();
+        let started = Instant::now();
+        let outcome = RuntimeCacheWriter::create_or_open_after_activity(
+            &paths,
+            CacheDeadline::after(Duration::from_secs(1)),
+        );
+        let elapsed = started.elapsed();
+        release_winner_tx.send(()).unwrap();
+
+        assert!(matches!(outcome, Err(RuntimeCacheBypass::Contended)));
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "first-open loser waited {elapsed:?}"
+        );
+    });
+}
+
+#[test]
 fn runtime_cache_concurrent_first_use_creates_one_exact_database() {
     let root = private_tempdir();
     let paths = StoragePaths::at(root.path());
@@ -6469,12 +6506,15 @@ fn runtime_cache_concurrent_first_use_creates_one_exact_database() {
         }),
         "unexpected concurrent outcomes: {outcomes:?}"
     );
-    let reader = RuntimeCacheReader::open_existing_read_only(
-        &paths,
-        CacheDeadline::after(Duration::from_millis(250)),
-    )
-    .unwrap();
-    assert_eq!(runtime_cache_table_names(reader.connection()).len(), 1);
+    drop(
+        RuntimeCacheReader::open_existing_read_only(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap(),
+    );
+    let connection = open_for_constraints(&paths.runtime_cache_v1());
+    assert_eq!(runtime_cache_table_names(&connection).len(), 1);
 }
 
 #[test]
