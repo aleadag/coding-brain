@@ -95,7 +95,8 @@ impl ProjectIdentity {
         paths: &CodingBrainPaths,
         runner: &mut impl ProjectCommandRunner,
     ) -> Result<ProjectResolution, ProjectError> {
-        let root = fs::canonicalize(project_root_with(cwd, runner))?;
+        let (project_root, root_discovery_failed) = project_root_with(cwd, runner);
+        let root = fs::canonicalize(project_root)?;
         let manifest_path = manifest_path(&root, paths);
         match fs::read_to_string(&manifest_path) {
             Ok(contents) => Ok(ProjectResolution {
@@ -104,12 +105,14 @@ impl ProjectIdentity {
                 provenance: ProjectProvenance::Manifest,
             }),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if let Some(id) = git_remote_project_id_with(&root, runner) {
-                    return Ok(ProjectResolution {
-                        root,
-                        identity: Self { id },
-                        provenance: ProjectProvenance::NetworkRemote,
-                    });
+                if !root_discovery_failed {
+                    if let Some(id) = git_remote_project_id_with(&root, runner) {
+                        return Ok(ProjectResolution {
+                            root,
+                            identity: Self { id },
+                            provenance: ProjectProvenance::NetworkRemote,
+                        });
+                    }
                 }
                 Ok(ProjectResolution {
                     identity: Self {
@@ -215,21 +218,27 @@ fn git_root(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
-fn git_root_with(cwd: &Path, runner: &mut impl ProjectCommandRunner) -> Option<PathBuf> {
-    let root = git_path_output_with(cwd, &["rev-parse", "--show-toplevel"], runner)?;
-    if root.is_absolute() {
-        Some(root)
-    } else {
-        fs::canonicalize(cwd.join(root)).ok()
-    }
+fn git_root_with(cwd: &Path, runner: &mut impl ProjectCommandRunner) -> (PathBuf, bool) {
+    let value = match runner.output(cwd, &["rev-parse", "--show-toplevel"]) {
+        Ok(value) => value,
+        Err(_) => return (cwd.to_path_buf(), true),
+    };
+    let root = git_path_from_output(value).and_then(|root| {
+        if root.is_absolute() {
+            Some(root)
+        } else {
+            fs::canonicalize(cwd.join(root)).ok()
+        }
+    });
+    (root.unwrap_or_else(|| cwd.to_path_buf()), false)
 }
 
 fn project_root(cwd: &Path) -> PathBuf {
     git_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
 }
 
-fn project_root_with(cwd: &Path, runner: &mut impl ProjectCommandRunner) -> PathBuf {
-    git_root_with(cwd, runner).unwrap_or_else(|| cwd.to_path_buf())
+fn project_root_with(cwd: &Path, runner: &mut impl ProjectCommandRunner) -> (PathBuf, bool) {
+    git_root_with(cwd, runner)
 }
 
 fn temporary_id(path: &Path) -> String {
@@ -272,7 +281,10 @@ fn git_path_output_with(
     args: &[&str],
     runner: &mut impl ProjectCommandRunner,
 ) -> Option<PathBuf> {
-    let mut value = runner.output(cwd, args).ok()?;
+    git_path_from_output(runner.output(cwd, args).ok()?)
+}
+
+fn git_path_from_output(mut value: Vec<u8>) -> Option<PathBuf> {
     if value.last() == Some(&b'\n') {
         value.pop();
         #[cfg(windows)]
@@ -532,6 +544,22 @@ mod tests {
         assert_eq!(resolved.root(), root);
         assert_eq!(resolved.provenance(), ProjectProvenance::Temporary);
         assert_eq!(runner.calls(), 2);
+    }
+
+    #[test]
+    fn root_discovery_failure_never_attempts_remote_identity() {
+        let fixture = tempfile::tempdir().unwrap();
+        let paths = fixture_paths(fixture.path());
+        let mut runner = FixtureRunner::new([(
+            vec!["rev-parse", "--show-toplevel"],
+            Err(ProjectCommandError::Timeout),
+        )]);
+
+        let resolved = ProjectIdentity::resolve_with(fixture.path(), &paths, &mut runner).unwrap();
+
+        assert_eq!(resolved.provenance(), ProjectProvenance::Temporary);
+        assert!(!resolved.identity().is_durable());
+        assert_eq!(runner.calls(), 1);
     }
 
     #[test]
