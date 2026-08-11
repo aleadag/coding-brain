@@ -28,12 +28,15 @@ use crate::brain::activity::ActivityLog;
 #[cfg(test)]
 use crate::brain::activity::ActivityStore;
 use crate::brain::storage::{BrainDb, OpenRole, StorageDeadline, StoragePaths};
-use crate::lifecycle_timing::{HookBudget, HookEventClass, HookOutcome, HookStage, HookTiming};
+use crate::lifecycle_timing::{
+    HookBudget, HookEventClass, HookOutcome, HookStage, HookTiming, MonotonicClock,
+};
 #[cfg(test)]
 use crate::provider_hooks::normalized_outcome;
 use crate::provider_hooks::{ParsedLifecycleHook, parse_lifecycle};
 
 pub(crate) const MAX_HOOK_INPUT_BYTES: usize = 64 * 1024;
+const AUTHORITATIVE_STORAGE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 static LIFECYCLE_ACTIVITY_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
@@ -1019,6 +1022,25 @@ pub(crate) fn run(provider: AgentProvider, antigravity_event: Option<&str>, budg
     );
 }
 
+fn authoritative_storage_deadline<C: MonotonicClock>(
+    budget: &HookBudget<C>,
+) -> Option<std::time::Instant> {
+    budget.child_deadline(AUTHORITATIVE_STORAGE_BUDGET)
+}
+
+fn parse_timing_event(
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+    input: &[u8],
+) -> Result<Option<HookEventClass>, String> {
+    let parsed =
+        parse_lifecycle(provider, antigravity_event, input).map_err(|error| error.to_string())?;
+    Ok(parsed
+        .event
+        .as_ref()
+        .map(|event| HookEventClass::from_lifecycle_name(event.name().as_str())))
+}
+
 fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
     provider: AgentProvider,
     mut stdin: R,
@@ -1042,32 +1064,48 @@ fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
             return;
         }
     };
-    if provider == AgentProvider::Antigravity && antigravity_event == Some("PostInvocation") {
-        match parse_lifecycle(provider, antigravity_event, &input) {
-            Ok(parsed) if parsed.event.is_none() => return,
-            Ok(_) => {}
-            Err(error) => {
-                write_diagnostic(&mut stderr, error);
-                timing.finish(HookStage::Parse, HookOutcome::Rejected);
-                return;
-            }
+    match parse_timing_event(provider, antigravity_event, &input) {
+        Ok(Some(event)) => timing.set_event(event),
+        Ok(None)
+            if provider == AgentProvider::Antigravity
+                && antigravity_event == Some("PostInvocation") =>
+        {
+            return;
         }
+        Ok(None) => {}
+        Err(error)
+            if provider == AgentProvider::Antigravity
+                && antigravity_event == Some("PostInvocation") =>
+        {
+            write_diagnostic(&mut stderr, error);
+            timing.finish(HookStage::Parse, HookOutcome::Rejected);
+            return;
+        }
+        Err(_) => {}
     }
     let state_root = coding_brain_state_root();
     let mut parent_output = crate::provider_hooks::OutputBudget::new(4 * 1024);
     let live_process = budget
         .optional_child_deadline(
             std::time::Duration::from_millis(250),
-            std::time::Duration::from_millis(500),
+            AUTHORITATIVE_STORAGE_BUDGET,
         )
         .and_then(|deadline| {
             crate::provider_hooks::live_parent_process_until(provider, deadline, &mut parent_output)
         });
     let paths = StoragePaths::at(&state_root);
+    let Some(storage_deadline) = authoritative_storage_deadline(&budget) else {
+        write_diagnostic(
+            &mut stderr,
+            "SQLite storage unavailable: hook deadline exhausted",
+        );
+        timing.finish(HookStage::Storage, HookOutcome::StorageUnavailable);
+        return;
+    };
     let mut database = match BrainDb::open_current(
         &paths,
         OpenRole::Hook,
-        StorageDeadline::after(std::time::Duration::from_millis(500)),
+        StorageDeadline::at(storage_deadline),
     ) {
         Ok(database) => database,
         Err(error) => {
@@ -1086,10 +1124,7 @@ fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
         live_process,
         crate::provider_hooks::revalidate_live_process,
     ) {
-        Ok(recorded) => {
-            timing.set_event(HookEventClass::from_lifecycle_name(
-                recorded.event.name().as_str(),
-            ));
+        Ok(_) => {
             timing.finish(HookStage::Lifecycle, HookOutcome::Success);
         }
         Err(error) => {
@@ -1243,10 +1278,62 @@ mod tests {
     use fs2::FileExt;
 
     use crate::brain::activity::ActivityStore;
+    use crate::lifecycle_timing::FakeClock;
 
     use super::*;
 
     const PROMPT: &[u8] = include_bytes!("../tests/fixtures/hooks/user-prompt-submit.json");
+
+    #[test]
+    fn authoritative_storage_deadline_never_extends_the_entry_deadline() {
+        let started = std::time::Instant::now();
+        let clock = FakeClock::at(started);
+        let budget = HookBudget::with_clock(clock.clone(), std::time::Duration::from_millis(1500));
+
+        assert_eq!(
+            authoritative_storage_deadline(&budget),
+            Some(started + std::time::Duration::from_millis(500))
+        );
+        clock.advance(std::time::Duration::from_millis(1200));
+
+        assert_eq!(
+            authoritative_storage_deadline(&budget),
+            Some(started + std::time::Duration::from_millis(1500))
+        );
+        clock.advance(std::time::Duration::from_millis(300));
+        assert_eq!(authoritative_storage_deadline(&budget), None);
+    }
+
+    #[test]
+    fn successful_preparse_establishes_timing_event_before_storage() {
+        let antigravity_stop = include_bytes!("../tests/fixtures/hooks/antigravity-stop.json");
+        let session_start = include_bytes!("../tests/fixtures/hooks/session-start.json");
+        for (provider, trusted_event, input, expected) in [
+            (
+                AgentProvider::Codex,
+                None,
+                &session_start[..],
+                HookEventClass::SessionStart,
+            ),
+            (
+                AgentProvider::Codex,
+                None,
+                PROMPT,
+                HookEventClass::UserPromptSubmit,
+            ),
+            (
+                AgentProvider::Antigravity,
+                Some("Stop"),
+                &antigravity_stop[..],
+                HookEventClass::Stop,
+            ),
+        ] {
+            assert_eq!(
+                parse_timing_event(provider, trusted_event, input).unwrap(),
+                Some(expected)
+            );
+        }
+    }
 
     fn decision_event(
         cwd: &Path,

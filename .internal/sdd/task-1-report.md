@@ -37,9 +37,9 @@ Commit: pending (created after this report is staged)
 
 ## Review correction pass
 
-- Deferred `StorageDeadline` construction until after optional parent discovery. Parent discovery receives only the child deadline that preserves 500 ms; authoritative SQLite open now receives a fresh full 500 ms reserve.
+- Deferred the authoritative storage deadline until after optional parent discovery. Parent discovery receives only a child deadline that preserves 500 ms when possible; SQLite receives the absolute minimum of the original entry deadline and storage start plus 500 ms, so slow input leaves only the remaining entry budget or prevents storage from starting.
 - Linux `/proc` reads now check the stored absolute deadline before and after each accepted read, and debit stat/link bytes from the shared `OutputBudget`.
-- Successful persisted hooks update `HookTiming` from the closed lifecycle event mapping; `other` remains the fallback when the event is not established.
+- Successful parsing immediately updates `HookTiming` from the closed lifecycle event mapping, including `SessionStart` and Antigravity preparse. Later storage or persistence failures therefore retain the parsed event; `other` remains the fallback only when parsing cannot establish one.
 - The stdin timeout test now writes partial input and holds the writer open through the deadline. The timeout occurs before `run_provider_with_sqlite` derives state paths or opens Brain storage, so this input-only fixture cannot touch cache or Brain state.
 - Added focused coverage for closed event mapping and Linux deadline/output accounting. Existing typed output-limit and timeout coverage remains in place.
 - `Spawn` and `ExitStatus` remain directly producible from commands, but the current public process API has no truthful deterministic injection point for post-spawn stdout I/O failure or unavailable reaper setup (`Cleanup`). I did not fabricate those outcomes; a separate seam would be needed if their deterministic coverage is required.
@@ -51,7 +51,7 @@ Correction verification:
 - `nix develop path:. --command cargo fmt` — passed.
 - `nix develop path:. --command cargo clippy -p coding-brain --all-targets -- -D warnings` — passed.
 
-Final correction commit `ef2dca41` adds a private resolved-reaper seam and cfg(test)-only stdout descriptor fault. It deterministically covers `Cleanup`, `Spawn`, `ExitStatus`, and post-spawn `Io` without changing the public process API.
+Final correction commit `ef2dca41` adds a private resolved-reaper seam and cfg(test)-only stdout descriptor fault. The final pass injects an invalid descriptor at descriptor setup so the real production `fcntl` error branch maps the failure to `Io`; the test no longer returns a seam-selected classification directly.
 
 Final process-group proof uses an inherited readiness socket and a descendant blocked on an inherited pipe; it waits for the parent/descendant PID handshake, observes the bounded timeout, and asserts both PIDs return `ESRCH` after group termination.
 
@@ -61,4 +61,32 @@ Post-`336656a5` verification:
 - `nix develop path:. --command cargo clippy -p coding-brain --all-targets -- -D warnings` — passed.
 - `nix develop path:. --command cargo test -p coding-brain bounded_process -- --nocapture` — passed.
 
-Task 1 commit list: `3d5b60f7`, `7ae473d6`, `ef2dca41`, `336656a5`.
+Task 1 commit list before this final pass: `3d5b60f7`, `7ae473d6`, `ef2dca41`, `336656a5`, `1a3e8809`.
+
+## Final correction pass
+
+- Carried the authoritative SQLite budget as one absolute instant through `StorageDeadline::at`, and rejected an expired hook deadline before migration preflight. A fake-clock contract test proves the deadline is exactly storage start plus 500 ms when available, the original entry deadline when less remains, and absent at entry-budget exhaustion.
+- Changed bounded `/proc` file reads to probe one sentinel byte at exact per-file or shared-budget exhaustion without debiting it. Exact-limit inputs now succeed; one-byte overflow fails with unchanged accepted-byte accounting.
+- Preparses lifecycle input immediately after the bounded stdin read and records every supported lifecycle class, including `SessionStart`, before parent discovery or storage. A subprocess test removes current storage after migration and proves a parsed SessionStart still reports `event=session_start` on the real storage-unavailable path.
+- Moved the cfg(test) process fault to descriptor setup (`-1`) and let the production `fcntl` branch perform cleanup and return `BoundedProcessError::Io`.
+- Increased only the synchronized descendant-cleanup test allowance from 100 ms to the established 250 ms parent-process timeout; production timing constants are unchanged.
+
+Final-pass TDD evidence:
+
+1. The absolute storage-deadline test first failed to compile because `authoritative_storage_deadline` did not exist; it passed after carrying the absolute child deadline into storage.
+2. The per-file and shared-budget exact-limit tests first returned `None` for exact-size input; they passed after the non-debiting sentinel probe.
+3. The preparse timing test first failed to compile because the preparse helper did not exist; the real SessionStart storage-failure test then failed with `event=other` before the closed class was added. Both now pass.
+4. The descriptor fault test first failed to compile against the renamed injection point; it passes through the production `fcntl` error branch.
+5. The synchronized descendant test first failed its 250 ms contract assertion while the local allowance was 100 ms; it passes with the test-only allowance set to 250 ms.
+
+Final-pass verification from the completed working tree:
+
+- `nix develop path:. --command cargo test -p coding-brain lifecycle_timing -- --nocapture` — passed (3 tests in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain bounded_reader_until -- --nocapture` — passed (1 test in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain bounded_proc -- --nocapture` — passed (9 tests in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain bounded_process -- --nocapture` — passed (6 tests in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain lifecycle_hook::tests -- --nocapture` — passed (64 tests in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain --test lifecycle_hook_cli -- --nocapture` — passed (31 passed, 1 existing latency smoke ignored).
+- `nix develop path:. --command cargo test -p coding-brain --test sqlite_storage -- --nocapture` — passed (113 passed, 1 subprocess helper ignored).
+- `nix develop path:. --command cargo fmt --check` — passed.
+- `nix develop path:. --command cargo clippy -p coding-brain --all-targets -- -D warnings` — passed.

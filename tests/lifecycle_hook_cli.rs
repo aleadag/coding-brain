@@ -1372,6 +1372,39 @@ fn lifecycle_hook_binary_fails_open_with_empty_stdout() {
 }
 
 #[test]
+fn parsed_session_start_keeps_its_timing_event_when_storage_is_unavailable() {
+    let home = tempfile::tempdir().unwrap();
+    prepare_current_storage(home.path());
+    let paths = StoragePaths::at(&home.path().join(".local/state/coding-brain"));
+    fs::remove_file(paths.brain_db()).unwrap();
+
+    let mut input: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/hooks/session-start.json")).unwrap();
+    input["cwd"] = serde_json::json!(home.path());
+    let input = serde_json::to_vec(&input).unwrap();
+
+    let mut child = command_for_home(home.path())
+        .arg("--lifecycle-hook")
+        .env("CBRAIN_HOOK_TIMING", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&input).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("event=session_start stage=storage outcome=storage_unavailable"),
+        "{stderr:?}"
+    );
+    assert!(!stderr.contains("event=other stage=storage"), "{stderr:?}");
+}
+
+#[test]
 #[cfg(unix)]
 fn permission_allow_is_suppressed_when_sqlite_storage_is_unavailable() {
     let request = |cwd: &std::path::Path| {

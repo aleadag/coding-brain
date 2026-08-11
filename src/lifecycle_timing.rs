@@ -85,6 +85,7 @@ impl<C: MonotonicClock> HookBudget<C> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HookEventClass {
+    SessionStart,
     UserPromptSubmit,
     PreToolUse,
     PostToolUse,
@@ -97,6 +98,7 @@ pub(crate) enum HookEventClass {
 impl HookEventClass {
     pub(crate) fn from_lifecycle_name(name: &str) -> Self {
         match name {
+            "SessionStart" => Self::SessionStart,
             "UserPromptSubmit" => Self::UserPromptSubmit,
             "PreToolUse" => Self::PreToolUse,
             "PostToolUse" => Self::PostToolUse,
@@ -109,6 +111,7 @@ impl HookEventClass {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::SessionStart => "session_start",
             Self::UserPromptSubmit => "user_prompt_submit",
             Self::PreToolUse => "pre_tool_use",
             Self::PostToolUse => "post_tool_use",
@@ -326,6 +329,10 @@ mod tests {
 
     #[test]
     fn lifecycle_event_names_stay_closed() {
+        assert_eq!(
+            HookEventClass::from_lifecycle_name("SessionStart"),
+            HookEventClass::SessionStart
+        );
         assert_eq!(
             HookEventClass::from_lifecycle_name("PreToolUse"),
             HookEventClass::PreToolUse

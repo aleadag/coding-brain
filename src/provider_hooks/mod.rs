@@ -643,7 +643,7 @@ pub(crate) fn run_bounded_process_until(
 #[derive(Clone, Copy)]
 enum ProcessFault {
     None,
-    StdoutDescriptor,
+    InvalidStdoutDescriptor,
 }
 
 #[cfg(unix)]
@@ -679,12 +679,13 @@ fn run_bounded_process_until_with(
             return Err(BoundedProcessError::Io);
         }
     };
-    #[cfg(test)]
-    if matches!(fault, ProcessFault::StdoutDescriptor) {
-        terminate_process_group(child, child_reaper);
-        return Err(BoundedProcessError::Io);
-    }
     let descriptor = stdout.as_raw_fd();
+    #[cfg(test)]
+    let descriptor = if matches!(fault, ProcessFault::InvalidStdoutDescriptor) {
+        -1
+    } else {
+        descriptor
+    };
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
     {
@@ -840,26 +841,32 @@ fn read_bounded_file_until(
 ) -> Option<Vec<u8>> {
     use std::io::ErrorKind;
 
-    if std::time::Instant::now() >= deadline || output.remaining == 0 {
+    if std::time::Instant::now() >= deadline {
         return None;
     }
     let mut file = File::open(path).ok()?;
     let mut bytes = Vec::new();
     loop {
-        if std::time::Instant::now() >= deadline || bytes.len() >= limit || output.remaining == 0 {
+        if std::time::Instant::now() >= deadline {
             return None;
         }
+        if bytes.len() == limit || output.remaining == 0 {
+            let mut sentinel = [0_u8; 1];
+            return match file.read(&mut sentinel) {
+                Ok(0) => Some(bytes),
+                Ok(_) => None,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => None,
+            };
+        }
         let mut chunk = [0_u8; 1024];
-        let wanted = chunk
-            .len()
-            .min(limit + 1 - bytes.len())
-            .min(output.remaining);
+        let wanted = chunk.len().min(limit - bytes.len()).min(output.remaining);
         match file.read(&mut chunk[..wanted]) {
             Ok(0) => return Some(bytes),
             Ok(read) => {
                 output.remaining -= read;
                 bytes.extend_from_slice(&chunk[..read]);
-                if bytes.len() > limit || std::time::Instant::now() >= deadline {
+                if std::time::Instant::now() >= deadline {
                     return None;
                 }
             }
@@ -1191,7 +1198,7 @@ mod tests {
                 deadline,
                 &mut OutputBudget::new(32),
                 bounded_child_reaper(),
-                ProcessFault::StdoutDescriptor,
+                ProcessFault::InvalidStdoutDescriptor,
             ),
             Err(BoundedProcessError::Io)
         );
@@ -1217,6 +1224,8 @@ mod tests {
         let blocked_reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
         let _blocked_writer = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
         let blocked_fd = blocked_reader.as_raw_fd();
+        let descendant_allowance = PARENT_PROCESS_TIMEOUT;
+        assert_eq!(descendant_allowance, Duration::from_millis(250));
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let _ready_writer = ready_writer;
@@ -1238,7 +1247,7 @@ mod tests {
             sender
                 .send(run_bounded_process_until(
                     &mut command,
-                    Instant::now() + Duration::from_millis(100),
+                    Instant::now() + descendant_allowance,
                     &mut output,
                 ))
                 .unwrap();
@@ -1263,13 +1272,47 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bounded_proc_reads_respect_deadline_and_shared_output_budget() {
+    fn bounded_proc_file_limit_accepts_exact_and_rejects_overflow() {
         use std::time::{Duration, Instant};
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("record");
         std::fs::write(&path, b"abc").unwrap();
-        let mut output = OutputBudget::new(4);
+        let mut output = OutputBudget::new(16);
+        assert_eq!(
+            read_bounded_file_until(
+                &path,
+                3,
+                Instant::now() + Duration::from_secs(1),
+                &mut output,
+            ),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(output.remaining(), 13);
+
+        std::fs::write(&path, b"abcd").unwrap();
+        let mut output = OutputBudget::new(16);
+        assert_eq!(
+            read_bounded_file_until(
+                &path,
+                3,
+                Instant::now() + Duration::from_secs(1),
+                &mut output,
+            ),
+            None
+        );
+        assert_eq!(output.remaining(), 13);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_proc_shared_budget_accepts_exact_and_rejects_overflow() {
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("record");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut output = OutputBudget::new(3);
         assert_eq!(
             read_bounded_file_until(
                 &path,
@@ -1279,7 +1322,31 @@ mod tests {
             ),
             Some(b"abc".to_vec())
         );
-        assert_eq!(output.remaining(), 1);
+        assert_eq!(output.remaining(), 0);
+
+        std::fs::write(&path, b"abcd").unwrap();
+        let mut output = OutputBudget::new(3);
+        assert_eq!(
+            read_bounded_file_until(
+                &path,
+                MAX_PARENT_RECORD_BYTES,
+                Instant::now() + Duration::from_secs(1),
+                &mut output,
+            ),
+            None
+        );
+        assert_eq!(output.remaining(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_proc_reads_reject_expired_deadline() {
+        use std::time::Instant;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("record");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut output = OutputBudget::new(4);
         assert_eq!(
             read_bounded_file_until(&path, MAX_PARENT_RECORD_BYTES, Instant::now(), &mut output),
             None
