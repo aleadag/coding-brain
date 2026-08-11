@@ -11,10 +11,12 @@ use coding_brain::brain::decisions::{
     DecisionContext, DecisionOutcome, DecisionRecord, DecisionType,
 };
 use coding_brain::brain::storage::{
-    ActivityCursor, BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, DecisionIdentity,
-    DecisionKind, DecisionPayload, HistoricalDeliveryState, HistoricalPermissionProvenance,
-    LearningErasePaths, OpenRole, REVIEW_APPLICATION_ID, REVIEW_SCHEMA_VERSION,
-    RecoveryReservationOutcome, ReviewDb, ReviewEligibility, ReviewEligibleOccurrence,
+    ActivityCursor, BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, CacheDeadline,
+    CacheProvenance, CacheRootKey, CacheRow, DecisionIdentity, DecisionKind, DecisionPayload,
+    HistoricalDeliveryState, HistoricalPermissionProvenance, LearningErasePaths, OpenRole,
+    REVIEW_APPLICATION_ID, REVIEW_SCHEMA_VERSION, RUNTIME_CACHE_APPLICATION_ID,
+    RUNTIME_CACHE_SCHEMA_VERSION, RecoveryReservationOutcome, ReviewDb, ReviewEligibility,
+    ReviewEligibleOccurrence, RuntimeCacheBypass, RuntimeCacheReader, RuntimeCacheWriter,
     StorageDeadline, StorageError, StorageFaultCategory, StorageOperation, StoragePaths,
     WAL_AUTOCHECKPOINT_PAGES,
 };
@@ -6099,4 +6101,429 @@ fn review_reset_rejects_replaced_gate_while_a_live_connection_uses_the_old_inode
     assert_eq!(fs::metadata(paths.review_db()).unwrap().ino(), inode_before);
     assert_eq!(fs::read(paths.review_db()).unwrap(), database_before);
     assert_eq!(review.user_version().unwrap(), REVIEW_SCHEMA_VERSION);
+}
+
+fn runtime_cache_row(root: &str, refresh_order: i64) -> CacheRow {
+    CacheRow::new(
+        CacheRootKey::from_canonical_path(std::path::Path::new(root)).unwrap(),
+        "123e4567-e89b-12d3-a456-426614174000",
+        CacheProvenance::Manifest,
+        vec![1, 2, 3],
+        refresh_order,
+    )
+    .unwrap()
+}
+
+#[test]
+fn runtime_cache_root_key_requires_normalized_absolute_path() {
+    for path in ["relative/project", "/work//project", "/work/project/"] {
+        assert!(
+            CacheRootKey::from_canonical_path(std::path::Path::new(path)).is_err(),
+            "accepted non-canonical root {path:?}"
+        );
+    }
+    assert_eq!(
+        CacheRootKey::from_canonical_path(std::path::Path::new("/work/project"))
+            .unwrap()
+            .as_path(),
+        std::path::Path::new("/work/project")
+    );
+}
+
+fn runtime_cache_table_names(connection: &Connection) -> Vec<String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn runtime_cache_creates_exact_v1_without_changing_authoritative_schemas() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let cache = RuntimeCacheWriter::create_or_open_after_activity(
+        &paths,
+        CacheDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        cache
+            .connection()
+            .query_row("PRAGMA application_id", [], |row| row.get::<_, i32>(0))
+            .unwrap(),
+        RUNTIME_CACHE_APPLICATION_ID
+    );
+    assert_eq!(
+        cache
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+            .unwrap(),
+        RUNTIME_CACHE_SCHEMA_VERSION
+    );
+    assert_eq!(
+        runtime_cache_table_names(cache.connection()),
+        ["project_identity_cache"]
+    );
+    assert_eq!(BRAIN_SCHEMA_VERSION, 1);
+    assert!(!paths.brain_db().exists());
+    assert!(!paths.review_db().exists());
+    assert_eq!(
+        fs::read_dir(paths.db_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        [OsString::from("runtime-cache-v1.sqlite3")]
+    );
+}
+
+#[test]
+fn runtime_cache_reader_absence_is_read_only_and_creates_nothing() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+
+    assert!(matches!(
+        RuntimeCacheReader::open_existing_read_only(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(25)),
+        ),
+        Err(RuntimeCacheBypass::Missing)
+    ));
+    assert!(!paths.db_dir().exists());
+    assert!(!paths.runtime_cache_v1().exists());
+}
+
+#[test]
+fn runtime_cache_hit_is_query_only_and_creates_no_sidecars() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let row = runtime_cache_row("/work/project", 1);
+    let mut writer = RuntimeCacheWriter::create_or_open_after_activity(
+        &paths,
+        CacheDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    writer.upsert_and_prune(&row).unwrap();
+    drop(writer);
+    let before = fs::read_dir(paths.db_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+
+    let reader = RuntimeCacheReader::open_existing_read_only(
+        &paths,
+        CacheDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    assert_eq!(reader.candidate_roots().unwrap(), [row.root().clone()]);
+    assert_eq!(reader.load_selected_row(row.root()).unwrap(), row);
+    assert_eq!(
+        reader
+            .connection()
+            .query_row("PRAGMA query_only", [], |row| row.get::<_, i32>(0))
+            .unwrap(),
+        1
+    );
+    drop(reader);
+
+    let after = fs::read_dir(paths.db_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+    assert_eq!(after, [OsString::from("runtime-cache-v1.sqlite3")]);
+}
+
+#[test]
+fn runtime_cache_incompatible_files_are_bypassed_without_mutation() {
+    for (application_id, user_version) in [
+        (RUNTIME_CACHE_APPLICATION_ID, 2),
+        (BRAIN_APPLICATION_ID, RUNTIME_CACHE_SCHEMA_VERSION),
+    ] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        drop(
+            RuntimeCacheWriter::create_or_open_after_activity(
+                &paths,
+                CacheDeadline::after(Duration::from_millis(250)),
+            )
+            .unwrap(),
+        );
+        let connection = open_for_constraints(&paths.runtime_cache_v1());
+        connection
+            .execute_batch(&format!(
+                "PRAGMA application_id = {application_id}; PRAGMA user_version = {user_version};"
+            ))
+            .unwrap();
+        drop(connection);
+        let before = fs::read(paths.runtime_cache_v1()).unwrap();
+        let inode = fs::metadata(paths.runtime_cache_v1()).unwrap().ino();
+
+        assert!(matches!(
+            RuntimeCacheReader::open_existing_read_only(
+                &paths,
+                CacheDeadline::after(Duration::from_millis(250)),
+            ),
+            Err(RuntimeCacheBypass::Incompatible)
+        ));
+        assert!(matches!(
+            RuntimeCacheWriter::create_or_open_after_activity(
+                &paths,
+                CacheDeadline::after(Duration::from_millis(250)),
+            ),
+            Err(RuntimeCacheBypass::Incompatible)
+        ));
+        assert_eq!(fs::read(paths.runtime_cache_v1()).unwrap(), before);
+        assert_eq!(fs::metadata(paths.runtime_cache_v1()).unwrap().ino(), inode);
+    }
+}
+
+#[test]
+fn runtime_cache_rejects_invalid_uuid_provenance_and_evidence_before_use() {
+    for insert in [
+        "INSERT INTO project_identity_cache VALUES (x'2f626164', 'temporary-identity-000000000000000', 1, x'01', 1, 1)",
+        "INSERT INTO project_identity_cache VALUES (x'2f626164', '123e4567-e89b-12d3-a456-426614174000', 3, x'01', 1, 1)",
+        "INSERT INTO project_identity_cache VALUES (x'2f626164', '123e4567-e89b-12d3-a456-426614174000', 1, x'', 1, 1)",
+        "INSERT INTO project_identity_cache VALUES (x'2f626164', '123e4567-e89b-12d3-a456-426614174000', 1, x'01', 1, 2)",
+    ] {
+        let root = private_tempdir();
+        let paths = StoragePaths::at(root.path());
+        let writer = RuntimeCacheWriter::create_or_open_after_activity(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap();
+        writer
+            .connection()
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        writer.connection().execute(insert, []).unwrap();
+        drop(writer);
+
+        let result = RuntimeCacheReader::open_existing_read_only(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        );
+        if let Ok(reader) = result {
+            let root = reader.candidate_roots().unwrap().remove(0);
+            assert!(matches!(
+                reader.load_selected_row(&root),
+                Err(RuntimeCacheBypass::Corrupt)
+            ));
+        } else {
+            assert!(matches!(result, Err(RuntimeCacheBypass::Corrupt)));
+        }
+    }
+}
+
+#[test]
+fn runtime_cache_rejects_oversized_evidence_before_materializing_it() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let writer = RuntimeCacheWriter::create_or_open_after_activity(
+        &paths,
+        CacheDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    writer
+        .connection()
+        .execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .unwrap();
+    writer
+        .connection()
+        .execute(
+            "INSERT INTO project_identity_cache VALUES (?1, ?2, 1, zeroblob(65537), 1, 1)",
+            params![b"/bad".as_slice(), "123e4567-e89b-12d3-a456-426614174000"],
+        )
+        .unwrap();
+    drop(writer);
+
+    let reader = RuntimeCacheReader::open_existing_read_only(
+        &paths,
+        CacheDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    let selected = reader.candidate_roots().unwrap().remove(0);
+    assert!(matches!(
+        reader.load_selected_row(&selected),
+        Err(RuntimeCacheBypass::Corrupt)
+    ));
+}
+
+#[test]
+fn runtime_cache_rejects_symlink_and_mode_violations_without_repair() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(
+        RuntimeCacheWriter::create_or_open_after_activity(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap(),
+    );
+    fs::set_permissions(paths.runtime_cache_v1(), fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        RuntimeCacheReader::open_existing_read_only(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        ),
+        Err(RuntimeCacheBypass::Unsafe)
+    ));
+    assert_eq!(
+        fs::metadata(paths.runtime_cache_v1())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+
+    let target = paths.db_dir().join("cache-target.sqlite3");
+    fs::rename(paths.runtime_cache_v1(), &target).unwrap();
+    symlink("cache-target.sqlite3", paths.runtime_cache_v1()).unwrap();
+    assert!(matches!(
+        RuntimeCacheReader::open_existing_read_only(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        ),
+        Err(RuntimeCacheBypass::Unsafe)
+    ));
+    assert!(
+        fs::symlink_metadata(paths.runtime_cache_v1())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn runtime_cache_lock_contention_respects_its_short_deadline() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    drop(
+        RuntimeCacheWriter::create_or_open_after_activity(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap(),
+    );
+    let blocker = open_for_constraints(&paths.runtime_cache_v1());
+    blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+    let started = Instant::now();
+
+    assert!(matches!(
+        RuntimeCacheReader::open_existing_read_only(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(25)),
+        ),
+        Err(RuntimeCacheBypass::Contended | RuntimeCacheBypass::Deadline)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(100));
+    blocker.execute_batch("ROLLBACK;").unwrap();
+}
+
+#[test]
+fn runtime_cache_concurrent_first_use_creates_one_exact_database() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let barrier = Arc::new(Barrier::new(8));
+    let outcomes = thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let paths = &paths;
+                scope.spawn(move || {
+                    barrier.wait();
+                    RuntimeCacheWriter::create_or_open_after_activity(
+                        paths,
+                        CacheDeadline::after(Duration::from_millis(250)),
+                    )
+                    .map(drop)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    assert!(outcomes.iter().any(Result::is_ok));
+    assert!(
+        outcomes.iter().all(|outcome| {
+            outcome.is_ok()
+                || matches!(
+                    outcome,
+                    Err(RuntimeCacheBypass::Contended
+                        | RuntimeCacheBypass::Corrupt
+                        | RuntimeCacheBypass::Incompatible)
+                )
+        }),
+        "unexpected concurrent outcomes: {outcomes:?}"
+    );
+    let reader = RuntimeCacheReader::open_existing_read_only(
+        &paths,
+        CacheDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    assert_eq!(runtime_cache_table_names(reader.connection()).len(), 1);
+}
+
+#[test]
+fn runtime_cache_prunes_atomically_to_256_rows_and_keeps_refreshed_root() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut writer = RuntimeCacheWriter::create_or_open_after_activity(
+        &paths,
+        CacheDeadline::after(Duration::from_secs(2)),
+    )
+    .unwrap();
+    for index in 0..257 {
+        writer
+            .upsert_and_prune(&runtime_cache_row(&format!("/work/project-{index}"), index))
+            .unwrap();
+    }
+    drop(writer);
+
+    let reader = RuntimeCacheReader::open_existing_read_only(
+        &paths,
+        CacheDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    let roots = reader.candidate_roots().unwrap();
+    assert_eq!(roots.len(), 256);
+    assert!(!roots.contains(
+        &CacheRootKey::from_canonical_path(std::path::Path::new("/work/project-0")).unwrap()
+    ));
+    let newest =
+        CacheRootKey::from_canonical_path(std::path::Path::new("/work/project-256")).unwrap();
+    assert_eq!(reader.load_selected_row(&newest).unwrap().root(), &newest);
+}
+
+#[test]
+fn runtime_cache_v2_file_coexists_without_being_read_or_modified() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    create_managed_dir(paths.db_dir());
+    let v2 = paths.db_dir().join("runtime-cache-v2.sqlite3");
+    write_managed_file(&v2, b"future format");
+
+    drop(
+        RuntimeCacheWriter::create_or_open_after_activity(
+            &paths,
+            CacheDeadline::after(Duration::from_millis(250)),
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(fs::read(&v2).unwrap(), b"future format");
+    assert!(paths.runtime_cache_v1().exists());
 }
