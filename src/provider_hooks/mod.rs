@@ -356,10 +356,11 @@ const MAX_PARENT_RECORD_BYTES: usize = 4 * 1024;
 #[cfg(unix)]
 const PARENT_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(unix)]
-const CHILD_REAPER_QUEUE_CAPACITY: usize = 16;
+pub(crate) const BOUNDED_PROCESS_CLEANUP_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(250);
 #[cfg(unix)]
 static BOUNDED_CHILD_REAPER: std::sync::OnceLock<
-    Option<std::sync::mpsc::SyncSender<std::process::Child>>,
+    Option<std::sync::mpsc::Sender<std::process::Child>>,
 > = std::sync::OnceLock::new();
 
 #[derive(Clone, Debug)]
@@ -651,7 +652,7 @@ fn run_bounded_process_until_with(
     command: &mut std::process::Command,
     deadline: std::time::Instant,
     output: &mut OutputBudget,
-    child_reaper: Option<&std::sync::mpsc::SyncSender<std::process::Child>>,
+    child_reaper: Option<&std::sync::mpsc::Sender<std::process::Child>>,
     #[cfg(test)] fault: ProcessFault,
 ) -> Result<Vec<u8>, BoundedProcessError> {
     use std::io::ErrorKind;
@@ -762,11 +763,10 @@ fn run_bounded_process_until_with(
 }
 
 #[cfg(unix)]
-fn bounded_child_reaper() -> Option<&'static std::sync::mpsc::SyncSender<std::process::Child>> {
+fn bounded_child_reaper() -> Option<&'static std::sync::mpsc::Sender<std::process::Child>> {
     BOUNDED_CHILD_REAPER
         .get_or_init(|| {
-            let (sender, receiver) =
-                std::sync::mpsc::sync_channel::<std::process::Child>(CHILD_REAPER_QUEUE_CAPACITY);
+            let (sender, receiver) = std::sync::mpsc::channel::<std::process::Child>();
             std::thread::Builder::new()
                 .name("coding-brain-child-reaper".into())
                 .spawn(move || {
@@ -783,7 +783,7 @@ fn bounded_child_reaper() -> Option<&'static std::sync::mpsc::SyncSender<std::pr
 #[cfg(unix)]
 fn terminate_process_group(
     mut child: std::process::Child,
-    child_reaper: &std::sync::mpsc::SyncSender<std::process::Child>,
+    child_reaper: &std::sync::mpsc::Sender<std::process::Child>,
 ) {
     if let Ok(process_group) = i32::try_from(child.id()) {
         unsafe {
@@ -792,28 +792,29 @@ fn terminate_process_group(
     }
     let _ = child.kill();
     let started = std::time::Instant::now();
-    while started.elapsed() < PARENT_PROCESS_TIMEOUT {
+    while started.elapsed() < BOUNDED_PROCESS_CLEANUP_BUDGET {
         if child.try_wait().ok().flatten().is_some() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    handoff_or_wait(child, child_reaper);
+    handoff_to_reaper(child, child_reaper);
 }
 
 #[cfg(unix)]
-fn handoff_or_wait(
+fn handoff_to_reaper(
     child: std::process::Child,
-    child_reaper: &std::sync::mpsc::SyncSender<std::process::Child>,
+    child_reaper: &std::sync::mpsc::Sender<std::process::Child>,
 ) {
-    match child_reaper.try_send(child) {
-        Ok(()) => {}
-        Err(
-            std::sync::mpsc::TrySendError::Full(mut child)
-            | std::sync::mpsc::TrySendError::Disconnected(mut child),
-        ) => {
-            let _ = child.wait();
+    if let Err(std::sync::mpsc::SendError(mut child)) = child_reaper.send(child) {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
         }
+        let _ = std::thread::Builder::new()
+            .name("coding-brain-child-reaper-fallback".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
     }
 }
 
@@ -839,21 +840,36 @@ fn read_bounded_file_until(
     deadline: std::time::Instant,
     output: &mut OutputBudget,
 ) -> Option<Vec<u8>> {
-    use std::io::ErrorKind;
-
     if std::time::Instant::now() >= deadline {
         return None;
     }
     let mut file = File::open(path).ok()?;
+    read_bounded_reader_until(&mut file, limit, deadline, output, std::time::Instant::now)
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_reader_until<R: Read>(
+    reader: &mut R,
+    limit: usize,
+    deadline: std::time::Instant,
+    output: &mut OutputBudget,
+    mut now: impl FnMut() -> std::time::Instant,
+) -> Option<Vec<u8>> {
+    use std::io::ErrorKind;
+
+    if now() >= deadline {
+        return None;
+    }
     let mut bytes = Vec::new();
     loop {
-        if std::time::Instant::now() >= deadline {
+        if now() >= deadline {
             return None;
         }
         if bytes.len() == limit || output.remaining == 0 {
             let mut sentinel = [0_u8; 1];
-            return match file.read(&mut sentinel) {
-                Ok(0) => Some(bytes),
+            return match reader.read(&mut sentinel) {
+                Ok(0) if now() < deadline => Some(bytes),
+                Ok(0) => None,
                 Ok(_) => None,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => None,
@@ -861,12 +877,13 @@ fn read_bounded_file_until(
         }
         let mut chunk = [0_u8; 1024];
         let wanted = chunk.len().min(limit - bytes.len()).min(output.remaining);
-        match file.read(&mut chunk[..wanted]) {
-            Ok(0) => return Some(bytes),
+        match reader.read(&mut chunk[..wanted]) {
+            Ok(0) if now() < deadline => return Some(bytes),
+            Ok(0) => return None,
             Ok(read) => {
                 output.remaining -= read;
                 bytes.extend_from_slice(&chunk[..read]);
-                if std::time::Instant::now() >= deadline {
+                if now() >= deadline {
                     return None;
                 }
             }
@@ -1155,12 +1172,12 @@ mod tests {
         use std::process::Command;
         use std::time::{Duration, Instant};
 
-        let deadline = Instant::now() + Duration::from_millis(100);
+        assert_eq!(PARENT_PROCESS_TIMEOUT, Duration::from_millis(250));
         let mut cleanup = Command::new("/bin/true");
         assert_eq!(
             run_bounded_process_until_with(
                 &mut cleanup,
-                deadline,
+                Instant::now() + PARENT_PROCESS_TIMEOUT,
                 &mut OutputBudget::new(32),
                 None,
                 ProcessFault::None,
@@ -1171,7 +1188,7 @@ mod tests {
         assert_eq!(
             run_bounded_process_until_with(
                 &mut spawn,
-                deadline,
+                Instant::now() + PARENT_PROCESS_TIMEOUT,
                 &mut OutputBudget::new(32),
                 bounded_child_reaper(),
                 ProcessFault::None,
@@ -1183,7 +1200,7 @@ mod tests {
         assert_eq!(
             run_bounded_process_until_with(
                 &mut status,
-                deadline,
+                Instant::now() + PARENT_PROCESS_TIMEOUT,
                 &mut OutputBudget::new(32),
                 bounded_child_reaper(),
                 ProcessFault::None,
@@ -1195,7 +1212,7 @@ mod tests {
         assert_eq!(
             run_bounded_process_until_with(
                 &mut io,
-                deadline,
+                Instant::now() + PARENT_PROCESS_TIMEOUT,
                 &mut OutputBudget::new(32),
                 bounded_child_reaper(),
                 ProcessFault::InvalidStdoutDescriptor,
@@ -1213,7 +1230,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
         use std::process::Command;
         use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let (mut ready_reader, ready_writer) = UnixStream::pair().unwrap();
         ready_reader
@@ -1244,12 +1261,22 @@ mod tests {
                 });
             }
             let mut output = OutputBudget::new(1024);
+            let storage_reserve = Duration::from_millis(500);
+            let budget = crate::lifecycle_timing::HookBudget::with_clock(
+                crate::lifecycle_timing::SystemClock,
+                descendant_allowance
+                    .saturating_add(BOUNDED_PROCESS_CLEANUP_BUDGET)
+                    .saturating_add(storage_reserve),
+            );
+            let child_deadline = budget
+                .optional_child_deadline(
+                    descendant_allowance,
+                    storage_reserve.saturating_add(BOUNDED_PROCESS_CLEANUP_BUDGET),
+                )
+                .unwrap();
+            let result = run_bounded_process_until(&mut command, child_deadline, &mut output);
             sender
-                .send(run_bounded_process_until(
-                    &mut command,
-                    Instant::now() + descendant_allowance,
-                    &mut output,
-                ))
+                .send((result, budget.remaining(), storage_reserve))
                 .unwrap();
         });
         let mut pids = String::new();
@@ -1260,7 +1287,9 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(pids.len(), 2);
-        assert_eq!(receiver.recv().unwrap(), Err(BoundedProcessError::Timeout));
+        let (result, remaining, storage_reserve) = receiver.recv().unwrap();
+        assert_eq!(result, Err(BoundedProcessError::Timeout));
+        assert!(remaining >= storage_reserve, "remaining: {remaining:?}");
         for pid in pids {
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
             assert_eq!(
@@ -1353,6 +1382,48 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_proc_rejects_deadline_that_expires_during_eof() {
+        use std::io::{Cursor, Read};
+        use std::time::{Duration, Instant};
+
+        struct ExpiringEofReader {
+            inner: Cursor<Vec<u8>>,
+            clock: crate::lifecycle_timing::FakeClock,
+        }
+
+        impl Read for ExpiringEofReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.inner.read(buffer)?;
+                if read == 0 {
+                    self.clock.advance(Duration::from_millis(2));
+                }
+                Ok(read)
+            }
+        }
+
+        for limit in [3, 4] {
+            let started = Instant::now();
+            let clock = crate::lifecycle_timing::FakeClock::at(started);
+            let mut reader = ExpiringEofReader {
+                inner: Cursor::new(b"abc".to_vec()),
+                clock: clock.clone(),
+            };
+            let mut output = OutputBudget::new(4);
+            assert_eq!(
+                read_bounded_reader_until(
+                    &mut reader,
+                    limit,
+                    started + Duration::from_millis(1),
+                    &mut output,
+                    || clock.now(),
+                ),
+                None
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_child_reaper_is_process_wide_and_reaps() {
@@ -1368,7 +1439,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = i32::try_from(child.id()).unwrap();
-        handoff_or_wait(child, first);
+        handoff_to_reaper(child, first);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
@@ -1383,32 +1454,57 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn reaper_handoff_failure_waits_instead_of_dropping_the_child() {
+    fn reaper_handoff_uses_an_unbounded_sender() {
         use std::process::Command;
         use std::sync::mpsc;
 
-        for disconnected in [false, true] {
-            let (sender, receiver) = mpsc::sync_channel(0);
-            let receiver = if disconnected {
-                drop(receiver);
-                None
-            } else {
-                Some(receiver)
-            };
-            let child = Command::new("/bin/sh")
-                .args(["-c", "exit 0"])
-                .spawn()
-                .unwrap();
-            let pid = i32::try_from(child.id()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let mut pids = Vec::new();
+        for _ in 0..17 {
+            let child = Command::new("/bin/true").spawn().unwrap();
+            pids.push(i32::try_from(child.id()).unwrap());
+            handoff_to_reaper(child, &sender);
+        }
 
-            handoff_or_wait(child, &sender);
-
+        for pid in pids {
+            let mut child = receiver.recv().unwrap();
+            child.wait().unwrap();
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
             assert_eq!(
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(libc::ESRCH)
             );
-            drop(receiver);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_reaper_handoff_is_nonblocking_and_still_reaps() {
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec tail -f /dev/null"])
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        child.kill().unwrap();
+
+        let started = Instant::now();
+        handoff_to_reaper(child, &sender);
+        assert!(started.elapsed() < BOUNDED_PROCESS_CLEANUP_BUDGET);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }

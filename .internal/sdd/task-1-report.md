@@ -27,6 +27,7 @@ Commit: pending (created after this report is staged)
 - `nix develop path:. --command cargo test -p coding-brain bounded_reader_until -- --nocapture` — passed (one test in both lib and binary targets).
 - `nix develop path:. --command cargo fmt --check` — passed.
 - `nix develop path:. --command cargo clippy -p coding-brain --all-targets -- -D warnings` — passed.
+
 - `git -c core.whitespace=blank-at-eol diff --check` — passed.
 
 ## Diagnostic notes
@@ -88,5 +89,31 @@ Final-pass verification from the completed working tree:
 - `nix develop path:. --command cargo test -p coding-brain lifecycle_hook::tests -- --nocapture` — passed (64 tests in both library and binary targets).
 - `nix develop path:. --command cargo test -p coding-brain --test lifecycle_hook_cli -- --nocapture` — passed (31 passed, 1 existing latency smoke ignored).
 - `nix develop path:. --command cargo test -p coding-brain --test sqlite_storage -- --nocapture` — passed (113 passed, 1 subprocess helper ignored).
+- `nix develop path:. --command cargo fmt --check` — passed.
+- `nix develop path:. --command cargo clippy -p coding-brain --all-targets -- -D warnings` — passed.
+
+## Controller correction pass
+
+- Reserved the full worst-case optional-work tail before parent discovery starts: 250 ms for bounded cleanup plus 500 ms for authoritative storage. The shared `BOUNDED_PROCESS_CLEANUP_BUDGET` constant is crate-visible so later Git callers can make the same admission decision without duplicating the cleanup bound.
+- Replaced the capacity-16 synchronous reaper queue with the process-wide unbounded `mpsc::Sender`. A completed 250 ms kill/wait interval can therefore hand the child to the reaper without blocking on queue capacity. Receiver disconnection cannot occur while the successful static sender and worker live; the defensive injected-disconnection path performs a nonblocking `try_wait` and otherwise delegates the wait to a detached fallback reaper.
+- Preserved process-group `SIGKILL` and reaping. The synchronized real-time regression budgets 250 ms for child work, 250 ms for cleanup, and 500 ms for storage; after timeout and cleanup it observes at least the full storage reserve and verifies both parent and blocked descendant return `ESRCH`.
+- Added a private reader/clock seam for bounded `/proc` input. Both ordinary EOF and exact-bound sentinel EOF now recheck the absolute deadline before returning success; a fake-clock reader advances during the EOF read, so the regression is deterministic and contains no sleep.
+- Gave `Cleanup`, `Spawn`, `ExitStatus`, and `Io` classification checks separate fresh 250 ms absolute deadlines. Production provider and process timeouts remain unchanged.
+
+Controller-pass TDD evidence:
+
+1. The reserve-admission test first failed to compile because `optional_parent_process_deadline` and `BOUNDED_PROCESS_CLEANUP_BUDGET` did not exist. It passed after the admission reserve became cleanup plus storage.
+2. The unbounded-handoff test first failed to compile because the production seam still required `SyncSender`; it passed after the static reaper moved to `mpsc::Sender`.
+3. The controlled EOF test first failed to compile because `read_bounded_reader_until` did not exist. It passed after both EOF success branches gained post-read deadline checks.
+
+Controller-pass verification from the completed working tree:
+
+- `nix develop path:. --command cargo test -p coding-brain bounded_process -- --nocapture` — passed (6 tests in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain bounded_proc -- --nocapture` — passed (10 tests in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain reaper -- --nocapture` — passed (4 tests in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain bounded_reader_until -- --nocapture` — passed (1 test in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain lifecycle_timing -- --nocapture` — passed (3 tests in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain lifecycle_hook::tests -- --nocapture` — passed (65 tests in both library and binary targets).
+- `nix develop path:. --command cargo test -p coding-brain --test lifecycle_hook_cli -- --nocapture` — passed (31 passed, 1 existing latency smoke ignored).
 - `nix develop path:. --command cargo fmt --check` — passed.
 - `nix develop path:. --command cargo clippy -p coding-brain --all-targets -- -D warnings` — passed.

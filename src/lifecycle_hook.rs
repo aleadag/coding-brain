@@ -1028,6 +1028,16 @@ fn authoritative_storage_deadline<C: MonotonicClock>(
     budget.child_deadline(AUTHORITATIVE_STORAGE_BUDGET)
 }
 
+fn optional_parent_process_deadline<C: MonotonicClock>(
+    budget: &HookBudget<C>,
+) -> Option<std::time::Instant> {
+    budget.optional_child_deadline(
+        std::time::Duration::from_millis(250),
+        AUTHORITATIVE_STORAGE_BUDGET
+            .saturating_add(crate::provider_hooks::BOUNDED_PROCESS_CLEANUP_BUDGET),
+    )
+}
+
 fn parse_timing_event(
     provider: AgentProvider,
     antigravity_event: Option<&str>,
@@ -1085,14 +1095,9 @@ fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
     }
     let state_root = coding_brain_state_root();
     let mut parent_output = crate::provider_hooks::OutputBudget::new(4 * 1024);
-    let live_process = budget
-        .optional_child_deadline(
-            std::time::Duration::from_millis(250),
-            AUTHORITATIVE_STORAGE_BUDGET,
-        )
-        .and_then(|deadline| {
-            crate::provider_hooks::live_parent_process_until(provider, deadline, &mut parent_output)
-        });
+    let live_process = optional_parent_process_deadline(&budget).and_then(|deadline| {
+        crate::provider_hooks::live_parent_process_until(provider, deadline, &mut parent_output)
+    });
     let paths = StoragePaths::at(&state_root);
     let Some(storage_deadline) = authoritative_storage_deadline(&budget) else {
         write_diagnostic(
@@ -1302,6 +1307,31 @@ mod tests {
         );
         clock.advance(std::time::Duration::from_millis(300));
         assert_eq!(authoritative_storage_deadline(&budget), None);
+    }
+
+    #[test]
+    fn optional_parent_admission_preserves_cleanup_and_storage_reserves() {
+        let started = std::time::Instant::now();
+        let clock = FakeClock::at(started);
+        let budget = HookBudget::with_clock(clock.clone(), std::time::Duration::from_millis(1500));
+        clock.advance(std::time::Duration::from_millis(500));
+
+        let child_deadline = optional_parent_process_deadline(&budget).unwrap();
+        assert_eq!(
+            child_deadline,
+            started + std::time::Duration::from_millis(750)
+        );
+        clock.advance(child_deadline.duration_since(clock.now()));
+        clock.advance(crate::provider_hooks::BOUNDED_PROCESS_CLEANUP_BUDGET);
+        assert_eq!(budget.remaining(), AUTHORITATIVE_STORAGE_BUDGET);
+
+        let threshold_clock = FakeClock::at(started);
+        let threshold_budget = HookBudget::with_clock(
+            threshold_clock.clone(),
+            std::time::Duration::from_millis(1500),
+        );
+        threshold_clock.advance(std::time::Duration::from_millis(750));
+        assert_eq!(optional_parent_process_deadline(&threshold_budget), None);
     }
 
     #[test]
