@@ -199,6 +199,10 @@ impl StorageDeadline {
         Self(Instant::now() + duration)
     }
 
+    pub(crate) fn at(deadline: Instant) -> Self {
+        Self(deadline)
+    }
+
     pub fn remaining(self) -> Result<Duration, StorageError> {
         let remaining = self
             .0
@@ -423,6 +427,7 @@ impl BrainDb {
         deadline: StorageDeadline,
     ) -> Result<Self, StorageError> {
         if role == OpenRole::Hook {
+            deadline.ensure_remaining()?;
             migration::hook_preflight(paths)?;
         }
         let connection = open_current(paths, BRAIN_DATABASE_NAME, DatabaseKind::Brain, deadline)?;

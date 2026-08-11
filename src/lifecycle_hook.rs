@@ -28,11 +28,15 @@ use crate::brain::activity::ActivityLog;
 #[cfg(test)]
 use crate::brain::activity::ActivityStore;
 use crate::brain::storage::{BrainDb, OpenRole, StorageDeadline, StoragePaths};
+use crate::lifecycle_timing::{
+    HookBudget, HookEventClass, HookOutcome, HookStage, HookTiming, MonotonicClock,
+};
 #[cfg(test)]
 use crate::provider_hooks::normalized_outcome;
 use crate::provider_hooks::{ParsedLifecycleHook, parse_lifecycle};
 
 pub(crate) const MAX_HOOK_INPUT_BYTES: usize = 64 * 1024;
+const AUTHORITATIVE_STORAGE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 static LIFECYCLE_ACTIVITY_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
@@ -48,6 +52,7 @@ pub(crate) struct RecordedProviderHook {
 pub(crate) enum HookInputError {
     Read,
     TooLarge,
+    Timeout,
 }
 
 impl fmt::Display for HookInputError {
@@ -55,6 +60,7 @@ impl fmt::Display for HookInputError {
         match self {
             Self::Read => f.write_str("could not read stdin"),
             Self::TooLarge => f.write_str("input exceeds 65536 bytes"),
+            Self::Timeout => f.write_str("input timed out"),
         }
     }
 }
@@ -70,6 +76,57 @@ pub(crate) fn read_bounded_hook_input(mut reader: impl Read) -> Result<Vec<u8>, 
         Err(HookInputError::TooLarge)
     } else {
         Ok(input)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn read_bounded_hook_input_until(
+    reader: &mut (impl Read + std::os::fd::AsFd),
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, HookInputError> {
+    use std::io::ErrorKind;
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let descriptor = reader.as_fd().as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(HookInputError::Read);
+    }
+
+    let mut input = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(HookInputError::Timeout);
+        }
+        let timeout_ms = i32::try_from(remaining.as_millis().saturating_add(1)).unwrap_or(i32::MAX);
+        let mut pollfd = libc::pollfd {
+            fd: descriptor,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } {
+            -1 if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted => continue,
+            -1 => return Err(HookInputError::Read),
+            0 => return Err(HookInputError::Timeout),
+            _ => {}
+        }
+
+        let mut chunk = [0_u8; 4096];
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(input),
+            Ok(read) => {
+                let accepted = read.min(MAX_HOOK_INPUT_BYTES.saturating_sub(input.len()));
+                input.extend_from_slice(&chunk[..accepted]);
+                if accepted != read {
+                    return Err(HookInputError::TooLarge);
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(HookInputError::Read),
+        }
     }
 }
 
@@ -953,45 +1010,112 @@ fn current_paths() -> Option<CodingBrainPaths> {
     CodingBrainPaths::resolve(&environment).ok()
 }
 
-pub(crate) fn run(provider: AgentProvider, antigravity_event: Option<&str>) {
+pub(crate) fn run(provider: AgentProvider, antigravity_event: Option<&str>, budget: HookBudget) {
     let stdin = std::io::stdin();
     let stderr = std::io::stderr();
-    run_provider_with_sqlite(provider, stdin.lock(), stderr.lock(), antigravity_event);
+    run_provider_with_sqlite(
+        provider,
+        stdin.lock(),
+        stderr.lock(),
+        antigravity_event,
+        budget,
+    );
 }
 
-fn run_provider_with_sqlite<R: Read, E: Write>(
+fn authoritative_storage_deadline<C: MonotonicClock>(
+    budget: &HookBudget<C>,
+) -> Option<std::time::Instant> {
+    budget.child_deadline(AUTHORITATIVE_STORAGE_BUDGET)
+}
+
+fn optional_parent_process_deadline<C: MonotonicClock>(
+    budget: &HookBudget<C>,
+) -> Option<std::time::Instant> {
+    budget.optional_child_deadline(
+        std::time::Duration::from_millis(250),
+        AUTHORITATIVE_STORAGE_BUDGET
+            .saturating_add(crate::provider_hooks::BOUNDED_PROCESS_CLEANUP_BUDGET),
+    )
+}
+
+fn parse_timing_event(
     provider: AgentProvider,
-    stdin: R,
+    antigravity_event: Option<&str>,
+    input: &[u8],
+) -> Result<Option<HookEventClass>, String> {
+    let parsed =
+        parse_lifecycle(provider, antigravity_event, input).map_err(|error| error.to_string())?;
+    Ok(parsed
+        .event
+        .as_ref()
+        .map(|event| HookEventClass::from_lifecycle_name(event.name().as_str())))
+}
+
+fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
+    provider: AgentProvider,
+    mut stdin: R,
     mut stderr: E,
     antigravity_event: Option<&str>,
+    budget: HookBudget,
 ) {
-    let input = match read_bounded_hook_input(stdin) {
+    let mut timing = HookTiming::new(provider, HookEventClass::Other, &budget);
+    let input = match read_bounded_hook_input_until(&mut stdin, budget.deadline()) {
         Ok(input) => input,
         Err(error) => {
             write_diagnostic(&mut stderr, error);
+            timing.finish(
+                HookStage::Input,
+                match error {
+                    HookInputError::Timeout => HookOutcome::Timeout,
+                    HookInputError::TooLarge => HookOutcome::InputTooLarge,
+                    HookInputError::Read => HookOutcome::InputRead,
+                },
+            );
             return;
         }
     };
-    if provider == AgentProvider::Antigravity && antigravity_event == Some("PostInvocation") {
-        match parse_lifecycle(provider, antigravity_event, &input) {
-            Ok(parsed) if parsed.event.is_none() => return,
-            Ok(_) => {}
-            Err(error) => {
-                write_diagnostic(&mut stderr, error);
-                return;
-            }
+    match parse_timing_event(provider, antigravity_event, &input) {
+        Ok(Some(event)) => timing.set_event(event),
+        Ok(None)
+            if provider == AgentProvider::Antigravity
+                && antigravity_event == Some("PostInvocation") =>
+        {
+            return;
         }
+        Ok(None) => {}
+        Err(error)
+            if provider == AgentProvider::Antigravity
+                && antigravity_event == Some("PostInvocation") =>
+        {
+            write_diagnostic(&mut stderr, error);
+            timing.finish(HookStage::Parse, HookOutcome::Rejected);
+            return;
+        }
+        Err(_) => {}
     }
     let state_root = coding_brain_state_root();
+    let mut parent_output = crate::provider_hooks::OutputBudget::new(4 * 1024);
+    let live_process = optional_parent_process_deadline(&budget).and_then(|deadline| {
+        crate::provider_hooks::live_parent_process_until(provider, deadline, &mut parent_output)
+    });
     let paths = StoragePaths::at(&state_root);
+    let Some(storage_deadline) = authoritative_storage_deadline(&budget) else {
+        write_diagnostic(
+            &mut stderr,
+            "SQLite storage unavailable: hook deadline exhausted",
+        );
+        timing.finish(HookStage::Storage, HookOutcome::StorageUnavailable);
+        return;
+    };
     let mut database = match BrainDb::open_current(
         &paths,
         OpenRole::Hook,
-        StorageDeadline::after(std::time::Duration::from_millis(500)),
+        StorageDeadline::at(storage_deadline),
     ) {
         Ok(database) => database,
         Err(error) => {
             write_diagnostic(&mut stderr, format!("SQLite storage unavailable: {error}"));
+            timing.finish(HookStage::Storage, HookOutcome::StorageUnavailable);
             return;
         }
     };
@@ -1002,12 +1126,15 @@ fn run_provider_with_sqlite<R: Read, E: Write>(
         &input,
         &mut database,
         &links,
-        crate::provider_hooks::live_parent_process(provider),
+        live_process,
         crate::provider_hooks::revalidate_live_process,
     ) {
-        Ok(_) => {}
+        Ok(_) => {
+            timing.finish(HookStage::Lifecycle, HookOutcome::Success);
+        }
         Err(error) => {
             write_diagnostic(&mut stderr, error);
+            timing.finish(HookStage::Lifecycle, HookOutcome::Error);
         }
     }
 }
@@ -1156,10 +1283,87 @@ mod tests {
     use fs2::FileExt;
 
     use crate::brain::activity::ActivityStore;
+    use crate::lifecycle_timing::FakeClock;
 
     use super::*;
 
     const PROMPT: &[u8] = include_bytes!("../tests/fixtures/hooks/user-prompt-submit.json");
+
+    #[test]
+    fn authoritative_storage_deadline_never_extends_the_entry_deadline() {
+        let started = std::time::Instant::now();
+        let clock = FakeClock::at(started);
+        let budget = HookBudget::with_clock(clock.clone(), std::time::Duration::from_millis(1500));
+
+        assert_eq!(
+            authoritative_storage_deadline(&budget),
+            Some(started + std::time::Duration::from_millis(500))
+        );
+        clock.advance(std::time::Duration::from_millis(1200));
+
+        assert_eq!(
+            authoritative_storage_deadline(&budget),
+            Some(started + std::time::Duration::from_millis(1500))
+        );
+        clock.advance(std::time::Duration::from_millis(300));
+        assert_eq!(authoritative_storage_deadline(&budget), None);
+    }
+
+    #[test]
+    fn optional_parent_admission_preserves_cleanup_and_storage_reserves() {
+        let started = std::time::Instant::now();
+        let clock = FakeClock::at(started);
+        let budget = HookBudget::with_clock(clock.clone(), std::time::Duration::from_millis(1500));
+        clock.advance(std::time::Duration::from_millis(500));
+
+        let child_deadline = optional_parent_process_deadline(&budget).unwrap();
+        assert_eq!(
+            child_deadline,
+            started + std::time::Duration::from_millis(750)
+        );
+        clock.advance(child_deadline.duration_since(clock.now()));
+        clock.advance(crate::provider_hooks::BOUNDED_PROCESS_CLEANUP_BUDGET);
+        assert_eq!(budget.remaining(), AUTHORITATIVE_STORAGE_BUDGET);
+
+        let threshold_clock = FakeClock::at(started);
+        let threshold_budget = HookBudget::with_clock(
+            threshold_clock.clone(),
+            std::time::Duration::from_millis(1500),
+        );
+        threshold_clock.advance(std::time::Duration::from_millis(750));
+        assert_eq!(optional_parent_process_deadline(&threshold_budget), None);
+    }
+
+    #[test]
+    fn successful_preparse_establishes_timing_event_before_storage() {
+        let antigravity_stop = include_bytes!("../tests/fixtures/hooks/antigravity-stop.json");
+        let session_start = include_bytes!("../tests/fixtures/hooks/session-start.json");
+        for (provider, trusted_event, input, expected) in [
+            (
+                AgentProvider::Codex,
+                None,
+                &session_start[..],
+                HookEventClass::SessionStart,
+            ),
+            (
+                AgentProvider::Codex,
+                None,
+                PROMPT,
+                HookEventClass::UserPromptSubmit,
+            ),
+            (
+                AgentProvider::Antigravity,
+                Some("Stop"),
+                &antigravity_stop[..],
+                HookEventClass::Stop,
+            ),
+        ] {
+            assert_eq!(
+                parse_timing_event(provider, trusted_event, input).unwrap(),
+                Some(expected)
+            );
+        }
+    }
 
     fn decision_event(
         cwd: &Path,
@@ -1670,6 +1874,22 @@ mod tests {
             read_bounded_hook_input(Cursor::new(&oversized)),
             Err(HookInputError::TooLarge)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_until_times_out_after_partial_input_with_open_writer() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_all(b"partial-input").unwrap();
+        assert_eq!(
+            read_bounded_hook_input_until(&mut reader, Instant::now() + Duration::from_millis(20)),
+            Err(HookInputError::Timeout)
+        );
+        writer.write_all(b"still-open").unwrap();
     }
 
     #[test]
