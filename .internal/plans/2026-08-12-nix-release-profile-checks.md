@@ -100,7 +100,7 @@ debug `cargo test`; the worktree remains clean.
 
 **Acceptance Criteria:**
 - The exact baseline derivation is first realized if absent, then the measured rebuild is forced with `--rebuild`; the realization run is not timing evidence.
-- The command exits successfully and records total wall time plus build/check phase markers.
+- The command exits successfully and records total wall time plus Nix-reported build/check phase durations.
 - The log proves the primary package check and custom integration tests use the debug profile before the fix.
 - The baseline output is copied outside the Nix store so garbage collection cannot remove the comparison input.
 
@@ -147,9 +147,10 @@ rg "Executing cargo(Build|Check)Hook|Finished cargo(Build|Check)Hook|cargoCheckH
 
 Expected: the saved path and copied output represent the successfully built
 package; primary check flags omit `--profile release`, and the custom `cargo
-test` omits `--release`. Use the leading epoch seconds around hook start/finish
-lines as integer-second contextual phase durations. If the baseline fails, stop
-and diagnose it before implementation.
+test` omits `--release`. Use Nix's `buildPhase completed in ...` and `checkPhase
+completed in ...` messages for contextual phase durations because Nix may flush
+builder output as one batch. If the baseline fails, stop and diagnose it before
+implementation.
 
 - [ ] **Step 4: Record baseline evidence before changing code**
 
@@ -157,10 +158,10 @@ Run:
 
 ```bash
 before_wall=$(rg -o 'wall_seconds=[0-9.]+' /tmp/fwrpm-before.log | tail -1)
-before_build=$(awk '/Executing cargoBuildHook/{start=$1} /Finished cargoBuildHook/{print $1-start; exit}' /tmp/fwrpm-before.log)
-before_check=$(awk '/Executing cargoCheckHook/{start=$1} /Finished cargoCheckHook/{print $1-start; exit}' /tmp/fwrpm-before.log)
+before_build=$(sed -n 's/^.*buildPhase completed in //p' /tmp/fwrpm-before.log | tail -1)
+before_check=$(sed -n 's/^.*checkPhase completed in //p' /tmp/fwrpm-before.log | tail -1)
 baseline_copy=$(< /tmp/fwrpm-before-copy-path)
-bd -C /home/alexander/.beads-planning note codexctl-fwrpm "Forced before-change package rebuild passed: ${before_wall}, cargoBuild=${before_build}s, cargoCheck=${before_check}s at integer-second resolution. Primary and custom checks used the debug profile. Baseline installed output copied to ${baseline_copy}."
+bd -C /home/alexander/.beads-planning note codexctl-fwrpm "Forced before-change package rebuild passed: ${before_wall}, buildPhase=${before_build}, checkPhase=${before_check}. Primary and custom checks used the debug profile. Baseline installed output copied to ${baseline_copy}."
 ```
 
 Expected: the Bead contains baseline evidence before any implementation edit.
@@ -343,8 +344,8 @@ diff -qr "$(< /tmp/fwrpm-before-copy-path)" "$(< /tmp/fwrpm-after-path)"
 Expected: primary check flags contain `--profile release`; the custom command
 contains `--release`; core, TUI, `release_workflow`, and `release_metadata` tests
 execute; no debug command/artifact path appears; installed outputs are
-identical. Report hook and wall timings from both timestamped logs at
-integer-second phase resolution without imposing a pass/fail threshold.
+identical. Report Nix phase and wall timings from both logs without imposing a
+pass/fail threshold.
 
 - [ ] **Step 4: Record local evidence without closing the Bead**
 
@@ -353,12 +354,12 @@ Run against the canonical planning checkout:
 ```bash
 before_wall=$(rg -o 'wall_seconds=[0-9.]+' /tmp/fwrpm-before.log | tail -1)
 after_wall=$(rg -o 'wall_seconds=[0-9.]+' /tmp/fwrpm-after.log | tail -1)
-before_build=$(awk '/Executing cargoBuildHook/{start=$1} /Finished cargoBuildHook/{print $1-start; exit}' /tmp/fwrpm-before.log)
-before_check=$(awk '/Executing cargoCheckHook/{start=$1} /Finished cargoCheckHook/{print $1-start; exit}' /tmp/fwrpm-before.log)
-after_build=$(awk '/Executing cargoBuildHook/{start=$1} /Finished cargoBuildHook/{print $1-start; exit}' /tmp/fwrpm-after.log)
-after_check=$(awk '/Executing cargoCheckHook/{start=$1} /Finished cargoCheckHook/{print $1-start; exit}' /tmp/fwrpm-after.log)
+before_build=$(sed -n 's/^.*buildPhase completed in //p' /tmp/fwrpm-before.log | tail -1)
+before_check=$(sed -n 's/^.*checkPhase completed in //p' /tmp/fwrpm-before.log | tail -1)
+after_build=$(sed -n 's/^.*buildPhase completed in //p' /tmp/fwrpm-after.log | tail -1)
+after_check=$(sed -n 's/^.*checkPhase completed in //p' /tmp/fwrpm-after.log | tail -1)
 implementation_commit=$(git rev-parse HEAD)
-bd -C /home/alexander/.beads-planning note codexctl-fwrpm "Local Linux verification at ${implementation_commit}: forced nix build --rebuild passed before and after; before ${before_wall}, cargoBuild=${before_build}s, cargoCheck=${before_check}s; after ${after_wall}, cargoBuild=${after_build}s, cargoCheck=${after_check}s. After log shows primary --profile release and postCheck --release, with no debug command/artifact path. Core, TUI, release_workflow, and release_metadata tests ran. nix fmt -- --check, all-system flake evaluation, cargo fmt, clippy -D warnings, focused contracts, and serialized all-target tests passed. diff -qr of the recorded installed outputs was empty. Hosted macOS acceptance remains pending."
+bd -C /home/alexander/.beads-planning note codexctl-fwrpm "Local Linux verification at ${implementation_commit}: forced nix build --rebuild passed before and after; before ${before_wall}, buildPhase=${before_build}, checkPhase=${before_check}; after ${after_wall}, buildPhase=${after_build}, checkPhase=${after_check}. After log shows primary --profile release and postCheck --release, with no debug command/artifact path. Core, TUI, release_workflow, and release_metadata tests ran. nix fmt -- --check, all-system flake evaluation, cargo fmt, clippy -D warnings, focused contracts, and serialized all-target tests passed. diff -qr of the recorded installed outputs was empty. Hosted macOS acceptance remains pending."
 git status --short --branch
 ```
 
@@ -437,8 +438,8 @@ Expected: the Bead remains open unless every acceptance criterion is evidenced a
 - Realize the exact package derivation before timing when its output is absent;
   Nix rejects `--rebuild` before hooks otherwise, and the realization run is not
   timing evidence.
-- Keep integer-second phase timestamps and `/usr/bin/time` totals as contextual
-  measurements rather than adding a benchmark dependency.
+- Use Nix's own phase-completion durations and `/usr/bin/time` totals as
+  contextual measurements; external timestamps may be batch-flushed.
 - Scope `checkType` and `postCheck` assertions to the bounded installable package
   expression, with one owning regression test.
 - Split local verification from publication and hosted acceptance.
@@ -454,6 +455,8 @@ Expected: the Bead remains open unless every acceptance criterion is evidenced a
 - Added immediate baseline evidence capture and a durable output copy.
 - Made the baseline copy collision-safe for repeated or interrupted executions.
 - Added the required untimed realization precondition for the forced baseline.
+- Switched phase timing extraction to Nix's emitted phase durations after
+  observing batched external timestamps.
 - Split the former combined verification task into local Task 4 and hosted Task 5.
 - Required per-job hosted log inspection and explicit Home Manager compatibility
   checks.
