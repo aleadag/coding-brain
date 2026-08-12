@@ -8,6 +8,9 @@ All notable changes to Coding Brain are documented here.
 
 ### Fixed
 
+- The TUI now spaces recovery discovery scans four seconds apart while idle,
+  reducing repeated process and storage work without delaying the first scan
+  or allowing scans to overlap.
 - Reviewing one visible item with `a` now advances to the next item on the
   active Attention, Recent, Review, or Diagnostics surface after the update
   succeeds, without moving the cursor when mutation or refresh fails.
