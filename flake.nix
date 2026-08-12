@@ -30,7 +30,6 @@
           version = cargoToml.package.version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          checkType = "debug";
           dontUseCargoParallelTests = true;
           cargoTestFlags = [
             "-p"
@@ -47,6 +46,7 @@
           ];
           postCheck = ''
             cargo test \
+              --release \
               --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
               --offline \
               --test release_workflow \
