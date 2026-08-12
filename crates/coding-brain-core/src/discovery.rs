@@ -59,7 +59,25 @@ pub struct ProviderSessionScan {
 }
 
 pub fn scan_agent_sessions_with_state(state: &mut ProviderDiscoveryState) -> Vec<AgentSession> {
-    scan_agent_sessions_with_status(state).sessions
+    scan_agent_sessions_with_state_and_runners(
+        state,
+        Instant::now(),
+        capture_process_snapshot,
+        claude::run_inventory_command,
+    )
+}
+
+fn scan_agent_sessions_with_state_and_runners<P, C>(
+    state: &mut ProviderDiscoveryState,
+    now: Instant,
+    process_runner: P,
+    claude_runner: C,
+) -> Vec<AgentSession>
+where
+    P: FnOnce() -> ProcessSnapshot,
+    C: FnOnce(Duration, usize) -> Result<Vec<u8>, claude::InventoryError>,
+{
+    scan_agent_sessions_with_runners(state, now, process_runner, claude_runner).sessions
 }
 
 pub fn scan_agent_sessions_with_status(state: &mut ProviderDiscoveryState) -> ProviderSessionScan {
@@ -1235,6 +1253,31 @@ mod tests {
             agy.identity_provenance,
             crate::session::SessionIdentityProvenance::ProcessOnly
         );
+    }
+
+    #[test]
+    fn compatibility_provider_scan_uses_one_snapshot_and_inventory_refresh() {
+        let now = Instant::now();
+        let mut state = ProviderDiscoveryState::default();
+        let mut process_scans = 0;
+        let mut inventory_refreshes = 0;
+
+        let sessions = scan_agent_sessions_with_state_and_runners(
+            &mut state,
+            now,
+            || {
+                process_scans += 1;
+                crate::process::ProcessSnapshot::from_entries(Vec::new())
+            },
+            |_, _| {
+                inventory_refreshes += 1;
+                Ok(Vec::new())
+            },
+        );
+
+        assert_eq!(process_scans, 1);
+        assert_eq!(inventory_refreshes, 1);
+        assert!(sessions.is_empty());
     }
 
     #[test]
