@@ -6611,7 +6611,7 @@ fn previous_compatible_binary() -> std::path::PathBuf {
 fn previous_compatible_binary_ignores_auxiliary_cache_and_reads_brain() {
     let root = private_tempdir();
     let binary = previous_compatible_binary();
-    let home = root.path().join("home");
+    let home = root.path().canonicalize().unwrap().join("home");
     let state_root = home.join(".local/state/coding-brain");
     create_managed_dir(&home);
     create_managed_dir(&home.join(".local"));
