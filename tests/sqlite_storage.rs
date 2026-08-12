@@ -11,14 +11,14 @@ use coding_brain::brain::decisions::{
     DecisionContext, DecisionOutcome, DecisionRecord, DecisionType,
 };
 use coding_brain::brain::storage::{
-    ActivityCursor, BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb, CacheDeadline,
-    CacheProvenance, CacheRootKey, CacheRow, DecisionIdentity, DecisionKind, DecisionPayload,
-    HistoricalDeliveryState, HistoricalPermissionProvenance, LearningErasePaths, OpenRole,
-    REVIEW_APPLICATION_ID, REVIEW_SCHEMA_VERSION, RUNTIME_CACHE_APPLICATION_ID,
-    RUNTIME_CACHE_SCHEMA_VERSION, RecoveryReservationOutcome, ReviewDb, ReviewEligibility,
-    ReviewEligibleOccurrence, RuntimeCacheBypass, RuntimeCacheReader, RuntimeCacheWriter,
-    StorageDeadline, StorageError, StorageFaultCategory, StorageOperation, StoragePaths,
-    WAL_AUTOCHECKPOINT_PAGES,
+    ActivityCursor, AuditExporter, BRAIN_APPLICATION_ID, BRAIN_SCHEMA_VERSION, BrainDb,
+    CacheDeadline, CacheProvenance, CacheRootKey, CacheRow, DecisionIdentity, DecisionKind,
+    DecisionPayload, HistoricalDeliveryState, HistoricalPermissionProvenance, LearningErasePaths,
+    LegacyExporter, OpenRole, REVIEW_APPLICATION_ID, REVIEW_SCHEMA_VERSION,
+    RUNTIME_CACHE_APPLICATION_ID, RUNTIME_CACHE_SCHEMA_VERSION, RecoveryReservationOutcome,
+    ReviewDb, ReviewEligibility, ReviewEligibleOccurrence, RuntimeCacheBypass, RuntimeCacheReader,
+    RuntimeCacheWriter, StorageDeadline, StorageError, StorageFaultCategory, StorageOperation,
+    StoragePaths, WAL_AUTOCHECKPOINT_PAGES,
 };
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityOutcome, ActivityState,
@@ -6566,4 +6566,220 @@ fn runtime_cache_v2_file_coexists_without_being_read_or_modified() {
 
     assert_eq!(fs::read(&v2).unwrap(), b"future format");
     assert!(paths.runtime_cache_v1().exists());
+}
+
+fn exported_tree_bytes(root: &std::path::Path) -> Vec<u8> {
+    let mut entries = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    let mut bytes = Vec::new();
+    for path in entries {
+        bytes.extend_from_slice(path.file_name().unwrap().as_encoded_bytes());
+        if path.is_dir() {
+            bytes.extend(exported_tree_bytes(&path));
+        } else {
+            bytes.extend(fs::read(path).unwrap());
+        }
+    }
+    bytes
+}
+
+fn previous_compatible_binary(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(binary) = std::env::var_os("CBRAIN_TEST_PREVIOUS_BINARY") {
+        return Some(binary.into());
+    }
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if !repository.join(".git").exists() {
+        return None;
+    }
+    let source = root.join("previous-source");
+    let target = repository.join("target/previous-compatible-42733e05");
+    let archive = root.join("previous-source.tar");
+    create_managed_dir(&source);
+    let archived = Command::new("git")
+        .args([
+            "archive",
+            "--format=tar",
+            &format!("--output={}", archive.display()),
+            "42733e055893361abb6879ea7e62edd817136199",
+        ])
+        .current_dir(repository)
+        .status()
+        .unwrap();
+    assert!(archived.success(), "historical source archive failed");
+    let extracted = Command::new("tar")
+        .args([
+            "-xf",
+            archive.to_str().unwrap(),
+            "-C",
+            source.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(extracted.success(), "historical source extraction failed");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let built = Command::new(cargo)
+        .args([
+            "build",
+            "--offline",
+            "--locked",
+            "-p",
+            "coding-brain",
+            "--bin",
+            "cbrain",
+        ])
+        .env("CARGO_TARGET_DIR", &target)
+        .current_dir(&source)
+        .status()
+        .unwrap();
+    assert!(built.success(), "historical cbrain build failed");
+    Some(target.join("debug/cbrain"))
+}
+
+#[test]
+fn previous_compatible_binary_ignores_auxiliary_cache_and_reads_brain() {
+    let root = private_tempdir();
+    let Some(binary) = previous_compatible_binary(root.path()) else {
+        eprintln!("historical rollback fixture requires local Git history");
+        return;
+    };
+    let home = root.path().join("home");
+    let state_root = home.join(".local/state/coding-brain");
+    create_managed_dir(&home);
+    create_managed_dir(&home.join(".local"));
+    create_managed_dir(&home.join(".local/state"));
+    create_managed_dir(&state_root);
+    let paths = StoragePaths::at(&state_root);
+    let mut brain = BrainDb::create_current(&paths).unwrap();
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Codex,
+        "rollback-session".into(),
+        Some("rollback-turn".into()),
+        None,
+        home.clone(),
+    )
+    .unwrap();
+    brain
+        .record_lifecycle(
+            LifecycleEvent::from_parts(identity, LifecycleEventKind::UserPromptSubmit).unwrap(),
+            1,
+        )
+        .unwrap();
+    brain
+        .append_activity(activity_event(
+            "rollback-authority",
+            1,
+            ActivityState::Denied,
+        ))
+        .unwrap();
+    drop(brain);
+    let mut cache = RuntimeCacheWriter::create_or_open_after_activity(
+        &paths,
+        CacheDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    cache
+        .upsert_and_prune(
+            &CacheRow::new(
+                CacheRootKey::from_canonical_path(&home).unwrap(),
+                "123e4567-e89b-12d3-a456-426614174000",
+                CacheProvenance::Manifest,
+                b"rollback-cache-only-evidence".to_vec(),
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    drop(cache);
+    let cache_before = fs::read(paths.runtime_cache_v1()).unwrap();
+    let cache_inode = fs::metadata(paths.runtime_cache_v1()).unwrap().ino();
+    let export = root.path().join("historical-export");
+
+    let output = Command::new(binary)
+        .args(["storage", "export-audit", export.to_str().unwrap()])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .current_dir(&home)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exported = exported_tree_bytes(&export);
+    assert!(
+        String::from_utf8_lossy(&exported).contains("rollback-authority"),
+        "historical reader did not export authoritative Brain evidence"
+    );
+    assert_eq!(fs::read(paths.runtime_cache_v1()).unwrap(), cache_before);
+    assert_eq!(
+        fs::metadata(paths.runtime_cache_v1()).unwrap().ino(),
+        cache_inode
+    );
+}
+
+#[test]
+fn runtime_cache_is_absent_from_authoritative_audit_and_legacy_exports() {
+    let root = private_tempdir();
+    let paths = StoragePaths::at(root.path());
+    let mut brain = BrainDb::create_current(&paths).unwrap();
+    let identity = LifecycleIdentity::try_new(
+        AgentProvider::Codex,
+        "cache-export-session".into(),
+        Some("cache-export-turn".into()),
+        None,
+        root.path().to_path_buf(),
+    )
+    .unwrap();
+    brain
+        .record_lifecycle(
+            LifecycleEvent::from_parts(identity, LifecycleEventKind::UserPromptSubmit).unwrap(),
+            1,
+        )
+        .unwrap();
+    drop(brain);
+
+    let cache_only_marker = b"CACHE-ONLY-EVIDENCE-MUST-NOT-BE-EXPORTED";
+    let row = CacheRow::new(
+        CacheRootKey::from_canonical_path(root.path()).unwrap(),
+        "123e4567-e89b-12d3-a456-426614174000",
+        CacheProvenance::Manifest,
+        cache_only_marker.to_vec(),
+        1,
+    )
+    .unwrap();
+    let mut cache = RuntimeCacheWriter::create_or_open_after_activity(
+        &paths,
+        CacheDeadline::after(Duration::from_millis(250)),
+    )
+    .unwrap();
+    cache.upsert_and_prune(&row).unwrap();
+    drop(cache);
+
+    let audit = root.path().join("audit-export");
+    let legacy = root.path().join("legacy-export");
+    AuditExporter::new(&paths).export(&audit).unwrap();
+    LegacyExporter::new(&paths).export(&legacy).unwrap();
+
+    for (label, bytes) in [
+        ("audit", exported_tree_bytes(&audit)),
+        ("legacy", exported_tree_bytes(&legacy)),
+    ] {
+        assert!(
+            !bytes
+                .windows(cache_only_marker.len())
+                .any(|window| window == cache_only_marker),
+            "{label} export leaked cache evidence"
+        );
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("runtime-cache-v1.sqlite3"),
+            "{label} export leaked the auxiliary cache path"
+        );
+    }
 }

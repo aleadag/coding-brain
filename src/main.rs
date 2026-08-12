@@ -441,12 +441,14 @@ fn fault_activation(
     ) else {
         return Err(io::Error::other("complete fault activation is required"));
     };
-    if cli.permission_hook == cli.fault_worker {
+    let fault_role_count = usize::from(cli.permission_hook)
+        + usize::from(cli.lifecycle_hook)
+        + usize::from(cli.fault_worker);
+    if fault_role_count != 1 {
         return Err(io::Error::other("exactly one fault role is required"));
     }
-    if cli.permission_hook
+    if (cli.permission_hook || cli.lifecycle_hook)
         && (cli.shell_safety_helper
-            || cli.lifecycle_hook
             || cli.recovery_hook
             || matches!(cli.command.as_ref(), Some(Command::Storage { .. })))
     {
@@ -454,29 +456,32 @@ fn fault_activation(
             "fault activation cannot be combined with a higher-precedence mode",
         ));
     }
-    match (cli.permission_hook, selection) {
-        (
-            true,
-            brain::storage::FaultSelection::Matrix(
-                brain::storage::FaultPoint::Checkpoint
-                | brain::storage::FaultPoint::MigrationPublish,
-            )
-            | brain::storage::FaultSelection::MigrationRegression(_),
-        ) => return Err(io::Error::other("fault point requires fault-worker role")),
-        (
-            false,
-            brain::storage::FaultSelection::Matrix(
-                brain::storage::FaultPoint::AdmissionWrite
-                | brain::storage::FaultPoint::InferenceExit
-                | brain::storage::FaultPoint::CommitBeforeCall
-                | brain::storage::FaultPoint::CommitAfterReturn
-                | brain::storage::FaultPoint::StdoutWrite
-                | brain::storage::FaultPoint::DeliveryWrite,
-            ),
-        ) => {
+    match selection {
+        brain::storage::FaultSelection::Matrix(
+            brain::storage::FaultPoint::Checkpoint | brain::storage::FaultPoint::MigrationPublish,
+        )
+        | brain::storage::FaultSelection::MigrationRegression(_)
+            if !cli.fault_worker =>
+        {
+            return Err(io::Error::other("fault point requires fault-worker role"));
+        }
+        brain::storage::FaultSelection::Matrix(
+            brain::storage::FaultPoint::AdmissionWrite
+            | brain::storage::FaultPoint::InferenceExit
+            | brain::storage::FaultPoint::CommitBeforeCall
+            | brain::storage::FaultPoint::CommitAfterReturn
+            | brain::storage::FaultPoint::StdoutWrite
+            | brain::storage::FaultPoint::DeliveryWrite,
+        ) if !cli.permission_hook => {
             return Err(io::Error::other(
                 "fault point requires permission-hook role",
             ));
+        }
+        brain::storage::FaultSelection::Matrix(
+            brain::storage::FaultPoint::CacheCommitBeforeCall
+            | brain::storage::FaultPoint::CacheCommitAfterReturn,
+        ) if !cli.lifecycle_hook => {
+            return Err(io::Error::other("fault point requires lifecycle-hook role"));
         }
         _ => {}
     }

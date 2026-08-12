@@ -501,7 +501,25 @@ impl RuntimeCacheWriter {
                 .map_err(map_sqlite_error)?;
         }
         self.deadline.ensure_remaining()?;
+        #[cfg(feature = "fault-injection")]
+        match super::hit_fault(
+            super::FaultPoint::CacheCommitBeforeCall,
+            super::FaultPosition::Before,
+        ) {
+            Ok(true) => std::process::abort(),
+            Ok(false) => {}
+            Err(_) => return Err(RuntimeCacheBypass::Corrupt),
+        }
         transaction.commit().map_err(map_sqlite_error)?;
+        #[cfg(feature = "fault-injection")]
+        match super::hit_fault(
+            super::FaultPoint::CacheCommitAfterReturn,
+            super::FaultPosition::After,
+        ) {
+            Ok(true) => std::process::abort(),
+            Ok(false) => {}
+            Err(_) => return Err(RuntimeCacheBypass::Corrupt),
+        }
         self.deadline.ensure_remaining()
     }
 }

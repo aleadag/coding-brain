@@ -27,6 +27,8 @@ pub(crate) enum FaultPoint {
     DeliveryWrite,
     Checkpoint,
     MigrationPublish,
+    CacheCommitBeforeCall,
+    CacheCommitAfterReturn,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -101,6 +103,8 @@ impl FaultPoint {
             Self::DeliveryWrite => "delivery-write",
             Self::Checkpoint => "checkpoint",
             Self::MigrationPublish => "migration-publish",
+            Self::CacheCommitBeforeCall => "cache-commit-before-call",
+            Self::CacheCommitAfterReturn => "cache-commit-after-return",
         }
     }
 

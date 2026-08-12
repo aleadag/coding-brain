@@ -341,7 +341,7 @@ fn run_provider_with_activity_and_live_process<R: Read, E: Write>(
             let result = activity
                 .append_from_snapshot(|log| {
                     let mut events = vec![observation];
-                    match correlate_outcome(log, &event, &activity_input) {
+                    match correlate_outcome(log, &event, &activity_input, &project) {
                         Correlation::Outcome(outcome) => events.push(outcome),
                         Correlation::Diagnostic { event, message } => {
                             correlation_message = Some(message);
@@ -467,7 +467,7 @@ fn persist_provider_hook_with_live_process(
             activity
                 .append_from_snapshot(|log| {
                     let mut events = vec![observation];
-                    match correlate_outcome(log, &event, &activity_input) {
+                    match correlate_outcome(log, &event, &activity_input, &project) {
                         Correlation::Outcome(outcome) => events.push(outcome),
                         Correlation::Diagnostic { event, .. } => events.push(event),
                         Correlation::None => {}
@@ -629,12 +629,14 @@ fn correlate_outcome(
     log: &ActivityLog,
     lifecycle: &LifecycleEvent,
     input: &LifecycleActivityInput,
+    project: &ProjectIdentity,
 ) -> Correlation {
     let identity = lifecycle.identity();
     let Some(tool_use_id) = input.normalized_tool_use_id() else {
         return diagnostic_correlation(
             lifecycle,
             input,
+            project,
             "orphan outcome: lifecycle event has no tool_use_id",
         );
     };
@@ -651,6 +653,7 @@ fn correlate_outcome(
             return diagnostic_correlation(
                 lifecycle,
                 input,
+                project,
                 "orphan outcome: exact lifecycle identity is ambiguous or ineligible",
             );
         }
@@ -671,6 +674,7 @@ fn correlate_outcome(
             log,
             lifecycle,
             input,
+            project,
             exact_activity_ids,
             "orphan outcome: exact lifecycle identity is ambiguous or ineligible",
         );
@@ -725,6 +729,7 @@ fn correlate_outcome(
         return diagnostic_correlation(
             lifecycle,
             input,
+            project,
             "orphan outcome: PreToolUse anchor is missing or ambiguous",
         );
     }
@@ -751,6 +756,7 @@ fn correlate_outcome(
         return diagnostic_correlation(
             lifecycle,
             input,
+            project,
             "orphan outcome: PreToolUse interval overlaps a later tool",
         );
     }
@@ -758,6 +764,7 @@ fn correlate_outcome(
         return diagnostic_correlation(
             lifecycle,
             input,
+            project,
             "orphan outcome: Bash command is not losslessly correlatable",
         );
     };
@@ -782,6 +789,7 @@ fn correlate_outcome(
         return diagnostic_correlation(
             lifecycle,
             input,
+            project,
             "orphan outcome: no eligible Decision in the PreToolUse interval",
         );
     }
@@ -789,6 +797,7 @@ fn correlate_outcome(
         log,
         lifecycle,
         input,
+        project,
         activity_ids,
         "orphan outcome: Decision correlation is ambiguous or ineligible",
     )
@@ -854,6 +863,7 @@ fn correlate_candidates(
     log: &ActivityLog,
     lifecycle: &LifecycleEvent,
     input: &LifecycleActivityInput,
+    project: &ProjectIdentity,
     activity_ids: Vec<String>,
     diagnostic: &'static str,
 ) -> Correlation {
@@ -868,7 +878,7 @@ fn correlate_candidates(
         })
         .collect::<Vec<_>>();
     if candidates.len() != 1 {
-        return diagnostic_correlation(lifecycle, input, diagnostic);
+        return diagnostic_correlation(lifecycle, input, project, diagnostic);
     }
     let matched = candidates[0];
     let post_id = input.normalized_tool_use_id();
@@ -948,9 +958,10 @@ fn outcome_event(
 fn diagnostic_correlation(
     lifecycle: &LifecycleEvent,
     input: &LifecycleActivityInput,
+    project: &ProjectIdentity,
     diagnostic: &'static str,
 ) -> Correlation {
-    match diagnostic_event(lifecycle, input, diagnostic) {
+    match diagnostic_event(lifecycle, input, project, diagnostic) {
         Ok(event) => Correlation::Diagnostic {
             event,
             message: diagnostic,
@@ -962,12 +973,10 @@ fn diagnostic_correlation(
 fn diagnostic_event(
     lifecycle: &LifecycleEvent,
     input: &LifecycleActivityInput,
+    project: &ProjectIdentity,
     diagnostic: &'static str,
 ) -> Result<ActivityEvent, String> {
-    let paths = current_paths().ok_or_else(|| "Coding Brain paths unavailable".to_string())?;
-    let identity = ProjectIdentity::load(lifecycle.identity().cwd(), &paths)
-        .map_err(|error| error.to_string())?;
-    let project_id = identity.id().clone();
+    let project_id = project.id().clone();
     let cwd = lifecycle.identity().cwd().to_path_buf();
     let (session_id, provider_session_id) = activity_session_identity(lifecycle);
     Ok(ActivityEvent {
@@ -1464,7 +1473,7 @@ fn persist_provider_hook_sqlite_with_stages(
                     let log = ActivityLog::from_events(
                         page.events.into_iter().map(|record| record.event).collect(),
                     );
-                    match correlate_outcome(&log, &event, &activity_input) {
+                    match correlate_outcome(&log, &event, &activity_input, project) {
                         Correlation::Outcome(outcome) => events.push(outcome),
                         Correlation::Diagnostic { event, .. } => {
                             events.push(event);

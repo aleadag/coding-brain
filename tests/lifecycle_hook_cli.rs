@@ -1,11 +1,16 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use coding_brain::brain::storage::{
     BrainDb, MigrationCoordinator, OpenRole, StorageDeadline, StoragePaths,
@@ -19,6 +24,8 @@ use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use sha2::{Digest, Sha256};
 
 const PROMPT: &[u8] = include_bytes!("fixtures/hooks/user-prompt-submit.json");
+const PRE_TOOL_USE: &[u8] = include_bytes!("fixtures/hooks/pre-tool-use.json");
+const POST_TOOL_USE: &[u8] = include_bytes!("fixtures/hooks/post-tool-use.json");
 const CLAUDE_STOP: &[u8] = include_bytes!("fixtures/hooks/claude-stop.json");
 const ANTIGRAVITY_STOP: &[u8] = include_bytes!("fixtures/hooks/antigravity-stop.json");
 const ANTIGRAVITY_PRE_TOOL_USE: &[u8] =
@@ -89,6 +96,38 @@ fn activity_events(
     records.into_iter().map(|record| record.event).collect()
 }
 
+fn normalized_activity_authority(
+    home: &std::path::Path,
+) -> Vec<coding_brain_core::brain_activity::ActivityEvent> {
+    let mut activity_ids = BTreeMap::<String, String>::new();
+    let mut decision_ids = BTreeMap::<String, String>::new();
+    activity_events(home)
+        .into_iter()
+        .map(|mut event| {
+            event.recorded_at_ms = 0;
+            let next_activity = format!("activity-{}", activity_ids.len());
+            event.activity_id = activity_ids
+                .entry(event.activity_id)
+                .or_insert(next_activity)
+                .clone();
+            if let Some(decision_id) = event.decision_id.take() {
+                let next_decision = format!("decision-{}", decision_ids.len());
+                event.decision_id = Some(
+                    decision_ids
+                        .entry(decision_id)
+                        .or_insert(next_decision)
+                        .clone(),
+                );
+            }
+            event.project.cwd.clear();
+            if let Some(session) = &mut event.session {
+                session.cwd.clear();
+            }
+            event
+        })
+        .collect()
+}
+
 fn run_hook(home: &std::path::Path, input: &[u8]) -> Output {
     run_provider_hook(home, None, input)
 }
@@ -134,6 +173,570 @@ fn run_provider_hook_with_event(
         .write_all(&normalized_input)
         .unwrap();
     child.wait_with_output().unwrap()
+}
+
+#[cfg(unix)]
+struct GitWrapperFixture {
+    _root: tempfile::TempDir,
+    home: std::path::PathBuf,
+    wrapper_dir: std::path::PathBuf,
+    real_git: std::path::PathBuf,
+    invocations: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl GitWrapperFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let wrapper_dir = root.path().join("bin");
+        let invocations = root.path().join("git-invocations");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&wrapper_dir).unwrap();
+        let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("git"))
+            .find(|candidate| candidate.is_file())
+            .and_then(|candidate| fs::canonicalize(candidate).ok())
+            .expect("git executable on PATH");
+        let initialized = Command::new(&real_git)
+            .args(["init", "--quiet"])
+            .current_dir(&home)
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        let project_dir = home.join(".coding-brain");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("project.toml"),
+            "schema_version = 1\nproject_id = \"123e4567-e89b-12d3-a456-426614174000\"\n",
+        )
+        .unwrap();
+        let wrapper = wrapper_dir.join("git");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\nprintf x >> \"$CBRAIN_TEST_GIT_INVOCATIONS\"\nexec \"$CBRAIN_TEST_REAL_GIT\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        Self {
+            _root: root,
+            home,
+            wrapper_dir,
+            real_git,
+            invocations,
+        }
+    }
+
+    fn run_hook(&self, input: &[u8], timing: bool) -> Output {
+        prepare_current_storage(&self.home);
+        let mut payload: serde_json::Value = serde_json::from_slice(input).unwrap();
+        payload["cwd"] = serde_json::json!(&self.home);
+        let payload = serde_json::to_vec(&payload).unwrap();
+        let mut command = command_for_home(&self.home);
+        command
+            .arg("--lifecycle-hook")
+            .env("PATH", &self.wrapper_dir)
+            .env("CBRAIN_TEST_REAL_GIT", &self.real_git)
+            .env("CBRAIN_TEST_GIT_INVOCATIONS", &self.invocations);
+        if timing {
+            command.env("CBRAIN_HOOK_TIMING", "1");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&payload).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn git_invocations(&self) -> usize {
+        fs::read(&self.invocations).map_or(0, |calls| calls.len())
+    }
+
+    fn invalidate_manifest_evidence(&self) {
+        let manifest = self.home.join(".coding-brain/project.toml");
+        let mut contents = fs::read(&manifest).unwrap();
+        contents.push(b'\n');
+        fs::write(manifest, contents).unwrap();
+    }
+
+    fn runtime_cache(&self) -> std::path::PathBuf {
+        self.home
+            .join(".local/state/coding-brain/db/runtime-cache-v1.sqlite3")
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn separate_hook_processes_share_a_validated_project_cache() {
+    let fixture = GitWrapperFixture::new();
+
+    let first = fixture.run_hook(PROMPT, false);
+    let calls_after_first = fixture.git_invocations();
+    let second = fixture.run_hook(PRE_TOOL_USE, false);
+
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(first.stdout.is_empty() && second.stdout.is_empty());
+    assert!(first.stderr.is_empty() && second.stderr.is_empty());
+    assert!(calls_after_first > 0);
+    assert_eq!(fixture.git_invocations(), calls_after_first);
+}
+
+#[test]
+#[cfg(unix)]
+fn project_cache_event_matrix_reports_closed_miss_hit_and_invalidation() {
+    for (input, event, tool) in [
+        (PROMPT, "user_prompt_submit", Some("UserPromptSubmit")),
+        (PRE_TOOL_USE, "pre_tool_use", Some("PreToolUse")),
+        (POST_TOOL_USE, "post_tool_use", Some("PostToolUse")),
+    ] {
+        let fixture = GitWrapperFixture::new();
+        let miss = fixture.run_hook(input, true);
+        let calls_after_miss = fixture.git_invocations();
+        let hit = fixture.run_hook(input, true);
+        assert_eq!(fixture.git_invocations(), calls_after_miss, "{event}");
+        fixture.invalidate_manifest_evidence();
+        let invalid = fixture.run_hook(input, true);
+        assert!(fixture.git_invocations() > calls_after_miss, "{event}");
+
+        for (output, outcome) in [
+            (&miss, "cache_miss"),
+            (&hit, "cache_hit"),
+            (&invalid, "cache_invalid"),
+        ] {
+            assert!(output.status.success(), "{event}: {:?}", output.stderr);
+            assert!(output.stdout.is_empty());
+            let timing = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                timing.contains(&format!(
+                    "event={event} stage=project_cache outcome={outcome}"
+                )),
+                "{timing:?}"
+            );
+            for line in timing.lines() {
+                assert!(line.starts_with("cbrain_hook_timing v=1 provider=codex event="));
+                assert!(!line.contains(fixture.home.to_string_lossy().as_ref()));
+                assert!(!line.contains(fixture.real_git.to_string_lossy().as_ref()));
+                assert!(!line.contains("do not persist me"));
+                assert_eq!(line.split_whitespace().count(), 8);
+            }
+        }
+        let matching = activity_events(&fixture.home)
+            .into_iter()
+            .filter(|activity| activity.tool.as_deref() == tool)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{event}");
+        if event == "post_tool_use" {
+            assert!(matching.iter().all(|activity| {
+                activity.session.as_ref().unwrap().tool_use_id.as_deref() == Some("call-1")
+            }));
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn private_cache_bypass_is_immutable_and_preserves_exact_brain_evidence() {
+    let healthy = GitWrapperFixture::new();
+    assert!(healthy.run_hook(PROMPT, false).status.success());
+    assert!(healthy.run_hook(PRE_TOOL_USE, false).status.success());
+    let healthy_authority = normalized_activity_authority(&healthy.home);
+
+    for mutation in ["incompatible", "corrupt_uuid", "unsafe_mode"] {
+        let fixture = GitWrapperFixture::new();
+        assert!(fixture.run_hook(PROMPT, false).status.success());
+        let cache = fixture.runtime_cache();
+        match mutation {
+            "incompatible" => rusqlite::Connection::open(&cache)
+                .unwrap()
+                .execute_batch("PRAGMA user_version = 2;")
+                .unwrap(),
+            "corrupt_uuid" => rusqlite::Connection::open(&cache)
+                .unwrap()
+                .execute_batch(
+                    "PRAGMA ignore_check_constraints = ON;
+                     UPDATE project_identity_cache SET project_uuid = 'invalid';",
+                )
+                .unwrap(),
+            "unsafe_mode" => {
+                fs::set_permissions(&cache, fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let bytes_before = fs::read(&cache).unwrap();
+        let inode_before = fs::metadata(&cache).unwrap().ino();
+
+        let output = fixture.run_hook(PRE_TOOL_USE, true);
+
+        assert!(output.status.success(), "{mutation}: {:?}", output.stderr);
+        assert!(output.stdout.is_empty(), "{mutation}");
+        let timing = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            timing.contains("event=pre_tool_use stage=project_cache outcome=cache_bypassed"),
+            "{mutation}: {timing:?}"
+        );
+        assert_eq!(fs::read(&cache).unwrap(), bytes_before, "{mutation}");
+        assert_eq!(
+            fs::metadata(&cache).unwrap().ino(),
+            inode_before,
+            "{mutation}"
+        );
+        assert_eq!(
+            normalized_activity_authority(&fixture.home),
+            healthy_authority,
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn contended_private_cache_refresh_preserves_exact_brain_evidence() {
+    let healthy = GitWrapperFixture::new();
+    assert!(healthy.run_hook(PROMPT, false).status.success());
+    assert!(healthy.run_hook(PRE_TOOL_USE, false).status.success());
+    let healthy_authority = normalized_activity_authority(&healthy.home);
+
+    let fixture = GitWrapperFixture::new();
+    assert!(fixture.run_hook(PROMPT, false).status.success());
+    let cache = fixture.runtime_cache();
+    let connection = rusqlite::Connection::open(&cache).unwrap();
+    let row_before = connection
+        .query_row(
+            "SELECT project_uuid, provenance, length(evidence), refresh_order, row_version FROM project_identity_cache",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?)),
+        )
+        .unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    fixture.invalidate_manifest_evidence();
+
+    let output = fixture.run_hook(PRE_TOOL_USE, true);
+
+    connection.execute_batch("ROLLBACK;").unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
+    let timing = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        timing.contains("event=pre_tool_use stage=project_cache outcome=cache_invalid"),
+        "{timing:?}"
+    );
+    let row_after = connection
+        .query_row(
+            "SELECT project_uuid, provenance, length(evidence), refresh_order, row_version FROM project_identity_cache",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?)),
+        )
+        .unwrap();
+    assert_eq!(row_after, row_before);
+    assert_eq!(
+        normalized_activity_authority(&fixture.home),
+        healthy_authority
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn malicious_private_cache_rows_cannot_change_permission_or_delivery_authority() {
+    let healthy = GitWrapperFixture::new();
+    assert!(healthy.run_hook(PROMPT, false).status.success());
+    write_brain_config(&healthy.home);
+    let permission_request = |home: &std::path::Path| {
+        serde_json::to_vec(&serde_json::json!({
+            "session_id": "permission-cache-isolation",
+            "turn_id": "permission-cache-turn",
+            "transcript_path": "/tmp/permission-cache.jsonl",
+            "cwd": home,
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"},
+        }))
+        .unwrap()
+    };
+    let healthy_output = run_permission_hook(&healthy.home, &permission_request(&healthy.home));
+    assert!(healthy_output.status.success());
+    let healthy_authority = normalized_activity_authority(&healthy.home);
+    for mutation in [
+        "invalid_uuid",
+        "temporary_identity",
+        "oversized",
+        "incompatible",
+    ] {
+        let fixture = GitWrapperFixture::new();
+        assert!(fixture.run_hook(PROMPT, false).status.success());
+        let cache = fixture.runtime_cache();
+        let connection = rusqlite::Connection::open(&cache).unwrap();
+        match mutation {
+            "incompatible" => connection
+                .execute_batch("PRAGMA user_version = 2;")
+                .unwrap(),
+            kind => {
+                connection
+                    .execute_batch(
+                        "PRAGMA ignore_check_constraints = ON;
+                         DELETE FROM project_identity_cache;",
+                    )
+                    .unwrap();
+                let uuid = if kind == "temporary_identity" {
+                    "temporary-identity-000000000000000"
+                } else {
+                    "not-a-canonical-project-uuid-value"
+                };
+                if kind == "oversized" {
+                    connection
+                        .execute(
+                            "INSERT INTO project_identity_cache VALUES (?1, ?2, 1, zeroblob(65537), 1, 1)",
+                            rusqlite::params![fixture.home.as_os_str().as_encoded_bytes(), "123e4567-e89b-12d3-a456-426614174000"],
+                        )
+                        .unwrap();
+                } else {
+                    connection
+                        .execute(
+                            "INSERT INTO project_identity_cache VALUES (?1, ?2, 1, x'01', 1, 1)",
+                            rusqlite::params![fixture.home.as_os_str().as_encoded_bytes(), uuid],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        drop(connection);
+        let cache_before = fs::read(&cache).unwrap();
+        let inode_before = fs::metadata(&cache).unwrap().ino();
+        write_brain_config(&fixture.home);
+        let output = run_permission_hook(&fixture.home, &permission_request(&fixture.home));
+
+        assert!(output.status.success(), "{mutation}: {:?}", output.stderr);
+        assert_eq!(output.stdout, healthy_output.stdout, "{mutation}");
+        assert_eq!(
+            normalized_activity_authority(&fixture.home),
+            healthy_authority,
+            "{mutation}"
+        );
+        assert_eq!(fs::read(&cache).unwrap(), cache_before, "{mutation}");
+        assert_eq!(
+            fs::metadata(&cache).unwrap().ino(),
+            inode_before,
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn blocked_git_and_descendant_are_bounded_and_reaped() {
+    for (input, event, tool_use_id, activity_count) in [
+        (PROMPT, "user_prompt_submit", None, 1),
+        (PRE_TOOL_USE, "pre_tool_use", Some("call-1"), 1),
+        (POST_TOOL_USE, "post_tool_use", Some("call-1"), 2),
+    ] {
+        assert_blocked_git_is_bounded_and_reaped(input, event, tool_use_id, activity_count);
+    }
+}
+
+#[cfg(unix)]
+fn assert_blocked_git_is_bounded_and_reaped(
+    input: &[u8],
+    event: &str,
+    tool_use_id: Option<&str>,
+    activity_count: usize,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let ready_fifo = root.path().join("ready");
+    let release_fifo = root.path().join("release");
+    let liveness_fifo = root.path().join("liveness");
+    for fifo in [&ready_fifo, &release_fifo, &liveness_fifo] {
+        let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    }
+    let mut ready_reader = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&ready_fifo)
+        .unwrap();
+    let release_keepalive = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&release_fifo)
+        .unwrap();
+    let liveness_keepalive = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&liveness_fifo)
+        .unwrap();
+    let mut liveness_reader = fs::OpenOptions::new()
+        .read(true)
+        .open(&liveness_fifo)
+        .unwrap();
+    let wrapper = bin.join("git");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nexec 9>\"$CBRAIN_TEST_LIVENESS_FIFO\"\n(IFS= read -r _ < \"$CBRAIN_TEST_RELEASE_FIFO\") &\nprintf r > \"$CBRAIN_TEST_READY_FIFO\"\nIFS= read -r _ < \"$CBRAIN_TEST_RELEASE_FIFO\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    prepare_current_storage(&home);
+    let mut payload: serde_json::Value = serde_json::from_slice(input).unwrap();
+    payload["cwd"] = serde_json::json!(&home);
+    let payload = serde_json::to_vec(&payload).unwrap();
+    let mut command = command_for_home(&home);
+    command
+        .arg("--lifecycle-hook")
+        .env("PATH", &bin)
+        .env("CBRAIN_HOOK_TIMING", "1")
+        .env("CBRAIN_TEST_READY_FIFO", &ready_fifo)
+        .env("CBRAIN_TEST_RELEASE_FIFO", &release_fifo)
+        .env("CBRAIN_TEST_LIVENESS_FIFO", &liveness_fifo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let mut child = command.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(&payload).unwrap();
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut ready = [0_u8; 1];
+        ready_sender
+            .send(ready_reader.read_exact(&mut ready).map(|()| ready))
+            .unwrap();
+    });
+    let ready = ready_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Git wrapper readiness timeout")
+        .unwrap();
+    assert_eq!(ready, *b"r");
+    drop(liveness_keepalive);
+
+    let (output_sender, output_receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || output_sender.send(child.wait_with_output()).unwrap());
+    let (liveness_sender, liveness_receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut liveness = [0_u8; 1];
+        liveness_sender
+            .send(liveness_reader.read(&mut liveness))
+            .unwrap();
+    });
+    let output = output_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_else(|error| panic!("{event}: outer deadlock safety ceiling: {error}"))
+        .unwrap();
+    let elapsed = started.elapsed();
+    drop(release_keepalive);
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(elapsed < Duration::from_millis(1500), "elapsed {elapsed:?}");
+    let timing = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        timing.contains(&format!("event={event} stage=project_git outcome=error")),
+        "{timing:?}"
+    );
+    assert!(timing.contains("stage=total outcome=success"), "{timing:?}");
+    for fifo in [&ready_fifo, &release_fifo, &liveness_fifo] {
+        assert!(!timing.contains(&fifo.display().to_string()), "{timing:?}");
+    }
+    assert_eq!(
+        liveness_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Git descendant retained its liveness FIFO")
+            .unwrap(),
+        0
+    );
+    assert!(!fixture_cache_path(&home).exists());
+    let activities = activity_events(&home);
+    assert_eq!(activities.len(), activity_count, "{event}");
+    assert!(
+        activities.iter().all(|activity| {
+            activity
+                .session
+                .as_ref()
+                .and_then(|session| session.tool_use_id.as_deref())
+                == tool_use_id
+        }),
+        "{event}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn oversized_git_output_is_bounded_and_timing_is_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let wrapper = bin.join("git");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 5000 ]; do printf RAW_REMOTE_SECRET; i=$((i + 1)); done\nprintf FREE_FORM_ERROR_SECRET >&2\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    prepare_current_storage(&home);
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "session_id": "overflow-session",
+        "turn_id": "overflow-turn",
+        "transcript_path": "/tmp/overflow.jsonl",
+        "cwd": home,
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "PAYLOAD_SECRET",
+    }))
+    .unwrap();
+    let started = Instant::now();
+    let mut child = command_for_home(&home)
+        .arg("--lifecycle-hook")
+        .env("PATH", &bin)
+        .env("GIT_CONFIG_VALUE_0", "ENVIRONMENT_SECRET")
+        .env("CBRAIN_HOOK_TIMING", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&payload).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    let timing = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        timing.contains("stage=project_git outcome=error"),
+        "{timing:?}"
+    );
+    assert!(timing.contains("stage=total outcome=success"), "{timing:?}");
+    for secret in [
+        "RAW_REMOTE_SECRET",
+        "FREE_FORM_ERROR_SECRET",
+        "ENVIRONMENT_SECRET",
+        "PAYLOAD_SECRET",
+        &wrapper.display().to_string(),
+    ] {
+        assert!(
+            !timing.contains(secret),
+            "timing leaked {secret:?}: {timing:?}"
+        );
+    }
+    assert!(!fixture_cache_path(&home).exists());
+}
+
+#[cfg(unix)]
+fn fixture_cache_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".local/state/coding-brain/db/runtime-cache-v1.sqlite3")
 }
 
 fn assert_antigravity_rejected(event: Option<&str>, payload: &serde_json::Value, label: &str) {
