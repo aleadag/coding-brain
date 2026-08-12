@@ -99,12 +99,24 @@ debug `cargo test`; the worktree remains clean.
 - Produces: timestamped forced-rebuild log, wall-clock measurement, phase markers, test-selection evidence, and a copied baseline package output.
 
 **Acceptance Criteria:**
-- The baseline rebuild is forced with `--rebuild`; an existing store result or substitute is not accepted as the measurement.
+- The exact baseline derivation is first realized if absent, then the measured rebuild is forced with `--rebuild`; the realization run is not timing evidence.
 - The command exits successfully and records total wall time plus build/check phase markers.
 - The log proves the primary package check and custom integration tests use the debug profile before the fix.
 - The baseline output is copied outside the Nix store so garbage collection cannot remove the comparison input.
 
-- [ ] **Step 1: Force and time the baseline build**
+- [ ] **Step 1: Realize the exact baseline derivation**
+
+Run:
+
+```bash
+nix build --no-link --print-build-logs .#
+```
+
+Expected: exit 0 and the exact current derivation has a valid store output.
+This setup run may build or substitute the package and is not used as timing
+evidence; it exists because `--rebuild` rejects an unrealized derivation.
+
+- [ ] **Step 2: Force and time the baseline build**
 
 Run in `zsh`:
 
@@ -121,7 +133,7 @@ dependencies. The log contains `Executing cargoBuildHook`, `Executing
 cargoCheckHook`, `Finished cargoCheckHook`, test results, the output store path,
 and the `wall_seconds` line.
 
-- [ ] **Step 2: Record the baseline output and phase evidence**
+- [ ] **Step 3: Record the baseline output and phase evidence**
 
 Run:
 
@@ -139,7 +151,7 @@ test` omits `--release`. Use the leading epoch seconds around hook start/finish
 lines as integer-second contextual phase durations. If the baseline fails, stop
 and diagnose it before implementation.
 
-- [ ] **Step 3: Record baseline evidence before changing code**
+- [ ] **Step 4: Record baseline evidence before changing code**
 
 Run:
 
@@ -422,6 +434,9 @@ Expected: the Bead remains open unless every acceptance criterion is evidenced a
   plan-commit steps before rebasing.
 - Describe `--rebuild` evidence as a forced top-level package rebuild with warm
   dependencies possible, not an empty-store clean build.
+- Realize the exact package derivation before timing when its output is absent;
+  Nix rejects `--rebuild` before hooks otherwise, and the realization run is not
+  timing evidence.
 - Keep integer-second phase timestamps and `/usr/bin/time` totals as contextual
   measurements rather than adding a benchmark dependency.
 - Scope `checkType` and `postCheck` assertions to the bounded installable package
@@ -438,6 +453,7 @@ Expected: the Bead remains open unless every acceptance criterion is evidenced a
 - Tightened the structural test code and expected red signal.
 - Added immediate baseline evidence capture and a durable output copy.
 - Made the baseline copy collision-safe for repeated or interrupted executions.
+- Added the required untimed realization precondition for the forced baseline.
 - Split the former combined verification task into local Task 4 and hosted Task 5.
 - Required per-job hosted log inspection and explicit Home Manager compatibility
   checks.
