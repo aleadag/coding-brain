@@ -17,6 +17,7 @@ mod doctor;
 mod executable;
 mod init;
 mod lifecycle_hook;
+mod lifecycle_project;
 mod lifecycle_timing;
 mod provider_hooks;
 mod runtime;

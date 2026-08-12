@@ -85,6 +85,18 @@ impl From<io::Error> for ProjectError {
 }
 
 impl ProjectIdentity {
+    pub fn from_stable_uuid(value: &str) -> Result<Self, uuid::Error> {
+        Ok(Self {
+            id: ProjectId::Stable(uuid::Uuid::parse_str(value)?.to_string()),
+        })
+    }
+
+    pub fn from_temporary_root(root: &Path) -> Self {
+        Self {
+            id: ProjectId::Temporary(temporary_id(root)),
+        }
+    }
+
     pub fn load(cwd: &Path, paths: &CodingBrainPaths) -> Result<Self, ProjectError> {
         let mut runner = SystemProjectCommandRunner;
         Self::resolve_with(cwd, paths, &mut runner).map(|resolution| resolution.identity)
@@ -544,6 +556,28 @@ mod tests {
         assert_eq!(resolved.root(), root);
         assert_eq!(resolved.provenance(), ProjectProvenance::Temporary);
         assert_eq!(runner.calls(), 2);
+    }
+
+    #[test]
+    fn stable_uuid_constructor_canonicalizes_and_never_builds_temporary_identity() {
+        let identity =
+            ProjectIdentity::from_stable_uuid("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA").unwrap();
+
+        assert_eq!(
+            identity.id(),
+            &ProjectId::Stable("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into())
+        );
+        assert!(ProjectIdentity::from_stable_uuid("temporary-project").is_err());
+    }
+
+    #[test]
+    fn temporary_root_constructor_requires_no_filesystem_discovery() {
+        let root = Path::new("/definitely/missing/project-root");
+
+        let identity = ProjectIdentity::from_temporary_root(root);
+
+        assert!(matches!(identity.id(), ProjectId::Temporary(_)));
+        assert_eq!(identity, ProjectIdentity::from_temporary_root(root));
     }
 
     #[test]
