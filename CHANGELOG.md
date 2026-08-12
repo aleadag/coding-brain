@@ -35,8 +35,9 @@ All notable changes to Coding Brain are documented here.
 ### Changed
 
 - Nix package checks now run the portable core, TUI, and release-contract test
-  boundary without nesting Bubblewrap or requiring user namespaces. CI builds
-  the package on Ubuntu and macOS, while a separate x86_64-linux NixOS VM test
+  boundary in the release profile, avoiding a second debug dependency graph,
+  without nesting Bubblewrap or requiring user namespaces. CI builds the
+  package on Ubuntu and macOS, while a separate x86_64-linux NixOS VM test
   exercises the installed binary's existing storage protections as real
   unprivileged users. This changes packaging and verification only; production
   storage validation and dependency pins are unchanged.
