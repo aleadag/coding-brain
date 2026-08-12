@@ -53,8 +53,14 @@ pub struct ProviderDiscoveryState {
     pub claude_inventory: claude::ClaudeInventoryCache,
 }
 
+/// Provider sessions together with the status of their shared process snapshot.
 pub struct ProviderSessionScan {
+    /// The existing provider-discovery result, sorted by most recent start time.
     pub sessions: Vec<AgentSession>,
+    /// Whether the shared bounded process snapshot completed successfully.
+    ///
+    /// `true` includes a successful empty snapshot. When `false`, process-backed
+    /// provider counts may be incomplete even if structured Claude sessions remain.
     pub process_snapshot_succeeded: bool,
 }
 
@@ -80,6 +86,7 @@ where
     scan_agent_sessions_with_runners(state, now, process_runner, claude_runner).sessions
 }
 
+/// Scans providers and returns their sessions with the shared process snapshot status.
 pub fn scan_agent_sessions_with_status(state: &mut ProviderDiscoveryState) -> ProviderSessionScan {
     scan_agent_sessions_with_runners(
         state,
