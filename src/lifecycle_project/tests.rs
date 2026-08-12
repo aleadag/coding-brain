@@ -101,11 +101,12 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("repo");
+        let temp_root = fs::canonicalize(temp.path()).unwrap();
+        let root = temp_root.join("repo");
         let cwd = root.join("src/nested");
-        let home = temp.path().join("home");
-        let state = temp.path().join("state");
-        let bin = temp.path().join("bin");
+        let home = temp_root.join("home");
+        let state = temp_root.join("state");
+        let bin = temp_root.join("bin");
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::create_dir_all(&home).unwrap();
@@ -119,7 +120,7 @@ impl Fixture {
         let git_executable = bin.join("git");
         fs::write(&git_executable, b"#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&git_executable, fs::Permissions::from_mode(0o755)).unwrap();
-        let system_config = temp.path().join("etc-gitconfig");
+        let system_config = temp_root.join("etc-gitconfig");
         let paths =
             CodingBrainPaths::resolve(&PathEnvironment::new(None, Some(state), Some(home.clone())))
                 .unwrap();
@@ -222,7 +223,7 @@ impl Fixture {
     fn install(&self, refresh: CacheRefresh) {
         let mut writer = RuntimeCacheWriter::create_or_open_after_activity(
             &self.storage,
-            CacheDeadline::after(Duration::from_millis(100)),
+            CacheDeadline::after(Duration::from_secs(1)),
         )
         .unwrap();
         refresh_after_activity_success(&mut writer, &refresh, 1).unwrap();

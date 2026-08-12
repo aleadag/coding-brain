@@ -1461,7 +1461,10 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut pids = Vec::new();
         for _ in 0..17 {
-            let child = Command::new("/bin/true").spawn().unwrap();
+            let child = Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap();
             pids.push(i32::try_from(child.id()).unwrap());
             handoff_to_reaper(child, &sender);
         }
