@@ -1,0 +1,49 @@
+# Coding Brain
+
+Coding Brain is a local TUI for supervising Codex, Claude Code, and Antigravity CLI through judgment and learning.
+
+Current product boundary:
+- Live shows provider-tagged Brain activity and attention, not a session dashboard.
+- Review collects denials, corrections, and uncertain decisions worth teaching from.
+- Scorecard reports decision quality and learning progress.
+- Structured lifecycle, permission, and recovery hooks record bounded activity before richer provider evidence catches up.
+- Session switching uses exact provider-qualified Agent Deck navigation, native Claude background attach, or supported terminal focus.
+- Pressing x in Live preflights the selected exact provider session, pane, and prompt; only recognized permission or recovery prompts expose their semantic actions.
+- Semantic dispatch independently revalidates the exact target and prompt and rejects changed evidence without fallback input. Manual text remains bounded, hidden, explicit operator input; its dispatch revalidates the exact target, backend, and capture but does not require prompt equality.
+- Diagnostics contains metadata-only safe categories for hooks, correlation, rejected or uncertain session actions and recovery, and store integrity; it is not ordinary command output and never stores terminal captures or manual text.
+- Coding Brain does not collect or display token usage or cost.
+- Coding Brain may derive a bounded context-window percentage for context-rot prevention, but it does not retain the provider token counts used to derive it.
+- Only that bounded percentage is retained.
+- The percentage uses provider-supplied context capacity when available and otherwise a known-model fallback; it is not raw usage or cost accounting.
+- Coding Brain does not provide a mailbox, scheduler, durable task queue, dependency engine, or distributed coordinator.
+
+Current paths:
+- User config: $XDG_CONFIG_HOME/coding-brain/config.toml
+- User state: $XDG_STATE_HOME/coding-brain/
+- Project config: .coding-brain.toml
+- Stable project identity: .coding-brain/project.toml
+
+Install and activate:
+- cargo install coding-brain
+- the package is coding-brain; its sole executable is cbrain
+- cbrain init codex (or claude, antigravity, several names, or all)
+- bare interactive init detects providers and asks; provider-less non-interactive init is deprecated Codex compatibility
+- cbrain doctor
+- restart configured agents; inspect /hooks for Codex
+- cbrain
+
+Managed provider paths:
+- Codex: project .codex/hooks.json or user ~/.codex/hooks.json
+- Claude Code: ~/.claude/settings.json
+- Antigravity CLI: ~/.gemini/config/hooks.json
+
+The crates.io package and internal Rust crates use the coding-brain namespace; the sole executable is cbrain. Imperatively managed hooks must be repaired after the executable rename with cbrain init <provider>. The raw installer stops before download or installation while ${INSTALL_DIR:-/usr/local/bin}/coding-brain exists; inspect and remove the old executable explicitly before rerunning it. There is no automatic migration or compatibility executable. Confirmed purge is irreversible; old global data remains available for rollback until purge.
+
+Documentation:
+- https://aleadag.github.io/coding-brain/
+- https://aleadag.github.io/coding-brain/quickstart/
+- https://aleadag.github.io/coding-brain/configuration/
+- https://aleadag.github.io/coding-brain/reference/
+- https://aleadag.github.io/coding-brain/terminal-support/
+- https://aleadag.github.io/coding-brain/troubleshooting/
+- https://aleadag.github.io/coding-brain/contributing/
