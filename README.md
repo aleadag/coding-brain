@@ -13,7 +13,7 @@ From Live, you can switch to the source session for the selected activity. Exact
 
 Press `x` in Live to preflight the selected exact provider session, pane, and current prompt. Coding Brain exposes Allow/Deny only for a recognized permission prompt and Continue only for a recognized recovery prompt. Manual text remains explicit operator input; it is bounded and hidden. Semantic dispatch independently revalidates the exact target and prompt, so a changed prompt is rejected without fallback input. Manual-text dispatch revalidates the exact target, backend, and bounded capture but does not require prompt equality. Diagnostics is not ordinary command output and never stores captured terminal content or manual text.
 
-Outside Live action mode, itemized views use `a`/`A` to review one/all visible NEW items, `d`/`D` to archive one/all reviewed items, and `u` to undo the latest archive. Recent uses `a`/`A` for seen state and cannot be archived; Review also keeps `s` as review-and-next. These surface-local actions do not delete evidence or change Scorecard results. See [review lifecycle state](docs/configuration.md#review-lifecycle-state) for persistence and safe reset details.
+Outside Live action mode, itemized views use `a`/`A` to review one/all visible NEW items, `d`/`D` to archive one/all reviewed items, and `u` to undo the latest archive. A successful single-item `a` action advances to the next item on the active surface. Recent uses `a`/`A` for seen state and cannot be archived; Review also keeps `s` as review-and-next. These surface-local actions do not delete evidence or change Scorecard results. See [review lifecycle state](docs/configuration.md#review-lifecycle-state) for persistence and safe reset details.
 
 ## Install and activate
 
