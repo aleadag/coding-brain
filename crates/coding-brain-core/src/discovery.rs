@@ -53,7 +53,16 @@ pub struct ProviderDiscoveryState {
     pub claude_inventory: claude::ClaudeInventoryCache,
 }
 
+pub struct ProviderSessionScan {
+    pub sessions: Vec<AgentSession>,
+    pub process_snapshot_succeeded: bool,
+}
+
 pub fn scan_agent_sessions_with_state(state: &mut ProviderDiscoveryState) -> Vec<AgentSession> {
+    scan_agent_sessions_with_status(state).sessions
+}
+
+pub fn scan_agent_sessions_with_status(state: &mut ProviderDiscoveryState) -> ProviderSessionScan {
     scan_agent_sessions_with_runners(
         state,
         Instant::now(),
@@ -67,12 +76,13 @@ fn scan_agent_sessions_with_runners<P, C>(
     now: Instant,
     process_runner: P,
     claude_runner: C,
-) -> Vec<AgentSession>
+) -> ProviderSessionScan
 where
     P: FnOnce() -> ProcessSnapshot,
     C: FnOnce(Duration, usize) -> Result<Vec<u8>, claude::InventoryError>,
 {
     let snapshot = process_runner();
+    let process_snapshot_succeeded = snapshot.succeeded;
     let inventory = claude::inventory_with_runner(&mut state.claude_inventory, now, claude_runner);
     let stale_inventory = state.claude_inventory.last_error.is_some();
 
@@ -86,7 +96,10 @@ where
     ));
     sessions.extend(antigravity::sessions_from_processes(&snapshot.entries));
     sessions.sort_by_key(|session| Reverse(session.started_at));
-    sessions
+    ProviderSessionScan {
+        sessions,
+        process_snapshot_succeeded,
+    }
 }
 
 fn scan_codex_sessions_from_snapshot(
@@ -1121,7 +1134,8 @@ mod tests {
         let now = Instant::now();
         let mut state = ProviderDiscoveryState::default();
         let mut process_scans = 0;
-        let sessions = scan_agent_sessions_with_runners(
+        let mut inventory_refreshes = 0;
+        let scan = scan_agent_sessions_with_runners(
             &mut state,
             now,
             || {
@@ -1165,11 +1179,15 @@ mod tests {
                 ])
             },
             |_, _| {
+                inventory_refreshes += 1;
                 Ok(br#"[{"kind":"interactive","cwd":"/work/claude","startedAt":"1970-01-01T00:00:00.102Z","pid":12,"sessionId":"claude-native"}]"#.to_vec())
             },
         );
 
         assert_eq!(process_scans, 1);
+        assert_eq!(inventory_refreshes, 1);
+        assert!(scan.process_snapshot_succeeded);
+        let sessions = scan.sessions;
         assert_eq!(sessions.len(), 4);
         let claude = sessions
             .iter()
@@ -1239,13 +1257,15 @@ mod tests {
             },
         };
 
-        let sessions = scan_agent_sessions_with_runners(
+        let scan = scan_agent_sessions_with_runners(
             &mut state,
             now,
             crate::process::ProcessSnapshot::default,
             |_, _| Err(claude::InventoryError::Oversized),
         );
 
+        assert!(!scan.process_snapshot_succeeded);
+        let sessions = scan.sessions;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].provider, AgentProvider::Claude);
         assert_eq!(sessions[0].session_id, "stale-session");
@@ -1266,13 +1286,15 @@ mod tests {
         let now = Instant::now();
         let mut state = provider_state_with_stale_claude_pid();
 
-        let sessions = scan_agent_sessions_with_runners(
+        let scan = scan_agent_sessions_with_runners(
             &mut state,
             now,
             crate::process::ProcessSnapshot::default,
             |_, _| Err(claude::InventoryError::Timeout),
         );
 
+        assert!(!scan.process_snapshot_succeeded);
+        let sessions = scan.sessions;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "stale-pid-session");
         assert_eq!(sessions[0].pid, 42);
@@ -1285,14 +1307,22 @@ mod tests {
         let now = Instant::now();
         let mut state = provider_state_with_stale_claude_pid();
 
-        let sessions = scan_agent_sessions_with_runners(
+        let scan = scan_agent_sessions_with_runners(
             &mut state,
             now,
             || crate::process::ProcessSnapshot::from_entries(Vec::new()),
             |_, _| Err(claude::InventoryError::Timeout),
         );
 
+        assert!(scan.process_snapshot_succeeded);
+        let sessions = scan.sessions;
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn public_provider_scan_status_api_is_exposed() {
+        let _: fn(&mut ProviderDiscoveryState) -> ProviderSessionScan =
+            scan_agent_sessions_with_status;
     }
 
     fn provider_state_with_stale_claude_pid() -> ProviderDiscoveryState {

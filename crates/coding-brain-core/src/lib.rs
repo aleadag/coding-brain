@@ -41,4 +41,7 @@ pub mod theme;
 pub mod transcript;
 
 pub use discovery::claude::{ClaudeInventoryCache, ClaudeInventoryEntry};
-pub use discovery::{ProviderDiscoveryState, scan_agent_sessions_with_state};
+pub use discovery::{
+    ProviderDiscoveryState, ProviderSessionScan, scan_agent_sessions_with_state,
+    scan_agent_sessions_with_status,
+};
