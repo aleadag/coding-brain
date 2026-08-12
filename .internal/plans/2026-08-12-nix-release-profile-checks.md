@@ -8,7 +8,10 @@
 
 **Tech Stack:** Nix flakes, Nixpkgs `rustPlatform.buildRustPackage`, Cargo/Rust integration tests, GitHub Actions, Beads.
 
-**Tracking:** Reuse epic `codexctl-c0wp5` and its ordered child tasks `codexctl-j0nlh`, `codexctl-ri4hx`, `codexctl-0nhhh`, and `codexctl-8ycvh`; do not create duplicate execution Beads.
+**Tracking:** Reuse epic `codexctl-c0wp5` and its ordered child tasks
+`codexctl-j0nlh`, `codexctl-ri4hx`, `codexctl-0nhhh`, `codexctl-8ycvh`, and
+hosted-acceptance task `codexctl-c0wp5.1`; do not create
+duplicate execution Beads.
 
 ## Global Constraints
 
@@ -22,8 +25,7 @@
 
 ## File Structure
 
-- Modify `.internal/specs/2026-08-12-nix-release-profile-checks-design.md` only to retain the already-approved inline stress-test findings in its existing documentation commit.
-- Create `.internal/plans/2026-08-12-nix-release-profile-checks.md` as this execution contract.
+- Do not modify the committed design or plan during implementation.
 - Modify `tests/release_workflow.rs` to enforce profile inheritance and scope `--release` to `postCheck` while retaining existing portability and CI contracts.
 - Modify `flake.nix` to remove the debug override and select release for the custom integration-test command.
 - Do not modify `.github/workflows/ci.yml`, `nix/home-manager.nix`, Cargo metadata, runtime code, or storage/security tests.
@@ -33,44 +35,32 @@
 ### Task 1: Finalize the reviewed design on the current upstream base
 
 **Files:**
-- Modify: `.internal/specs/2026-08-12-nix-release-profile-checks-design.md`
-- Create: `.internal/plans/2026-08-12-nix-release-profile-checks.md`
+- Modify: none
 
 **Interfaces:**
-- Consumes: approved design commit `b376927d` and the resolved 9/9 stress-test findings.
+- Consumes: the clean committed design and plan, including both completed stress tests.
 - Produces: a clean branch rebased onto current `origin/main`, with the target files rechecked before measurement or code changes.
 
 **Acceptance Criteria:**
-- The approved inline stress-test findings are included in the design commit.
+- The approved spec, plan, and both stress-test findings are committed before execution.
 - The branch is rebased onto current `origin/main` before baseline measurement.
 - `flake.nix`, `tests/release_workflow.rs`, `Cargo.toml`, `Cargo.lock`, and `.github/workflows/ci.yml` retain the behavior analyzed by the design, or execution stops for renewed design review.
 - No unrelated worktree changes are staged, amended, or rebased away.
 
-- [ ] **Step 1: Audit the exact documentation diff**
+- [ ] **Step 1: Audit the clean planning stack**
 
 Run:
 
 ```bash
 git status --short --branch
-git diff -- .internal/specs/2026-08-12-nix-release-profile-checks-design.md
-git diff --check
+git log --oneline --decorate --max-count=4
+git diff --name-only origin/main...HEAD
 ```
 
-Expected: only the approved stress-test additions to the design and this new plan are uncommitted; whitespace checks pass.
+Expected: the worktree is clean and the local stack contains only the approved
+planning documentation; implementation target files are unchanged.
 
-- [ ] **Step 2: Amend only the approved design findings into the restore-point commit**
-
-Run:
-
-```bash
-git add .internal/specs/2026-08-12-nix-release-profile-checks-design.md
-git diff --cached --name-only
-git commit --amend --no-edit
-```
-
-Expected: the cached file list contains only the design spec; the amended commit retains `📝 docs: design release-profile Nix checks`.
-
-- [ ] **Step 3: Rebase onto the current upstream base**
+- [ ] **Step 2: Rebase onto the current upstream base**
 
 Run:
 
@@ -79,9 +69,12 @@ git rebase origin/main
 git log --oneline --left-right HEAD...origin/main
 ```
 
-Expected: rebase completes without conflict and the left/right log contains only the local design commit on the left. If a target file conflicts or upstream now changes a target file, stop and re-run design analysis instead of resolving silently.
+Expected: rebase completes without conflict and the left/right log contains only
+the local planning commits on the left. If a target file conflicts or upstream
+now changes a target file, stop and re-run design analysis instead of resolving
+silently.
 
-- [ ] **Step 4: Reconfirm the analyzed boundary after rebase**
+- [ ] **Step 3: Reconfirm the analyzed boundary after rebase**
 
 Run:
 
@@ -91,20 +84,9 @@ rg -n "cargo test --all-targets -- --test-threads=1" .github/workflows/ci.yml
 git status --short --branch
 ```
 
-Expected: `flake.nix` still has `checkType = "debug"` and a profile-less `postCheck`; the contract still requires debug; CI still contains ordinary debug `cargo test`; only the plan file remains uncommitted.
-
-- [ ] **Step 5: Commit the implementation plan after user approval**
-
-Run:
-
-```bash
-git add .internal/plans/2026-08-12-nix-release-profile-checks.md
-git diff --cached --check
-git diff --cached --name-only
-git commit -m "📝 docs: plan release-profile Nix checks"
-```
-
-Expected: the commit contains only the approved plan.
+Expected: `flake.nix` still has `checkType = "debug"` and a profile-less
+`postCheck`; the contract still requires debug; CI still contains ordinary
+debug `cargo test`; the worktree remains clean.
 
 ### Task 2: Capture the forced before-change package baseline
 
@@ -114,13 +96,13 @@ Expected: the commit contains only the approved plan.
 
 **Interfaces:**
 - Consumes: clean current-base branch with the old debug package checks.
-- Produces: timestamped clean-build log, wall-clock measurement, phase markers, test-selection evidence, and the baseline package output path.
+- Produces: timestamped forced-rebuild log, wall-clock measurement, phase markers, test-selection evidence, and a copied baseline package output.
 
 **Acceptance Criteria:**
 - The baseline rebuild is forced with `--rebuild`; an existing store result or substitute is not accepted as the measurement.
 - The command exits successfully and records total wall time plus build/check phase markers.
 - The log proves the primary package check and custom integration tests use the debug profile before the fix.
-- The baseline output path is retained for after-change output comparison.
+- The baseline output is copied outside the Nix store so garbage collection cannot remove the comparison input.
 
 - [ ] **Step 1: Force and time the baseline build**
 
@@ -134,7 +116,10 @@ set -o pipefail
   | tee /tmp/fwrpm-before.log
 ```
 
-Expected: exit 0; the log contains `Executing cargoBuildHook`, `Executing cargoCheckHook`, `Finished cargoCheckHook`, test results, the output store path, and the `wall_seconds` line.
+Expected: exit 0; the forced top-level package rebuild may reuse warm store
+dependencies. The log contains `Executing cargoBuildHook`, `Executing
+cargoCheckHook`, `Finished cargoCheckHook`, test results, the output store path,
+and the `wall_seconds` line.
 
 - [ ] **Step 2: Record the baseline output and phase evidence**
 
@@ -142,10 +127,31 @@ Run:
 
 ```bash
 nix path-info .# > /tmp/fwrpm-before-path
+baseline_copy=$(mktemp -d /tmp/fwrpm-before-output.XXXXXXXXXX)
+cp -a "$(< /tmp/fwrpm-before-path)/." "${baseline_copy}/"
+printf '%s\n' "${baseline_copy}" > /tmp/fwrpm-before-copy-path
 rg "Executing cargo(Build|Check)Hook|Finished cargo(Build|Check)Hook|cargoCheckHook flags|cargo test|wall_seconds|test result:" /tmp/fwrpm-before.log
 ```
 
-Expected: the saved path is the successfully built package; primary check flags omit `--profile release`, and the custom `cargo test` omits `--release`. Use the leading epoch seconds around hook start/finish lines to report build and check phase durations.
+Expected: the saved path and copied output represent the successfully built
+package; primary check flags omit `--profile release`, and the custom `cargo
+test` omits `--release`. Use the leading epoch seconds around hook start/finish
+lines as integer-second contextual phase durations. If the baseline fails, stop
+and diagnose it before implementation.
+
+- [ ] **Step 3: Record baseline evidence before changing code**
+
+Run:
+
+```bash
+before_wall=$(rg -o 'wall_seconds=[0-9.]+' /tmp/fwrpm-before.log | tail -1)
+before_build=$(awk '/Executing cargoBuildHook/{start=$1} /Finished cargoBuildHook/{print $1-start; exit}' /tmp/fwrpm-before.log)
+before_check=$(awk '/Executing cargoCheckHook/{start=$1} /Finished cargoCheckHook/{print $1-start; exit}' /tmp/fwrpm-before.log)
+baseline_copy=$(< /tmp/fwrpm-before-copy-path)
+bd -C /home/alexander/.beads-planning note codexctl-fwrpm "Forced before-change package rebuild passed: ${before_wall}, cargoBuild=${before_build}s, cargoCheck=${before_check}s at integer-second resolution. Primary and custom checks used the debug profile. Baseline installed output copied to ${baseline_copy}."
+```
+
+Expected: the Bead contains baseline evidence before any implementation edit.
 
 ### Task 3: Enforce and implement one release-profile check graph
 
@@ -166,23 +172,25 @@ Expected: the saved path is the successfully built package; primary check flags 
 
 - [ ] **Step 1: Write the structural failing contract**
 
-In `tests/release_workflow.rs`, replace the debug assertion in `official_release_nix_and_package_paths_remain_feature_free` with:
+In `official_release_nix_and_package_paths_remain_feature_free`, remove only the
+old `assert_contract(flake, "checkType = \"debug\"");` line. In
+`nix_package_check_is_portable_and_bounded`, remove
+`"checkType = \"debug\";"` from the `required` array, then add this after that
+required-contract loop:
 
 ```rust
+    let package = flake
+        .split_once("package = pkgs.rustPlatform.buildRustPackage {")
+        .expect("Nix must retain the installable Rust package")
+        .1
+        .split_once("\n        };")
+        .expect("Nix Rust package must remain a bounded attribute set")
+        .0;
     assert!(
-        !flake.contains("checkType"),
+        !package.contains("checkType"),
         "Nix package checks must inherit the release build profile"
     );
-```
-
-Remove `"checkType = \"debug\";"` from the `required` array in `nix_package_check_is_portable_and_bounded`, then add this after that required-contract loop:
-
-```rust
-    assert!(
-        !flake.contains("checkType"),
-        "Nix package checks must inherit the release build profile"
-    );
-    let post_check = flake
+    let post_check = package
         .split_once("postCheck = ''")
         .expect("Nix package checks must retain the custom integration post-check")
         .1
@@ -203,7 +211,9 @@ Run:
 nix develop path:. --command cargo test --test release_workflow
 ```
 
-Expected: FAIL in both profile assertions because `flake.nix` still contains `checkType = "debug"`; this proves the test detects the old configuration.
+Expected: FAIL in `nix_package_check_is_portable_and_bounded` because the bounded
+package block still contains `checkType = "debug"`; this proves the owning test
+detects the old configuration.
 
 - [ ] **Step 3: Apply the minimal Nix fix**
 
@@ -260,23 +270,22 @@ git commit -m "⚡️ perf: reuse release profile in Nix checks (codexctl-fwrpm)
 
 Expected: the commit contains exactly the Nix expression and its contract test.
 
-### Task 4: Verify local readiness and obtain hosted acceptance
+### Task 4: Verify local Linux readiness
 
 **Files:**
 - Modify: none unless a directly related failure requires returning to Task 3.
-- Evidence: `/tmp/fwrpm-after.log`, `/tmp/fwrpm-after-path`, Beads notes, and later GitHub Actions check results.
+- Evidence: `/tmp/fwrpm-after.log`, `/tmp/fwrpm-after-path`, and Beads notes.
 
 **Interfaces:**
 - Consumes: the committed implementation and `/tmp/fwrpm-before-*` evidence.
-- Produces: local Linux correctness/timing comparison, exact package-output comparison, and—only after separate publication authorization—hosted Linux/macOS acceptance.
+- Produces: local Linux correctness/timing comparison and exact package-output comparison.
 
 **Acceptance Criteria:**
 - Nix formatting/evaluation, Rust formatting, Clippy, focused contracts, and relevant workspace tests pass.
 - A forced Linux package rebuild passes with primary `--profile release`, custom `--release`, retained tests, and no debug-profile command or artifact graph.
 - Before/after phase and wall timings are recorded as contextual evidence.
 - The before/after installed package outputs are byte-for-byte identical, preserving the optimized binary and package metadata.
-- Hosted Linux and macOS Nix package jobs pass before `codexctl-fwrpm` is closed.
-- No push, PR, or Bead closure occurs without explicit user authorization.
+- Local evidence is recorded without claiming hosted acceptance or closing `codexctl-fwrpm`.
 
 - [ ] **Step 1: Run static and workspace quality gates**
 
@@ -316,10 +325,14 @@ Run:
 rg "Executing cargo(Build|Check)Hook|Finished cargo(Build|Check)Hook|cargoCheckHook flags|cargo test|wall_seconds|test result:" /tmp/fwrpm-after.log
 rg -- "--profile release|--release" /tmp/fwrpm-after.log
 if rg -- "--profile debug|target/.*/debug" /tmp/fwrpm-after.log; then exit 1; fi
-diff -qr "$(< /tmp/fwrpm-before-path)" "$(< /tmp/fwrpm-after-path)"
+diff -qr "$(< /tmp/fwrpm-before-copy-path)" "$(< /tmp/fwrpm-after-path)"
 ```
 
-Expected: primary check flags contain `--profile release`; the custom command contains `--release`; core, TUI, `release_workflow`, and `release_metadata` tests execute; no debug command/artifact path appears; installed outputs are identical. Report hook and wall timings from both timestamped logs without imposing a pass/fail threshold.
+Expected: primary check flags contain `--profile release`; the custom command
+contains `--release`; core, TUI, `release_workflow`, and `release_metadata` tests
+execute; no debug command/artifact path appears; installed outputs are
+identical. Report hook and wall timings from both timestamped logs at
+integer-second phase resolution without imposing a pass/fail threshold.
 
 - [ ] **Step 4: Record local evidence without closing the Bead**
 
@@ -337,15 +350,34 @@ bd -C /home/alexander/.beads-planning note codexctl-fwrpm "Local Linux verificat
 git status --short --branch
 ```
 
-Expected: the note contains concrete evidence rather than a success claim; the branch is clean and `codexctl-fwrpm` remains in progress.
+Expected: the note contains concrete evidence rather than a hosted success
+claim; the branch is clean and `codexctl-fwrpm` remains in progress. Task 4 can
+close while hosted acceptance remains blocked on separate authority.
 
-- [ ] **Step 5: Obtain explicit publication authorization**
+### Task 5: Publish and obtain hosted acceptance
+
+**Files:**
+- Modify: none unless a directly related hosted failure returns execution to Task 3.
+- Evidence: draft PR, GitHub Actions job results and logs, and Beads notes.
+
+**Interfaces:**
+- Consumes: completed local Linux verification and a clean committed branch.
+- Produces: hosted Linux/macOS Nix evidence and a closure recommendation.
+
+**Acceptance Criteria:**
+- Publication occurs only after explicit user authorization.
+- `Nix (ubuntu-latest)` and `Nix (macos-latest)` pass.
+- Each job's `Build Nix package` step log demonstrates release-profile package checks.
+- `nix/home-manager.nix` remains unchanged and the local installed-output comparison is byte-identical.
+- `codexctl-fwrpm` closes only after explicit user authorization.
+
+- [ ] **Step 1: Obtain explicit publication authorization**
 
 Ask the user whether to push the branch and open a draft PR. Do not infer this authority from approval to execute local implementation.
 
 Expected: execution pauses unless the user explicitly authorizes publication.
 
-- [ ] **Step 6: Publish and verify hosted acceptance only when authorized**
+- [ ] **Step 2: Publish and verify hosted acceptance only when authorized**
 
 Use the repository's GitHub publication workflow to push the rebased branch and open a draft PR. Then inspect the exact PR checks and logs, requiring at minimum:
 
@@ -354,9 +386,25 @@ Nix (ubuntu-latest) / Build Nix package
 Nix (macos-latest) / Build Nix package
 ```
 
-Expected: both hosted Nix package jobs pass and their logs show release-profile package checks. Record hosted timings as contextual evidence. If a failure is unrelated, file a separate Bead; do not weaken `fwrpm` to mask it.
+Expected: both hosted Nix package jobs pass. Inspect each job log rather than
+relying only on aggregate status; its `Build Nix package` step shows the primary
+release profile and custom `--release`. Record hosted timings as contextual
+evidence. If a failure is unrelated, file a separate Bead; do not weaken
+`fwrpm` to mask it.
 
-- [ ] **Step 7: Request closure authorization**
+- [ ] **Step 3: Reconfirm Home Manager/package compatibility**
+
+Run:
+
+```bash
+git diff --exit-code origin/main...HEAD -- nix/home-manager.nix
+diff -qr "$(< /tmp/fwrpm-before-copy-path)" "$(< /tmp/fwrpm-after-path)"
+```
+
+Expected: Home Manager wiring is unchanged and the installed package output is
+byte-identical.
+
+- [ ] **Step 4: Request closure authorization**
 
 Present the local, hosted, Home Manager/package-output, and timing evidence to the user. Close `codexctl-fwrpm` only after explicit authorization:
 
@@ -365,3 +413,42 @@ bd -C /home/alexander/.beads-planning close codexctl-fwrpm --reason "Release-pro
 ```
 
 Expected: the Bead remains open unless every acceptance criterion is evidenced and the user authorizes closure.
+
+## Stress Test Results: Nix Release-Profile Checks Implementation Plan
+
+### Resolved Decisions
+
+- Begin execution from the committed planning stack; remove obsolete amend and
+  plan-commit steps before rebasing.
+- Describe `--rebuild` evidence as a forced top-level package rebuild with warm
+  dependencies possible, not an empty-store clean build.
+- Keep integer-second phase timestamps and `/usr/bin/time` totals as contextual
+  measurements rather than adding a benchmark dependency.
+- Scope `checkType` and `postCheck` assertions to the bounded installable package
+  expression, with one owning regression test.
+- Split local verification from publication and hosted acceptance.
+- Copy the baseline installed output outside the Nix store before implementation
+  into a unique `mktemp` directory so garbage collection and stale-path
+  collisions cannot invalidate comparison evidence.
+- Keep all security, failure, publication, and closure boundaries fail-closed.
+
+### Changes Made
+
+- Rewrote Task 1 for the already-committed restore point.
+- Tightened the structural test code and expected red signal.
+- Added immediate baseline evidence capture and a durable output copy.
+- Made the baseline copy collision-safe for repeated or interrupted executions.
+- Split the former combined verification task into local Task 4 and hosted Task 5.
+- Required per-job hosted log inspection and explicit Home Manager compatibility
+  checks.
+
+### Deferred / Parking Lot
+
+- Publication, hosted Linux/macOS acceptance, and Bead closure remain gated on
+  explicit user authorization.
+
+### Confidence Assessment
+
+- Overall: High
+- Areas of concern: Timing comparisons remain host- and store-state-dependent;
+  they are useful context but not correctness gates.
