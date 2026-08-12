@@ -135,9 +135,9 @@
             assert setup["fix_hint"] is None, setup
             assert "evidence" not in setup, setup
         trust = named_check(checks, "Codex hook trust")
-        assert trust["status"] == "advisory", trust
-        assert "trust unverified" in trust["message"], trust
-        assert "/hooks" in trust["fix_hint"], trust
+        assert trust["status"] == "pass", trust
+        assert trust["message"] == "1 enabled cbrain hook trusted", trust
+        assert trust["fix_hint"] is None, trust
 
         mixed_project = f"{home}/mixed-project"
         mixed_config = f"{mixed_project}/.config"
