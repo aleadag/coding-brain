@@ -444,6 +444,16 @@ mod provider_snapshot_tests {
         file
     }
 
+    fn fixture_cat_command() -> std::process::Command {
+        let path = std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH is available for process tests"),
+        )
+        .map(|directory| directory.join("cat"))
+        .find(|candidate| candidate.is_file())
+        .expect("cat is available on the test PATH");
+        std::process::Command::new(path)
+    }
+
     #[test]
     fn process_snapshot_command_uses_portable_elapsed_and_stable_start_columns() {
         assert_eq!(
@@ -502,8 +512,9 @@ mod provider_snapshot_tests {
     #[test]
     fn process_snapshot_command_accepts_recognized_rows_beyond_terminal_limit() {
         let fixture = write_process_snapshot_fixture(256 * 1024);
-        let snapshot =
-            capture_process_snapshot_with(std::process::Command::new("cat").arg(fixture.path()));
+        let mut command = fixture_cat_command();
+        assert!(Path::new(command.get_program()).is_absolute());
+        let snapshot = capture_process_snapshot_with(command.arg(fixture.path()));
 
         assert!(snapshot.succeeded);
         assert_eq!(snapshot.entries.len(), 2);
@@ -525,8 +536,7 @@ mod provider_snapshot_tests {
     #[test]
     fn process_snapshot_command_rejects_output_beyond_process_limit() {
         let fixture = write_process_snapshot_fixture(PROCESS_MAX_CAPTURE_BYTES + 1);
-        let snapshot =
-            capture_process_snapshot_with(std::process::Command::new("cat").arg(fixture.path()));
+        let snapshot = capture_process_snapshot_with(fixture_cat_command().arg(fixture.path()));
 
         assert!(!snapshot.succeeded);
         assert!(snapshot.entries.is_empty());
