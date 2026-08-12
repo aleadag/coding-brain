@@ -252,6 +252,50 @@ fn config_output(records: &[(&str, &str, &str, &str)]) -> Vec<u8> {
     output
 }
 
+#[test]
+fn explicit_project_deadline_is_shared_by_every_git_command() {
+    let fixture = Fixture::new();
+    fixture.write_manifest();
+    let mut runner = CountingRunner::new(fixture.root_replies());
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    let resolved = resolve_lifecycle_project_until_with_environment(
+        &fixture.cwd,
+        &fixture.paths,
+        None,
+        &mut runner,
+        &fixture.environment,
+        deadline,
+    )
+    .unwrap();
+
+    assert_eq!(resolved.provenance, ProjectProvenance::Manifest);
+    assert!(!runner.calls.is_empty());
+    assert!(runner.calls.iter().all(|call| call.1 == deadline));
+}
+
+#[test]
+fn cold_cache_stage_reports_miss() {
+    let fixture = Fixture::new();
+    fixture.write_manifest();
+    let mut runner = CountingRunner::new(fixture.root_replies());
+    let mut cache_outcome = None;
+
+    let resolved = resolve_lifecycle_project_until_with_environment_and_cache_stage(
+        &fixture.cwd,
+        &fixture.paths,
+        None,
+        &mut runner,
+        &fixture.environment,
+        Instant::now() + Duration::from_secs(1),
+        |outcome| cache_outcome = Some(outcome),
+    )
+    .unwrap();
+
+    assert_eq!(cache_outcome, Some(ProjectCacheOutcome::Miss));
+    assert_eq!(resolved.provenance, ProjectProvenance::Manifest);
+}
+
 fn root_reply(root: &Path) -> Reply {
     Reply {
         args: vec!["rev-parse", "--show-toplevel"],

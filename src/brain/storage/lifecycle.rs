@@ -111,7 +111,6 @@ impl BrainDb {
                 transaction.commit()
             },
         )?;
-        ensure_deadline(self.deadline)?;
         Ok(recorded)
     }
 

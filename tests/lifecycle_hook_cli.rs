@@ -1398,10 +1398,17 @@ fn parsed_session_start_keeps_its_timing_event_when_storage_is_unavailable() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("event=session_start stage=storage outcome=storage_unavailable"),
+        stderr.contains("event=session_start stage=parse outcome=success"),
         "{stderr:?}"
     );
-    assert!(!stderr.contains("event=other stage=storage"), "{stderr:?}");
+    assert!(
+        stderr.contains("event=session_start stage=sqlite_open outcome=storage_unavailable"),
+        "{stderr:?}"
+    );
+    assert!(
+        !stderr.contains("event=other stage=sqlite_open"),
+        "{stderr:?}"
+    );
 }
 
 #[test]

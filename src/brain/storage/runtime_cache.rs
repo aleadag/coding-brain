@@ -55,6 +55,10 @@ fn retry_cache_busy_until_deadline(_attempt: i32) -> bool {
 pub struct CacheDeadline(Instant);
 
 impl CacheDeadline {
+    pub fn at(deadline: Instant) -> Self {
+        Self(deadline)
+    }
+
     pub fn after(duration: Duration) -> Self {
         Self(Instant::now() + duration)
     }

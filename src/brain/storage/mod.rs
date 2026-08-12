@@ -17,6 +17,8 @@ mod security;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(test)]
+pub(crate) use maintenance::with_sqlite_fault;
 
 #[cfg(feature = "fault-injection")]
 #[allow(unused_imports)]

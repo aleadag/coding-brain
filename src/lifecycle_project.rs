@@ -659,7 +659,60 @@ pub(crate) fn resolve_lifecycle_project(
         Ok(environment) => environment,
         Err(_) => return Ok(resolve_without_discovery(cwd)),
     };
-    resolve_lifecycle_project_at_deadline(cwd, paths, reader, runner, &environment, deadline)
+    resolve_lifecycle_project_until_with_environment_and_cache_stage(
+        cwd,
+        paths,
+        reader,
+        runner,
+        &environment,
+        deadline,
+        |_| {},
+    )
+}
+
+pub(crate) fn resolve_lifecycle_project_until(
+    cwd: &Path,
+    paths: &CodingBrainPaths,
+    reader: Option<&RuntimeCacheReader>,
+    runner: &mut impl LifecycleProjectRunner,
+    deadline: Instant,
+) -> Result<ResolvedLifecycleProject, LifecycleProjectError> {
+    let environment = match DiscoveryEnvironment::current(deadline) {
+        Ok(environment) => environment,
+        Err(_) => return Ok(resolve_without_discovery(cwd)),
+    };
+    resolve_lifecycle_project_until_with_environment_and_cache_stage(
+        cwd,
+        paths,
+        reader,
+        runner,
+        &environment,
+        deadline,
+        |_| {},
+    )
+}
+
+pub(crate) fn resolve_lifecycle_project_until_with_cache_stage(
+    cwd: &Path,
+    paths: &CodingBrainPaths,
+    reader: Option<&RuntimeCacheReader>,
+    runner: &mut impl LifecycleProjectRunner,
+    deadline: Instant,
+    on_cache: impl FnOnce(ProjectCacheOutcome),
+) -> Result<ResolvedLifecycleProject, LifecycleProjectError> {
+    let environment = match DiscoveryEnvironment::current(deadline) {
+        Ok(environment) => environment,
+        Err(_) => return Ok(resolve_without_discovery(cwd)),
+    };
+    resolve_lifecycle_project_until_with_environment_and_cache_stage(
+        cwd,
+        paths,
+        reader,
+        runner,
+        &environment,
+        deadline,
+        on_cache,
+    )
 }
 
 fn resolve_lifecycle_project_with_environment<C: MonotonicClock>(
@@ -675,10 +728,18 @@ fn resolve_lifecycle_project_with_environment<C: MonotonicClock>(
     else {
         return Ok(resolve_without_discovery(cwd));
     };
-    resolve_lifecycle_project_at_deadline(cwd, paths, reader, runner, environment, deadline)
+    resolve_lifecycle_project_until_with_environment_and_cache_stage(
+        cwd,
+        paths,
+        reader,
+        runner,
+        environment,
+        deadline,
+        |_| {},
+    )
 }
 
-fn resolve_lifecycle_project_at_deadline(
+fn resolve_lifecycle_project_until_with_environment(
     cwd: &Path,
     paths: &CodingBrainPaths,
     reader: Option<&RuntimeCacheReader>,
@@ -686,12 +747,33 @@ fn resolve_lifecycle_project_at_deadline(
     environment: &DiscoveryEnvironment,
     deadline: Instant,
 ) -> Result<ResolvedLifecycleProject, LifecycleProjectError> {
+    resolve_lifecycle_project_until_with_environment_and_cache_stage(
+        cwd,
+        paths,
+        reader,
+        runner,
+        environment,
+        deadline,
+        |_| {},
+    )
+}
+
+fn resolve_lifecycle_project_until_with_environment_and_cache_stage(
+    cwd: &Path,
+    paths: &CodingBrainPaths,
+    reader: Option<&RuntimeCacheReader>,
+    runner: &mut impl LifecycleProjectRunner,
+    environment: &DiscoveryEnvironment,
+    deadline: Instant,
+    on_cache: impl FnOnce(ProjectCacheOutcome),
+) -> Result<ResolvedLifecycleProject, LifecycleProjectError> {
     ensure_before(deadline)
         .map_err(|_| LifecycleProjectError::Cwd(io::Error::other("deadline")))?;
     let canonical_cwd = fs::canonicalize(cwd).map_err(LifecycleProjectError::Cwd)?;
     ensure_before(deadline)
         .map_err(|_| LifecycleProjectError::Cwd(io::Error::other("deadline")))?;
     let (hit, initial_outcome) = lookup_cache(&canonical_cwd, reader, environment, deadline);
+    on_cache(initial_outcome);
     if let Some(hit) = hit {
         return Ok(hit);
     }

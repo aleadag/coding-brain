@@ -125,23 +125,33 @@ impl HookEventClass {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HookStage {
-    Input,
+    CliInput,
     Parse,
-    Storage,
-    Lifecycle,
-    Activity,
+    ParentDiscovery,
+    ProjectCache,
     ProjectGit,
+    SqliteOpen,
+    LifecycleCommit,
+    PostToolCorrelation,
+    ActivityCommit,
+    CacheRefresh,
+    Total,
 }
 
 impl HookStage {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Input => "input",
+            Self::CliInput => "cli_input",
             Self::Parse => "parse",
-            Self::Storage => "storage",
-            Self::Lifecycle => "lifecycle",
-            Self::Activity => "activity",
+            Self::ParentDiscovery => "parent_discovery",
+            Self::ProjectCache => "project_cache",
             Self::ProjectGit => "project_git",
+            Self::SqliteOpen => "sqlite_open",
+            Self::LifecycleCommit => "lifecycle_commit",
+            Self::PostToolCorrelation => "posttool_correlation",
+            Self::ActivityCommit => "activity_commit",
+            Self::CacheRefresh => "cache_refresh",
+            Self::Total => "total",
         }
     }
 }
@@ -155,6 +165,12 @@ pub(crate) enum HookOutcome {
     StorageUnavailable,
     Rejected,
     Error,
+    CacheHit,
+    CacheMiss,
+    CacheInvalid,
+    CacheBypassed,
+    NonCacheable,
+    DiscoveryFailure,
 }
 
 impl HookOutcome {
@@ -167,6 +183,12 @@ impl HookOutcome {
             Self::StorageUnavailable => "storage_unavailable",
             Self::Rejected => "rejected",
             Self::Error => "error",
+            Self::CacheHit => "cache_hit",
+            Self::CacheMiss => "cache_miss",
+            Self::CacheInvalid => "cache_invalid",
+            Self::CacheBypassed => "cache_bypassed",
+            Self::NonCacheable => "non_cacheable",
+            Self::DiscoveryFailure => "discovery_failure",
         }
     }
 }
@@ -340,6 +362,64 @@ mod tests {
         assert_eq!(
             HookEventClass::from_lifecycle_name("untrusted-event"),
             HookEventClass::Other
+        );
+    }
+
+    #[test]
+    fn lifecycle_pipeline_stage_names_are_closed_and_ordered() {
+        let stages = [
+            HookStage::CliInput,
+            HookStage::Parse,
+            HookStage::ParentDiscovery,
+            HookStage::ProjectCache,
+            HookStage::ProjectGit,
+            HookStage::SqliteOpen,
+            HookStage::LifecycleCommit,
+            HookStage::PostToolCorrelation,
+            HookStage::ActivityCommit,
+            HookStage::CacheRefresh,
+            HookStage::Total,
+        ];
+
+        assert_eq!(
+            stages.map(HookStage::as_str),
+            [
+                "cli_input",
+                "parse",
+                "parent_discovery",
+                "project_cache",
+                "project_git",
+                "sqlite_open",
+                "lifecycle_commit",
+                "posttool_correlation",
+                "activity_commit",
+                "cache_refresh",
+                "total",
+            ]
+        );
+    }
+
+    #[test]
+    fn project_cache_outcomes_are_closed_without_treating_misses_as_errors() {
+        let outcomes = [
+            HookOutcome::CacheHit,
+            HookOutcome::CacheMiss,
+            HookOutcome::CacheInvalid,
+            HookOutcome::CacheBypassed,
+            HookOutcome::NonCacheable,
+            HookOutcome::DiscoveryFailure,
+        ];
+
+        assert_eq!(
+            outcomes.map(HookOutcome::as_str),
+            [
+                "cache_hit",
+                "cache_miss",
+                "cache_invalid",
+                "cache_bypassed",
+                "non_cacheable",
+                "discovery_failure",
+            ]
         );
     }
 }
