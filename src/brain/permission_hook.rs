@@ -2572,7 +2572,9 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _environment = set_test_path_environment(home.path());
+        let diagnostics = crate::brain::storage::SidecarDiagnosticGuard::arm();
         let state_root = initialize_sqlite_hook_storage(home.path());
+        drop(diagnostics);
         let wal = state_root.join("db/brain.sqlite3-wal");
         OpenOptions::new()
             .create(true)

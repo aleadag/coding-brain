@@ -41,6 +41,9 @@ use rusqlite::{Connection, OpenFlags};
 
 use security::{SecureDatabaseDirectory, SecurityError};
 
+#[cfg(test)]
+pub(crate) use security::SidecarDiagnosticGuard;
+
 #[allow(unused_imports)]
 pub use activity::{ActivityCursor, ActivityPage, ActivityRecord, RecoveryReservationOutcome};
 #[allow(unused_imports)]
