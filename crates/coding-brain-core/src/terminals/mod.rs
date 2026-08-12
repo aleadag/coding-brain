@@ -22,7 +22,6 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Stdio;
 use std::process::{Command, ExitStatus};
-#[cfg(any(unix, test))]
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -30,6 +29,8 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
 const CAPTURE_LIMIT_EXCEEDED: &str = "capture exceeded output limit";
+#[cfg(unix)]
+const CAPTURE_TIMEOUT_UNAVAILABLE: &str = "terminal capture timeout unavailable";
 const CAPTURE_LINES: usize = 80;
 
 #[derive(Debug)]
@@ -307,6 +308,9 @@ pub(crate) fn run_bounded_with(
 ) -> Result<BoundedOutput, String> {
     use std::os::unix::process::CommandExt;
 
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| CAPTURE_TIMEOUT_UNAVAILABLE.to_string())?;
     command.process_group(0);
     let mut child = command
         .stdout(Stdio::piped())
@@ -327,7 +331,6 @@ pub(crate) fn run_bounded_with(
         drop(stderr);
         return Err("terminal capture pipe configuration failed".into());
     }
-    let deadline = std::time::Instant::now() + timeout;
     let mut status = None;
     let mut stdout_open = true;
     let mut stderr_open = true;
@@ -3735,6 +3738,7 @@ mod tests {
         assert_eq!(io.sends.load(Ordering::SeqCst), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bounded_command_runner_handles_success_and_non_zero_exit() {
         let success = run_bounded(Command::new("sh").args(["-c", "printf ok"])).unwrap();
@@ -3745,12 +3749,14 @@ mod tests {
         assert_eq!(failure.status.code(), Some(7));
     }
 
+    #[cfg(unix)]
     #[test]
     fn bounded_command_runner_times_out() {
         let error = run_bounded(Command::new("sh").args(["-c", "sleep 2"])).unwrap_err();
         assert!(error.contains("timed out"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn bounded_command_runner_does_not_wait_for_inherited_pipe() {
         let started = std::time::Instant::now();
@@ -3760,10 +3766,27 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    #[cfg(unix)]
     #[test]
     fn bounded_command_runner_rejects_oversized_output() {
         let error = run_bounded(Command::new("sh").args(["-c", "printf '%70000s' x"])).unwrap_err();
         assert_eq!(error, CAPTURE_LIMIT_EXCEEDED);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_runner_rejects_unrepresentable_timeout_without_spawning() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("spawned");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf spawned > \"$1\"", "sh"])
+            .arg(&marker);
+
+        let error = run_bounded_with(&mut command, Duration::MAX, MAX_CAPTURE_BYTES).unwrap_err();
+
+        assert_eq!(error, "terminal capture timeout unavailable");
+        assert!(!marker.exists());
     }
 
     #[cfg(unix)]
