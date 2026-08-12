@@ -962,7 +962,8 @@ fn most_specific_row_wins_and_invalid_selected_row_never_falls_outward() {
 fn separate_linked_worktrees_keep_closed_rows_and_worktree_config_evidence() {
     let mut fixture = Fixture::new();
     fs::remove_dir_all(fixture.root.join(".git")).unwrap();
-    let common = fixture._temp.path().join("common.git");
+    let temp_root = fixture.root.parent().unwrap();
+    let common = temp_root.join("common.git");
     fs::create_dir_all(&common).unwrap();
     let common_config = common.join("config");
     fs::write(
@@ -973,7 +974,7 @@ fn separate_linked_worktrees_keep_closed_rows_and_worktree_config_evidence() {
     fixture.git_config = common_config.clone();
 
     let first_config = create_linked_worktree(&fixture.root, &common, "one");
-    let second_root = fixture._temp.path().join("repo-two");
+    let second_root = temp_root.join("repo-two");
     let second_cwd = second_root.join("src");
     fs::create_dir_all(&second_cwd).unwrap();
     let second_config = create_linked_worktree(&second_root, &common, "two");
