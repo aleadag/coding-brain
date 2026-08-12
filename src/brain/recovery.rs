@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coding_brain_core::brain_activity::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, ActivityKind, ActivityState, MAX_ACTIVITY_FIELD_BYTES,
@@ -32,6 +32,7 @@ use crate::config::BrainConfig;
 pub const MAX_RECOVERY_REASON_BYTES: usize = 160;
 const MAX_RECOVERY_QUEUE: usize = 64;
 const MAX_RECOVERY_WORKERS: usize = 2;
+const RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(4);
 const RECOVERY_STORAGE_TIMEOUT: Duration = Duration::from_millis(25_500);
 
 fn reserve_recovery_sqlite(
@@ -1141,6 +1142,7 @@ struct RecoveryPollState {
     inflight: HashSet<RecoveryAttemptKey>,
     active_workers: usize,
     scan_inflight: bool,
+    next_scan_not_before: Option<Instant>,
     saturation_reported: bool,
     tx: SyncSender<RecoveryPollResult>,
     rx: Receiver<RecoveryPollResult>,
@@ -1207,6 +1209,7 @@ impl RecoveryCoordinator {
                 inflight: HashSet::new(),
                 active_workers: 0,
                 scan_inflight: false,
+                next_scan_not_before: None,
                 saturation_reported: false,
                 tx,
                 rx,
@@ -1219,6 +1222,10 @@ impl RecoveryCoordinator {
     }
 
     pub fn poll(&self) -> Vec<String> {
+        self.poll_at(Instant::now())
+    }
+
+    fn poll_at(&self, now: Instant) -> Vec<String> {
         let mut messages = Vec::new();
         let Ok(mut state) = self.state.try_lock() else {
             return messages;
@@ -1322,9 +1329,15 @@ impl RecoveryCoordinator {
                 state.inflight.remove(&failed_attempt);
             }
         }
-        if !state.scan_inflight && state.active_workers < MAX_RECOVERY_WORKERS {
+        if !state.scan_inflight
+            && state.active_workers < MAX_RECOVERY_WORKERS
+            && state
+                .next_scan_not_before
+                .is_none_or(|deadline| now >= deadline)
+        {
             state.scan_inflight = true;
             state.active_workers += 1;
+            state.next_scan_not_before = Some(now + RECOVERY_SCAN_INTERVAL);
             let tx = state.tx.clone();
             let scan = Arc::clone(&self.scan);
             if std::thread::Builder::new()
@@ -2610,6 +2623,97 @@ mod tests {
         assert!(coordinator.poll().is_empty());
         assert!(started.elapsed() < Duration::from_millis(100));
         blocked.wait();
+    }
+
+    #[test]
+    fn recovery_poll_scan_starts_immediately_then_obeys_start_cooldown() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let scans = Arc::clone(&count);
+        let (started_tx, started_rx) = mpsc::channel();
+        let coordinator = RecoveryCoordinator::with_workers(
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                Vec::new()
+            }),
+            Arc::new(|_, _, _| None),
+        );
+        let start = Instant::now();
+
+        assert!(coordinator.poll_at(start).is_empty());
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            coordinator.state.lock().unwrap().next_scan_not_before,
+            Some(start + RECOVERY_SCAN_INTERVAL)
+        );
+
+        let before = start + RECOVERY_SCAN_INTERVAL - Duration::from_nanos(1);
+        let timeout = Instant::now() + Duration::from_secs(1);
+        while coordinator.state.lock().unwrap().scan_inflight {
+            assert!(coordinator.poll_at(before).is_empty());
+            assert!(Instant::now() < timeout);
+            std::thread::yield_now();
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            coordinator.state.lock().unwrap().next_scan_not_before,
+            Some(start + RECOVERY_SCAN_INTERVAL)
+        );
+
+        assert!(
+            coordinator
+                .poll_at(start + RECOVERY_SCAN_INTERVAL)
+                .is_empty()
+        );
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn recovery_poll_overdue_scan_never_overlaps() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let scans = Arc::clone(&count);
+        let blocked = Arc::new(Barrier::new(2));
+        let worker = Arc::clone(&blocked);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let coordinator = RecoveryCoordinator::with_workers(
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                worker.wait();
+                finished_tx.send(()).unwrap();
+                Vec::new()
+            }),
+            Arc::new(|_, _, _| None),
+        );
+        let start = Instant::now();
+
+        assert!(coordinator.poll_at(start).is_empty());
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            coordinator
+                .poll_at(start + Duration::from_secs(5))
+                .is_empty()
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        blocked.wait();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let before = start + RECOVERY_SCAN_INTERVAL - Duration::from_nanos(1);
+        let timeout = Instant::now() + Duration::from_secs(1);
+        loop {
+            assert!(coordinator.poll_at(before).is_empty());
+            let state = coordinator.state.lock().unwrap();
+            if !state.scan_inflight {
+                assert_eq!(state.active_workers, 0);
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < timeout);
+            std::thread::yield_now();
+        }
     }
 
     #[test]
