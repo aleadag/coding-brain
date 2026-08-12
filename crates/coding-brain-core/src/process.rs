@@ -501,7 +501,7 @@ mod provider_snapshot_tests {
     #[cfg(unix)]
     #[test]
     fn process_snapshot_command_accepts_recognized_rows_beyond_terminal_limit() {
-        let fixture = write_process_snapshot_fixture(128 * 1024);
+        let fixture = write_process_snapshot_fixture(256 * 1024);
         let snapshot =
             capture_process_snapshot_with(std::process::Command::new("cat").arg(fixture.path()));
 

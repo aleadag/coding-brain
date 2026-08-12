@@ -1750,10 +1750,9 @@ pub(crate) fn endpoint_warning(endpoint: &str) -> Option<String> {
 }
 
 fn check_session_discovery() -> Check {
-    // Discovery never errors per se — it returns 0 sessions when nothing
-    // matches. The signal we want is "the scanner runs and finds at
-    // least one session." Zero sessions is normal if no Codex is
-    // running; advise instead of fail.
+    // Process-backed discovery can be unavailable, leaving only partial Claude
+    // results. When it succeeds, an empty scan is advisory and a nonempty scan
+    // passes.
     let scan = coding_brain_core::discovery::scan_agent_sessions_with_status(
         &mut coding_brain_core::discovery::ProviderDiscoveryState::default(),
     );
