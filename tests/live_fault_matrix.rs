@@ -10,17 +10,20 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use coding_brain::brain::storage::{
     BrainDb, MigrationCoordinator, MigrationStatus, OpenRole, StorageDeadline, StoragePaths,
 };
-use coding_brain_core::brain_activity::ActivityEvent;
+use coding_brain_core::brain_activity::{
+    ActivityEvent, ActivityKind, ActivityState, SessionTargetProvenance,
+};
 use coding_brain_core::lifecycle::{
-    ApplyOutcome, LifecycleEvent, LifecycleEventKind, LifecycleIdentity,
+    ApplyOutcome, LifecycleEvent, LifecycleEventKind, LifecycleEventName, LifecycleIdentity,
 };
 use coding_brain_core::paths::{CodingBrainPaths, PathEnvironment};
-use coding_brain_core::project::ProjectIdentity;
+use coding_brain_core::project::{ProjectId, ProjectIdentity};
 use coding_brain_core::provider::{AgentProvider, AgentSessionKey};
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -33,6 +36,8 @@ const PROVIDERS: [AgentProvider; 3] = [
     AgentProvider::Antigravity,
 ];
 
+static LIVE_FAULT_MATRIX_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum MatrixFault {
     AdmissionWrite,
@@ -43,6 +48,8 @@ enum MatrixFault {
     DeliveryWrite,
     Checkpoint,
     MigrationPublish,
+    CacheCommitBeforeCall,
+    CacheCommitAfterReturn,
 }
 
 const FAULTS: [MatrixFault; 8] = [
@@ -67,6 +74,8 @@ impl MatrixFault {
             Self::DeliveryWrite => "delivery-write",
             Self::Checkpoint => "checkpoint",
             Self::MigrationPublish => "migration-publish",
+            Self::CacheCommitBeforeCall => "cache-commit-before-call",
+            Self::CacheCommitAfterReturn => "cache-commit-after-return",
         }
     }
 
@@ -75,16 +84,25 @@ impl MatrixFault {
             Self::AdmissionWrite
             | Self::CommitBeforeCall
             | Self::DeliveryWrite
-            | Self::Checkpoint => "before",
+            | Self::Checkpoint
+            | Self::CacheCommitBeforeCall => "before",
             Self::InferenceExit
             | Self::CommitAfterReturn
             | Self::StdoutWrite
-            | Self::MigrationPublish => "after",
+            | Self::MigrationPublish
+            | Self::CacheCommitAfterReturn => "after",
         }
     }
 
     const fn is_worker(self) -> bool {
         matches!(self, Self::Checkpoint | Self::MigrationPublish)
+    }
+
+    const fn is_lifecycle(self) -> bool {
+        matches!(
+            self,
+            Self::CacheCommitBeforeCall | Self::CacheCommitAfterReturn
+        )
     }
 }
 
@@ -183,7 +201,10 @@ fn expected_cell(fault: MatrixFault) -> ExpectedCell {
             stdout: ExpectedStdout::ExactResponse,
             outcome: ExpectedOutcome::Success,
         },
-        MatrixFault::Checkpoint | MatrixFault::MigrationPublish => {
+        MatrixFault::Checkpoint
+        | MatrixFault::MigrationPublish
+        | MatrixFault::CacheCommitBeforeCall
+        | MatrixFault::CacheCommitAfterReturn => {
             panic!("composite cells do not use the hook-only expected table")
         }
     }
@@ -428,6 +449,8 @@ impl FaultHarness {
         command
             .arg(if fault.is_worker() {
                 "--fault-worker"
+            } else if fault.is_lifecycle() {
+                "--lifecycle-hook"
             } else {
                 "--permission-hook"
             })
@@ -473,6 +496,35 @@ impl FaultHarness {
             .stderr(Stdio::piped());
         self.child = Some(command.spawn().unwrap());
         self.marker_writer.take();
+    }
+
+    fn spawn_armed_lifecycle(&mut self, fault: MatrixFault) {
+        let mut command = self.command_base();
+        self.arm_command(&mut command, fault);
+        command
+            .args(["--provider", "codex"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        self.child = Some(command.spawn().unwrap());
+        self.marker_writer.take();
+        let payload = serde_json::to_vec(&json!({
+            "session_id": "cache-fault-session",
+            "turn_id": "cache-fault-turn",
+            "transcript_path": "/tmp/cache-fault-rollout.jsonl",
+            "cwd": self.home,
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "cache fault payload",
+        }))
+        .unwrap();
+        self.child
+            .as_mut()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&payload)
+            .unwrap();
     }
 
     fn finish_armed(&mut self, fault: MatrixFault) -> ProcessResult {
@@ -1412,7 +1464,10 @@ fn run_hook_fault_case(provider: AgentProvider, fault: MatrixFault) {
             assert_eq!(after_ids, first_ids);
             assert_eq!(after, first);
         }
-        MatrixFault::Checkpoint | MatrixFault::MigrationPublish => unreachable!(),
+        MatrixFault::Checkpoint
+        | MatrixFault::MigrationPublish
+        | MatrixFault::CacheCommitBeforeCall
+        | MatrixFault::CacheCommitAfterReturn => unreachable!(),
     }
     assert_global_permission_counts(&harness, &after);
     harness.assert_no_second_marker();
@@ -1664,9 +1719,11 @@ fn run_migration_case(provider: AgentProvider) {
 }
 
 fn run_live_fault_case(provider: AgentProvider, fault: MatrixFault) {
+    let _guard = LIVE_FAULT_MATRIX_LOCK.lock().unwrap();
     match fault {
         MatrixFault::Checkpoint => run_checkpoint_case(provider),
         MatrixFault::MigrationPublish => run_migration_case(provider),
+        MatrixFault::CacheCommitBeforeCall | MatrixFault::CacheCommitAfterReturn => unreachable!(),
         _ => run_hook_fault_case(provider, fault),
     }
 }
@@ -1932,7 +1989,108 @@ fn assert_hung_restart_is_bounded_and_reaped() {
 }
 
 #[test]
+fn runtime_cache_commit_faults_preserve_exact_brain_evidence() {
+    let _guard = LIVE_FAULT_MATRIX_LOCK.lock().unwrap();
+    for fault in [
+        MatrixFault::CacheCommitBeforeCall,
+        MatrixFault::CacheCommitAfterReturn,
+    ] {
+        let mut harness = FaultHarness::new(fault);
+        harness.prepare_current_storage();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&harness.home)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let manifest = harness.home.join(".coding-brain/project.toml");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(
+            manifest,
+            "schema_version = 1\nproject_id = \"123e4567-e89b-12d3-a456-426614174000\"\n",
+        )
+        .unwrap();
+
+        harness.spawn_armed_lifecycle(fault);
+        let result = harness.finish_armed(fault);
+
+        assert_eq!(result.status.signal(), Some(libc::SIGABRT));
+        assert!(result.stdout.is_empty());
+        let database = BrainDb::open_current(
+            &StoragePaths::at(&harness.state_root),
+            OpenRole::NonHook,
+            StorageDeadline::after(Duration::from_secs(2)),
+        )
+        .unwrap();
+        let lifecycle = database.read_lifecycle().unwrap();
+        let session = lifecycle
+            .sessions
+            .get(
+                &AgentSessionKey::native(AgentProvider::Codex, "cache-fault-session").storage_key(),
+            )
+            .unwrap();
+        assert_eq!(
+            session.latest_event,
+            Some(LifecycleEventName::UserPromptSubmit)
+        );
+        assert_eq!(session.cwd, harness.home);
+        assert_eq!(
+            session.transcript_path.as_deref(),
+            Some(Path::new("/tmp/cache-fault-rollout.jsonl"))
+        );
+        assert_eq!(session.current_turn.as_deref(), Some("cache-fault-turn"));
+        assert_eq!(
+            session
+                .last_signature
+                .as_ref()
+                .map(|signature| &signature.kind),
+            Some(&LifecycleEventKind::UserPromptSubmit)
+        );
+        let activities = database
+            .read_activity_page(None, 8, 128 * 1024)
+            .unwrap()
+            .events;
+        assert_eq!(activities.len(), 1);
+        let activity = &activities[0].event;
+        assert_eq!(activity.kind, ActivityKind::Lifecycle);
+        assert_eq!(activity.state, ActivityState::Abstained);
+        assert_eq!(activity.tool.as_deref(), Some("UserPromptSubmit"));
+        assert_eq!(
+            activity.project.project_id,
+            ProjectId::Stable("123e4567-e89b-12d3-a456-426614174000".into())
+        );
+        assert_eq!(activity.project.cwd, harness.home);
+        let target = activity.session.as_ref().unwrap();
+        assert_eq!(target.provider, AgentProvider::Codex);
+        assert_eq!(target.session_id, "cache-fault-session");
+        assert_eq!(target.turn_id.as_deref(), Some("cache-fault-turn"));
+        assert_eq!(target.tool_use_id, None);
+        assert_eq!(target.project_id, activity.project.project_id);
+        assert_eq!(target.cwd, harness.home);
+        assert_eq!(target.provenance, SessionTargetProvenance::Structured);
+        let cache = harness.state_root.join("db/runtime-cache-v1.sqlite3");
+        let rows = Connection::open(cache)
+            .unwrap()
+            .query_row("SELECT count(*) FROM project_identity_cache", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(
+            rows,
+            if fault == MatrixFault::CacheCommitAfterReturn {
+                1
+            } else {
+                0
+            }
+        );
+    }
+}
+
+#[test]
 fn declared_matrix_is_the_exact_cartesian_product() {
+    let _guard = LIVE_FAULT_MATRIX_LOCK.lock().unwrap();
     assert_hung_child_without_marker_is_bounded_and_reaped();
     assert_hung_restart_is_bounded_and_reaped();
     let declared = DECLARED_CELLS.into_iter().collect::<BTreeSet<_>>();

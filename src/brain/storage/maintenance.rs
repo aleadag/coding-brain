@@ -136,7 +136,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(super) fn with_sqlite_fault<T>(
+pub(crate) fn with_sqlite_fault<T>(
     point: &'static str,
     extended_code: i32,
     operation: impl FnOnce() -> T,

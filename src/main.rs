@@ -17,13 +17,15 @@ mod doctor;
 mod executable;
 mod init;
 mod lifecycle_hook;
+mod lifecycle_project;
+mod lifecycle_timing;
 mod provider_hooks;
 mod runtime;
 
 use std::io;
 #[cfg(feature = "fault-injection")]
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
@@ -377,6 +379,7 @@ fn select_mode(cli: &Cli) -> RunMode {
 }
 
 fn main() -> io::Result<()> {
+    let started = Instant::now();
     let cli = Cli::parse();
     #[cfg(feature = "fault-injection")]
     if fault_activation_requested(&cli) {
@@ -401,7 +404,7 @@ fn main() -> io::Result<()> {
     let is_internal_hook =
         cli.permission_hook || cli.lifecycle_hook || cli.recovery_hook || cli.distill_once;
     let is_storage_command = matches!(cli.command, Some(Command::Storage { .. }));
-    let result = run_main(cli);
+    let result = run_main(cli, started);
     if result.is_ok() && !is_internal_hook && !is_storage_command {
         maybe_print_star_prompt();
     }
@@ -438,12 +441,14 @@ fn fault_activation(
     ) else {
         return Err(io::Error::other("complete fault activation is required"));
     };
-    if cli.permission_hook == cli.fault_worker {
+    let fault_role_count = usize::from(cli.permission_hook)
+        + usize::from(cli.lifecycle_hook)
+        + usize::from(cli.fault_worker);
+    if fault_role_count != 1 {
         return Err(io::Error::other("exactly one fault role is required"));
     }
-    if cli.permission_hook
+    if (cli.permission_hook || cli.lifecycle_hook)
         && (cli.shell_safety_helper
-            || cli.lifecycle_hook
             || cli.recovery_hook
             || matches!(cli.command.as_ref(), Some(Command::Storage { .. })))
     {
@@ -451,29 +456,32 @@ fn fault_activation(
             "fault activation cannot be combined with a higher-precedence mode",
         ));
     }
-    match (cli.permission_hook, selection) {
-        (
-            true,
-            brain::storage::FaultSelection::Matrix(
-                brain::storage::FaultPoint::Checkpoint
-                | brain::storage::FaultPoint::MigrationPublish,
-            )
-            | brain::storage::FaultSelection::MigrationRegression(_),
-        ) => return Err(io::Error::other("fault point requires fault-worker role")),
-        (
-            false,
-            brain::storage::FaultSelection::Matrix(
-                brain::storage::FaultPoint::AdmissionWrite
-                | brain::storage::FaultPoint::InferenceExit
-                | brain::storage::FaultPoint::CommitBeforeCall
-                | brain::storage::FaultPoint::CommitAfterReturn
-                | brain::storage::FaultPoint::StdoutWrite
-                | brain::storage::FaultPoint::DeliveryWrite,
-            ),
-        ) => {
+    match selection {
+        brain::storage::FaultSelection::Matrix(
+            brain::storage::FaultPoint::Checkpoint | brain::storage::FaultPoint::MigrationPublish,
+        )
+        | brain::storage::FaultSelection::MigrationRegression(_)
+            if !cli.fault_worker =>
+        {
+            return Err(io::Error::other("fault point requires fault-worker role"));
+        }
+        brain::storage::FaultSelection::Matrix(
+            brain::storage::FaultPoint::AdmissionWrite
+            | brain::storage::FaultPoint::InferenceExit
+            | brain::storage::FaultPoint::CommitBeforeCall
+            | brain::storage::FaultPoint::CommitAfterReturn
+            | brain::storage::FaultPoint::StdoutWrite
+            | brain::storage::FaultPoint::DeliveryWrite,
+        ) if !cli.permission_hook => {
             return Err(io::Error::other(
                 "fault point requires permission-hook role",
             ));
+        }
+        brain::storage::FaultSelection::Matrix(
+            brain::storage::FaultPoint::CacheCommitBeforeCall
+            | brain::storage::FaultPoint::CacheCommitAfterReturn,
+        ) if !cli.lifecycle_hook => {
+            return Err(io::Error::other("fault point requires lifecycle-hook role"));
         }
         _ => {}
     }
@@ -582,11 +590,12 @@ fn early_config_action(cli: &Cli) -> Option<&ConfigAction> {
     }
 }
 
-fn run_main(cli: Cli) -> io::Result<()> {
+fn run_main(cli: Cli, started: Instant) -> io::Result<()> {
     if cli.lifecycle_hook {
         lifecycle_hook::run(
             cli.provider.map(Into::into).unwrap_or_default(),
             cli.antigravity_hook_event.as_deref(),
+            lifecycle_timing::HookBudget::from_start(started),
         );
         return Ok(());
     }

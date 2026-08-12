@@ -11,11 +11,14 @@ mod maintenance;
 mod migration;
 mod permissions;
 mod review;
+mod runtime_cache;
 mod schema;
 mod security;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(test)]
+pub(crate) use maintenance::with_sqlite_fault;
 
 #[cfg(feature = "fault-injection")]
 #[allow(unused_imports)]
@@ -70,6 +73,12 @@ pub use permissions::{
 };
 #[allow(unused_imports)]
 pub use review::{ReviewEligibility, ReviewEligibleOccurrence, ReviewSurfaceState};
+#[allow(unused_imports)]
+pub use runtime_cache::{
+    CacheDeadline, CacheProvenance, CacheRootKey, CacheRow, MAX_RUNTIME_CACHE_ROWS,
+    RUNTIME_CACHE_APPLICATION_ID, RUNTIME_CACHE_SCHEMA_VERSION, RuntimeCacheBypass,
+    RuntimeCacheReader, RuntimeCacheWriter,
+};
 
 pub const BRAIN_APPLICATION_ID: i32 = 0x4342_524e;
 pub const BRAIN_SCHEMA_VERSION: i32 = 1;
@@ -78,6 +87,7 @@ pub const REVIEW_SCHEMA_VERSION: i32 = 1;
 
 const BRAIN_DATABASE_NAME: &CStr = c"brain.sqlite3";
 const REVIEW_DATABASE_NAME: &CStr = c"review.sqlite3";
+const RUNTIME_CACHE_DATABASE_NAME: &CStr = c"runtime-cache-v1.sqlite3";
 const REVIEW_RESET_GATE_NAME: &CStr = c"review-reset.lock";
 const MIGRATION_LOCK_NAME: &CStr = c"migration.lock";
 
@@ -107,6 +117,11 @@ impl StoragePaths {
     pub fn review_db(&self) -> PathBuf {
         self.db_dir
             .join(OsStr::from_bytes(REVIEW_DATABASE_NAME.to_bytes()))
+    }
+
+    pub fn runtime_cache_v1(&self) -> PathBuf {
+        self.db_dir
+            .join(OsStr::from_bytes(RUNTIME_CACHE_DATABASE_NAME.to_bytes()))
     }
 
     fn brain_learning_root(&self) -> PathBuf {
@@ -184,6 +199,10 @@ fn retry_sqlite_busy_until_deadline(_attempt: i32) -> bool {
 impl StorageDeadline {
     pub fn after(duration: Duration) -> Self {
         Self(Instant::now() + duration)
+    }
+
+    pub(crate) fn at(deadline: Instant) -> Self {
+        Self(deadline)
     }
 
     pub fn remaining(self) -> Result<Duration, StorageError> {
@@ -410,6 +429,7 @@ impl BrainDb {
         deadline: StorageDeadline,
     ) -> Result<Self, StorageError> {
         if role == OpenRole::Hook {
+            deadline.ensure_remaining()?;
             migration::hook_preflight(paths)?;
         }
         let connection = open_current(paths, BRAIN_DATABASE_NAME, DatabaseKind::Brain, deadline)?;

@@ -27,12 +27,23 @@ use crate::brain::UNSUPPORTED_PERMISSION_TOOL_REASON;
 use crate::brain::activity::ActivityLog;
 #[cfg(test)]
 use crate::brain::activity::ActivityStore;
-use crate::brain::storage::{BrainDb, OpenRole, StorageDeadline, StoragePaths};
+use crate::brain::storage::{
+    BrainDb, CacheDeadline, OpenRole, RuntimeCacheBypass, RuntimeCacheReader, RuntimeCacheWriter,
+    StorageDeadline, StoragePaths,
+};
+use crate::lifecycle_project::{
+    ProjectCacheOutcome, SystemLifecycleProjectRunner, refresh_after_activity_success,
+    resolve_lifecycle_project, resolve_lifecycle_project_until_with_cache_stage,
+};
+use crate::lifecycle_timing::{
+    HookBudget, HookEventClass, HookOutcome, HookStage, HookTiming, MonotonicClock,
+};
 #[cfg(test)]
 use crate::provider_hooks::normalized_outcome;
 use crate::provider_hooks::{ParsedLifecycleHook, parse_lifecycle};
 
 pub(crate) const MAX_HOOK_INPUT_BYTES: usize = 64 * 1024;
+const AUTHORITATIVE_STORAGE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 static LIFECYCLE_ACTIVITY_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
@@ -45,9 +56,17 @@ pub(crate) struct RecordedProviderHook {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistenceStage {
+    LifecycleCommit,
+    PostToolCorrelation,
+    ActivityCommit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HookInputError {
     Read,
     TooLarge,
+    Timeout,
 }
 
 impl fmt::Display for HookInputError {
@@ -55,6 +74,7 @@ impl fmt::Display for HookInputError {
         match self {
             Self::Read => f.write_str("could not read stdin"),
             Self::TooLarge => f.write_str("input exceeds 65536 bytes"),
+            Self::Timeout => f.write_str("input timed out"),
         }
     }
 }
@@ -70,6 +90,57 @@ pub(crate) fn read_bounded_hook_input(mut reader: impl Read) -> Result<Vec<u8>, 
         Err(HookInputError::TooLarge)
     } else {
         Ok(input)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn read_bounded_hook_input_until(
+    reader: &mut (impl Read + std::os::fd::AsFd),
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, HookInputError> {
+    use std::io::ErrorKind;
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let descriptor = reader.as_fd().as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(HookInputError::Read);
+    }
+
+    let mut input = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(HookInputError::Timeout);
+        }
+        let timeout_ms = i32::try_from(remaining.as_millis().saturating_add(1)).unwrap_or(i32::MAX);
+        let mut pollfd = libc::pollfd {
+            fd: descriptor,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } {
+            -1 if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted => continue,
+            -1 => return Err(HookInputError::Read),
+            0 => return Err(HookInputError::Timeout),
+            _ => {}
+        }
+
+        let mut chunk = [0_u8; 4096];
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(input),
+            Ok(read) => {
+                let accepted = read.min(MAX_HOOK_INPUT_BYTES.saturating_sub(input.len()));
+                input.extend_from_slice(&chunk[..accepted]);
+                if accepted != read {
+                    return Err(HookInputError::TooLarge);
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(HookInputError::Read),
+        }
     }
 }
 
@@ -257,8 +328,9 @@ fn run_provider_with_activity_and_live_process<R: Read, E: Write>(
     if let Some(activity) = activity
         && lifecycle_applied
     {
+        let project = ProjectIdentity::from_temporary_root(event.identity().cwd());
         let result = if event.name().as_str() == "PostToolUse" {
-            let observation = match observation_event(&event, &activity_input) {
+            let observation = match observation_event(&event, &activity_input, &project) {
                 Ok(observation) => observation,
                 Err(error) => {
                     write_diagnostic(&mut stderr, error);
@@ -269,7 +341,7 @@ fn run_provider_with_activity_and_live_process<R: Read, E: Write>(
             let result = activity
                 .append_from_snapshot(|log| {
                     let mut events = vec![observation];
-                    match correlate_outcome(log, &event, &activity_input) {
+                    match correlate_outcome(log, &event, &activity_input, &project) {
                         Correlation::Outcome(outcome) => events.push(outcome),
                         Correlation::Diagnostic { event, message } => {
                             correlation_message = Some(message);
@@ -287,7 +359,7 @@ fn run_provider_with_activity_and_live_process<R: Read, E: Write>(
             }
             result
         } else {
-            append_observation(activity, &event, &activity_input)
+            append_observation(activity, &event, &activity_input, &project)
         };
         if let Err(error) = result {
             write_diagnostic(&mut stderr, error);
@@ -389,12 +461,13 @@ fn persist_provider_hook_with_live_process(
     if let Some(activity) = activity
         && lifecycle_applied
     {
+        let project = ProjectIdentity::from_temporary_root(event.identity().cwd());
         let result = if event.name().as_str() == "PostToolUse" {
-            let observation = observation_event(&event, &activity_input)?;
+            let observation = observation_event(&event, &activity_input, &project)?;
             activity
                 .append_from_snapshot(|log| {
                     let mut events = vec![observation];
-                    match correlate_outcome(log, &event, &activity_input) {
+                    match correlate_outcome(log, &event, &activity_input, &project) {
                         Correlation::Outcome(outcome) => events.push(outcome),
                         Correlation::Diagnostic { event, .. } => events.push(event),
                         Correlation::None => {}
@@ -403,7 +476,7 @@ fn persist_provider_hook_with_live_process(
                 })
                 .map_err(|error| error.to_string())
         } else {
-            append_observation(activity, &event, &activity_input)
+            append_observation(activity, &event, &activity_input, &project)
         };
         result?;
         let _ = activity.compact_if_needed();
@@ -443,20 +516,19 @@ fn append_observation(
     activity: &ActivityStore,
     lifecycle: &LifecycleEvent,
     input: &LifecycleActivityInput,
+    project: &ProjectIdentity,
 ) -> Result<(), String> {
     activity
-        .append(observation_event(lifecycle, input)?)
+        .append(observation_event(lifecycle, input, project)?)
         .map_err(|error| error.to_string())
 }
 
 fn observation_event(
     lifecycle: &LifecycleEvent,
     input: &LifecycleActivityInput,
+    project: &ProjectIdentity,
 ) -> Result<ActivityEvent, String> {
-    let paths = current_paths().ok_or_else(|| "Coding Brain paths unavailable".to_string())?;
-    let identity = ProjectIdentity::load(lifecycle.identity().cwd(), &paths)
-        .map_err(|error| error.to_string())?;
-    let project_id = identity.id().clone();
+    let project_id = project.id().clone();
     let cwd = lifecycle.identity().cwd().to_path_buf();
     let (session_id, provider_session_id) = activity_session_identity(lifecycle);
     Ok(ActivityEvent {
@@ -557,12 +629,14 @@ fn correlate_outcome(
     log: &ActivityLog,
     lifecycle: &LifecycleEvent,
     input: &LifecycleActivityInput,
+    project: &ProjectIdentity,
 ) -> Correlation {
     let identity = lifecycle.identity();
     let Some(tool_use_id) = input.normalized_tool_use_id() else {
         return diagnostic_correlation(
             lifecycle,
             input,
+            project,
             "orphan outcome: lifecycle event has no tool_use_id",
         );
     };
@@ -579,6 +653,7 @@ fn correlate_outcome(
             return diagnostic_correlation(
                 lifecycle,
                 input,
+                project,
                 "orphan outcome: exact lifecycle identity is ambiguous or ineligible",
             );
         }
@@ -599,6 +674,7 @@ fn correlate_outcome(
             log,
             lifecycle,
             input,
+            project,
             exact_activity_ids,
             "orphan outcome: exact lifecycle identity is ambiguous or ineligible",
         );
@@ -653,6 +729,7 @@ fn correlate_outcome(
         return diagnostic_correlation(
             lifecycle,
             input,
+            project,
             "orphan outcome: PreToolUse anchor is missing or ambiguous",
         );
     }
@@ -679,6 +756,7 @@ fn correlate_outcome(
         return diagnostic_correlation(
             lifecycle,
             input,
+            project,
             "orphan outcome: PreToolUse interval overlaps a later tool",
         );
     }
@@ -686,6 +764,7 @@ fn correlate_outcome(
         return diagnostic_correlation(
             lifecycle,
             input,
+            project,
             "orphan outcome: Bash command is not losslessly correlatable",
         );
     };
@@ -710,6 +789,7 @@ fn correlate_outcome(
         return diagnostic_correlation(
             lifecycle,
             input,
+            project,
             "orphan outcome: no eligible Decision in the PreToolUse interval",
         );
     }
@@ -717,6 +797,7 @@ fn correlate_outcome(
         log,
         lifecycle,
         input,
+        project,
         activity_ids,
         "orphan outcome: Decision correlation is ambiguous or ineligible",
     )
@@ -782,6 +863,7 @@ fn correlate_candidates(
     log: &ActivityLog,
     lifecycle: &LifecycleEvent,
     input: &LifecycleActivityInput,
+    project: &ProjectIdentity,
     activity_ids: Vec<String>,
     diagnostic: &'static str,
 ) -> Correlation {
@@ -796,7 +878,7 @@ fn correlate_candidates(
         })
         .collect::<Vec<_>>();
     if candidates.len() != 1 {
-        return diagnostic_correlation(lifecycle, input, diagnostic);
+        return diagnostic_correlation(lifecycle, input, project, diagnostic);
     }
     let matched = candidates[0];
     let post_id = input.normalized_tool_use_id();
@@ -876,9 +958,10 @@ fn outcome_event(
 fn diagnostic_correlation(
     lifecycle: &LifecycleEvent,
     input: &LifecycleActivityInput,
+    project: &ProjectIdentity,
     diagnostic: &'static str,
 ) -> Correlation {
-    match diagnostic_event(lifecycle, input, diagnostic) {
+    match diagnostic_event(lifecycle, input, project, diagnostic) {
         Ok(event) => Correlation::Diagnostic {
             event,
             message: diagnostic,
@@ -890,12 +973,10 @@ fn diagnostic_correlation(
 fn diagnostic_event(
     lifecycle: &LifecycleEvent,
     input: &LifecycleActivityInput,
+    project: &ProjectIdentity,
     diagnostic: &'static str,
 ) -> Result<ActivityEvent, String> {
-    let paths = current_paths().ok_or_else(|| "Coding Brain paths unavailable".to_string())?;
-    let identity = ProjectIdentity::load(lifecycle.identity().cwd(), &paths)
-        .map_err(|error| error.to_string())?;
-    let project_id = identity.id().clone();
+    let project_id = project.id().clone();
     let cwd = lifecycle.identity().cwd().to_path_buf();
     let (session_id, provider_session_id) = activity_session_identity(lifecycle);
     Ok(ActivityEvent {
@@ -944,7 +1025,7 @@ fn epoch_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn current_paths() -> Option<CodingBrainPaths> {
+pub(crate) fn current_paths() -> Option<CodingBrainPaths> {
     let environment = PathEnvironment::new(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
@@ -953,73 +1034,338 @@ fn current_paths() -> Option<CodingBrainPaths> {
     CodingBrainPaths::resolve(&environment).ok()
 }
 
-pub(crate) fn run(provider: AgentProvider, antigravity_event: Option<&str>) {
+pub(crate) fn run(provider: AgentProvider, antigravity_event: Option<&str>, budget: HookBudget) {
     let stdin = std::io::stdin();
     let stderr = std::io::stderr();
-    run_provider_with_sqlite(provider, stdin.lock(), stderr.lock(), antigravity_event);
+    run_provider_with_sqlite(
+        provider,
+        stdin.lock(),
+        stderr.lock(),
+        antigravity_event,
+        budget,
+    );
 }
 
-fn run_provider_with_sqlite<R: Read, E: Write>(
+fn authoritative_storage_deadline<C: MonotonicClock>(
+    budget: &HookBudget<C>,
+) -> Option<std::time::Instant> {
+    if budget.remaining() < AUTHORITATIVE_STORAGE_BUDGET {
+        return None;
+    }
+    budget.child_deadline(AUTHORITATIVE_STORAGE_BUDGET)
+}
+
+fn optional_parent_process_deadline<C: MonotonicClock>(
+    budget: &HookBudget<C>,
+) -> Option<std::time::Instant> {
+    budget.optional_child_deadline(
+        std::time::Duration::from_millis(250),
+        AUTHORITATIVE_STORAGE_BUDGET
+            .saturating_add(crate::provider_hooks::BOUNDED_PROCESS_CLEANUP_BUDGET),
+    )
+}
+
+fn project_cache_timing_outcome(outcome: ProjectCacheOutcome) -> HookOutcome {
+    match outcome {
+        ProjectCacheOutcome::Hit => HookOutcome::CacheHit,
+        ProjectCacheOutcome::Miss => HookOutcome::CacheMiss,
+        ProjectCacheOutcome::Invalid => HookOutcome::CacheInvalid,
+        ProjectCacheOutcome::Bypassed => HookOutcome::CacheBypassed,
+        ProjectCacheOutcome::NonCacheable => HookOutcome::NonCacheable,
+        ProjectCacheOutcome::DiscoveryFailure => HookOutcome::DiscoveryFailure,
+    }
+}
+
+fn parse_timing_event(
     provider: AgentProvider,
-    stdin: R,
+    antigravity_event: Option<&str>,
+    input: &[u8],
+) -> Result<Option<HookEventClass>, String> {
+    let parsed =
+        parse_lifecycle(provider, antigravity_event, input).map_err(|error| error.to_string())?;
+    Ok(parsed
+        .event
+        .as_ref()
+        .map(|event| HookEventClass::from_lifecycle_name(event.name().as_str())))
+}
+
+fn run_provider_with_sqlite<R: Read + std::os::fd::AsFd, E: Write>(
+    provider: AgentProvider,
+    mut stdin: R,
     mut stderr: E,
     antigravity_event: Option<&str>,
+    budget: HookBudget,
 ) {
-    let input = match read_bounded_hook_input(stdin) {
+    let mut timing = HookTiming::new(provider, HookEventClass::Other, &budget);
+    let input = match read_bounded_hook_input_until(&mut stdin, budget.deadline()) {
         Ok(input) => input,
         Err(error) => {
             write_diagnostic(&mut stderr, error);
+            let outcome = match error {
+                HookInputError::Timeout => HookOutcome::Timeout,
+                HookInputError::TooLarge => HookOutcome::InputTooLarge,
+                HookInputError::Read => HookOutcome::InputRead,
+            };
+            timing.finish(HookStage::CliInput, outcome);
+            timing.finish(HookStage::Total, outcome);
             return;
         }
     };
-    if provider == AgentProvider::Antigravity && antigravity_event == Some("PostInvocation") {
-        match parse_lifecycle(provider, antigravity_event, &input) {
-            Ok(parsed) if parsed.event.is_none() => return,
-            Ok(_) => {}
-            Err(error) => {
-                write_diagnostic(&mut stderr, error);
-                return;
-            }
+    match parse_timing_event(provider, antigravity_event, &input) {
+        Ok(Some(event)) => timing.set_event(event),
+        Ok(None)
+            if provider == AgentProvider::Antigravity
+                && antigravity_event == Some("PostInvocation") =>
+        {
+            timing.finish(HookStage::CliInput, HookOutcome::Success);
+            timing.finish(HookStage::Total, HookOutcome::Success);
+            return;
         }
+        Ok(None) => {}
+        Err(error)
+            if provider == AgentProvider::Antigravity
+                && antigravity_event == Some("PostInvocation") =>
+        {
+            write_diagnostic(&mut stderr, error);
+            timing.finish(HookStage::Parse, HookOutcome::Rejected);
+            timing.finish(HookStage::Total, HookOutcome::Rejected);
+            return;
+        }
+        Err(_) => {}
     }
+    timing.finish(HookStage::CliInput, HookOutcome::Success);
+    let parsed_for_project = match parse_lifecycle(provider, antigravity_event, &input) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            timing.finish(HookStage::Parse, HookOutcome::Rejected);
+            timing.finish(HookStage::Total, HookOutcome::Rejected);
+            return;
+        }
+    };
+    let Some(project_event) = parsed_for_project.event.clone() else {
+        timing.finish(HookStage::Parse, HookOutcome::Rejected);
+        timing.finish(HookStage::Total, HookOutcome::Rejected);
+        return;
+    };
+    let project_lifecycle = match LifecycleEvent::from_parts_with_turn_initial_step(
+        parsed_for_project.identity.clone(),
+        project_event,
+        parsed_for_project.turn_initial_step,
+    ) {
+        Ok(event) => event,
+        Err(error) => {
+            write_diagnostic(&mut stderr, error);
+            timing.finish(HookStage::Parse, HookOutcome::Rejected);
+            timing.finish(HookStage::Total, HookOutcome::Rejected);
+            return;
+        }
+    };
+    timing.finish(HookStage::Parse, HookOutcome::Success);
     let state_root = coding_brain_state_root();
+    let mut parent_output = crate::provider_hooks::OutputBudget::new(4 * 1024);
+    let live_process = optional_parent_process_deadline(&budget).and_then(|deadline| {
+        crate::provider_hooks::live_parent_process_until(provider, deadline, &mut parent_output)
+    });
+    timing.finish(HookStage::ParentDiscovery, HookOutcome::Success);
     let paths = StoragePaths::at(&state_root);
+    let Some(coding_paths) = current_paths() else {
+        write_diagnostic(&mut stderr, "Coding Brain paths unavailable");
+        timing.finish(HookStage::ProjectCache, HookOutcome::Error);
+        timing.finish(HookStage::Total, HookOutcome::Error);
+        return;
+    };
+    let project_deadline = budget.optional_child_deadline(
+        std::time::Duration::from_millis(250),
+        AUTHORITATIVE_STORAGE_BUDGET
+            .saturating_add(crate::provider_hooks::BOUNDED_PROCESS_CLEANUP_BUDGET),
+    );
+    let cache_open = project_deadline.map(|deadline| {
+        RuntimeCacheReader::open_existing_read_only(&paths, CacheDeadline::at(deadline))
+    });
+    let cache_open_bypassed = matches!(
+        cache_open.as_ref(),
+        Some(Err(error)) if *error != RuntimeCacheBypass::Missing
+    ) || cache_open.is_none();
+    let cache_reader = cache_open.and_then(Result::ok);
+    let mut project_runner = SystemLifecycleProjectRunner;
+    let mut cache_timed = false;
+    let mut git_started = false;
+    let project_result = if let Some(deadline) = project_deadline {
+        resolve_lifecycle_project_until_with_cache_stage(
+            project_lifecycle.identity().cwd(),
+            &coding_paths,
+            cache_reader.as_ref(),
+            &mut project_runner,
+            deadline,
+            |outcome| {
+                cache_timed = true;
+                git_started = outcome != ProjectCacheOutcome::Hit;
+                timing.finish(
+                    HookStage::ProjectCache,
+                    project_cache_timing_outcome(if cache_open_bypassed {
+                        ProjectCacheOutcome::Bypassed
+                    } else {
+                        outcome
+                    }),
+                );
+            },
+        )
+    } else {
+        resolve_lifecycle_project(
+            project_lifecycle.identity().cwd(),
+            &coding_paths,
+            cache_reader.as_ref(),
+            &budget,
+            &mut project_runner,
+        )
+    };
+    let mut resolved_project = match project_result {
+        Ok(project) => project,
+        Err(_) => {
+            write_diagnostic(&mut stderr, "project resolution unavailable");
+            timing.finish(
+                if cache_timed {
+                    HookStage::ProjectGit
+                } else {
+                    HookStage::ProjectCache
+                },
+                HookOutcome::Error,
+            );
+            timing.finish(HookStage::Total, HookOutcome::Error);
+            return;
+        }
+    };
+    if cache_open_bypassed {
+        resolved_project.cache_outcome = ProjectCacheOutcome::Bypassed;
+        resolved_project.refresh = None;
+    }
+    if !cache_timed {
+        timing.finish(
+            HookStage::ProjectCache,
+            project_cache_timing_outcome(resolved_project.cache_outcome()),
+        );
+    }
+    if git_started {
+        let git_failed =
+            resolved_project.provenance == coding_brain_core::project::ProjectProvenance::Temporary;
+        timing.finish(
+            HookStage::ProjectGit,
+            if git_failed {
+                HookOutcome::Error
+            } else {
+                HookOutcome::Success
+            },
+        );
+    }
+    let Some(storage_deadline) = authoritative_storage_deadline(&budget) else {
+        write_diagnostic(
+            &mut stderr,
+            "SQLite storage unavailable: hook deadline exhausted",
+        );
+        timing.finish(HookStage::SqliteOpen, HookOutcome::StorageUnavailable);
+        timing.finish(HookStage::Total, HookOutcome::StorageUnavailable);
+        return;
+    };
     let mut database = match BrainDb::open_current(
         &paths,
         OpenRole::Hook,
-        StorageDeadline::after(std::time::Duration::from_millis(500)),
+        StorageDeadline::at(storage_deadline),
     ) {
         Ok(database) => database,
         Err(error) => {
             write_diagnostic(&mut stderr, format!("SQLite storage unavailable: {error}"));
+            timing.finish(HookStage::SqliteOpen, HookOutcome::StorageUnavailable);
+            timing.finish(HookStage::Total, HookOutcome::StorageUnavailable);
             return;
         }
     };
+    timing.finish(HookStage::SqliteOpen, HookOutcome::Success);
     let links = SessionLinkStore::at(state_root.join("session-links.jsonl"));
-    match persist_provider_hook_sqlite(
+    match persist_provider_hook_sqlite_with_stages(
         provider,
         antigravity_event,
         &input,
         &mut database,
+        &resolved_project.identity,
         &links,
-        crate::provider_hooks::live_parent_process(provider),
+        live_process,
         crate::provider_hooks::revalidate_live_process,
+        |stage, outcome| match stage {
+            PersistenceStage::LifecycleCommit => timing.finish(HookStage::LifecycleCommit, outcome),
+            PersistenceStage::PostToolCorrelation => {
+                timing.finish(HookStage::PostToolCorrelation, outcome)
+            }
+            PersistenceStage::ActivityCommit => timing.finish(HookStage::ActivityCommit, outcome),
+        },
     ) {
-        Ok(_) => {}
+        Ok(recorded) => {
+            if recorded.outcome == ApplyOutcome::Applied {
+                if let Some(refresh) = resolved_project.refresh.as_ref() {
+                    let refresh_result = i64::try_from(recorded.sequence).map_err(|_| ()).and_then(
+                        |refresh_order| {
+                            let mut writer = RuntimeCacheWriter::create_or_open_after_activity(
+                                &paths,
+                                CacheDeadline::at(budget.deadline()),
+                            )
+                            .map_err(|_| ())?;
+                            refresh_after_activity_success(&mut writer, refresh, refresh_order)
+                                .map_err(|_| ())
+                        },
+                    );
+                    let outcome = if refresh_result.is_ok() {
+                        HookOutcome::Success
+                    } else {
+                        write_diagnostic(&mut stderr, "project cache write failed");
+                        HookOutcome::Error
+                    };
+                    timing.finish(HookStage::CacheRefresh, outcome);
+                }
+            }
+            timing.finish(HookStage::Total, HookOutcome::Success);
+        }
         Err(error) => {
             write_diagnostic(&mut stderr, error);
+            timing.finish(HookStage::Total, HookOutcome::Error);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_provider_hook_sqlite(
     provider: AgentProvider,
     antigravity_event: Option<&str>,
     input: &[u8],
     database: &mut BrainDb,
+    project: &ProjectIdentity,
     session_links: &SessionLinkStore,
     live_process: Option<coding_brain_core::provider::LiveProcessIdentity>,
     revalidate_live_process: impl Fn(&coding_brain_core::provider::LiveProcessIdentity) -> bool,
+) -> Result<RecordedProviderHook, String> {
+    persist_provider_hook_sqlite_with_stages(
+        provider,
+        antigravity_event,
+        input,
+        database,
+        project,
+        session_links,
+        live_process,
+        revalidate_live_process,
+        |_, _| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_provider_hook_sqlite_with_stages(
+    provider: AgentProvider,
+    antigravity_event: Option<&str>,
+    input: &[u8],
+    database: &mut BrainDb,
+    project: &ProjectIdentity,
+    session_links: &SessionLinkStore,
+    live_process: Option<coding_brain_core::provider::LiveProcessIdentity>,
+    revalidate_live_process: impl Fn(&coding_brain_core::provider::LiveProcessIdentity) -> bool,
+    mut on_stage: impl FnMut(PersistenceStage, HookOutcome),
 ) -> Result<RecordedProviderHook, String> {
     let mut parsed =
         parse_lifecycle(provider, antigravity_event, input).map_err(|error| error.to_string())?;
@@ -1034,14 +1380,20 @@ pub(crate) fn persist_provider_hook_sqlite(
         parsed.turn_initial_step,
     )
     .map_err(|error| error.to_string())?;
-    let (recorded, recovery_link_persisted) = persist_recovery_event_in_order(
-        requires_recovery_link(&event),
-        || {
-            database
-                .record_lifecycle(event.clone(), epoch_ms())
-                .map_err(|error| error.to_string())
-        },
-        || {
+    let recorded = match database.record_lifecycle(event.clone(), epoch_ms()) {
+        Ok(recorded) => {
+            on_stage(PersistenceStage::LifecycleCommit, HookOutcome::Success);
+            recorded
+        }
+        Err(error) => {
+            on_stage(PersistenceStage::LifecycleCommit, HookOutcome::Error);
+            return Err(error.to_string());
+        }
+    };
+    let recovery_link_persisted = if requires_recovery_link(&event)
+        && recorded.outcome == ApplyOutcome::Applied
+    {
+        let link_persisted: Result<bool, String> = (|| {
             let Some(live_process) = parsed.live_process.clone() else {
                 return Ok(false);
             };
@@ -1064,8 +1416,15 @@ pub(crate) fn persist_provider_hook_sqlite(
                 projection.native_for(&live_process) == Some(native_session_id.as_str())
                     && projection.live_for(&native) == Some(&live_process),
             )
-        },
-    )?;
+        })();
+        let link_persisted = link_persisted?;
+        if !link_persisted {
+            return Err("exact recovery identity link unavailable".into());
+        }
+        true
+    } else {
+        false
+    };
     if recorded.outcome != ApplyOutcome::Applied {
         return Ok(RecordedProviderHook {
             parsed,
@@ -1076,57 +1435,71 @@ pub(crate) fn persist_provider_hook_sqlite(
         });
     }
     let activity_input = LifecycleActivityInput::from_parsed(&parsed, input);
-    let observation = observation_event(&event, &activity_input)?;
+    let observation = observation_event(&event, &activity_input, project)?;
     let mut events = vec![observation];
     if event.name().as_str() == "PostToolUse" {
         let identity = event.identity();
-        let related = match (identity.turn_id(), activity_input.normalized_tool_use_id()) {
-            (Some(turn_id), Some(tool_use_id)) => database.activity_for_permission_outcome(
-                identity.provider(),
-                identity.session_id(),
-                turn_id,
-                &tool_use_id,
-                64,
-                4 * 1024 * 1024,
-            ),
-            _ => Ok(Default::default()),
-        };
-        match related {
-            Ok(mut page) => {
-                if let Some(before) = page
-                    .events
-                    .iter()
-                    .map(|record| record.cursor.get())
-                    .max()
-                    .and_then(|cursor| cursor.checked_add(1))
-                    .and_then(|cursor| crate::brain::storage::ActivityCursor::try_from(cursor).ok())
-                {
-                    let anchor_page = database
-                        .read_activity_page(Some(before), 64, 4 * 1024 * 1024)
-                        .map_err(|error| error.to_string())?;
-                    page.events.extend(anchor_page.events);
-                }
-                page.events.sort_by_key(|record| record.cursor);
-                page.events.dedup_by_key(|record| record.cursor);
-                let log = ActivityLog::from_events(
-                    page.events.into_iter().map(|record| record.event).collect(),
-                );
-                match correlate_outcome(&log, &event, &activity_input) {
-                    Correlation::Outcome(outcome) => events.push(outcome),
-                    Correlation::Diagnostic { event, .. } => {
-                        events.push(event);
+        let correlation = (|| {
+            let related = match (identity.turn_id(), activity_input.normalized_tool_use_id()) {
+                (Some(turn_id), Some(tool_use_id)) => database.activity_for_permission_outcome(
+                    identity.provider(),
+                    identity.session_id(),
+                    turn_id,
+                    &tool_use_id,
+                    64,
+                    4 * 1024 * 1024,
+                ),
+                _ => Ok(Default::default()),
+            };
+            match related {
+                Ok(mut page) => {
+                    if let Some(before) = page
+                        .events
+                        .iter()
+                        .map(|record| record.cursor.get())
+                        .max()
+                        .and_then(|cursor| cursor.checked_add(1))
+                        .and_then(|cursor| {
+                            crate::brain::storage::ActivityCursor::try_from(cursor).ok()
+                        })
+                    {
+                        let anchor_page = database
+                            .read_activity_page(Some(before), 64, 4 * 1024 * 1024)
+                            .map_err(|error| error.to_string())?;
+                        page.events.extend(anchor_page.events);
                     }
-                    Correlation::None => {}
+                    page.events.sort_by_key(|record| record.cursor);
+                    page.events.dedup_by_key(|record| record.cursor);
+                    let log = ActivityLog::from_events(
+                        page.events.into_iter().map(|record| record.event).collect(),
+                    );
+                    match correlate_outcome(&log, &event, &activity_input, project) {
+                        Correlation::Outcome(outcome) => events.push(outcome),
+                        Correlation::Diagnostic { event, .. } => {
+                            events.push(event);
+                        }
+                        Correlation::None => {}
+                    }
+                    Ok(())
                 }
+                Err(error) => Err(error.to_string()),
             }
+        })();
+        match correlation {
+            Ok(()) => on_stage(PersistenceStage::PostToolCorrelation, HookOutcome::Success),
             Err(error) => {
-                return Err(error.to_string());
+                on_stage(PersistenceStage::PostToolCorrelation, HookOutcome::Error);
+                return Err(error);
             }
         }
     }
-    database
-        .append_activity_batch(&events)
-        .map_err(|error| error.to_string())?;
+    match database.append_activity_batch(&events) {
+        Ok(_) => on_stage(PersistenceStage::ActivityCommit, HookOutcome::Success),
+        Err(error) => {
+            on_stage(PersistenceStage::ActivityCommit, HookOutcome::Error);
+            return Err(error.to_string());
+        }
+    }
     Ok(RecordedProviderHook {
         parsed,
         event,
@@ -1156,10 +1529,87 @@ mod tests {
     use fs2::FileExt;
 
     use crate::brain::activity::ActivityStore;
+    use crate::lifecycle_timing::FakeClock;
 
     use super::*;
 
     const PROMPT: &[u8] = include_bytes!("../tests/fixtures/hooks/user-prompt-submit.json");
+
+    #[test]
+    fn authoritative_storage_deadline_never_extends_the_entry_deadline() {
+        let started = std::time::Instant::now();
+        let clock = FakeClock::at(started);
+        let budget = HookBudget::with_clock(clock.clone(), std::time::Duration::from_millis(1500));
+
+        assert_eq!(
+            authoritative_storage_deadline(&budget),
+            Some(started + std::time::Duration::from_millis(500))
+        );
+        clock.advance(std::time::Duration::from_millis(1000));
+
+        assert_eq!(
+            authoritative_storage_deadline(&budget),
+            Some(started + std::time::Duration::from_millis(1500))
+        );
+        clock.advance(std::time::Duration::from_millis(1));
+        assert_eq!(authoritative_storage_deadline(&budget), None);
+    }
+
+    #[test]
+    fn optional_parent_admission_preserves_cleanup_and_storage_reserves() {
+        let started = std::time::Instant::now();
+        let clock = FakeClock::at(started);
+        let budget = HookBudget::with_clock(clock.clone(), std::time::Duration::from_millis(1500));
+        clock.advance(std::time::Duration::from_millis(500));
+
+        let child_deadline = optional_parent_process_deadline(&budget).unwrap();
+        assert_eq!(
+            child_deadline,
+            started + std::time::Duration::from_millis(750)
+        );
+        clock.advance(child_deadline.duration_since(clock.now()));
+        clock.advance(crate::provider_hooks::BOUNDED_PROCESS_CLEANUP_BUDGET);
+        assert_eq!(budget.remaining(), AUTHORITATIVE_STORAGE_BUDGET);
+
+        let threshold_clock = FakeClock::at(started);
+        let threshold_budget = HookBudget::with_clock(
+            threshold_clock.clone(),
+            std::time::Duration::from_millis(1500),
+        );
+        threshold_clock.advance(std::time::Duration::from_millis(750));
+        assert_eq!(optional_parent_process_deadline(&threshold_budget), None);
+    }
+
+    #[test]
+    fn successful_preparse_establishes_timing_event_before_storage() {
+        let antigravity_stop = include_bytes!("../tests/fixtures/hooks/antigravity-stop.json");
+        let session_start = include_bytes!("../tests/fixtures/hooks/session-start.json");
+        for (provider, trusted_event, input, expected) in [
+            (
+                AgentProvider::Codex,
+                None,
+                &session_start[..],
+                HookEventClass::SessionStart,
+            ),
+            (
+                AgentProvider::Codex,
+                None,
+                PROMPT,
+                HookEventClass::UserPromptSubmit,
+            ),
+            (
+                AgentProvider::Antigravity,
+                Some("Stop"),
+                &antigravity_stop[..],
+                HookEventClass::Stop,
+            ),
+        ] {
+            assert_eq!(
+                parse_timing_event(provider, trusted_event, input).unwrap(),
+                Some(expected)
+            );
+        }
+    }
 
     fn decision_event(
         cwd: &Path,
@@ -1672,6 +2122,22 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_until_times_out_after_partial_input_with_open_writer() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_all(b"partial-input").unwrap();
+        assert_eq!(
+            read_bounded_hook_input_until(&mut reader, Instant::now() + Duration::from_millis(20)),
+            Err(HookInputError::Timeout)
+        );
+        writer.write_all(b"still-open").unwrap();
+    }
+
     #[test]
     fn valid_event_records_state_without_protocol_output() {
         let temp = tempfile::tempdir().unwrap();
@@ -1922,12 +2388,14 @@ mod tests {
             "pts/8",
         )
         .unwrap();
+        let project = ProjectIdentity::from_temporary_root(temp.path());
 
         let recorded = persist_provider_hook_sqlite(
             AgentProvider::Codex,
             None,
             &root_stop_payload(temp.path(), "claimed-root", "turn-a"),
             &mut database,
+            &project,
             &links,
             Some(live_process.clone()),
             |_| true,
@@ -1951,6 +2419,108 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_persistence_reports_ordered_stages_and_uses_injected_project() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = StoragePaths::at(temp.path());
+        let mut database = BrainDb::create_current(&paths).unwrap();
+        let links = SessionLinkStore::at(temp.path().join("session-links.jsonl"));
+        let project =
+            ProjectIdentity::from_stable_uuid("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let payload = serde_json::to_vec(&hook_payload(
+            temp.path(),
+            "UserPromptSubmit",
+            "prompt-1",
+            "",
+            None,
+        ))
+        .unwrap();
+        let mut stages = Vec::new();
+
+        let recorded = persist_provider_hook_sqlite_with_stages(
+            AgentProvider::Codex,
+            None,
+            &payload,
+            &mut database,
+            &project,
+            &links,
+            None,
+            |_| false,
+            |stage, outcome| stages.push((stage, outcome)),
+        )
+        .unwrap();
+
+        assert_eq!(recorded.outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            stages,
+            [
+                (PersistenceStage::LifecycleCommit, HookOutcome::Success),
+                (PersistenceStage::ActivityCommit, HookOutcome::Success),
+            ]
+        );
+        let page = database.read_activity_page(None, 8, 1024 * 1024).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(
+            page.events[0].event.project.project_id,
+            project.id().clone()
+        );
+    }
+
+    #[test]
+    fn sqlite_persistence_reports_the_stage_that_failed() {
+        for (fault, expected) in [
+            (
+                "lifecycle-body",
+                vec![(PersistenceStage::LifecycleCommit, HookOutcome::Error)],
+            ),
+            (
+                "activity-commit",
+                vec![
+                    (PersistenceStage::LifecycleCommit, HookOutcome::Success),
+                    (PersistenceStage::ActivityCommit, HookOutcome::Error),
+                ],
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let paths = StoragePaths::at(temp.path());
+            let mut database = BrainDb::create_current(&paths).unwrap();
+            let links = SessionLinkStore::at(temp.path().join("session-links.jsonl"));
+            let project = ProjectIdentity::from_temporary_root(temp.path());
+            let payload = serde_json::to_vec(&hook_payload(
+                temp.path(),
+                "UserPromptSubmit",
+                "prompt-1",
+                "",
+                None,
+            ))
+            .unwrap();
+            let mut stages = Vec::new();
+
+            let result = crate::brain::storage::with_sqlite_fault(
+                fault,
+                rusqlite::ffi::SQLITE_IOERR,
+                || {
+                    persist_provider_hook_sqlite_with_stages(
+                        AgentProvider::Codex,
+                        None,
+                        &payload,
+                        &mut database,
+                        &project,
+                        &links,
+                        None,
+                        |_| false,
+                        |stage, outcome| stages.push((stage, outcome)),
+                    )
+                },
+            );
+
+            assert!(result.is_err(), "{fault}");
+            assert_eq!(stages, expected, "{fault}");
+        }
+    }
+
+    #[test]
     fn sqlite_root_stop_commits_lifecycle_but_aborts_recovery_when_link_is_unverified() {
         let temp = tempfile::tempdir().unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1965,12 +2535,14 @@ mod tests {
             "pts/8",
         )
         .unwrap();
+        let project = ProjectIdentity::from_temporary_root(temp.path());
 
         let error = persist_provider_hook_sqlite(
             AgentProvider::Codex,
             None,
             &root_stop_payload(temp.path(), "claimed-root", "turn-a"),
             &mut database,
+            &project,
             &links,
             Some(live_process),
             |_| false,

@@ -588,6 +588,20 @@ fn run_hook_with<R: Read, W: Write, E: Write>(
             return;
         }
     };
+    let project = match crate::provider_hooks::parse_lifecycle(provider, antigravity_event, &input)
+        .map_err(|error| error.to_string())
+        .and_then(|parsed| {
+            let paths = crate::lifecycle_hook::current_paths()
+                .ok_or_else(|| "Coding Brain paths unavailable".to_owned())?;
+            coding_brain_core::project::ProjectIdentity::load(parsed.identity.cwd(), &paths)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(project) => project,
+        Err(_) => {
+            write_recovery_diagnostic(&mut stderr, "invalid recovery hook input");
+            return;
+        }
+    };
     let state_root = coding_brain_core::lifecycle::coding_brain_state_root();
     let paths = StoragePaths::at(&state_root);
     let mut database = match BrainDb::open_current(
@@ -609,6 +623,7 @@ fn run_hook_with<R: Read, W: Write, E: Write>(
         antigravity_event,
         &input,
         &mut database,
+        &project,
         &links,
         crate::provider_hooks::live_parent_process(provider),
         crate::provider_hooks::revalidate_live_process,
