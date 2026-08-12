@@ -313,7 +313,13 @@ fn inspect_provider_hooks_at_with_store_and_executable(
     let ownership = files
         .iter()
         .fold(ProviderHookOwnership::Absent, |ownership, file| {
-            combine_ownership(ownership, file.ownership)
+            if file.state == ProviderHookFileState::Missing
+                && file.ownership == ProviderHookOwnership::Imperative
+            {
+                ownership
+            } else {
+                combine_ownership(ownership, file.ownership)
+            }
         });
     let state = if files
         .iter()
@@ -1602,7 +1608,7 @@ fn merge_nested_hooks(
             .get_mut(definition.event)
             .and_then(serde_json::Value::as_array_mut)
         {
-            for matcher in matchers.iter_mut() {
+            matchers.retain_mut(|matcher| {
                 let matcher_object = matcher.as_object_mut().expect("shape validated");
                 let matcher_is_exact = matcher_object
                     .keys()
@@ -1616,6 +1622,7 @@ fn merge_nested_hooks(
                     .get_mut("hooks")
                     .and_then(serde_json::Value::as_array_mut)
                     .expect("shape validated");
+                let had_handlers = !handlers.is_empty();
                 handlers.retain(|handler| {
                     let Some(command) = handler.get("command").and_then(serde_json::Value::as_str)
                     else {
@@ -1636,12 +1643,7 @@ fn merge_nested_hooks(
                     }
                     !exact
                 });
-            }
-            matchers.retain(|matcher| {
-                matcher
-                    .get("hooks")
-                    .and_then(serde_json::Value::as_array)
-                    .is_none_or(|handlers| !handlers.is_empty())
+                !had_handlers || !handlers.is_empty()
             });
         }
         if !remove && !collision {
@@ -2953,6 +2955,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn provider_inspection_accepts_home_manager_claude_with_unrelated_empty_matcher() {
+        let executable = Path::new("/nix/store/current-coding-brain/bin/cbrain");
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let store = temp.path().join("nix/store");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut root = serde_json::from_slice::<serde_json::Value>(
+            &home_manager_schema_variant_bytes(&home, &project, AgentProvider::Claude, executable),
+        )
+        .unwrap();
+        let stop = root["hooks"]["Stop"].as_array_mut().unwrap();
+        stop.insert(0, serde_json::json!({ "matcher": "", "hooks": [] }));
+        assert!(stop[0]["hooks"].as_array().unwrap().is_empty());
+        assert!(
+            stop[1]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("--recovery-hook --provider claude")
+        );
+        let mut bytes = serde_json::to_vec_pretty(&root).unwrap();
+        bytes.push(b'\n');
+        let comparison = compare_provider_hook(
+            AgentProvider::Claude,
+            Some(&bytes),
+            false,
+            ProviderHookComparisonContract::HomeManager { executable },
+        )
+        .unwrap();
+        assert!(comparison.replacement.is_none());
+        assert!(comparison.preserved_modified_entries.is_empty());
+        write_home_manager_provider_store_leaf(
+            &store,
+            &home,
+            &project,
+            AgentProvider::Claude,
+            &bytes,
+        );
+
+        let inspection = inspect_provider_hooks_at_with_store_and_executable(
+            AgentProvider::Claude,
+            &home,
+            &project,
+            &store,
+            executable,
+        );
+
+        assert_eq!(inspection.state, ProviderHookState::Current);
+        assert_eq!(inspection.ownership, ProviderHookOwnership::HomeManager);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn provider_inspection_rejects_wrong_home_manager_executable_for_all_providers() {
         let executable = Path::new("/nix/store/current-coding-brain/bin/coding-brain");
         let wrong_executable = Path::new("/nix/store/wrong-coding-brain/bin/coding-brain");
@@ -3081,28 +3136,32 @@ mod tests {
                 "malformed",
                 b"{".to_vec(),
                 ProviderHookState::Invalid,
+                ProviderHookOwnership::HomeManager,
                 Some(ProviderHookDiagnosticReason::MalformedContent),
             ),
             (
                 "non-object",
                 b"[]".to_vec(),
                 ProviderHookState::Invalid,
+                ProviderHookOwnership::HomeManager,
                 Some(ProviderHookDiagnosticReason::MalformedContent),
             ),
             (
                 "missing",
                 br#"{"user":true}"#.to_vec(),
                 ProviderHookState::Missing,
+                ProviderHookOwnership::HomeManager,
                 None,
             ),
             (
                 "oversized",
                 vec![b' '; MAX_FILE_BYTES + 1],
                 ProviderHookState::Invalid,
+                ProviderHookOwnership::HomeManager,
                 Some(ProviderHookDiagnosticReason::Unreadable),
             ),
         ];
-        for (name, bytes, state, reason) in cases {
+        for (name, bytes, state, ownership, reason) in cases {
             let temp = tempfile::tempdir().unwrap();
             let home = temp.path().join("home");
             let project = temp.path().join("project");
@@ -3113,8 +3172,9 @@ mod tests {
             let inspection =
                 inspect_provider_hooks_at_with_store(provider, &home, &project, &store);
             assert_eq!(inspection.state, state, "{name}");
+            assert_eq!(inspection.ownership, ownership, "{name}");
             assert_eq!(
-                inspection.ownership,
+                inspection.files[0].ownership,
                 ProviderHookOwnership::HomeManager,
                 "{name}"
             );
@@ -3655,6 +3715,69 @@ mod tests {
                 inspect_provider_hooks_at_with_store(provider, &home, &project, &store);
             assert_eq!(inspection.state, state);
             assert_eq!(inspection.ownership, ownership);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_inspection_ignores_definition_free_project_file_for_ownership() {
+        for stale in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let project = temp.path().join("project");
+            let store = temp.path().join("nix/store");
+            std::fs::create_dir_all(project.join(".git")).unwrap();
+            let mut bytes = home_manager_schema_variant_bytes(
+                &home,
+                &project,
+                AgentProvider::Claude,
+                Path::new("cbrain"),
+            );
+            if stale {
+                bytes = String::from_utf8(bytes)
+                    .unwrap()
+                    .replacen("--lifecycle-hook", "--lifecycle-hook --changed", 1)
+                    .into_bytes();
+            }
+            write_home_manager_provider_file(
+                &store,
+                &home,
+                &project,
+                AgentProvider::Claude,
+                &bytes,
+            );
+            let project_path =
+                provider_path(AgentProvider::Claude, HookScope::Project, &home, &project);
+            std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &project_path,
+                br#"{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"bd prime --hook-json"}]}]}}"#,
+            )
+            .unwrap();
+
+            let inspection = inspect_provider_hooks_at_with_store(
+                AgentProvider::Claude,
+                &home,
+                &project,
+                &store,
+            );
+
+            assert_eq!(
+                inspection.state,
+                if stale {
+                    ProviderHookState::Stale
+                } else {
+                    ProviderHookState::Current
+                }
+            );
+            assert_eq!(inspection.ownership, ProviderHookOwnership::HomeManager);
+            let project_file = inspection
+                .files
+                .iter()
+                .find(|file| file.path == project_path)
+                .unwrap();
+            assert_eq!(project_file.state, ProviderHookFileState::Missing);
+            assert_eq!(project_file.ownership, ProviderHookOwnership::Imperative);
         }
     }
 
