@@ -118,6 +118,13 @@ Multi-provider init parses, validates, and stages the complete selected set befo
 | Transcript context | Codex rollout JSONL | Unavailable: the hook transcript path is retained as lifecycle identity/status evidence, but records are not parsed into `AgentSession` context | Unavailable: the hook transcript path is retained as lifecycle identity/status evidence, but records are not parsed into `AgentSession` context; SQLite is not read |
 | Context pressure | Bounded percentage from provider capacity or a known-model fallback | Unavailable | Unavailable |
 
+Process-backed provider discovery is bounded to 1 MiB each for stdout and
+stderr. A successful zero means the scan ran and found no matching processes.
+`Unavailable` or `incomplete` means the bounded scan did not complete
+successfully, for example because of its size/deadline or unusable process
+output, so its session count is not authoritative. Transcript files remain
+context or lifecycle evidence; they do not create live sessions by themselves.
+
 Automatic terminal input revalidates provider process identity, a unique pane, a versioned prompt fingerprint, and pending request evidence immediately before input, then verifies that the prompt cleared or advanced. A mismatch leaves the activity for manual attention. Terminal focus alone never grants input authority.
 
 ## Configuration helpers

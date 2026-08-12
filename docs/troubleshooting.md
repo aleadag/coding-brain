@@ -37,6 +37,14 @@ Use `cbrain init` to create an explicit override when the origin is unusable or 
 
 Live shows persisted Brain activity, not every idle process or a general session dashboard. Confirm the provider is running, then check its setup row in `cbrain doctor`. Codex uses rollout evidence under `~/.codex/sessions/`; Claude prefers bounded `claude agents --json` inventory and falls back to its live process; Antigravity uses `agy` process evidence until hooks provide a conversation identity.
 
+Process-backed discovery is bounded to 1 MiB for stdout and independently for
+stderr. Treat zero sessions as authoritative only when that scan succeeded:
+it means the scan ran and found none. If discovery is unavailable or
+incomplete, the bounded scan did not complete successfully, for example due to
+its size/deadline or unusable process output, and its count is not
+authoritative. Retry from the same provider environment, then inspect host
+load and process volume before drawing conclusions from Live.
+
 Hook events may appear before Codex transcript or Claude inventory evidence can enrich the activity. Claude and Antigravity hook transcript paths are retained as lifecycle identity/status evidence, but their records are not parsed into `AgentSession` context. Run doctor from the same terminal environment as the agent. For terminal-specific setup, see the [navigation matrix](terminal-support.md#navigation-matrix).
 
 ## Permission or recovery stayed at the native prompt
