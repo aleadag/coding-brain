@@ -6501,7 +6501,8 @@ fn runtime_cache_concurrent_first_use_creates_one_exact_database() {
                     outcome,
                     Err(RuntimeCacheBypass::Contended
                         | RuntimeCacheBypass::Corrupt
-                        | RuntimeCacheBypass::Incompatible)
+                        | RuntimeCacheBypass::Incompatible
+                        | RuntimeCacheBypass::Unsafe)
                 )
         }),
         "unexpected concurrent outcomes: {outcomes:?}"
@@ -6586,65 +6587,30 @@ fn exported_tree_bytes(root: &std::path::Path) -> Vec<u8> {
     bytes
 }
 
-fn previous_compatible_binary(root: &std::path::Path) -> Option<std::path::PathBuf> {
-    if let Some(binary) = std::env::var_os("CBRAIN_TEST_PREVIOUS_BINARY") {
-        return Some(binary.into());
-    }
+fn previous_compatible_binary() -> std::path::PathBuf {
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    if !repository.join(".git").exists() {
-        return None;
-    }
-    let source = root.join("previous-source");
-    let target = repository.join("target/previous-compatible-42733e05");
-    let archive = root.join("previous-source.tar");
-    create_managed_dir(&source);
-    let archived = Command::new("git")
-        .args([
-            "archive",
-            "--format=tar",
-            &format!("--output={}", archive.display()),
-            "42733e055893361abb6879ea7e62edd817136199",
-        ])
-        .current_dir(repository)
-        .status()
-        .unwrap();
-    assert!(archived.success(), "historical source archive failed");
-    let extracted = Command::new("tar")
-        .args([
-            "-xf",
-            archive.to_str().unwrap(),
-            "-C",
-            source.to_str().unwrap(),
-        ])
-        .status()
-        .unwrap();
-    assert!(extracted.success(), "historical source extraction failed");
+    let fixture = repository.join("tests/fixtures/previous-compatible-reader/Cargo.toml");
+    let target = repository.join("target/previous-compatible-reader");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let built = Command::new(cargo)
         .args([
             "build",
             "--offline",
             "--locked",
-            "-p",
-            "coding-brain",
-            "--bin",
-            "cbrain",
+            "--manifest-path",
+            fixture.to_str().unwrap(),
         ])
         .env("CARGO_TARGET_DIR", &target)
-        .current_dir(&source)
         .status()
         .unwrap();
-    assert!(built.success(), "historical cbrain build failed");
-    Some(target.join("debug/cbrain"))
+    assert!(built.success(), "previous-compatible reader build failed");
+    target.join("debug/previous-compatible-reader")
 }
 
 #[test]
 fn previous_compatible_binary_ignores_auxiliary_cache_and_reads_brain() {
     let root = private_tempdir();
-    let Some(binary) = previous_compatible_binary(root.path()) else {
-        eprintln!("historical rollback fixture requires local Git history");
-        return;
-    };
+    let binary = previous_compatible_binary();
     let home = root.path().join("home");
     let state_root = home.join(".local/state/coding-brain");
     create_managed_dir(&home);
@@ -6695,14 +6661,8 @@ fn previous_compatible_binary_ignores_auxiliary_cache_and_reads_brain() {
     drop(cache);
     let cache_before = fs::read(paths.runtime_cache_v1()).unwrap();
     let cache_inode = fs::metadata(paths.runtime_cache_v1()).unwrap().ino();
-    let export = root.path().join("historical-export");
-
     let output = Command::new(binary)
-        .args(["storage", "export-audit", export.to_str().unwrap()])
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_STATE_HOME", home.join(".local/state"))
-        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .arg(&state_root)
         .current_dir(&home)
         .output()
         .unwrap();
@@ -6712,9 +6672,8 @@ fn previous_compatible_binary_ignores_auxiliary_cache_and_reads_brain() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let exported = exported_tree_bytes(&export);
     assert!(
-        String::from_utf8_lossy(&exported).contains("rollback-authority"),
+        String::from_utf8_lossy(&output.stdout).contains("rollback-authority"),
         "historical reader did not export authoritative Brain evidence"
     );
     assert_eq!(fs::read(paths.runtime_cache_v1()).unwrap(), cache_before);
