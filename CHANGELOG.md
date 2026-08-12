@@ -8,6 +8,9 @@ All notable changes to Coding Brain are documented here.
 
 ### Fixed
 
+- Provider discovery now accepts larger process tables within a 1 MiB bound for
+  each output stream. A failed bounded scan is reported as unavailable or
+  incomplete instead of appearing as zero sessions.
 - The TUI now spaces recovery discovery scans four seconds apart while idle,
   reducing repeated process and storage work without delaying the first scan
   or allowing scans to overlap.

@@ -1750,20 +1750,41 @@ pub(crate) fn endpoint_warning(endpoint: &str) -> Option<String> {
 }
 
 fn check_session_discovery() -> Check {
-    // Discovery never errors per se — it returns 0 sessions when nothing
-    // matches. The signal we want is "the scanner runs and finds at
-    // least one session." Zero sessions is normal if no Codex is
-    // running; advise instead of fail.
-    let sessions = coding_brain_core::discovery::scan_agent_sessions_with_state(
+    // Process-backed discovery can be unavailable, leaving only partial Claude
+    // results. When it succeeds, an empty scan is advisory and a nonempty scan
+    // passes.
+    let scan = coding_brain_core::discovery::scan_agent_sessions_with_status(
         &mut coding_brain_core::discovery::ProviderDiscoveryState::default(),
     );
-    check_session_discovery_for(&sessions)
+    check_session_discovery_for(&scan)
 }
 
-fn check_session_discovery_for(sessions: &[coding_brain_core::session::AgentSession]) -> Check {
-    let counts = coding_brain_core::health::provider_session_counts(sessions);
+fn check_session_discovery_for(scan: &coding_brain_core::discovery::ProviderSessionScan) -> Check {
+    if !scan.process_snapshot_succeeded {
+        let claude_sessions = scan
+            .sessions
+            .iter()
+            .filter(|session| session.provider == AgentProvider::Claude)
+            .count();
+        let message = if claude_sessions == 0 {
+            "process-backed discovery unavailable; provider counts may be incomplete".into()
+        } else {
+            format!(
+                "process-backed discovery unavailable; provider counts may be incomplete; partial Claude: {claude_sessions}"
+            )
+        };
+        return Check {
+            name: "session discovery".into(),
+            status: CheckStatus::Advisory,
+            message,
+            fix_hint: Some("Retry `cbrain doctor` once after a short delay.".into()),
+            evidence: None,
+        };
+    }
+
+    let counts = coding_brain_core::health::provider_session_counts(&scan.sessions);
     let message = coding_brain_core::health::format_provider_session_counts(&counts);
-    if sessions.is_empty() {
+    if scan.sessions.is_empty() {
         Check {
             name: "session discovery".into(),
             status: CheckStatus::Advisory,
@@ -3432,16 +3453,79 @@ mod tests {
 
     #[test]
     fn discovery_check_reports_only_provider_counts() {
-        let sessions = [
-            provider_session(AgentProvider::Claude, "private-session-id"),
-            provider_session(AgentProvider::Codex, "another-private-id"),
-        ];
+        let scan = provider_session_scan(
+            true,
+            vec![
+                provider_session(AgentProvider::Claude, "private-session-id"),
+                provider_session(AgentProvider::Codex, "another-private-id"),
+            ],
+        );
 
-        let check = check_session_discovery_for(&sessions);
+        let check = check_session_discovery_for(&scan);
 
         assert_eq!(check.status, CheckStatus::Pass);
         assert_eq!(check.message, "Codex: 1, Claude: 1, Antigravity: 0");
         assert!(!check.message.contains("private"));
+    }
+
+    #[test]
+    fn discovery_check_advises_when_process_discovery_is_unavailable_without_sessions() {
+        let check = check_session_discovery_for(&provider_session_scan(false, Vec::new()));
+
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert_eq!(
+            check.message,
+            "process-backed discovery unavailable; provider counts may be incomplete"
+        );
+        assert_eq!(
+            check.fix_hint.as_deref(),
+            Some("Retry `cbrain doctor` once after a short delay.")
+        );
+        assert!(!check.message.contains("Codex:"));
+        assert!(!check.message.contains("Claude:"));
+        assert!(!check.message.contains("Antigravity:"));
+    }
+
+    #[test]
+    fn discovery_check_reports_only_partial_claude_when_process_discovery_is_unavailable() {
+        let check = check_session_discovery_for(&provider_session_scan(
+            false,
+            vec![provider_session(
+                AgentProvider::Claude,
+                "private-session-id",
+            )],
+        ));
+
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert_eq!(
+            check.message,
+            "process-backed discovery unavailable; provider counts may be incomplete; partial Claude: 1"
+        );
+        assert!(!check.message.contains("private"));
+        assert!(!check.message.contains("Codex:"));
+        assert!(!check.message.contains("Antigravity:"));
+    }
+
+    #[test]
+    fn discovery_check_keeps_successful_empty_advisory() {
+        let check = check_session_discovery_for(&provider_session_scan(true, Vec::new()));
+
+        assert_eq!(check.status, CheckStatus::Advisory);
+        assert_eq!(check.message, "Codex: 0, Claude: 0, Antigravity: 0");
+        assert_eq!(
+            check.fix_hint.as_deref(),
+            Some("Start a selected provider session and re-run `cbrain doctor`.")
+        );
+    }
+
+    fn provider_session_scan(
+        process_snapshot_succeeded: bool,
+        sessions: Vec<coding_brain_core::session::AgentSession>,
+    ) -> coding_brain_core::discovery::ProviderSessionScan {
+        coding_brain_core::discovery::ProviderSessionScan {
+            sessions,
+            process_snapshot_succeeded,
+        }
     }
 
     fn provider_session(

@@ -22,12 +22,15 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Stdio;
 use std::process::{Command, ExitStatus};
-#[cfg(any(unix, test))]
 use std::time::Duration;
 
 #[cfg(unix)]
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+#[cfg(unix)]
+const CAPTURE_LIMIT_EXCEEDED: &str = "capture exceeded output limit";
+#[cfg(unix)]
+const CAPTURE_TIMEOUT_UNAVAILABLE: &str = "terminal capture timeout unavailable";
 const CAPTURE_LINES: usize = 80;
 
 #[derive(Debug)]
@@ -272,15 +275,16 @@ fn read_available(
     stream: &mut impl Read,
     bytes: &mut Vec<u8>,
     label: &str,
+    max_capture_bytes: usize,
 ) -> Result<bool, String> {
     let mut buffer = [0_u8; 8192];
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => return Ok(true),
             Ok(read) => {
-                let remaining = MAX_CAPTURE_BYTES.saturating_sub(bytes.len());
+                let remaining = max_capture_bytes.saturating_sub(bytes.len());
                 if read > remaining {
-                    return Err("terminal capture exceeded 64 KiB".into());
+                    return Err(CAPTURE_LIMIT_EXCEEDED.into());
                 }
                 bytes.extend_from_slice(&buffer[..read]);
             }
@@ -293,8 +297,20 @@ fn read_available(
 
 #[cfg(unix)]
 pub(crate) fn run_bounded(command: &mut Command) -> Result<BoundedOutput, String> {
+    run_bounded_with(command, CAPTURE_TIMEOUT, MAX_CAPTURE_BYTES)
+}
+
+#[cfg(unix)]
+pub(crate) fn run_bounded_with(
+    command: &mut Command,
+    timeout: Duration,
+    max_capture_bytes: usize,
+) -> Result<BoundedOutput, String> {
     use std::os::unix::process::CommandExt;
 
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| CAPTURE_TIMEOUT_UNAVAILABLE.to_string())?;
     command.process_group(0);
     let mut child = command
         .stdout(Stdio::piped())
@@ -315,7 +331,6 @@ pub(crate) fn run_bounded(command: &mut Command) -> Result<BoundedOutput, String
         drop(stderr);
         return Err("terminal capture pipe configuration failed".into());
     }
-    let deadline = std::time::Instant::now() + CAPTURE_TIMEOUT;
     let mut status = None;
     let mut stdout_open = true;
     let mut stderr_open = true;
@@ -325,10 +340,12 @@ pub(crate) fn run_bounded(command: &mut Command) -> Result<BoundedOutput, String
     loop {
         let read_result = (|| {
             if stdout_open {
-                stdout_open = !read_available(&mut stdout, &mut stdout_bytes, "stdout")?;
+                stdout_open =
+                    !read_available(&mut stdout, &mut stdout_bytes, "stdout", max_capture_bytes)?;
             }
             if stderr_open {
-                stderr_open = !read_available(&mut stderr, &mut stderr_bytes, "stderr")?;
+                stderr_open =
+                    !read_available(&mut stderr, &mut stderr_bytes, "stderr", max_capture_bytes)?;
             }
             Ok::<(), String>(())
         })();
@@ -368,6 +385,15 @@ pub(crate) fn run_bounded(command: &mut Command) -> Result<BoundedOutput, String
 
 #[cfg(not(unix))]
 pub(crate) fn run_bounded(_command: &mut Command) -> Result<BoundedOutput, String> {
+    Err("guarded terminal capture is unsupported on this platform".into())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn run_bounded_with(
+    _command: &mut Command,
+    _timeout: Duration,
+    _max_capture_bytes: usize,
+) -> Result<BoundedOutput, String> {
     Err("guarded terminal capture is unsupported on this platform".into())
 }
 
@@ -3712,6 +3738,7 @@ mod tests {
         assert_eq!(io.sends.load(Ordering::SeqCst), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bounded_command_runner_handles_success_and_non_zero_exit() {
         let success = run_bounded(Command::new("sh").args(["-c", "printf ok"])).unwrap();
@@ -3722,12 +3749,14 @@ mod tests {
         assert_eq!(failure.status.code(), Some(7));
     }
 
+    #[cfg(unix)]
     #[test]
     fn bounded_command_runner_times_out() {
         let error = run_bounded(Command::new("sh").args(["-c", "sleep 2"])).unwrap_err();
         assert!(error.contains("timed out"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn bounded_command_runner_does_not_wait_for_inherited_pipe() {
         let started = std::time::Instant::now();
@@ -3737,10 +3766,81 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    #[cfg(unix)]
     #[test]
     fn bounded_command_runner_rejects_oversized_output() {
         let error = run_bounded(Command::new("sh").args(["-c", "printf '%70000s' x"])).unwrap_err();
-        assert!(error.contains("exceeded 64 KiB"));
+        assert_eq!(error, CAPTURE_LIMIT_EXCEEDED);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_runner_rejects_unrepresentable_timeout_without_spawning() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("spawned");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf spawned > \"$1\"", "sh"])
+            .arg(&marker);
+
+        let error = run_bounded_with(&mut command, Duration::MAX, MAX_CAPTURE_BYTES).unwrap_err();
+
+        assert_eq!(error, "terminal capture timeout unavailable");
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_runner_parameterizes_capture_limits_per_stream() {
+        use std::io::Write;
+
+        let cat = find_command_path("cat").expect("cat must be available for process tests");
+        let larger_fixture = vec![b'x'; MAX_CAPTURE_BYTES + 1];
+        assert_eq!(larger_fixture.len(), MAX_CAPTURE_BYTES + 1);
+        let mut larger_file = tempfile::NamedTempFile::new().unwrap();
+        larger_file.write_all(&larger_fixture).unwrap();
+
+        let mut stdout_command = Command::new(&cat);
+        stdout_command.arg(larger_file.path());
+        let stdout =
+            run_bounded_with(&mut stdout_command, CAPTURE_TIMEOUT, larger_fixture.len()).unwrap();
+        assert!(stdout.status.success());
+        assert_eq!(stdout.stdout, larger_fixture);
+
+        const EXPLICIT_LIMIT: usize = 128;
+        let bounded_fixture = vec![b'y'; EXPLICIT_LIMIT];
+        assert_eq!(bounded_fixture.len(), EXPLICIT_LIMIT);
+        let mut bounded_file = tempfile::NamedTempFile::new().unwrap();
+        bounded_file.write_all(&bounded_fixture).unwrap();
+
+        let mut stderr_command = Command::new("sh");
+        stderr_command.args(["-c", "\"$1\" \"$2\" >&2", "sh"]);
+        stderr_command.arg(&cat).arg(bounded_file.path());
+        let stderr =
+            run_bounded_with(&mut stderr_command, CAPTURE_TIMEOUT, EXPLICIT_LIMIT).unwrap();
+        assert!(stderr.status.success());
+        assert!(stderr.stdout.is_empty());
+
+        let oversized_fixture = vec![b'z'; EXPLICIT_LIMIT + 1];
+        assert_eq!(oversized_fixture.len(), EXPLICIT_LIMIT + 1);
+        let mut oversized_file = tempfile::NamedTempFile::new().unwrap();
+        oversized_file.write_all(&oversized_fixture).unwrap();
+
+        let mut oversized_stderr_command = Command::new("sh");
+        oversized_stderr_command.args(["-c", "\"$1\" \"$2\" >&2", "sh"]);
+        oversized_stderr_command
+            .arg(&cat)
+            .arg(oversized_file.path());
+        let error = run_bounded_with(
+            &mut oversized_stderr_command,
+            CAPTURE_TIMEOUT,
+            EXPLICIT_LIMIT,
+        )
+        .unwrap_err();
+        assert_eq!(error, CAPTURE_LIMIT_EXCEEDED);
+        assert!(!error.contains('z'));
+        assert!(!error.contains("cat"));
+        assert!(!error.contains(oversized_file.path().to_str().unwrap()));
     }
 
     #[cfg(unix)]
@@ -3816,7 +3916,7 @@ mod tests {
         ]))
         .unwrap_err();
 
-        assert!(error.contains("exceeded 64 KiB"));
+        assert_eq!(error, CAPTURE_LIMIT_EXCEEDED);
         assert_descendant_cleaned(&pid_file);
     }
 

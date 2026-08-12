@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use crate::session::{AgentSession, SessionStatus};
 
 const PROCESS_COLUMNS: &str = "pid=,ppid=,tty=,%cpu=,rss=,etime=,lstart=,comm=,args=";
+const PROCESS_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+const PROCESS_MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProcessSnapshot {
@@ -83,7 +85,11 @@ pub fn capture_process_snapshot() -> ProcessSnapshot {
 
 fn capture_process_snapshot_with(command: &mut std::process::Command) -> ProcessSnapshot {
     command.env_clear();
-    let Ok(output) = crate::terminals::run_bounded(command) else {
+    let Ok(output) = crate::terminals::run_bounded_with(
+        command,
+        PROCESS_CAPTURE_TIMEOUT,
+        PROCESS_MAX_CAPTURE_BYTES,
+    ) else {
         return ProcessSnapshot::default();
     };
     if !output.status.success() {
@@ -396,7 +402,57 @@ fn looks_like_uuid(s: &str) -> bool {
 #[cfg(test)]
 mod provider_snapshot_tests {
     use super::*;
+    use std::io::Write;
     use std::time::{Duration, Instant};
+
+    const OLD_TERMINAL_STREAM_LIMIT: usize = 64 * 1024;
+
+    fn recognized_process_row(pid: u32, marker: &str) -> String {
+        format!(
+            "{pid} 1 ? 0.0 1 00:00 Wed Jul 22 08:00:00 2026 /usr/bin/.codex-wrapped /usr/bin/.codex-wrapped {marker}\n"
+        )
+    }
+
+    fn append_unrecognized_rows_to_size(fixture: &mut String, target_size: usize) {
+        const ROW_PREFIX: &str = "999999 1 ? 0.0 1 00:00 Wed Jul 22 08:00:00 2026 /usr/bin/other ";
+        const ROW_SIZE: usize = 256;
+        const MIN_ROW_SIZE: usize = ROW_PREFIX.len() + 1;
+
+        while fixture.len() + ROW_SIZE + MIN_ROW_SIZE <= target_size {
+            fixture.push_str(ROW_PREFIX);
+            fixture.push_str(&"x".repeat(ROW_SIZE - ROW_PREFIX.len() - 1));
+            fixture.push('\n');
+        }
+
+        let remaining = target_size - fixture.len();
+        assert!(remaining >= MIN_ROW_SIZE);
+        fixture.push_str(ROW_PREFIX);
+        fixture.push_str(&"x".repeat(remaining - ROW_PREFIX.len() - 1));
+        fixture.push('\n');
+    }
+
+    fn write_process_snapshot_fixture(size: usize) -> tempfile::NamedTempFile {
+        let pid = std::process::id();
+        let mut fixture = recognized_process_row(pid, "before-old-boundary");
+        append_unrecognized_rows_to_size(&mut fixture, OLD_TERMINAL_STREAM_LIMIT + 128);
+        fixture.push_str(&recognized_process_row(pid, "after-old-boundary"));
+        append_unrecognized_rows_to_size(&mut fixture, size);
+        assert_eq!(fixture.len(), size);
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(fixture.as_bytes()).unwrap();
+        file
+    }
+
+    fn fixture_cat_command() -> std::process::Command {
+        let path = std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH is available for process tests"),
+        )
+        .map(|directory| directory.join("cat"))
+        .find(|candidate| candidate.is_file())
+        .expect("cat is available on the test PATH");
+        std::process::Command::new(path)
+    }
 
     #[test]
     fn process_snapshot_command_uses_portable_elapsed_and_stable_start_columns() {
@@ -454,13 +510,36 @@ mod provider_snapshot_tests {
 
     #[cfg(unix)]
     #[test]
-    fn process_snapshot_command_is_output_bounded() {
-        let snapshot = capture_process_snapshot_with(std::process::Command::new("sh").args([
-            "-c",
-            "i=0; while [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done",
-        ]));
+    fn process_snapshot_command_accepts_recognized_rows_beyond_terminal_limit() {
+        let fixture = write_process_snapshot_fixture(256 * 1024);
+        let mut command = fixture_cat_command();
+        assert!(Path::new(command.get_program()).is_absolute());
+        let snapshot = capture_process_snapshot_with(command.arg(fixture.path()));
+
+        assert!(snapshot.succeeded);
+        assert_eq!(snapshot.entries.len(), 2);
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.args.ends_with("before-old-boundary"))
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.args.ends_with("after-old-boundary"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_snapshot_command_rejects_output_beyond_process_limit() {
+        let fixture = write_process_snapshot_fixture(PROCESS_MAX_CAPTURE_BYTES + 1);
+        let snapshot = capture_process_snapshot_with(fixture_cat_command().arg(fixture.path()));
 
         assert!(!snapshot.succeeded);
+        assert!(snapshot.entries.is_empty());
     }
 
     #[test]
