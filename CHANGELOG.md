@@ -8,6 +8,9 @@ All notable changes to Coding Brain are documented here.
 
 ### Fixed
 
+- Reviewing one visible item with `a` now advances to the next item on the
+  active Attention, Recent, Review, or Diagnostics surface after the update
+  succeeds, without moving the cursor when mutation or refresh fails.
 - Doctor now recognizes Home Manager provider files whose generation leaves
   link to immutable Nix-store sources, while unsupported project paths and
   imperative init or removal remain fail-closed.
