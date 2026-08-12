@@ -6,7 +6,7 @@ Start with:
 cbrain doctor
 ```
 
-Doctor reports separate `Codex setup`, `Claude setup`, and `Antigravity setup` rows. An unselected provider with no executable is skipped. A selected provider whose executable disappeared is advisory, while invalid, unsafe, or stale managed definitions fail. For a non-current setup, Doctor lists each resolved candidate in inspection order with its path, scope, ownership, state, and a bounded reason when applicable; the list is empty when no candidate path can be resolved, such as when `HOME` is unavailable. `cbrain doctor --json` exposes the same records under `evidence.provider_files`. The report also keeps Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback separate so focus is never mistaken for input authority.
+Doctor reports separate `Codex setup`, `Claude setup`, and `Antigravity setup` rows. An unselected provider with no executable is skipped. A selected provider whose executable disappeared is advisory, while invalid, unsafe, or stale managed definitions fail. Doctor lists each non-current file candidate in inspection order with its path, scope, ownership, state, and a bounded reason when applicable, even if another file makes the aggregate provider setup current. The list is empty when no candidate path can be resolved, such as when `HOME` is unavailable. `cbrain doctor --json` exposes the same records under `evidence.provider_files`. The report also keeps Codex hook trust, Agent Deck navigation, Claude native attach, guarded semantic input, and focus-only fallback separate so one capability is never mistaken for another.
 
 ## Hooks are missing or stale
 
@@ -21,7 +21,7 @@ cbrain init antigravity
 cbrain doctor
 ```
 
-Restart the repaired provider. For Codex, inspect `/hooks`; Coding Brain cannot observe whether Codex trusts a command, so trust remains advisory even when every definition is current.
+Restart the repaired provider. For Codex, Doctor queries the bounded `hooks/list` app-server method. Trusted or policy-managed cbrain hooks pass; modified or untrusted hooks remain advisory and name the affected events. If Codex is unavailable, times out, or returns malformed trust data, Doctor fails closed to a trust-unavailable advisory. Inspect `/hooks` before approving or repairing any affected command.
 
 Init removes only exact Coding Brain-owned definitions. Lookalike, unrelated, disabled, and user-modified former managed entries remain in place. A multi-provider change is fully staged and validated before replacement. If the process is interrupted, recovery completes or rolls back only while recorded hashes still prove which version Coding Brain wrote; a concurrent edit is preserved.
 

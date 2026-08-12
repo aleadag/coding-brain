@@ -12,9 +12,11 @@
 //! non-fatal so optional brain configuration does not make doctor fail.
 
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -818,10 +820,16 @@ fn check_provider_setup(provider: AgentProvider, evidence: ProviderSetupEvidence
             provider.as_str()
         )),
     };
-    let evidence = (state != ProviderSetupState::Current).then(|| CheckEvidence {
-        provider_files: evidence.hooks.files.iter().map(Into::into).collect(),
-        storage: None,
-    });
+    let has_non_current_file = evidence
+        .hooks
+        .files
+        .iter()
+        .any(|file| file.state != ProviderHookFileState::Current);
+    let evidence =
+        (state != ProviderSetupState::Current || has_non_current_file).then(|| CheckEvidence {
+            provider_files: evidence.hooks.files.iter().map(Into::into).collect(),
+            storage: None,
+        });
     Check {
         name: format!("{} setup", provider.label()),
         status,
@@ -984,18 +992,292 @@ fn check_codex_hooks_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -
 }
 
 fn check_codex_hook_trust() -> Check {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    check_codex_hook_trust_at(home.as_deref(), &cwd)
+    let result = probe_codex_hook_trust_at(&cwd);
+    check_codex_hook_trust_from_probe(&cwd, result)
 }
 
-fn check_codex_hook_trust_at(home: Option<&std::path::Path>, cwd: &std::path::Path) -> Check {
-    let discovery = crate::init::hooks::discover_lifecycle_hooks_at(home, cwd);
-    if !discovery.trust_unverified {
+const CODEX_HOOK_TRUST_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_APP_SERVER_LINE_LIMIT: usize = 1024 * 1024;
+const CODEX_APP_SERVER_CHANNEL_CAPACITY: usize = 32;
+
+#[derive(Debug, Deserialize)]
+struct CodexHooksListResult {
+    data: Vec<CodexHooksListEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexHooksListEntry {
+    cwd: String,
+    hooks: Vec<CodexHookTrustEntry>,
+    #[serde(rename = "warnings")]
+    _warnings: Vec<serde_json::Value>,
+    errors: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexHookTrustEntry {
+    event_name: String,
+    handler_type: String,
+    command: Option<String>,
+    enabled: bool,
+    trust_status: String,
+}
+
+fn probe_codex_hook_trust_at(cwd: &Path) -> Result<serde_json::Value, String> {
+    probe_codex_hook_trust_with(Path::new("codex"), cwd, CODEX_HOOK_TRUST_TIMEOUT)
+}
+
+fn probe_codex_hook_trust_with(
+    program: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let deadline = Instant::now() + timeout;
+    let cwd_text = cwd
+        .to_str()
+        .ok_or_else(|| "working directory is not valid UTF-8".to_string())?;
+    let mut command = Command::new(program);
+    command
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start Codex app-server: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Codex app-server stdin unavailable".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Codex app-server stdout unavailable".to_string())?;
+    let (line_tx, line_rx) = mpsc::sync_channel::<Result<Option<serde_json::Value>, String>>(
+        CODEX_APP_SERVER_CHANNEL_CAPACITY,
+    );
+    let _reader = std::thread::spawn(move || {
+        let mut reader = io::BufReader::new(stdout);
+        loop {
+            let mut line = Vec::new();
+            let read = match reader
+                .by_ref()
+                .take((CODEX_APP_SERVER_LINE_LIMIT + 1) as u64)
+                .read_until(b'\n', &mut line)
+            {
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = line_tx.send(Err(format!(
+                        "could not read Codex app-server response: {error}"
+                    )));
+                    break;
+                }
+            };
+            if read == 0 {
+                let _ = line_tx.send(Ok(None));
+                break;
+            }
+            if line.len() > CODEX_APP_SERVER_LINE_LIMIT {
+                let _ = line_tx.send(Err("Codex app-server response line too large".into()));
+                break;
+            }
+            while matches!(line.last(), Some(b'\n' | b'\r')) {
+                line.pop();
+            }
+            let parsed = serde_json::from_slice(&line)
+                .map(Some)
+                .map_err(|error| format!("invalid Codex app-server JSON: {error}"));
+            if line_tx.send(parsed).is_err() {
+                break;
+            }
+        }
+    });
+
+    let exchange = (|| {
+        write_codex_app_server_message(
+            &mut stdin,
+            &serde_json::json!({
+                "method": "initialize",
+                "id": 0,
+                "params": {
+                    "clientInfo": {
+                        "name": "coding_brain_doctor",
+                        "title": "coding-brain Doctor",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": { "experimentalApi": true }
+                }
+            }),
+        )?;
+        receive_codex_app_server_response(&line_rx, 0, deadline)?;
+        write_codex_app_server_message(
+            &mut stdin,
+            &serde_json::json!({ "method": "initialized", "params": {} }),
+        )?;
+        write_codex_app_server_message(
+            &mut stdin,
+            &serde_json::json!({
+                "method": "hooks/list",
+                "id": 1,
+                "params": { "cwds": [cwd_text] }
+            }),
+        )?;
+        receive_codex_app_server_response(&line_rx, 1, deadline)
+    })();
+
+    drop(stdin);
+    terminate_codex_app_server(child, deadline);
+    drop(line_rx);
+    exchange
+}
+
+fn terminate_codex_app_server(mut child: std::process::Child, deadline: Instant) {
+    #[cfg(unix)]
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let _ = std::thread::Builder::new()
+        .name("coding-brain-codex-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
+fn write_codex_app_server_message(
+    stdin: &mut impl Write,
+    message: &serde_json::Value,
+) -> Result<(), String> {
+    serde_json::to_writer(&mut *stdin, message)
+        .map_err(|error| format!("could not encode Codex app-server request: {error}"))?;
+    stdin
+        .write_all(b"\n")
+        .and_then(|()| stdin.flush())
+        .map_err(|error| format!("could not write Codex app-server request: {error}"))
+}
+
+fn receive_codex_app_server_response(
+    receiver: &mpsc::Receiver<Result<Option<serde_json::Value>, String>>,
+    expected_id: u64,
+    deadline: Instant,
+) -> Result<serde_json::Value, String> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "Codex app-server timed out".to_string())?;
+        let message = receiver
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => "Codex app-server timed out".to_string(),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "Codex app-server response channel closed".to_string()
+                }
+            })??;
+        let Some(message) = message else {
+            return Err("Codex app-server exited before responding".into());
+        };
+        if message.get("id").and_then(serde_json::Value::as_u64) != Some(expected_id) {
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            return Err(format!("Codex app-server returned an error: {error}"));
+        }
+        return message
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "Codex app-server response omitted result".to_string());
+    }
+}
+
+fn check_codex_hook_trust_from_probe(
+    cwd: &Path,
+    result: Result<serde_json::Value, String>,
+) -> Check {
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => return codex_hook_trust_unavailable(&error),
+    };
+    let response = match serde_json::from_value::<CodexHooksListResult>(result) {
+        Ok(response) => response,
+        Err(error) => return codex_hook_trust_unavailable(&format!("invalid response: {error}")),
+    };
+    let Some(entry) = response
+        .data
+        .into_iter()
+        .find(|entry| Path::new(&entry.cwd) == cwd)
+    else {
+        return codex_hook_trust_unavailable("response omitted the active working directory");
+    };
+    if !entry.errors.is_empty() {
+        return codex_hook_trust_unavailable("Codex reported hook discovery errors");
+    }
+
+    let mut trusted = 0usize;
+    let mut needs_review = Vec::new();
+    for hook in entry.hooks {
+        if !hook.enabled || hook.handler_type != "command" {
+            continue;
+        }
+        let Some(event) =
+            crate::init::hooks::ManagedHookEvent::from_codex_app_server_name(&hook.event_name)
+        else {
+            continue;
+        };
+        let Some(command) = hook.command.as_deref() else {
+            continue;
+        };
+        if !crate::init::hooks::is_discoverable_managed_command(event, command) {
+            continue;
+        }
+        match hook.trust_status.as_str() {
+            "trusted" | "managed" => trusted += 1,
+            "untrusted" | "modified" => {
+                needs_review.push(format!("{} ({})", hook.event_name, hook.trust_status));
+            }
+            status => {
+                return codex_hook_trust_unavailable(&format!("unknown trust status {status:?}"));
+            }
+        }
+    }
+
+    if !needs_review.is_empty() {
+        needs_review.sort();
+        needs_review.dedup();
+        return Check {
+            name: "Codex hook trust".into(),
+            status: CheckStatus::Advisory,
+            message: format!("cbrain hooks require review: {}", needs_review.join(", ")),
+            fix_hint: Some(
+                "Review and approve the affected managed commands through Codex `/hooks`, then rerun `cbrain doctor`."
+                    .into(),
+            ),
+            evidence: None,
+        };
+    }
+
+    if trusted == 0 {
         return Check {
             name: "Codex hook trust".into(),
             status: CheckStatus::Skipped,
-            message: "no enabled managed definitions".into(),
+            message: "no enabled cbrain hooks reported by Codex".into(),
             fix_hint: None,
             evidence: None,
         };
@@ -1003,9 +1285,25 @@ fn check_codex_hook_trust_at(home: Option<&std::path::Path>, cwd: &std::path::Pa
 
     Check {
         name: "Codex hook trust".into(),
+        status: CheckStatus::Pass,
+        message: format!(
+            "{trusted} enabled cbrain hook{} trusted",
+            if trusted == 1 { "" } else { "s" }
+        ),
+        fix_hint: None,
+        evidence: None,
+    }
+}
+
+fn codex_hook_trust_unavailable(reason: &str) -> Check {
+    Check {
+        name: "Codex hook trust".into(),
         status: CheckStatus::Advisory,
-        message: "trust unverified; review /hooks".into(),
-        fix_hint: Some("Restart Codex and confirm the managed commands through `/hooks`.".into()),
+        message: format!("trust unavailable: {reason}"),
+        fix_hint: Some(
+            "Resolve the Codex app-server error, review `/hooks`, then rerun `cbrain doctor`."
+                .into(),
+        ),
         evidence: None,
     }
 }
@@ -2352,7 +2650,7 @@ mod tests {
     }
 
     #[test]
-    fn current_definitions_pass_while_trust_remains_advisory() {
+    fn current_definitions_and_authoritative_trust_pass() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         let cwd = temp.path().join("project");
@@ -2371,17 +2669,132 @@ mod tests {
                 ),
             },
         );
-        let trust = check_codex_hook_trust_at(Some(&home), &cwd);
+        let trust = check_codex_hook_trust_from_probe(
+            &cwd,
+            Ok(serde_json::json!({
+                "data": [{
+                    "cwd": cwd,
+                    "hooks": [{
+                        "eventName": "sessionStart",
+                        "handlerType": "command",
+                        "command": "cbrain --lifecycle-hook",
+                        "enabled": true,
+                        "trustStatus": "trusted"
+                    }],
+                    "warnings": [],
+                    "errors": []
+                }]
+            })),
+        );
 
         assert_eq!(definitions.status, CheckStatus::Pass);
         assert_eq!(definitions.message, "global definitions current");
         assert_eq!(setup.status, CheckStatus::Pass);
         assert!(setup.fix_hint.is_none());
-        assert_eq!(trust.status, CheckStatus::Advisory);
-        assert_eq!(trust.message, "trust unverified; review /hooks");
+        assert_eq!(trust.status, CheckStatus::Pass);
+        assert_eq!(trust.message, "1 enabled cbrain hook trusted");
         assert!(!definitions.message.contains("/hooks"));
         assert!(!setup.message.contains("/hooks"));
-        assert!(trust.message.contains("/hooks"));
+        assert!(!trust.message.contains("/hooks"));
+    }
+
+    #[test]
+    fn codex_hook_trust_maps_authoritative_statuses_fail_closed() {
+        let cwd = Path::new("/work/project");
+        let hook = |event: &str, trust_status: &str| {
+            serde_json::json!({
+                "eventName": event,
+                "handlerType": "command",
+                "command": "cbrain --lifecycle-hook",
+                "enabled": true,
+                "trustStatus": trust_status
+            })
+        };
+        let response = |hooks: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "data": [{
+                    "cwd": "/work/project",
+                    "hooks": hooks,
+                    "warnings": [],
+                    "errors": []
+                }]
+            })
+        };
+
+        let managed = check_codex_hook_trust_from_probe(
+            cwd,
+            Ok(response(vec![hook("sessionStart", "managed")])),
+        );
+        assert_eq!(managed.status, CheckStatus::Pass);
+
+        let needs_review = check_codex_hook_trust_from_probe(
+            cwd,
+            Ok(response(vec![
+                hook("sessionStart", "modified"),
+                hook("stop", "untrusted"),
+            ])),
+        );
+        assert_eq!(needs_review.status, CheckStatus::Advisory);
+        assert!(needs_review.message.contains("sessionStart (modified)"));
+        assert!(needs_review.message.contains("stop (untrusted)"));
+        assert!(needs_review.fix_hint.unwrap().contains("/hooks"));
+
+        let empty = check_codex_hook_trust_from_probe(cwd, Ok(response(Vec::new())));
+        assert_eq!(empty.status, CheckStatus::Skipped);
+
+        for result in [
+            Err("codex unavailable".to_string()),
+            Ok(serde_json::json!({"data": "invalid"})),
+            Ok(serde_json::json!({
+                "data": [{
+                    "cwd": "/work/project",
+                    "hooks": [],
+                    "warnings": []
+                }]
+            })),
+            Ok(serde_json::json!({
+                "data": [{
+                    "cwd": "/work/project",
+                    "hooks": [],
+                    "errors": []
+                }]
+            })),
+            Ok(response(vec![hook("sessionStart", "future-status")])),
+        ] {
+            let unavailable = check_codex_hook_trust_from_probe(cwd, result);
+            assert_eq!(unavailable.status, CheckStatus::Advisory);
+            assert!(unavailable.message.contains("trust unavailable"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_hook_trust_probe_completes_handshake_and_bounds_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let probe = temp.path().join("codex-probe");
+        let script = format!(
+            "#!/bin/sh\nIFS= read -r initialize\nprintf '%s\\n' '{{\"id\":0,\"result\":{{}}}}'\nIFS= read -r initialized\nIFS= read -r hooks_list\nprintf '%s\\n' '{{\"id\":1,\"result\":{{\"data\":[{{\"cwd\":\"{}\",\"hooks\":[{{\"eventName\":\"stop\",\"handlerType\":\"command\",\"command\":\"cbrain --recovery-hook\",\"enabled\":true,\"trustStatus\":\"trusted\"}}],\"warnings\":[],\"errors\":[]}}]}}}}'\n",
+            cwd.display()
+        );
+        std::fs::write(&probe, script).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = probe_codex_hook_trust_with(&probe, &cwd, Duration::from_secs(2)).unwrap();
+        let check = check_codex_hook_trust_from_probe(&cwd, Ok(result));
+        assert_eq!(check.status, CheckStatus::Pass);
+
+        let stalled = temp.path().join("codex-stalled");
+        std::fs::write(&stalled, "#!/bin/sh\nsleep 2\n").unwrap();
+        std::fs::set_permissions(&stalled, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let error =
+            probe_codex_hook_trust_with(&stalled, &cwd, Duration::from_millis(50)).unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -3107,6 +3520,84 @@ mod tests {
         assert!(human.contains("/home/example/.claude/settings.json"));
         assert!(human.contains("project"));
         assert!(human.contains("/work/project/.claude/settings.json"));
+    }
+
+    #[test]
+    fn provider_setup_stale_home_manager_definition_with_unrelated_project_file_uses_declarative_repair()
+     {
+        let check = check_provider_setup(
+            AgentProvider::Claude,
+            ProviderSetupEvidence {
+                recorded: true,
+                executable_available: true,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Stale,
+                    ownership: ProviderHookOwnership::HomeManager,
+                    files: vec![
+                        provider_file(
+                            "/home/example/.claude/settings.json",
+                            HookScope::Global,
+                            ProviderHookFileState::Stale,
+                            ProviderHookOwnership::HomeManager,
+                            Some(ProviderHookDiagnosticReason::ContractMismatch),
+                        ),
+                        provider_file(
+                            "/work/project/.claude/settings.json",
+                            HookScope::Project,
+                            ProviderHookFileState::Missing,
+                            ProviderHookOwnership::Imperative,
+                            None,
+                        ),
+                    ],
+                },
+            },
+        );
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        let hint = check.fix_hint.unwrap();
+        assert!(hint.contains("Home Manager"));
+        assert!(!hint.contains("duplicate scope"));
+        assert_eq!(
+            check.evidence.unwrap().provider_files[1].state,
+            ProviderHookFileState::Missing
+        );
+    }
+
+    #[test]
+    fn current_provider_setup_retains_non_current_file_evidence() {
+        let check = check_provider_setup(
+            AgentProvider::Claude,
+            ProviderSetupEvidence {
+                recorded: true,
+                executable_available: true,
+                hooks: ProviderHookInspection {
+                    state: ProviderHookState::Current,
+                    ownership: ProviderHookOwnership::HomeManager,
+                    files: vec![
+                        provider_file(
+                            "/home/example/.claude/settings.json",
+                            HookScope::Global,
+                            ProviderHookFileState::Current,
+                            ProviderHookOwnership::HomeManager,
+                            None,
+                        ),
+                        provider_file(
+                            "/work/project/.claude/settings.json",
+                            HookScope::Project,
+                            ProviderHookFileState::Missing,
+                            ProviderHookOwnership::Imperative,
+                            None,
+                        ),
+                    ],
+                },
+            },
+        );
+
+        assert_eq!(check.status, CheckStatus::Pass);
+        let files = check.evidence.unwrap().provider_files;
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[1].state, ProviderHookFileState::Missing);
+        assert_eq!(files[1].ownership, ProviderHookOwnership::Imperative);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::io;
 #[cfg(test)]
@@ -9,6 +10,7 @@ use crate::executable::CURRENT_PROGRAM;
 use crate::executable::{is_current_program, is_managed_program};
 
 /// One managed Codex hook definition.
+#[cfg(test)]
 struct HookSpec {
     event: &'static str,
     matcher: Option<&'static str>,
@@ -17,6 +19,7 @@ struct HookSpec {
     status_message: Option<&'static str>,
 }
 
+#[cfg(test)]
 const HOOKS: &[HookSpec] = &[
     HookSpec {
         event: "SessionStart",
@@ -91,6 +94,7 @@ pub enum ManagedHookEvent {
 }
 
 impl ManagedHookEvent {
+    #[cfg(test)]
     pub const ALL: [Self; 8] = [
         Self::SessionStart,
         Self::UserPromptSubmit,
@@ -102,6 +106,7 @@ impl ManagedHookEvent {
         Self::Stop,
     ];
 
+    #[cfg(test)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SessionStart => "SessionStart",
@@ -114,9 +119,24 @@ impl ManagedHookEvent {
             Self::Stop => "Stop",
         }
     }
+
+    pub(crate) fn from_codex_app_server_name(name: &str) -> Option<Self> {
+        match name {
+            "sessionStart" => Some(Self::SessionStart),
+            "userPromptSubmit" => Some(Self::UserPromptSubmit),
+            "preToolUse" => Some(Self::PreToolUse),
+            "permissionRequest" => Some(Self::PermissionRequest),
+            "postToolUse" => Some(Self::PostToolUse),
+            "subagentStart" => Some(Self::SubagentStart),
+            "subagentStop" => Some(Self::SubagentStop),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg(test)]
 pub struct ManagedHookEventState {
     pub configured: bool,
     pub current: bool,
@@ -126,10 +146,12 @@ pub struct ManagedHookEventState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub struct LifecycleHookScope {
     pub events: BTreeMap<ManagedHookEvent, ManagedHookEventState>,
 }
 
+#[cfg(test)]
 impl Default for LifecycleHookScope {
     fn default() -> Self {
         Self {
@@ -141,6 +163,7 @@ impl Default for LifecycleHookScope {
     }
 }
 
+#[cfg(test)]
 impl LifecycleHookScope {
     #[cfg(test)]
     pub fn configured(&self) -> bool {
@@ -156,12 +179,13 @@ impl LifecycleHookScope {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg(test)]
 pub struct LifecycleHookDiscovery {
     pub global: LifecycleHookScope,
     pub project: LifecycleHookScope,
-    pub trust_unverified: bool,
 }
 
+#[cfg(test)]
 impl LifecycleHookDiscovery {
     #[cfg(test)]
     pub fn configured(&self) -> bool {
@@ -215,6 +239,7 @@ fn settings_path(project: bool) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn discover_lifecycle_hooks_at(
     home: Option<&Path>,
     cwd: &Path,
@@ -224,17 +249,7 @@ pub(crate) fn discover_lifecycle_hooks_at(
         .unwrap_or_default();
     let markers = project_root_markers(home);
     let project = lifecycle_scope_from_paths(applicable_project_hook_paths(cwd, &markers));
-    let trust_unverified = [&global, &project].into_iter().any(|scope| {
-        scope
-            .events
-            .values()
-            .any(|state| state.configured && !state.disabled)
-    });
-    LifecycleHookDiscovery {
-        global,
-        project,
-        trust_unverified,
-    }
+    LifecycleHookDiscovery { global, project }
 }
 
 pub(crate) fn discover_permission_hooks_at(
@@ -355,6 +370,7 @@ fn scope_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> PermissionHookS
     scope
 }
 
+#[cfg(test)]
 fn lifecycle_scope_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> LifecycleHookScope {
     let mut scope = LifecycleHookScope::default();
     for path in paths {
@@ -369,6 +385,7 @@ fn lifecycle_scope_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Lifec
     scope
 }
 
+#[cfg(test)]
 fn inspect_lifecycle_handlers(value: &serde_json::Value, scope: &mut LifecycleHookScope) {
     let Some(hooks) = value.get("hooks").and_then(serde_json::Value::as_object) else {
         return;
@@ -428,7 +445,7 @@ fn inspect_lifecycle_handlers(value: &serde_json::Value, scope: &mut LifecycleHo
     }
 }
 
-fn is_discoverable_managed_command(event: ManagedHookEvent, command: &str) -> bool {
+pub(crate) fn is_discoverable_managed_command(event: ManagedHookEvent, command: &str) -> bool {
     let expected = match event {
         ManagedHookEvent::PermissionRequest => "--permission-hook",
         ManagedHookEvent::Stop => "--recovery-hook",
@@ -452,6 +469,7 @@ fn is_discoverable_managed_command(event: ManagedHookEvent, command: &str) -> bo
         ) && is_managed_snapshot_command(command))
 }
 
+#[cfg(test)]
 fn command_uses_missing_absolute_binary(command: &str) -> bool {
     let Some(program) = command.split_whitespace().next() else {
         return false;
@@ -1466,7 +1484,6 @@ mod tests {
 
         assert!(discovery.global.definitions_current());
         assert!(!discovery.project.configured());
-        assert!(discovery.trust_unverified);
     }
 
     #[test]

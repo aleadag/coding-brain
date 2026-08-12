@@ -14,6 +14,13 @@ All notable changes to Coding Brain are documented here.
 - Doctor now recognizes Home Manager provider files whose generation leaves
   link to immutable Nix-store sources, while unsupported project paths and
   imperative init or removal remain fail-closed.
+- `cbrain doctor` now accepts exact Home Manager Claude hooks alongside
+  unrelated empty matchers and keeps definition-free project files visible
+  without misreporting mixed ownership or duplicate scopes. Missing
+  declarative definitions continue to point back to Home Manager.
+- Codex hook trust now comes from Codex's bounded `hooks/list` response.
+  Trusted or managed cbrain hooks pass; modified, untrusted, unavailable, or
+  malformed trust results remain advisory and direct users to `/hooks`.
 - SQLite migration now creates and safely recovers the Review reset gate before
   reporting healthy Review storage. Doctor validates both Brain and Review, so
   an unusable migrated Review database is reported before the TUI opens it.
