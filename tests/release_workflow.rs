@@ -167,7 +167,6 @@ fn official_release_nix_and_package_paths_remain_feature_free() {
 
     let flake = include_str!("../flake.nix");
     assert_contract(flake, "buildRustPackage");
-    assert_contract(flake, "checkType = \"debug\"");
     assert!(
         !flake.contains("fault-injection"),
         "Nix build and package commands must remain feature-free"
@@ -195,7 +194,6 @@ fn nix_package_check_is_portable_and_bounded() {
     }
 
     for required in [
-        "checkType = \"debug\";",
         "dontUseCargoParallelTests = true;",
         "cargoTestFlags = [",
         "\"coding-brain-core\"",
@@ -211,6 +209,27 @@ fn nix_package_check_is_portable_and_bounded() {
     ] {
         assert_contract(flake, required);
     }
+
+    let package = flake
+        .split_once("package = pkgs.rustPlatform.buildRustPackage {")
+        .expect("Nix must retain the installable Rust package")
+        .1
+        .split_once("\n        };")
+        .expect("Nix Rust package must remain a bounded attribute set")
+        .0;
+    assert!(
+        !package.contains("checkType"),
+        "Nix package checks must inherit the release build profile"
+    );
+    let post_check = package
+        .split_once("postCheck = ''")
+        .expect("Nix package checks must retain the custom integration post-check")
+        .1
+        .split_once("'';")
+        .expect("Nix package post-check must remain a bounded shell block")
+        .0;
+    assert_contract(post_check, "cargo test");
+    assert_contract(post_check, "--release");
 
     let darwin = flake
         .split_once("++ pkgs.lib.optionals pkgs.stdenv.isDarwin [")
