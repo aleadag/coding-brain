@@ -3,6 +3,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use syn::visit::Visit;
+use syn::{Attribute, Expr, Item, UseTree};
+
 fn isolated_command(temp: &tempfile::TempDir) -> Command {
     let home = temp.path().join("home");
     let config = temp.path().join("config");
@@ -458,4 +461,110 @@ fn doctor_reports_identity_and_remote_endpoint_risks() {
     let http_stdout = String::from_utf8_lossy(&http.stdout);
     assert!(http_stdout.contains("remote plaintext HTTP"));
     assert!(http_stdout.contains("exposed in transit"));
+}
+
+fn directly_cfg_test(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("cfg")
+            && attribute
+                .meta
+                .require_list()
+                .is_ok_and(|list| list.tokens.to_string().replace(' ', "") == "test")
+    })
+}
+
+fn use_tree_contains(tree: &UseTree, expected: &str) -> bool {
+    match tree {
+        UseTree::Name(name) => name.ident == expected,
+        UseTree::Rename(rename) => rename.ident == expected || rename.rename == expected,
+        UseTree::Path(path) => use_tree_contains(&path.tree, expected),
+        UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|item| use_tree_contains(item, expected)),
+        UseTree::Glob(_) => false,
+    }
+}
+
+#[test]
+fn staging_sidecar_diagnostics_are_test_compiled_only() {
+    let security_source = include_str!("../src/brain/storage/security.rs");
+    let storage_source = include_str!("../src/brain/storage/mod.rs");
+    let diagnostics_source = include_str!("../src/brain/storage/security/diagnostics.rs");
+    let security = syn::parse_file(security_source).unwrap();
+    let storage = syn::parse_file(storage_source).unwrap();
+    let diagnostics = syn::parse_file(diagnostics_source).unwrap();
+
+    let child_module = security.items.iter().find_map(|item| match item {
+        Item::Mod(module) if module.ident == "diagnostics" => Some(module),
+        _ => None,
+    });
+    assert!(
+        child_module.is_some_and(|module| directly_cfg_test(&module.attrs)),
+        "diagnostics child module must be directly cfg(test)"
+    );
+
+    let guard_reexport = security.items.iter().find_map(|item| match item {
+        Item::Use(item) if use_tree_contains(&item.tree, "SidecarDiagnosticGuard") => Some(item),
+        _ => None,
+    });
+    assert!(
+        guard_reexport.is_some_and(|item| directly_cfg_test(&item.attrs)),
+        "diagnostic guard re-export must be directly cfg(test)"
+    );
+
+    let outer_guard_reexports = storage
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Use(item) if use_tree_contains(&item.tree, "SidecarDiagnosticGuard") => {
+                Some(item)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outer_guard_reexports.len(), 1);
+    assert!(
+        directly_cfg_test(&outer_guard_reexports[0].attrs),
+        "outer diagnostic guard re-export must be directly cfg(test)"
+    );
+
+    struct CaptureCallVisitor {
+        direct_cfg: Vec<bool>,
+    }
+    impl<'ast> Visit<'ast> for CaptureCallVisitor {
+        fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
+            if matches!(
+                &*expression.func,
+                Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|segment| {
+                        segment.ident == "capture_sidecar_rejection"
+                    })
+            ) {
+                self.direct_cfg.push(directly_cfg_test(&expression.attrs));
+            }
+            syn::visit::visit_expr_call(self, expression);
+        }
+    }
+    let mut visitor = CaptureCallVisitor {
+        direct_cfg: Vec::new(),
+    };
+    visitor.visit_file(&security);
+    assert_eq!(
+        visitor.direct_cfg,
+        [true],
+        "validator capture call must be unique and directly cfg(test)"
+    );
+
+    assert!(
+        diagnostics.attrs.iter().any(|attribute| {
+            matches!(attribute.style, syn::AttrStyle::Inner(_))
+                && directly_cfg_test(std::slice::from_ref(attribute))
+        }),
+        "diagnostics child file must begin with an inner cfg(test) attribute"
+    );
+    assert!(
+        diagnostics_source.starts_with("#![cfg(test)]"),
+        "diagnostics child file must begin with #![cfg(test)]"
+    );
 }

@@ -9,6 +9,13 @@ use std::path::{Component, Path, PathBuf};
 
 use super::super::secure_state::state_root_for_traversal;
 
+#[cfg(test)]
+#[path = "security/diagnostics.rs"]
+mod diagnostics;
+
+#[cfg(test)]
+pub(crate) use diagnostics::SidecarDiagnosticGuard;
+
 #[derive(Debug)]
 pub(super) enum SecurityError {
     Missing,
@@ -429,7 +436,11 @@ impl SecureDatabaseDirectory {
             let name = sidecar_name(database_name, suffix)?;
             match metadata_at(&self.descriptor, &name) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Ok(_) => return Err(SecurityError::Invalid("staging SQLite sidecar remains")),
+                Ok(_metadata) => {
+                    #[cfg(test)]
+                    diagnostics::capture_sidecar_rejection(self, database_name, &name, _metadata);
+                    return Err(SecurityError::Invalid("staging SQLite sidecar remains"));
+                }
                 Err(error) => return Err(error.into()),
             }
         }
