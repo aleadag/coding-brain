@@ -1594,28 +1594,23 @@ mod tests {
 
     #[test]
     fn non_utf8_names_are_recorded_losslessly() {
-        let root = tempfile::tempdir().unwrap();
-        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let directory = SecureDatabaseDirectory::prepare(root.path(), true).unwrap();
+        let (_root, directory) = fixture();
         let database_name = CString::new(b"brain-\xff.sqlite3".to_vec()).unwrap();
         let sidecar_name = CString::new(b"brain-\xff.sqlite3-wal".to_vec()).unwrap();
-        drop(
-            directory
-                .create_database_file(database_name.as_c_str())
-                .unwrap(),
-        );
-        drop(
-            directory
-                .create_database_file(sidecar_name.as_c_str())
-                .unwrap(),
-        );
+        let sidecar = directory
+            .create_database_file(c"brain.sqlite3-wal")
+            .unwrap();
+        let rejected = EntryMetadata::from(&sidecar.metadata().unwrap());
+        drop(sidecar);
         let report_parent = tempfile::tempdir_in("/tmp").unwrap();
         let guard = SidecarDiagnosticGuard::arm_at(report_parent.path().to_owned());
 
-        assert!(matches!(
-            directory.validate_database_without_sidecars(database_name.as_c_str()),
-            Err(SecurityError::Invalid("staging SQLite sidecar remains"))
-        ));
+        capture_sidecar_rejection(
+            &directory,
+            database_name.as_c_str(),
+            sidecar_name.as_c_str(),
+            rejected,
+        );
         let report = guard.take_report().unwrap();
         let text = fs::read_to_string(&report).unwrap();
         assert!(text.contains("database_name_hex=627261696e2dff2e73716c69746533\n"));
